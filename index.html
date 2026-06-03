@@ -3485,46 +3485,42 @@
       const [validating, setValidating] = React.useState(false);
       const [lastValidated, setLastValidated] = React.useState(null);
 
-      // Charge la liste FL depuis l'onglet S10 (CSV gviz, sans OAuth si Sheet public)
-      React.useEffect(() => {
-        let cancelled = false;
-        (async () => {
-          setLoading(true); setErr('');
-          try {
-            // Lecture via le proxy Apps Script (pas de CORS, fonctionne même si le Sheet est privé)
-            const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_read' });
-            if (cancelled) return;
-            if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
-            const rows = data.rows || [];
-            if (!rows.length) throw new Error('Feuille vide');
-            // En-tête : repérer les colonnes par nom
-            const header = rows[0].map(h => String(h || '').trim().toLowerCase());
-            const idxProd = header.findIndex(h => h === 'producteur');
-            const idxName = header.findIndex(h => h === 'produit');
-            const idxCol  = header.findIndex(h => h === 'col');
-            const idxUv   = header.findIndex(h => h === 'uv');
-            const list = [];
-            for (let r = 1; r < rows.length; r++) {
-              const row = rows[r];
-              const producer = String(row[idxProd] || '').trim();
-              const produit = String(row[idxName] || '').trim();
-              const colRaw = String(idxCol >= 0 ? row[idxCol] : '').replace(',', '.').trim();
-              const col = parseFloat(colRaw);
-              // Ligne FL = a un producteur, un produit, et un COL numérique > 0
-              if (!producer || !produit) continue;
-              if (!isFinite(col) || col <= 0) continue;
-              const uv = String(idxUv >= 0 ? (row[idxUv] || '') : '').trim();
-              list.push({ key: `${producer}__${produit}`, producer, produit, uv, col });
-            }
-            setItems(list);
-          } catch (e) {
-            if (!cancelled) setErr(e.message || String(e));
-          } finally {
-            if (!cancelled) setLoading(false);
+      // Charge la liste FL depuis l'onglet S10 via le proxy Apps Script.
+      // Extrait dans un useCallback pour pouvoir rafraîchir à la demande.
+      const loadFL = React.useCallback(async () => {
+        setLoading(true); setErr('');
+        try {
+          // ts = anti-cache, force une lecture fraîche du Sheet à chaque appel
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_read', ts: Date.now() });
+          if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
+          const rows = data.rows || [];
+          if (!rows.length) throw new Error('Feuille vide');
+          const header = rows[0].map(h => String(h || '').trim().toLowerCase());
+          const idxProd = header.findIndex(h => h === 'producteur');
+          const idxName = header.findIndex(h => h === 'produit');
+          const idxCol  = header.findIndex(h => h === 'col');
+          const idxUv   = header.findIndex(h => h === 'uv');
+          const list = [];
+          for (let r = 1; r < rows.length; r++) {
+            const row = rows[r];
+            const producer = String(row[idxProd] || '').trim();
+            const produit = String(row[idxName] || '').trim();
+            const colRaw = String(idxCol >= 0 ? row[idxCol] : '').replace(',', '.').trim();
+            const col = parseFloat(colRaw);
+            if (!producer || !produit) continue;
+            if (!isFinite(col) || col <= 0) continue;
+            const uv = String(idxUv >= 0 ? (row[idxUv] || '') : '').trim();
+            list.push({ key: `${producer}__${produit}`, producer, produit, uv, col });
           }
-        })();
-        return () => { cancelled = true; };
+          setItems(list);
+        } catch (e) {
+          setErr(e.message || String(e));
+        } finally {
+          setLoading(false);
+        }
       }, []);
+
+      React.useEffect(() => { loadFL(); }, [loadFL]);
 
       // Comptages de la date (collection séparée fl_inventory_<date>)
       React.useEffect(() => {
@@ -3637,6 +3633,9 @@
           <div className="card" style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
             <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filtrer un produit ou producteur…"
               style={{flex:1,minWidth:160,fontSize:15,padding:'8px'}} />
+            <button className="btn-secondary" style={{fontSize:13}} disabled={loading} onClick={() => loadFL()}>
+              {loading ? '⏳…' : '🔄 Rafraîchir'}
+            </button>
             <button className="btn-secondary" style={{fontSize:13}} onClick={exportCSV}>⬇️ Exporter CSV</button>
             <button className="btn-primary" style={{fontSize:13}} disabled={validating} onClick={validate}>
               {validating ? 'Validation…' : '✅ Valider l\'inventaire'}
