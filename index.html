@@ -515,7 +515,15 @@
     ];
     const LOSS_DESTINATIONS = [
       { id:"jete", label:"Jeté (perte)", color:"danger" },
-      { id:"pribon", label:"Envoyé Pribon Montreuil (ROB)", color:"info" },
+      { id:"partage", label:"Partage équipe (cagette DLC)", color:"accent" },
+      { id:"pribon", label:"Envoi Montreuil (Pribon/ROB)", color:"info" },
+    ];
+    // Destinations pour un produit en RETOUR PDP (prépa) : comme les pertes + remise en rayon
+    const RETURN_DESTINATIONS = [
+      { id:"rayon", label:"Remettre en rayon (revente)", color:"accent" },
+      { id:"partage", label:"Partage équipe (cagette DLC)", color:"accent" },
+      { id:"pribon", label:"Envoi Montreuil (Pribon/ROB)", color:"info" },
+      { id:"jete", label:"Jeté (perte)", color:"danger" },
     ];
 
     // ============================================================
@@ -2755,7 +2763,12 @@
       }
       const sortedDates = Object.keys(byDate).sort((a, b) => b.localeCompare(a));
       const totalPending = enriched.length;
-      const alertCount = enriched.filter(f => daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP).length;
+      // Statuts "terminaux" : le client est venu / dossier clos → JAMAIS de retour PDP
+      const TERMINAL_STATUSES = ['resolved', 'picked_up', 'credited', 'returned'];
+      const alertCount = enriched.filter(f =>
+        !TERMINAL_STATUSES.includes(f.status) &&
+        daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP
+      ).length;
 
       return (
         <div className="stack">
@@ -4431,6 +4444,7 @@
               phone: cached?.telephone || o.telephone || '',
               hasPhone: !!(cached?.telephone || o.telephone),
               day, distribDate: day,
+              items: o.items || [],
               status: 'pending',
               createdBy: session.name,
               createdAt: new Date().toISOString(),
@@ -4473,6 +4487,7 @@
               hasPhone: !!(cached?.telephone || o.telephone),
               day: activeDay(),
               distribDate: activeDay(),
+              items: o.items || [],
               status: 'pending',
               createdBy: session.name,
               createdAt: new Date().toISOString(),
@@ -6114,6 +6129,123 @@
     // ============================================================
     // PAGE PERTES (préparateur)
     // ============================================================
+    // === RETOURS PDP (prépa) ===
+    // Liste auto des produits des commandes non récupérées depuis +7j (non résolues).
+    // Pour chaque produit, la prépa choisit une destination. Montreuil/partage/jeté → crée une perte.
+    function PdpReturnsPage({ session, catalogue }) {
+      const showToast = React.useContext(ToastContext);
+      const [followups, setFollowups] = React.useState([]);
+      const [treatments, setTreatments] = React.useState([]);
+
+      React.useEffect(() => {
+        const u1 = storage.subscribe('followups', setFollowups);
+        const u2 = storage.subscribe('pdp_treatments', setTreatments);
+        return () => { u1(); u2(); };
+      }, []);
+
+      const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
+      // Commandes en retour PDP : +7j, non terminales, avec des items
+      const returns = followups.filter(f =>
+        !TERMINAL.includes(f.status) &&
+        daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP &&
+        Array.isArray(f.items) && f.items.length > 0
+      );
+
+      const treatMap = React.useMemo(() => {
+        const m = {}; for (const t of treatments) m[t.id] = t; return m;
+      }, [treatments]);
+
+      // Clé unique d'une ligne produit dans un retour
+      const lineId = (f, it, idx) => `${f.orderId}__${it.id || idx}`;
+
+      const setDestination = async (f, it, idx, destination) => {
+        const id = lineId(f, it, idx);
+        await storage.setDoc('pdp_treatments', id, {
+          id, orderId: f.orderId, site: f.site,
+          produit: it.produit, producteur: it.producteur, qty: it.qty || 1,
+          destination,
+          treatedBy: session.name, treatedAt: new Date().toISOString(),
+        });
+        // Destination ≠ rayon → crée une perte (sauf si déjà créée)
+        if (destination !== 'rayon') {
+          const prod = (catalogue || []).find(p => p.produit === it.produit && p.producteur === it.producteur);
+          const unitPrice = prod ? (prod.prixAchat || prod.prixHT || 0) : 0;
+          const qty = it.qty || 1;
+          await storage.setDoc('losses', `lossret_${id}`, {
+            id: `lossret_${id}`,
+            productKey: prod ? `${prod.producteur}|${prod.produit}` : `${it.producteur}|${it.produit}`,
+            producteur: it.producteur, produit: it.produit,
+            unite: prod?.unite || '',
+            destination, reason: 'erreur_prepa',
+            usingWeight: false, quantity: qty, weight: 0,
+            unitPrice, totalValue: unitPrice * qty,
+            remark: `Retour PDP — ${f.consumer_name || ''} (${f.site})`,
+            day: activeDay(),
+            fromReturn: true,
+            createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+          });
+        } else {
+          // Si on repasse en "rayon", retirer la perte éventuellement créée avant
+          try { await storage.deleteDoc('losses', `lossret_${id}`); } catch(e){}
+        }
+        showToast('✓ Destination enregistrée');
+      };
+
+      const totalLines = returns.reduce((s, f) => s + f.items.length, 0);
+      const treatedLines = returns.reduce((s, f) =>
+        s + f.items.filter((it, idx) => treatMap[lineId(f, it, idx)]).length, 0);
+
+      return (
+        <div className="stack">
+          <h1>Retours PDP</h1>
+          <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
+            Produits des commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j. Choisis une destination pour chacun.
+            Montreuil, partage équipe et jeté sont comptés en perte ; « remettre en rayon » non.
+          </p>
+
+          {returns.length === 0 ? (
+            <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Aucun retour PDP en attente. 👍</p></div>
+          ) : (
+            <>
+              <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
+                <strong>{treatedLines}/{totalLines}</strong> produits traités · {returns.length} commande{returns.length>1?'s':''}
+              </div>
+              {returns.map(f => (
+                <div key={f.orderId} className="card">
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
+                    <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
+                    <span style={{fontSize:12,color:'var(--ink-mute)'}}>{f.site} · il y a {daysSince(f.distribDate || f.day)}j</span>
+                  </div>
+                  <div className="stack" style={{gap:0}}>
+                    {f.items.map((it, idx) => {
+                      const t = treatMap[lineId(f, it, idx)];
+                      return (
+                        <div key={idx} style={{padding:'8px 0',borderTop: idx ? '1px solid var(--line)' : 'none',
+                          background: t ? 'transparent' : 'var(--warn-soft)'}}>
+                          <div style={{fontWeight:600,fontSize:13}}>{it.produit}{it.qty>1?` ×${it.qty}`:''}</div>
+                          <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{it.producteur}</div>
+                          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                            {RETURN_DESTINATIONS.map(d => (
+                              <div key={d.id}
+                                className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
+                                style={{fontSize:12}}
+                                onClick={() => setDestination(f, it, idx, d.id)}>
+                                {d.label}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      );
+    }
+
     function LossesPage({ session, catalogue, catalogueMeta }) {
       const showToast = React.useContext(ToastContext);
       const [losses, setLosses] = React.useState([]);
@@ -7248,12 +7380,16 @@
             </div>
             {tab === 'prep' && <PrepPage session={session} products={products} dispatchData={dispatchData} />}
             {tab === 'prepdispatch' && <PrepDispatchPage session={session} />}
+            {tab === 'pdpreturns' && <PdpReturnsPage session={session} catalogue={catalogue} />}
             {tab === 'losses' && <LossesPage session={session} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
             {tab === 'inventory' && <InventoryPage session={session} />}
             {tab === 'admin' && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
             <div className="tab-bar">
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
                 <span className="tab-icon">🚚</span>Manquants & ND
+              </button>
+              <button className={tab==='pdpreturns'?'active':''} onClick={()=>setTab('pdpreturns')}>
+                <span className="tab-icon">↩️</span>Retours PDP
               </button>
               <button className={tab==='losses'?'active':''} onClick={()=>setTab('losses')}>
                 <span className="tab-icon">🗑️</span>Pertes
