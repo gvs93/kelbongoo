@@ -749,6 +749,7 @@
       const missingProducts = new Set();
       const aggManquants = {};
       const aggRemises = {};
+      const caBySite = {}; // { SITE: { reel_cents, manquant_cents, remise_cents } }
       const out = [];
       let dateKey = null;
 
@@ -826,11 +827,28 @@
           aggRemises[pid].qty += (r.quantity || 1);
           aggRemises[pid].clients += 1;
         }
+
+        // Agrégation CA par site (en centimes TTC)
+        if (oSite) {
+          if (!caBySite[oSite]) caBySite[oSite] = { reel_cents: 0, manquant_cents: 0, remise_cents: 0 };
+          for (const it of (o.items || [])) {
+            caBySite[oSite].reel_cents += (it.consumer_price || 0) * (it.quantity || 1);
+          }
+          for (const r of (o.removed || [])) {
+            caBySite[oSite].manquant_cents += (r.consumer_price || 0) * (r.quantity || 1);
+          }
+          // Perte due aux remises : percentage % du prix de la ligne réduite
+          for (const r of (o.reduced || [])) {
+            const lineTTC = (r.consumer_price || 0) * (r.quantity || 1);
+            caBySite[oSite].remise_cents += Math.round(lineTTC * ((r.percentage || 0) / 100));
+          }
+        }
       }
       return {
         orders: out, missingConsumers, missingProducts, dateKey,
         manquants: Object.values(aggManquants),
         remises: Object.values(aggRemises),
+        caBySite,
       };
     }
 
@@ -6129,6 +6147,117 @@
     // ============================================================
     // PAGE PERTES (préparateur)
     // ============================================================
+    // === SUIVI CA (master) ===
+    // CA prévisionnel / réel théorique / réel final / manque à gagner, global + par site.
+    function CaSuiviPage({ session }) {
+      const [ca, setCa] = React.useState(null);
+      const [anomalies, setAnomalies] = React.useState([]);
+
+      React.useEffect(() => {
+        const day = activeDay();
+        const u1 = storage.subscribe(`day_${day}_ca`, (arr) => {
+          const doc = (arr || []).find(x => x.id === 'data') || (arr || [])[0];
+          setCa(doc && doc.caBySite ? doc.caBySite : null);
+        });
+        const u2 = storage.subscribe(`day_${day}_anomalies`, setAnomalies);
+        return () => { u1(); u2(); };
+      }, []);
+
+      const eur = (cents) => (cents / 100).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+
+      // Avoirs (manques boutique) par site
+      const creditBySite = React.useMemo(() => {
+        const m = {};
+        for (const a of anomalies) {
+          const s = (a.site || '').toUpperCase();
+          if (!s) continue;
+          m[s] = (m[s] || 0) + Math.round((a.amountCredit || 0) * 100); // € → centimes
+        }
+        return m;
+      }, [anomalies]);
+
+      if (!ca) {
+        return (
+          <div className="stack">
+            <h1>Suivi CA</h1>
+            <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>
+              Aucune donnée CA pour cette distribution. Charge le JSON commandes (Admin) pour calculer le CA.
+            </p></div>
+          </div>
+        );
+      }
+
+      const sites = Object.keys(ca).sort();
+      // Calcul par site
+      const rows = sites.map(s => {
+        const reel = ca[s].reel_cents || 0;
+        const manquant = ca[s].manquant_cents || 0;
+        const remise = ca[s].remise_cents || 0;
+        const credit = creditBySite[s] || 0;
+        const previsionnel = reel + manquant + remise; // tout ce qui était commandé, au prix plein
+        const reelFinal = reel - credit;               // après manques signalés en boutique
+        const mae = previsionnel - reelFinal;           // manque à gagner total
+        return { s, previsionnel, reel, reelFinal, credit, manquant, remise, mae };
+      });
+      const tot = rows.reduce((a, r) => ({
+        previsionnel: a.previsionnel + r.previsionnel,
+        reel: a.reel + r.reel,
+        reelFinal: a.reelFinal + r.reelFinal,
+        mae: a.mae + r.mae,
+      }), { previsionnel: 0, reel: 0, reelFinal: 0, mae: 0 });
+
+      const Stat = ({ label, cents, color }) => (
+        <div style={{flex:'1 1 120px',padding:'10px 12px',borderRadius:8,background:'var(--card-2,#f7f7f5)'}}>
+          <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:2}}>{label}</div>
+          <div style={{fontSize:18,fontWeight:700,color:color||'var(--ink)'}}>{eur(cents)}</div>
+        </div>
+      );
+
+      return (
+        <div className="stack">
+          <h1>Suivi CA</h1>
+          <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
+            Distribution du {dayLabelShort(activeDay())} · prix TTC.
+          </p>
+
+          {/* GLOBAL */}
+          <div className="card">
+            <h3 style={{marginTop:0}}>Global</h3>
+            <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+              <Stat label="CA prévisionnel" cents={tot.previsionnel} />
+              <Stat label="CA réel théorique" cents={tot.reel} color="var(--accent-dark,#2F5C3E)" />
+              <Stat label="CA réel final" cents={tot.reelFinal} color="var(--accent-dark,#2F5C3E)" />
+              <Stat label="Manque à gagner" cents={tot.mae} color="var(--danger,#E63946)" />
+            </div>
+            <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
+              Prévisionnel = commandé au départ · Réel théorique = après manquants/remises · Réel final = après avoirs boutique ({eur(tot.previsionnel - tot.reel)} de manquants/remises, {eur(rows.reduce((a,r)=>a+r.credit,0))} d'avoirs boutique).
+            </div>
+          </div>
+
+          {/* PAR SITE */}
+          <div className="card">
+            <h3 style={{marginTop:0}}>Par site</h3>
+            <div className="stack" style={{gap:0}}>
+              <div style={{display:'flex',fontSize:11,color:'var(--ink-mute)',fontWeight:600,padding:'4px 0',borderBottom:'1px solid var(--line)'}}>
+                <span style={{flex:'0 0 52px'}}>Site</span>
+                <span style={{flex:1,textAlign:'right'}}>Prévis.</span>
+                <span style={{flex:1,textAlign:'right'}}>Réel fin.</span>
+                <span style={{flex:1,textAlign:'right'}}>Manque</span>
+              </div>
+              {rows.map(r => (
+                <div key={r.s} style={{display:'flex',fontSize:13,padding:'7px 0',borderBottom:'1px solid var(--line)'}}>
+                  <span style={{flex:'0 0 52px',fontWeight:600}}>{r.s}</span>
+                  <span style={{flex:1,textAlign:'right'}}>{eur(r.previsionnel)}</span>
+                  <span style={{flex:1,textAlign:'right',color:'var(--accent-dark,#2F5C3E)'}}>{eur(r.reelFinal)}</span>
+                  <span style={{flex:1,textAlign:'right',color: r.mae>0?'var(--danger,#E63946)':'var(--ink-mute)'}}>{eur(r.mae)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     // === RETOURS PDP (prépa) ===
     // Liste auto des produits des commandes non récupérées depuis +7j (non résolues).
     // Pour chaque produit, la prépa choisit une destination. Montreuil/partage/jeté → crée une perte.
@@ -6803,6 +6932,11 @@
               uploadedBy: session.name, uploadedAt: new Date().toISOString(),
             });
           }
+          // CA par site (prévisionnel / réel théorique / manque à gagner)
+          await storage.setDoc(`day_${dayKey}_ca`, 'data', {
+            caBySite: res.caBySite || {},
+            uploadedBy: session.name, uploadedAt: new Date().toISOString(),
+          });
           setActiveDay(dayKey);
           setV4Result({
             count: res.orders.length,
@@ -7458,6 +7592,7 @@
           {tab === 'closure' && <ClosurePage session={session} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           {tab === 'inventory' && <InventoryPage session={session} />}
           {tab === 'masterrecap' && session.isMaster && <MasterRecapPage session={session} consumersByEmail={consumersByEmail} />}
+          {tab === 'casuivi' && session.isMaster && <CaSuiviPage session={session} />}
           {tab === 'stats' && session.isMaster && <StatsPage session={session} />}
           {tab === 'admin' && session.isMaster && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
@@ -7489,6 +7624,11 @@
             {session.isMaster && (
               <button className={tab==='masterrecap'?'active':''} onClick={()=>setTab('masterrecap')}>
                 <span className="tab-icon">📋</span>Récap
+              </button>
+            )}
+            {session.isMaster && (
+              <button className={tab==='casuivi'?'active':''} onClick={()=>setTab('casuivi')}>
+                <span className="tab-icon">💶</span>Suivi CA
               </button>
             )}
             {session.isMaster && (
