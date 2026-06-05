@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution v2</title>
+  <title>Kelbongoo — Distribution V7</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -150,6 +150,12 @@
     .badge-info { background: var(--info-soft); color: var(--info); }
     .badge-danger { background: var(--danger-soft); color: var(--danger); }
     .badge-ok { background: var(--accent-soft); color: var(--accent-dark); }
+    .ver-badge {
+      display: inline-flex; align-items: center; font-size: 9px; font-weight: 800;
+      letter-spacing: 0.06em; padding: 1px 5px; border-radius: 5px;
+      background: var(--master-soft); color: var(--master); margin-left: 4px;
+      text-transform: uppercase; line-height: 1.6;
+    }
 
     /* === CARDS === */
     .card {
@@ -384,6 +390,30 @@
     .bar-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s ease; }
     .bar-value { flex: 0 0 50px; text-align: right; font-weight: 600; font-size: 12px; }
 
+    /* === TABLEAU DE BORD CA === */
+    .seg { display: inline-flex; background: var(--bg-muted); border: 1px solid var(--line); border-radius: 999px; padding: 3px; gap: 2px; }
+    .seg button {
+      background: transparent; color: var(--ink-soft); border-radius: 999px;
+      padding: 6px 14px; font-size: 13px; font-weight: 600;
+    }
+    .seg button.active { background: white; color: var(--ink); box-shadow: var(--shadow-sm); }
+    .kpi-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .kpi { background: var(--bg-muted); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; }
+    .kpi-val { font-size: 20px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
+    .kpi-label { font-size: 11px; color: var(--ink-mute); margin-top: 3px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi-sub { font-size: 11px; color: var(--ink-soft); margin-top: 2px; }
+    .chart-wrap { width: 100%; overflow: hidden; }
+    .chart-wrap svg { display: block; width: 100%; height: auto; }
+    .rank-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .rank-num { flex: 0 0 22px; text-align: center; font-weight: 700; color: var(--ink-mute); font-size: 12px; }
+    .rank-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rank-track { flex: 0 0 70px; height: 8px; background: var(--bg-muted); border-radius: 4px; overflow: hidden; }
+    .rank-fill { height: 100%; background: var(--accent); border-radius: 4px; }
+    .rank-val { flex: 0 0 62px; text-align: right; font-weight: 700; font-size: 12px; }
+    .cat-frais { background: var(--accent); }
+    .cat-pain { background: var(--prep); }
+    .cat-nd { background: var(--info); }
+
     /* === Responsive === */
     @media (max-width: 480px) {
       h1 { font-size: 20px; }
@@ -413,6 +443,7 @@
     const PREP_PASSWORD = "Prepa2026";   // mot de passe préparateurs
     const DISTRIB_PASSWORD = "Distrib2026";  // mot de passe distributeurs (partagé)
     const SITES = ["BAR","BIC","BOR","CES","CHA","DOM","FOR","LIL","NCA","NCC","PAD","PDC","PDP","ROB","ROM","STB","TOL"];
+    const APP_VERSION = 'V7';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -750,6 +781,7 @@
       const aggManquants = {};
       const aggRemises = {};
       const caBySite = {}; // { SITE: { reel_cents, manquant_cents, remise_cents } }
+      const salesByProduct = {}; // { pid: { id, produit, producteur, cat, qty, ca_cents } }
       const out = [];
       let dateKey = null;
 
@@ -843,13 +875,123 @@
             caBySite[oSite].remise_cents += Math.round(lineTTC * ((r.percentage || 0) / 100));
           }
         }
+
+        // Agrégation ventes par produit (CA réel, après manquants prépa) — pour les meilleures ventes
+        for (const it of (o.items || [])) {
+          const pid = oid(it.producerproduct_id);
+          const p = prodById[pid];
+          if (!salesByProduct[pid]) {
+            salesByProduct[pid] = {
+              id: pid,
+              produit: p ? p.name : '(produit inconnu)',
+              producteur: p ? p.producer : '',
+              cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais',
+              qty: 0, ca_cents: 0,
+            };
+          }
+          salesByProduct[pid].qty += (it.quantity || 1);
+          salesByProduct[pid].ca_cents += (it.consumer_price || 0) * (it.quantity || 1);
+        }
       }
       return {
         orders: out, missingConsumers, missingProducts, dateKey,
         manquants: Object.values(aggManquants),
         remises: Object.values(aggRemises),
         caBySite,
+        salesByProduct: Object.values(salesByProduct).sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 300),
       };
+    }
+
+    // ============================================================
+    // ANALYTICS / HISTORIQUE CA (collection `ca_history`, 1 doc par date)
+    // Doc : { date, dow, caBySite, salesByProduct[top], totals:{reel,manquant,remise}, ordersCount }
+    // CA "réel" = après manquants de prépa (somme des items livrés, prix plein).
+    // Les avoirs/remises boutique ne sont PAS déduits ici (ils vivent dans les anomalies).
+    // ============================================================
+    function dateKeyFromIso(dIsoRaw) {
+      const dIso = oid(dIsoRaw) || (dIsoRaw && dIsoRaw.$date) || dIsoRaw;
+      if (!dIso) return null;
+      const d = new Date(dIso);
+      if (isNaN(d)) return null;
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    function totalsFromCaBySite(caBySite) {
+      return Object.values(caBySite || {}).reduce((a, s) => ({
+        reel: a.reel + (s.reel_cents || 0),
+        manquant: a.manquant + (s.manquant_cents || 0),
+        remise: a.remise + (s.remise_cents || 0),
+      }), { reel: 0, manquant: 0, remise: 0 });
+    }
+    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source) {
+      return {
+        date: dateKey,
+        dow: new Date(dateKey + 'T12:00:00').getDay(), // 0=dim … 6=sam
+        caBySite: caBySite || {},
+        salesByProduct: (salesByProduct || []).slice(0, 300),
+        totals: totalsFromCaBySite(caBySite),
+        ordersCount: ordersCount || 0,
+        source: source || 'daily',
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    // Ventile un gros export commandes multi-dates → { dateKey: caHistoryDoc }
+    // opts.fromKey / opts.toKey : bornes (YYYY-MM-DD) pour limiter les dates écrites.
+    function buildDailyAnalytics(jsonText, prodById, opts = {}) {
+      const data = typeof jsonText === 'string' ? JSON.parse(jsonText) : jsonText;
+      const arr = Array.isArray(data) ? data : (data.orders || []);
+      const fromKey = opts.fromKey || null;
+      const toKey = opts.toKey || null;
+      const byDate = {}; // dateKey -> { caBySite, sales, ordersCount }
+
+      for (const o of arr) {
+        const status = o.status;
+        if (status === 8 || status === 0) continue;
+        const dateKey = dateKeyFromIso(o.distribution_date);
+        if (!dateKey) continue;
+        if (fromKey && dateKey < fromKey) continue;
+        if (toKey && dateKey > toKey) continue;
+
+        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0 };
+        const b = byDate[dateKey];
+        b.ordersCount++;
+        const oSite = (o.locale || '').trim().toUpperCase();
+        if (oSite && !b.caBySite[oSite]) b.caBySite[oSite] = { reel_cents: 0, manquant_cents: 0, remise_cents: 0 };
+
+        for (const it of (o.items || [])) {
+          const cents = (it.consumer_price || 0) * (it.quantity || 1);
+          if (oSite) b.caBySite[oSite].reel_cents += cents;
+          const pid = oid(it.producerproduct_id);
+          const p = prodById[pid];
+          if (!b.sales[pid]) {
+            b.sales[pid] = {
+              id: pid,
+              produit: p ? p.name : '(produit inconnu)',
+              producteur: p ? p.producer : '',
+              cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais',
+              qty: 0, ca_cents: 0,
+            };
+          }
+          b.sales[pid].qty += (it.quantity || 1);
+          b.sales[pid].ca_cents += cents;
+        }
+        if (oSite) {
+          for (const r of (o.removed || [])) {
+            b.caBySite[oSite].manquant_cents += (r.consumer_price || 0) * (r.quantity || 1);
+          }
+          for (const r of (o.reduced || [])) {
+            const lineTTC = (r.consumer_price || 0) * (r.quantity || 1);
+            b.caBySite[oSite].remise_cents += Math.round(lineTTC * ((r.percentage || 0) / 100));
+          }
+        }
+      }
+
+      const docs = {};
+      for (const [dateKey, b] of Object.entries(byDate)) {
+        const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 300);
+        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk');
+      }
+      return docs;
     }
 
     function parseProductsCSV(csvText) {
@@ -1495,7 +1637,7 @@
           <div className="login-card">
             <div className="login-logo">
               <div className="title">Kelbongoo</div>
-              <div className="subtitle">Distribution</div>
+              <div className="subtitle">Distribution · {APP_VERSION}</div>
             </div>
 
             <div className="role-tabs">
@@ -6147,11 +6289,275 @@
     // ============================================================
     // PAGE PERTES (préparateur)
     // ============================================================
+    // === TABLEAU DE BORD CA (bilan multi-dates, lit la collection ca_history) ===
+    const DOW_LABELS = ['Dim','Lun','Mar','Mer','Jeu','Ven','Sam'];
+    const DOW_ORDER = [1,2,3,4,5,6,0]; // Lun → Dim
+    const CAT_LABELS = { frais:'Frais', pain:'Pain/Sec', nd:'Non-dispatch' };
+    function isoWeekKey(dateKey) {
+      const d = new Date(dateKey + 'T12:00:00');
+      const t = new Date(d);
+      t.setDate(d.getDate() + 4 - (d.getDay() || 7));
+      const yStart = new Date(t.getFullYear(), 0, 1);
+      const wk = Math.ceil((((t - yStart) / 86400000) + 1) / 7);
+      return `${t.getFullYear()}-S${String(wk).padStart(2,'0')}`;
+    }
+    const eurCents = (c) => (c / 100).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+    const eurRound = (c) => Math.round(c / 100).toLocaleString('fr-FR') + ' €';
+
+    // Petit graphe courbe SVG (aire + ligne), responsive via viewBox.
+    function MiniLineChart({ points, color = '#4a7c3b', valueFmt }) {
+      if (!points || !points.length) return null;
+      const W = 360, H = 168, padL = 6, padR = 6, padT = 16, padB = 24;
+      const innerW = W - padL - padR, innerH = H - padT - padB;
+      const n = points.length;
+      const max = Math.max(...points.map(p => p.value), 1);
+      const xOf = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+      const yOf = v => padT + innerH - (v / max) * innerH;
+      const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(' ');
+      const areaPath = `M${xOf(0).toFixed(1)},${(padT + innerH).toFixed(1)} ` +
+        points.map((p, i) => `L${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(' ') +
+        ` L${xOf(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)} Z`;
+      const labelStep = Math.max(1, Math.ceil(n / 5));
+      const fmt = valueFmt || (v => v);
+      return (
+        <div className="chart-wrap">
+          <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
+            {[0, 0.5, 1].map((f, i) => (
+              <g key={i}>
+                <line x1={padL} y1={yOf(max * f)} x2={W - padR} y2={yOf(max * f)} stroke="var(--line)" strokeWidth="1" strokeDasharray={f === 0 ? '' : '3 3'} />
+                <text x={padL} y={yOf(max * f) - 3} fontSize="9" fill="var(--ink-mute)">{fmt(max * f)}</text>
+              </g>
+            ))}
+            <path d={areaPath} fill={color} opacity="0.12" />
+            <path d={linePath} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+            {points.map((p, i) => (n <= 40 ? <circle key={i} cx={xOf(i)} cy={yOf(p.value)} r="2.4" fill={color} /> : null))}
+            {points.map((p, i) => (i % labelStep === 0 || i === n - 1) ? (
+              <text key={'l' + i} x={xOf(i)} y={H - 8} fontSize="9" fill="var(--ink-mute)" textAnchor={i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle')}>{p.label}</text>
+            ) : null)}
+          </svg>
+        </div>
+      );
+    }
+
+    function HBars({ data, fmt, color }) {
+      // data : [ [label, value], ... ] déjà triées
+      const max = Math.max(...data.map(d => d[1]), 1);
+      const f = fmt || (v => v);
+      return (
+        <div className="bar-chart">
+          {data.map(([k, v]) => (
+            <div key={k} className="bar-row">
+              <div className="bar-label">{k}</div>
+              <div className="bar-track"><div className="bar-fill" style={{ width: `${(v / max) * 100}%`, background: color || 'var(--accent)' }}></div></div>
+              <div className="bar-value">{f(v)}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function CaDashboard() {
+      const [all, setAll] = React.useState(null); // null = chargement
+      const [from, setFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
+      const [to, setTo] = React.useState(() => new Date().toISOString().slice(0,10));
+      const [metric, setMetric] = React.useState('ca'); // ca | qty
+      const [catFilter, setCatFilter] = React.useState('all');
+      const [evoBy, setEvoBy] = React.useState('day'); // day | week
+
+      React.useEffect(() => {
+        let alive = true;
+        storage.getAll('ca_history').then(arr => { if (alive) setAll(arr || []); });
+        return () => { alive = false; };
+      }, []);
+
+      const inRange = React.useMemo(() => {
+        if (!all) return [];
+        return all
+          .filter(d => d.date && d.date >= from && d.date <= to)
+          .sort((a, b) => a.date.localeCompare(b.date));
+      }, [all, from, to]);
+
+      const agg = React.useMemo(() => {
+        let reel = 0, manquant = 0, remise = 0, orders = 0;
+        const bySite = {}, byDow = {}, byWeek = {}, byCat = { frais: 0, pain: 0, nd: 0 };
+        const products = {};
+        for (const d of inRange) {
+          const t = d.totals || totalsFromCaBySite(d.caBySite);
+          reel += t.reel || 0; manquant += t.manquant || 0; remise += t.remise || 0;
+          orders += d.ordersCount || 0;
+          for (const [s, v] of Object.entries(d.caBySite || {})) bySite[s] = (bySite[s] || 0) + (v.reel_cents || 0);
+          byDow[d.dow] = (byDow[d.dow] || 0) + (t.reel || 0);
+          const wk = isoWeekKey(d.date);
+          byWeek[wk] = (byWeek[wk] || 0) + (t.reel || 0);
+          for (const p of (d.salesByProduct || [])) {
+            byCat[p.cat] = (byCat[p.cat] || 0) + (p.ca_cents || 0);
+            if (!products[p.id]) products[p.id] = { id: p.id, produit: p.produit, producteur: p.producteur, cat: p.cat, qty: 0, ca_cents: 0 };
+            products[p.id].qty += p.qty || 0;
+            products[p.id].ca_cents += p.ca_cents || 0;
+          }
+        }
+        const nb = inRange.length;
+        return {
+          reel, manquant, remise, orders, nb,
+          previsionnel: reel + manquant + remise,
+          caMoyen: nb ? reel / nb : 0,
+          panier: orders ? reel / orders : 0,
+          bySite, byDow, byWeek, byCat,
+          products: Object.values(products),
+        };
+      }, [inRange]);
+
+      const evoPoints = React.useMemo(() => {
+        if (evoBy === 'week') {
+          const byWeek = {};
+          for (const d of inRange) { const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + ((d.totals || {}).reel || 0); }
+          return Object.entries(byWeek).sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([wk, v]) => ({ label: wk.split('-')[1], value: v / 100 }));
+        }
+        return inRange.map(d => ({ label: formatDateShort(d.date), value: ((d.totals || {}).reel || 0) / 100 }));
+      }, [inRange, evoBy]);
+
+      const bestSellers = React.useMemo(() => {
+        let list = agg.products;
+        if (catFilter !== 'all') list = list.filter(p => p.cat === catFilter);
+        return list.sort((a, b) => metric === 'qty' ? (b.qty - a.qty) : (b.ca_cents - a.ca_cents)).slice(0, 20);
+      }, [agg.products, metric, catFilter]);
+
+      const setPreset = (days) => {
+        const t = new Date(); const f = new Date(); f.setDate(f.getDate() - days);
+        setFrom(f.toISOString().slice(0,10)); setTo(t.toISOString().slice(0,10));
+      };
+      const setAllTime = () => {
+        if (!all || !all.length) return;
+        const dates = all.map(d => d.date).filter(Boolean).sort();
+        setFrom(dates[0]); setTo(dates[dates.length-1]);
+      };
+
+      if (all === null) return <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Chargement de l'historique…</p></div>;
+      if (all.length === 0) return (
+        <div className="card" style={{borderLeft:'3px solid var(--warn)'}}>
+          <p style={{padding:'4px 0',fontSize:14}}>Aucun historique CA pour l'instant.</p>
+          <p style={{fontSize:13,color:'var(--ink-soft)',marginTop:6}}>
+            Va dans <strong>Admin → 📊 Charger l'historique CA</strong> et charge un export commandes multi-dates (ex. 2 mois). Chaque distribution chargée au quotidien s'ajoutera aussi automatiquement ici.
+          </p>
+        </div>
+      );
+
+      const maxProd = Math.max(...bestSellers.map(p => metric === 'qty' ? p.qty : p.ca_cents), 1);
+
+      return (
+        <div className="stack">
+          {/* Période */}
+          <div className="card">
+            <div className="date-range">
+              <div style={{flex:1}}><label>Du</label><input type="date" value={from} onChange={e => setFrom(e.target.value)} /></div>
+              <div style={{flex:1}}><label>Au</label><input type="date" value={to} onChange={e => setTo(e.target.value)} /></div>
+            </div>
+            <div className="chip-group" style={{marginTop:10}}>
+              <div className="chip" onClick={() => setPreset(7)}>7 jours</div>
+              <div className="chip" onClick={() => setPreset(30)}>30 jours</div>
+              <div className="chip" onClick={() => setPreset(90)}>3 mois</div>
+              <div className="chip" onClick={() => setPreset(180)}>6 mois</div>
+              <div className="chip" onClick={setAllTime}>Tout</div>
+            </div>
+            <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
+              {agg.nb} distribution{agg.nb>1?'s':''} sur la période · CA réel = après manquants de prépa (avant avoirs/remises boutique).
+            </p>
+          </div>
+
+          {/* KPIs */}
+          <div className="kpi-grid">
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">après manquants prépa</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.previsionnel)}</div><div className="kpi-label">CA prévisionnel</div><div className="kpi-sub">commandé au départ</div></div>
+            <div className="kpi"><div className="kpi-val" style={{color:'var(--danger)'}}>{eurRound(agg.manquant + agg.remise)}</div><div className="kpi-label">Manque à gagner</div><div className="kpi-sub">{eurRound(agg.manquant)} manq. · {eurRound(agg.remise)} remises</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.caMoyen)}</div><div className="kpi-label">CA moyen / distrib</div><div className="kpi-sub">{agg.orders.toLocaleString('fr-FR')} commandes · panier {agg.panier ? (agg.panier/100).toFixed(2) : '0'} €</div></div>
+          </div>
+
+          {/* Évolution */}
+          <div className="card">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <h3 style={{margin:0}}>Évolution du CA</h3>
+              <div className="seg">
+                <button className={evoBy==='day'?'active':''} onClick={()=>setEvoBy('day')}>Jour</button>
+                <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
+              </div>
+            </div>
+            {evoPoints.length ? <MiniLineChart points={evoPoints} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
+              : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
+          </div>
+
+          {/* Par site */}
+          <div className="card">
+            <h3 style={{marginBottom:10}}>CA par site</h3>
+            <HBars data={Object.entries(agg.bySite).sort((a,b)=>b[1]-a[1])} fmt={eurRound} />
+          </div>
+
+          {/* Par jour de semaine */}
+          <div className="card">
+            <h3 style={{marginBottom:10}}>CA par jour de semaine</h3>
+            <HBars data={DOW_ORDER.filter(dw => agg.byDow[dw]).map(dw => [DOW_LABELS[dw], agg.byDow[dw]])} fmt={eurRound} color="var(--master)" />
+          </div>
+
+          {/* Par catégorie */}
+          <div className="card">
+            <h3 style={{marginBottom:10}}>CA par catégorie</h3>
+            <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
+              {['frais','pain','nd'].map(c => (
+                <div key={c} className="kpi" style={{padding:'10px'}}>
+                  <div className="kpi-val" style={{fontSize:16}}>{eurRound(agg.byCat[c]||0)}</div>
+                  <div className="kpi-label">{CAT_LABELS[c]}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Meilleures ventes */}
+          <div className="card">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,flexWrap:'wrap',gap:8}}>
+              <h3 style={{margin:0}}>Meilleures ventes</h3>
+              <div className="seg">
+                <button className={metric==='ca'?'active':''} onClick={()=>setMetric('ca')}>€ CA</button>
+                <button className={metric==='qty'?'active':''} onClick={()=>setMetric('qty')}>Quantité</button>
+              </div>
+            </div>
+            <div className="chip-group" style={{marginBottom:8}}>
+              {[['all','Tout'],['frais','Frais'],['pain','Pain/Sec'],['nd','ND']].map(([k,l]) => (
+                <div key={k} className={`chip ${catFilter===k?'selected':''}`} onClick={()=>setCatFilter(k)}>{l}</div>
+              ))}
+            </div>
+            {bestSellers.length ? bestSellers.map((p, i) => {
+              const val = metric === 'qty' ? p.qty : p.ca_cents;
+              return (
+                <div key={p.id} className="rank-row">
+                  <div className="rank-num">{i+1}</div>
+                  <div className="rank-name" title={p.produit}>{p.produit}<span style={{color:'var(--ink-mute)',fontSize:11}}> · {p.producteur}</span></div>
+                  <div className="rank-track"><div className={`rank-fill cat-${p.cat}`} style={{width:`${(val/maxProd)*100}%`}}></div></div>
+                  <div className="rank-val">{metric==='qty' ? val.toLocaleString('fr-FR') : eurRound(p.ca_cents)}</div>
+                </div>
+              );
+            }) : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Aucun produit sur la période.</p>}
+            <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>Top 20 · couleur = catégorie (vert frais, orange pain/sec, bleu ND).</p>
+          </div>
+        </div>
+      );
+    }
+
     // === SUIVI CA (master) ===
     // CA prévisionnel / réel théorique / réel final / manque à gagner, global + par site.
     function CaSuiviPage({ session }) {
       const [ca, setCa] = React.useState(null);
       const [anomalies, setAnomalies] = React.useState([]);
+      const [view, setView] = React.useState('jour'); // jour | bilan
+
+      const Header = () => (
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          <h1 style={{margin:0}}>Suivi CA <span className="ver-badge">{APP_VERSION}</span></h1>
+          <div className="seg">
+            <button className={view==='jour'?'active':''} onClick={()=>setView('jour')}>Jour J</button>
+            <button className={view==='bilan'?'active':''} onClick={()=>setView('bilan')}>📈 Bilan</button>
+          </div>
+        </div>
+      );
 
       React.useEffect(() => {
         const day = activeDay();
@@ -6176,12 +6582,21 @@
         return m;
       }, [anomalies]);
 
+      if (view === 'bilan') {
+        return (
+          <div className="stack">
+            <Header />
+            <CaDashboard />
+          </div>
+        );
+      }
+
       if (!ca) {
         return (
           <div className="stack">
-            <h1>Suivi CA</h1>
+            <Header />
             <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>
-              Aucune donnée CA pour cette distribution. Charge le JSON commandes (Admin) pour calculer le CA.
+              Aucune donnée CA pour cette distribution. Charge le JSON commandes (Admin) pour calculer le CA, ou consulte le <strong>📈 Bilan</strong> ci-dessus pour l'historique.
             </p></div>
           </div>
         );
@@ -6215,7 +6630,7 @@
 
       return (
         <div className="stack">
-          <h1>Suivi CA</h1>
+          <Header />
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Distribution du {dayLabelShort(activeDay())} · prix TTC.
           </p>
@@ -6868,6 +7283,45 @@
       const [v4Result, setV4Result] = React.useState(null);   // {orders, missingConsumers, missingProducts}
       const [showSecours, setShowSecours] = React.useState(false); // ancien chargement PDF/CSV (repli)
 
+      // --- Historique CA en masse (gros export commandes multi-dates) ---
+      const [histOrders, setHistOrders] = React.useState(null);
+      const [histProds, setHistProds] = React.useState(null);
+      const [histFrom, setHistFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
+      const [histTo, setHistTo] = React.useState(() => new Date().toISOString().slice(0,10));
+      const [histBusy, setHistBusy] = React.useState(false);
+      const [histProgress, setHistProgress] = React.useState('');
+      const [histResult, setHistResult] = React.useState(null);
+
+      const handleLoadHistory = async () => {
+        if (!histOrders) { showToast('Charge le fichier commandes (multi-dates)'); return; }
+        setHistBusy(true); setHistResult(null); setHistProgress('Préparation…');
+        try {
+          // Produits : fichier fourni, sinon cache
+          let prodById;
+          if (histProds) { prodById = parseProducersJSON(histProds); await writeCache('products', prodById); }
+          else {
+            const cd = await readCache('products');
+            if (!cd) { showToast('Aucun fichier produits en mémoire : charge-le'); setHistBusy(false); return; }
+            prodById = cd;
+          }
+          setHistProgress('Analyse des commandes…');
+          const docs = buildDailyAnalytics(histOrders, prodById, { fromKey: histFrom, toKey: histTo });
+          const dates = Object.keys(docs).sort();
+          if (dates.length === 0) { showToast('Aucune distribution dans cette plage'); setHistBusy(false); setHistProgress(''); return; }
+          let i = 0, caTot = 0;
+          for (const dk of dates) {
+            i++;
+            setHistProgress(`Écriture ${i}/${dates.length} · ${dk}`);
+            await storage.setDoc('ca_history', dk, docs[dk], { replace: true });
+            caTot += docs[dk].totals.reel;
+          }
+          setHistResult({ dates: dates.length, first: dates[0], last: dates[dates.length-1], caTot });
+          setHistProgress('');
+          showToast(`✓ ${dates.length} distributions enregistrées`);
+        } catch (e) { showToast('Erreur : ' + e.message); setHistProgress(''); }
+        finally { setHistBusy(false); }
+      };
+
       const readJSON = (file, setter) => {
         const r = new FileReader();
         r.onload = () => { try { setter(JSON.parse(r.result)); showToast(`✓ ${file.name}`); } catch(e){ showToast('JSON invalide : ' + file.name); } };
@@ -6937,6 +7391,12 @@
             caBySite: res.caBySite || {},
             uploadedBy: session.name, uploadedAt: new Date().toISOString(),
           });
+          // Historique CA (1 doc/date) — alimente le tableau de bord Bilan
+          await storage.setDoc(
+            'ca_history', dayKey,
+            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily'),
+            { replace: true }
+          );
           setActiveDay(dayKey);
           setV4Result({
             count: res.orders.length,
@@ -7152,6 +7612,50 @@
                     ⚠️ {v4Result.missingProducts.length} produit(s) introuvable(s) → <strong>mettre à jour le JSON produits</strong>
                   </div>
                 )}
+              </div>
+            )}
+          </div>
+
+          {/* ====== Historique CA en masse (gros export multi-dates) ====== */}
+          <div className="card" style={{border:'2px solid var(--master)'}}>
+            <h3 style={{marginBottom:4,color:'var(--master)'}}>📊 Charger l'historique CA <span className="ver-badge">{APP_VERSION}</span></h3>
+            <p style={{fontSize:12,color:'var(--ink-soft)',marginBottom:12}}>
+              Un seul gros export <strong>commandes</strong> couvrant plusieurs distributions (ex. 2 mois). Il est ventilé automatiquement par date de distribution et alimente le <strong>Tableau de bord</strong> (onglet Suivi&nbsp;CA → Bilan). N'écrase pas les données opérationnelles du jour.
+            </p>
+
+            <label className="upload-zone" style={{display:'block',marginBottom:6}}>
+              <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
+                onChange={e => e.target.files[0] && readJSON(e.target.files[0], setHistOrders)} />
+              <span>📦 Commandes multi-dates {histOrders ? '✓' : '(obligatoire)'}</span>
+            </label>
+            <label className="upload-zone" style={{display:'block',marginBottom:10}}>
+              <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
+                onChange={e => e.target.files[0] && readJSON(e.target.files[0], setHistProds)} />
+              <span>🏷️ Produits {histProds ? '✓' : '(optionnel — sinon dernier en mémoire)'}</span>
+            </label>
+
+            <div className="date-range" style={{marginBottom:10}}>
+              <div style={{flex:1}}>
+                <label>Dates à garder — du</label>
+                <input type="date" value={histFrom} onChange={e => setHistFrom(e.target.value)} />
+              </div>
+              <div style={{flex:1}}>
+                <label>au</label>
+                <input type="date" value={histTo} onChange={e => setHistTo(e.target.value)} />
+              </div>
+            </div>
+            <p style={{fontSize:11,color:'var(--ink-mute)',margin:'-4px 0 10px'}}>
+              Seules les distributions dont la date tombe dans cette plage sont enregistrées (le fichier peut en contenir davantage).
+            </p>
+
+            <button className="btn-primary btn-block" disabled={histBusy || !histOrders} onClick={handleLoadHistory}
+              style={{background: histBusy ? undefined : 'var(--master)'}}>
+              {histBusy ? (histProgress || 'Chargement…') : 'Charger l\'historique'}
+            </button>
+
+            {histResult && (
+              <div className="alert-success" style={{marginTop:10}}>
+                ✓ {histResult.dates} distribution(s) enregistrées ({formatDateShort(histResult.first)} → {formatDateShort(histResult.last)}) · CA réel cumulé {(histResult.caTot/100).toLocaleString('fr-FR',{maximumFractionDigits:0})} €
               </div>
             )}
           </div>
@@ -7507,7 +8011,7 @@
           <div className="app-shell">
             <div className="topbar">
               <div className="topbar-title">
-                <strong>📦 Préparation <span className="badge badge-prep">PRÉPA</span></strong>
+                <strong>📦 Préparation <span className="badge badge-prep">PRÉPA</span><span className="ver-badge">{APP_VERSION}</span></strong>
                 <small>{session.name} · {formatDateFR()}</small>
               </div>
               <button className="btn-ghost" onClick={handleLogout} style={{fontSize:13}}>Sortir</button>
@@ -7549,6 +8053,7 @@
                   ? <>Master <span className="badge badge-master">{currentSite}</span></>
                   : <>Distrib <span className="badge badge-site">{currentSite}</span></>}
                 {isClosed && <span className="badge badge-info">🔒 Clos</span>}
+                <span className="ver-badge">{APP_VERSION}</span>
               </strong>
               <small>
                 {session.name} · {activeDay() !== todayKey()
