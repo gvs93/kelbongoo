@@ -834,7 +834,7 @@
           frais: items.filter(i => i.cat === 'frais'),
           removed: (o.removed || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
-            return { produit: p ? p.name : '(inconnu)', qty: r.quantity || 1, reason: r.reason };
+            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', qty: r.quantity || 1, reason: r.reason };
           }),
           reduced: (o.reduced || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
@@ -1271,12 +1271,11 @@
       return hit || null;
     }
 
-    // Besoin d'un produit manquant par local, à partir des dispatch chargés.
-    // dispatchBySite = { [site]: {frais, sec, ...} }
-    // Renvoie { [site]: { casiers:[{casier,qty}], total } } (frais + sec confondus)
-    // Besoin par local calculé À PARTIR DES COMMANDES JSON (plus de PDF).
-    // Pour le produit manquant, compte combien d'unités sont commandées par local.
-    // orders = liste des commandes du jour (chaque o a .site et .items[{id, produit, qty}])
+    // Besoin d'un produit manquant par local, à partir des COMMANDES retirées (V4 JSON).
+    // Pour chaque client qui avait ce produit en "removed" (manquant), on récupère SA quantité
+    // ET son casier (frais en priorité, sinon sec, sinon ND) → permet l'attribution automatique
+    // du dispatch dernière minute sur la fiche de chaque client concerné.
+    // Renvoie { [site]: { total, casiers:[{casier, qty}] } }
     function computeNeedFromOrders(manquant, orders, { excludeSites = [] } = {}) {
       const out = {};
       const targetId = manquant.id || null;
@@ -1284,17 +1283,20 @@
       for (const o of (orders || [])) {
         const site = (o.site || '').toUpperCase();
         if (!site || excludeSites.includes(site)) continue;
+        // quantité retirée (manquant) chez CE client pour CE produit
         let q = 0;
-        for (const it of (o.items || [])) {
-          // match par id de produit si dispo, sinon par nom normalisé
-          const sameId = targetId && it.id && it.id === targetId;
-          const sameName = !targetId && normalizeText(it.produit || '') === targetName;
-          if (sameId || sameName) q += (it.qty || 0);
+        for (const r of (o.removed || [])) {
+          const sameId = targetId && r.id && r.id === targetId;
+          const sameName = normalizeText(r.produit || '') === targetName;
+          if (sameId || sameName) q += (r.qty || 0);
         }
-        if (q > 0) {
-          if (!out[site]) out[site] = { total: 0, casiers: [] };
-          out[site].total += q;
-        }
+        if (q <= 0) continue;
+        // casier du client : frais d'abord, sinon sec, sinon bac ND
+        const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
+        if (!out[site]) out[site] = { total: 0, casiers: [] };
+        out[site].total += q;
+        const ex = out[site].casiers.find(c => c.casier === casier);
+        if (ex) ex.qty += q; else out[site].casiers.push({ casier, qty: q });
       }
       return out;
     }
@@ -3622,13 +3624,15 @@
 
     // ============================================================
     // INVENTAIRE FRUITS & LÉGUMES (soir / Rungis)
-    // Lit l'onglet "S10" du Google Sheet, ne garde que les lignes FL
-    // (COL numérique), et saisit 2 quantités par produit :
-    //   - Colis en stock (cagettes)
-    //   - Stock Mu (sachets préparés)
+    // Lit l'onglet "INVENTAIRE DU JOUR PDP" du Google Sheet (producteur / produit / uv,
+    // alimentés par TON lien depuis l'ancienne S10 renommée), et saisit 2 quantités par produit :
+    //   - Colis en stock (cagettes)  → colonne "stock colis"
+    //   - Stock Mu (sachets préparés) → colonne "stock mu"
+    // À la validation, SEULES ces 2 colonnes sont écrites, ligne par ligne (jamais d'ajout
+    // de ligne, jamais d'écriture sur les autres colonnes → les formules restent intactes).
     // ============================================================
     const FL_SHEET_ID = '1euOgP9n0j_F0XH_kOfb_jFLWkcYy7-Cg6WcTrihPLRI';
-    const FL_SHEET_TAB = 'S10';
+    const FL_SHEET_TAB = 'INVENTAIRE DU JOUR PDP';
 
     // Parseur CSV minimal robuste (gère les champs entre guillemets contenant des virgules)
     function FLInventoryPage({ session, invDate }) {
@@ -3647,7 +3651,7 @@
         setLoading(true); setErr('');
         try {
           // ts = anti-cache, force une lecture fraîche du Sheet à chaque appel
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_read', ts: Date.now() });
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
           if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
           const rows = data.rows || [];
           if (!rows.length) throw new Error('Feuille vide');
@@ -3737,10 +3741,10 @@
           const c = counts[it.key] || {};
           return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: c.mu || 0 };
         });
-        if (!confirm(`Valider l'inventaire FL du ${invDate} ?\n\nLes quantités seront écrites dans le Sheet (onglet S10) et l'inventaire sera archivé.`)) return;
+        if (!confirm(`Valider l'inventaire FL du ${invDate} ?\n\nLes quantités (stock colis + stock mu) seront écrites dans l'onglet « ${FL_SHEET_TAB} » et l'inventaire sera archivé.`)) return;
         setValidating(true);
         try {
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_write', items: payloadItems });
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_write', tab: FL_SHEET_TAB, items: payloadItems });
           if (!data.ok) { showToast('Erreur écriture Sheet : ' + (data.error || 'inconnue')); setValidating(false); return; }
           // Instantané daté (consultable en master)
           const meta = {
@@ -3767,7 +3771,7 @@
           <span style={{fontSize:12}}>Vérifie que le proxy Apps Script est déployé (accès « Tout le monde »), que l'action <code>fl_read</code> y est branchée, et que l'onglet s'appelle bien « {FL_SHEET_TAB} ».</span>
         </div>
       );
-      if (!items || items.length === 0) return <div className="alert-warning">Aucune ligne fruits & légumes trouvée dans l'onglet « {FL_SHEET_TAB} » (lignes avec un COL numérique).</div>;
+      if (!items || items.length === 0) return <div className="alert-warning">Aucune ligne trouvée dans l'onglet « {FL_SHEET_TAB} » (il faut au moins une colonne « producteur » et « produit » remplies).</div>;
 
       const q = normalizeText(search);
       const filtered = q ? items.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q)) : items;
@@ -3802,7 +3806,7 @@
           {lastValidated && (
             <div className="alert-info" style={{borderLeft:'3px solid var(--ok, #2e7d32)',fontSize:13}}>
               ✓ Inventaire validé le {new Date(lastValidated.validatedAt).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})} par {lastValidated.validatedBy} · {lastValidated.written} ligne(s) écrites dans le Sheet.
-              {lastValidated.notFound > 0 && <span> ({lastValidated.notFound} produit(s) non trouvé(s) dans S10)</span>}
+              {lastValidated.notFound > 0 && <span> ({lastValidated.notFound} produit(s) non trouvé(s) dans « {FL_SHEET_TAB} »)</span>}
               <br/><span style={{fontSize:12,color:'var(--ink-mute)'}}>Tu peux re-saisir et re-valider : ça réécrit le Sheet.</span>
             </div>
           )}
@@ -4167,7 +4171,7 @@
               </div>
             )}
             {invType === 'fl' && (
-              <div style={{fontSize:12,color:'var(--ink-mute)'}}>Inventaire du soir des fruits & légumes pour la commande Rungis. Deux quantités par produit : cagettes (colis) et sachets préparés (µ). Liste chargée depuis le Google Sheet (onglet S10).</div>
+              <div style={{fontSize:12,color:'var(--ink-mute)'}}>Inventaire du soir des fruits & légumes pour la commande Rungis. Deux quantités par produit : cagettes (colis) et sachets préparés (µ). Liste chargée depuis le Google Sheet (onglet « INVENTAIRE DU JOUR PDP »).</div>
             )}
           </div>
 
@@ -5293,11 +5297,15 @@
       // Mode SANS PDF : l'utilisateur choisit les locaux et les quantités à la main.
       const [noPdfAlloc, setNoPdfAlloc] = React.useState({}); // {site: nombre}
 
-      // Besoin par local : priorité au bySite du manquant (calculé depuis les commandes retirées),
-      // puis calcul depuis les items des commandes, puis repli sur les dispatch PDF.
+      // Besoin par local : on privilégie le calcul depuis les commandes (besoin réel + casiers
+      // des clients concernés → attribution auto), puis repli sur bySite (sans casiers → bac ND),
+      // puis repli sur les dispatch PDF.
       const needBySite = React.useMemo(() => {
         const exclude = excludeLivdom ? ['DOM'] : [];
-        // 1) bySite stocké sur le manquant (la demande réelle par local)
+        // 1) depuis les commandes : besoin + casiers (attribution client automatique)
+        const fromOrders = computeNeedFromOrders(manquant, dayOrders, { excludeSites: exclude });
+        if (Object.keys(fromOrders).length) return fromOrders;
+        // 2) bySite stocké sur le manquant (la demande réelle par local, sans casiers)
         if (manquant.bySite && Object.keys(manquant.bySite).length) {
           const out = {};
           for (const [site, n] of Object.entries(manquant.bySite)) {
@@ -5306,9 +5314,6 @@
           }
           if (Object.keys(out).length) return out;
         }
-        // 2) calcul depuis les items des commandes
-        const fromOrders = computeNeedFromOrders(manquant, dayOrders, { excludeSites: exclude });
-        if (Object.keys(fromOrders).length) return fromOrders;
         // 3) repli : dispatch PDF
         return computeNeedBySite(manquant, dispatchData, { excludeSites: exclude });
       }, [manquant, dispatchData, dayOrders, excludeLivdom]);
@@ -6291,19 +6296,21 @@
     const eurRound = (c) => Math.round(c / 100).toLocaleString('fr-FR') + ' €';
 
     // Petit graphe courbe SVG (aire + ligne), responsive via viewBox.
-    function MiniLineChart({ points, color = '#4a7c3b', valueFmt }) {
+    // pointsB (optionnel) : 2ᵉ série tracée en pointillés gris (comparaison), alignée par index.
+    function MiniLineChart({ points, color = '#4a7c3b', valueFmt, pointsB = null, colorB = '#9aa0a6' }) {
       if (!points || !points.length) return null;
       const W = 360, H = 168, padL = 6, padR = 6, padT = 16, padB = 24;
       const innerW = W - padL - padR, innerH = H - padT - padB;
-      const n = points.length;
-      const max = Math.max(...points.map(p => p.value), 1);
+      const n = Math.max(points.length, pointsB ? pointsB.length : 0);
+      const max = Math.max(...points.map(p => p.value), ...((pointsB || []).map(p => p.value)), 1);
       const xOf = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
       const yOf = v => padT + innerH - (v / max) * innerH;
-      const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(' ');
+      const pathOf = pts => pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(' ');
+      const linePath = pathOf(points);
       const areaPath = `M${xOf(0).toFixed(1)},${(padT + innerH).toFixed(1)} ` +
         points.map((p, i) => `L${xOf(i).toFixed(1)},${yOf(p.value).toFixed(1)}`).join(' ') +
-        ` L${xOf(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)} Z`;
-      const labelStep = Math.max(1, Math.ceil(n / 5));
+        ` L${xOf(points.length - 1).toFixed(1)},${(padT + innerH).toFixed(1)} Z`;
+      const labelStep = Math.max(1, Math.ceil(points.length / 5));
       const fmt = valueFmt || (v => v);
       return (
         <div className="chart-wrap">
@@ -6314,15 +6321,66 @@
                 <text x={padL} y={yOf(max * f) - 3} fontSize="9" fill="var(--ink-mute)">{fmt(max * f)}</text>
               </g>
             ))}
+            {pointsB && pointsB.length > 0 && (
+              <path d={pathOf(pointsB)} fill="none" stroke={colorB} strokeWidth="2" strokeDasharray="4 3" strokeLinejoin="round" strokeLinecap="round" opacity="0.85" />
+            )}
             <path d={areaPath} fill={color} opacity="0.12" />
             <path d={linePath} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-            {points.map((p, i) => (n <= 40 ? <circle key={i} cx={xOf(i)} cy={yOf(p.value)} r="2.4" fill={color} /> : null))}
-            {points.map((p, i) => (i % labelStep === 0 || i === n - 1) ? (
-              <text key={'l' + i} x={xOf(i)} y={H - 8} fontSize="9" fill="var(--ink-mute)" textAnchor={i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle')}>{p.label}</text>
+            {points.map((p, i) => (points.length <= 40 ? <circle key={i} cx={xOf(i)} cy={yOf(p.value)} r="2.4" fill={color} /> : null))}
+            {points.map((p, i) => (i % labelStep === 0 || i === points.length - 1) ? (
+              <text key={'l' + i} x={xOf(i)} y={H - 8} fontSize="9" fill="var(--ink-mute)" textAnchor={i === 0 ? 'start' : (i === points.length - 1 ? 'end' : 'middle')}>{p.label}</text>
             ) : null)}
           </svg>
         </div>
       );
+    }
+
+    // Agrégat CA réutilisable (période A ou B) à partir d'une liste de docs ca_history.
+    function computeCaAgg(docs) {
+      let reel = 0, manquant = 0, remise = 0, orders = 0;
+      const bySite = {}, byDow = {}, byWeek = {}, byCat = { frais: 0, pain: 0, nd: 0 };
+      const products = {};
+      for (const d of docs) {
+        const t = d.totals || totalsFromCaBySite(d.caBySite);
+        reel += t.reel || 0; manquant += t.manquant || 0; remise += t.remise || 0;
+        orders += d.ordersCount || 0;
+        for (const [s, v] of Object.entries(d.caBySite || {})) bySite[s] = (bySite[s] || 0) + (v.reel_cents || 0);
+        byDow[d.dow] = (byDow[d.dow] || 0) + (t.reel || 0);
+        const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + (t.reel || 0);
+        for (const p of (d.salesByProduct || [])) {
+          byCat[p.cat] = (byCat[p.cat] || 0) + (p.ca_cents || 0);
+          if (!products[p.id]) products[p.id] = { id: p.id, produit: p.produit, producteur: p.producteur, cat: p.cat, qty: 0, ca_cents: 0 };
+          products[p.id].qty += p.qty || 0;
+          products[p.id].ca_cents += p.ca_cents || 0;
+        }
+      }
+      const nb = docs.length;
+      return {
+        reel, manquant, remise, orders, nb,
+        previsionnel: reel + manquant + remise,
+        caMoyen: nb ? reel / nb : 0,
+        panier: orders ? reel / orders : 0,
+        bySite, byDow, byWeek, byCat, products: Object.values(products),
+      };
+    }
+    function buildEvoPoints(docs, evoBy) {
+      if (evoBy === 'week') {
+        const byWeek = {};
+        for (const d of docs) { const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + ((d.totals || {}).reel || 0); }
+        return Object.entries(byWeek).sort((a, b) => a[0].localeCompare(b[0])).map(([wk, v]) => ({ label: wk.split('-')[1], value: v / 100 }));
+      }
+      return docs.map(d => ({ label: formatDateShort(d.date), value: ((d.totals || {}).reel || 0) / 100 }));
+    }
+    // Badge d'écart % entre A et B. goodUp=false → une hausse est "mauvaise" (ex. manque à gagner).
+    function DeltaBadge({ a, b, goodUp = true, suffix = '' }) {
+      if (b === 0 || b == null) return null;
+      const pct = ((a - b) / b) * 100;
+      const flat = Math.abs(pct) < 0.5;
+      const up = pct >= 0;
+      const good = goodUp ? up : !up;
+      const color = flat ? 'var(--ink-mute)' : (good ? 'var(--accent-dark,#2e7d32)' : 'var(--danger)');
+      const arrow = flat ? '→' : (up ? '▲' : '▼');
+      return <span style={{ color, fontWeight: 700 }}>{arrow} {up ? '+' : ''}{pct.toFixed(0)}%{suffix}</span>;
     }
 
     function HBars({ data, fmt, color }) {
@@ -6349,6 +6407,9 @@
       const [metric, setMetric] = React.useState('ca'); // ca | qty
       const [catFilter, setCatFilter] = React.useState('all');
       const [evoBy, setEvoBy] = React.useState('day'); // day | week
+      const [compare, setCompare] = React.useState(false);
+      const [fromB, setFromB] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 120); return d.toISOString().slice(0,10); });
+      const [toB, setToB] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 61); return d.toISOString().slice(0,10); });
 
       React.useEffect(() => {
         let alive = true;
@@ -6356,52 +6417,15 @@
         return () => { alive = false; };
       }, []);
 
-      const inRange = React.useMemo(() => {
-        if (!all) return [];
-        return all
-          .filter(d => d.date && d.date >= from && d.date <= to)
-          .sort((a, b) => a.date.localeCompare(b.date));
-      }, [all, from, to]);
+      const filterRange = (f, t) => (all || []).filter(d => d.date && d.date >= f && d.date <= t).sort((a, b) => a.date.localeCompare(b.date));
+      const inRange = React.useMemo(() => filterRange(from, to), [all, from, to]);
+      const inRangeB = React.useMemo(() => compare ? filterRange(fromB, toB) : [], [all, compare, fromB, toB]);
 
-      const agg = React.useMemo(() => {
-        let reel = 0, manquant = 0, remise = 0, orders = 0;
-        const bySite = {}, byDow = {}, byWeek = {}, byCat = { frais: 0, pain: 0, nd: 0 };
-        const products = {};
-        for (const d of inRange) {
-          const t = d.totals || totalsFromCaBySite(d.caBySite);
-          reel += t.reel || 0; manquant += t.manquant || 0; remise += t.remise || 0;
-          orders += d.ordersCount || 0;
-          for (const [s, v] of Object.entries(d.caBySite || {})) bySite[s] = (bySite[s] || 0) + (v.reel_cents || 0);
-          byDow[d.dow] = (byDow[d.dow] || 0) + (t.reel || 0);
-          const wk = isoWeekKey(d.date);
-          byWeek[wk] = (byWeek[wk] || 0) + (t.reel || 0);
-          for (const p of (d.salesByProduct || [])) {
-            byCat[p.cat] = (byCat[p.cat] || 0) + (p.ca_cents || 0);
-            if (!products[p.id]) products[p.id] = { id: p.id, produit: p.produit, producteur: p.producteur, cat: p.cat, qty: 0, ca_cents: 0 };
-            products[p.id].qty += p.qty || 0;
-            products[p.id].ca_cents += p.ca_cents || 0;
-          }
-        }
-        const nb = inRange.length;
-        return {
-          reel, manquant, remise, orders, nb,
-          previsionnel: reel + manquant + remise,
-          caMoyen: nb ? reel / nb : 0,
-          panier: orders ? reel / orders : 0,
-          bySite, byDow, byWeek, byCat,
-          products: Object.values(products),
-        };
-      }, [inRange]);
+      const agg = React.useMemo(() => computeCaAgg(inRange), [inRange]);
+      const aggB = React.useMemo(() => computeCaAgg(inRangeB), [inRangeB]);
 
-      const evoPoints = React.useMemo(() => {
-        if (evoBy === 'week') {
-          const byWeek = {};
-          for (const d of inRange) { const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + ((d.totals || {}).reel || 0); }
-          return Object.entries(byWeek).sort((a, b) => a[0].localeCompare(b[0]))
-            .map(([wk, v]) => ({ label: wk.split('-')[1], value: v / 100 }));
-        }
-        return inRange.map(d => ({ label: formatDateShort(d.date), value: ((d.totals || {}).reel || 0) / 100 }));
-      }, [inRange, evoBy]);
+      const evoPoints = React.useMemo(() => buildEvoPoints(inRange, evoBy), [inRange, evoBy]);
+      const evoPointsB = React.useMemo(() => compare ? buildEvoPoints(inRangeB, evoBy) : null, [inRangeB, evoBy, compare]);
 
       const bestSellers = React.useMemo(() => {
         let list = agg.products;
@@ -6418,6 +6442,15 @@
         const dates = all.map(d => d.date).filter(Boolean).sort();
         setFrom(dates[0]); setTo(dates[dates.length-1]);
       };
+      // Période B = fenêtre de même durée, juste avant la période A.
+      const setPrevPeriod = () => {
+        const f = new Date(from + 'T12:00:00'), t = new Date(to + 'T12:00:00');
+        const len = Math.round((t - f) / 86400000);
+        const bTo = new Date(f); bTo.setDate(f.getDate() - 1);
+        const bFrom = new Date(bTo); bFrom.setDate(bTo.getDate() - len);
+        setFromB(bFrom.toISOString().slice(0,10)); setToB(bTo.toISOString().slice(0,10));
+      };
+      const toggleCompare = () => { const nv = !compare; setCompare(nv); if (nv) setPrevPeriod(); };
 
       if (all === null) return <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Chargement de l'historique…</p></div>;
       if (all.length === 0) return (
@@ -6447,16 +6480,63 @@
               <div className="chip" onClick={setAllTime}>Tout</div>
             </div>
             <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
-              {agg.nb} distribution{agg.nb>1?'s':''} sur la période · CA réel = après manquants de prépa (avant avoirs/remises boutique).
+              {agg.nb} distribution{agg.nb>1?'s':''} sur la période · <strong>CA réel</strong> = produits livrés à prix plein (après manquants de prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
             </p>
+
+            <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--line)'}}>
+              <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:14,fontWeight:600}}>
+                <input type="checkbox" checked={compare} onChange={toggleCompare} style={{width:18,height:18}} />
+                Comparer une 2ᵉ période
+              </label>
+              {compare && (
+                <div style={{marginTop:10}}>
+                  <div className="date-range">
+                    <div style={{flex:1}}><label>Période B — du</label><input type="date" value={fromB} onChange={e => setFromB(e.target.value)} /></div>
+                    <div style={{flex:1}}><label>au</label><input type="date" value={toB} onChange={e => setToB(e.target.value)} /></div>
+                  </div>
+                  <div className="chip-group" style={{marginTop:8}}>
+                    <div className="chip" onClick={setPrevPeriod}>↩ Période précédente (même durée)</div>
+                  </div>
+                  <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
+                    B : {aggB.nb} distribution{aggB.nb>1?'s':''}. <span style={{color:'#4a7c3b',fontWeight:700}}>━ A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>┄ B</span>
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
+
+          {/* Comparaison A vs B */}
+          {compare && (
+            <div className="card">
+              <h3 style={{marginBottom:4}}>Comparaison A vs B</h3>
+              <p style={{fontSize:11,color:'var(--ink-mute)',marginBottom:10}}>A = {formatDateShort(from)} → {formatDateShort(to)} · B = {formatDateShort(fromB)} → {formatDateShort(toB)}</p>
+              {[
+                { label:'CA réel', a:agg.reel, b:aggB.reel, fmt:eurRound, goodUp:true },
+                { label:'CA prévisionnel', a:agg.previsionnel, b:aggB.previsionnel, fmt:eurRound, goodUp:true },
+                { label:'Manque à gagner', a:agg.manquant+agg.remise, b:aggB.manquant+aggB.remise, fmt:eurRound, goodUp:false },
+                { label:'Nb distributions', a:agg.nb, b:aggB.nb, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
+                { label:'CA moyen / distrib', a:agg.caMoyen, b:aggB.caMoyen, fmt:eurRound, goodUp:true },
+                { label:'Panier moyen', a:agg.panier, b:aggB.panier, fmt:(v)=>(v/100).toFixed(2)+' €', goodUp:true },
+              ].map((r, i) => (
+                <div key={i} style={{display:'flex',alignItems:'center',padding:'7px 0',borderTop: i ? '1px solid var(--line)' : 'none'}}>
+                  <div style={{flex:1,fontSize:13,fontWeight:600}}>{r.label}</div>
+                  <div style={{flex:'0 0 78px',textAlign:'right',fontSize:13,fontWeight:700}}>{r.fmt(r.a)}</div>
+                  <div style={{flex:'0 0 78px',textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>{r.fmt(r.b)}</div>
+                  <div style={{flex:'0 0 56px',textAlign:'right',fontSize:12}}><DeltaBadge a={r.a} b={r.b} goodUp={r.goodUp} /></div>
+                </div>
+              ))}
+              <div style={{display:'flex',marginTop:6,fontSize:10,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.04em'}}>
+                <div style={{flex:1}}></div><div style={{flex:'0 0 78px',textAlign:'right'}}>A</div><div style={{flex:'0 0 78px',textAlign:'right'}}>B</div><div style={{flex:'0 0 56px',textAlign:'right'}}>Δ</div>
+              </div>
+            </div>
+          )}
 
           {/* KPIs */}
           <div className="kpi-grid">
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">après manquants prépa</div></div>
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.previsionnel)}</div><div className="kpi-label">CA prévisionnel</div><div className="kpi-sub">commandé au départ</div></div>
-            <div className="kpi"><div className="kpi-val" style={{color:'var(--danger)'}}>{eurRound(agg.manquant + agg.remise)}</div><div className="kpi-label">Manque à gagner</div><div className="kpi-sub">{eurRound(agg.manquant)} manq. · {eurRound(agg.remise)} remises</div></div>
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.caMoyen)}</div><div className="kpi-label">CA moyen / distrib</div><div className="kpi-sub">{agg.orders.toLocaleString('fr-FR')} commandes · panier {agg.panier ? (agg.panier/100).toFixed(2) : '0'} €</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.reel} b={aggB.reel} /> : 'après manquants prépa'}</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.previsionnel)}</div><div className="kpi-label">CA prévisionnel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.previsionnel} b={aggB.previsionnel} /> : 'commandé au départ'}</div></div>
+            <div className="kpi"><div className="kpi-val" style={{color:'var(--danger)'}}>{eurRound(agg.manquant + agg.remise)}</div><div className="kpi-label">Manque à gagner</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.manquant + agg.remise} b={aggB.manquant + aggB.remise} goodUp={false} /> : `${eurRound(agg.manquant)} manq. · ${eurRound(agg.remise)} remises`}</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.caMoyen)}</div><div className="kpi-label">CA moyen / distrib</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.caMoyen} b={aggB.caMoyen} /> : `${agg.orders.toLocaleString('fr-FR')} cmd · panier ${agg.panier ? (agg.panier/100).toFixed(2) : '0'} €`}</div></div>
           </div>
 
           {/* Évolution */}
@@ -6468,8 +6548,9 @@
                 <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
               </div>
             </div>
-            {evoPoints.length ? <MiniLineChart points={evoPoints} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
+            {evoPoints.length ? <MiniLineChart points={evoPoints} pointsB={compare ? evoPointsB : null} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
               : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
+            {compare && <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4,textAlign:'center'}}>Courbes alignées par rang (1ᵉʳ jour A vs 1ᵉʳ jour B…). <span style={{color:'#4a7c3b',fontWeight:700}}>A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>B</span></p>}
           </div>
 
           {/* Par site */}
