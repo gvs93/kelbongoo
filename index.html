@@ -491,6 +491,7 @@
       { id:"poids_inferieur", label:"Poids inférieur à l'indiqué", color:"warn" },
       { id:"inversion_casier", label:"Inversion casier", color:"warn" },
       { id:"oubli_casier", label:"Article oublié dans casier", color:"warn" },
+      { id:"retour_pdp", label:"↩️ Retour PDP (produit non attribué)", color:"warn" },
     ];
     const ACTIONS = [
       { id:"remise", label:"Remise" },
@@ -1827,47 +1828,6 @@
     }
 
     // ============================================================
-    // CLIENT PICKER
-    // ============================================================
-    function ClientPicker({ orders, value, onChange }) {
-      const [search, setSearch] = React.useState('');
-      const filtered = React.useMemo(() => {
-        const s = normalizeText(search);
-        if (!s) return orders.slice(0, 50);
-        return orders.filter(o => normalizeText(displayName(o)).includes(s)).slice(0, 50);
-      }, [orders, search]);
-      const selected = orders.find(o => o.orderId === value);
-      return (
-        <div>
-          {selected && (
-            <div className="alert-success" style={{marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-              <span>✓ <strong>{displayName(selected)}</strong></span>
-              <button className="btn-ghost" style={{padding:'2px 8px', fontSize:11}} onClick={() => onChange('')}>Changer</button>
-            </div>
-          )}
-          {!selected && (
-            <>
-              <div className="search-box">
-                <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Chercher un client…" />
-              </div>
-              <div className="product-list">
-                {filtered.length === 0 ? (
-                  <div style={{padding: 20, textAlign: 'center', color: 'var(--ink-mute)', fontSize: 13}}>
-                    Aucun client
-                  </div>
-                ) : filtered.map(o => (
-                  <div key={o.orderId} className="product-item" onClick={() => onChange(o.orderId)}>
-                    {displayName(o)}
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-      );
-    }
-
-    // ============================================================
     // ANOMALY FORM
     // ============================================================
     function AnomalyForm({ orders, products, session, currentSite, onClose, editing, consumersByEmail }) {
@@ -1881,7 +1841,9 @@
       const [amountRefund, setAmountRefund] = React.useState(editing?.amountRefund || '');
       const [amountCredit, setAmountCredit] = React.useState(editing?.amountCredit || '');
       const [remark, setRemark] = React.useState(editing?.remark || '');
+      const [retourQty, setRetourQty] = React.useState(editing?.retourQty ? String(editing.retourQty) : '1');
       const [busy, setBusy] = React.useState(false);
+      const isRetourPdp = anomalyTypes.includes('retour_pdp');
       const selectedOrder = orders.find(o => o.orderId === selectedKey);
       const toggle = (list, setList, id) => {
         if (list.includes(id)) setList(list.filter(x => x !== id));
@@ -1893,23 +1855,26 @@
         setClientEmail(info.email || '');
       };
       const handleSubmit = async () => {
-        if (!selectedKey || !clientName) { showToast('Choisis un client'); return; }
+        if (!isRetourPdp && (!selectedKey || !clientName)) { showToast('Choisis un client'); return; }
         if (!productKey) { showToast('Choisis un produit'); return; }
         if (anomalyTypes.length === 0) { showToast("Au moins un type d'anomalie"); return; }
         setBusy(true);
         try {
           const id = editing?.id || `anom_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
           let productLabel = '';
-          if (productKey.startsWith('FREE:')) productLabel = productKey.substring(5);
+          let prodName = '', prodProducer = '';
+          if (productKey.startsWith('FREE:')) { productLabel = productKey.substring(5); prodName = productLabel; }
           else {
             const [prod, name] = productKey.split('|');
             productLabel = `${name} (${prod})`;
+            prodProducer = prod; prodName = name;
           }
+          const effName = clientName || (isRetourPdp ? 'Produit non attribué' : '');
           // orderId robuste : commande du jour, sinon email, sinon clé, sinon id
           const safeOrderId = selectedOrder ? selectedOrder.orderId : (clientEmail || selectedKey || id);
           const data = {
             orderId: safeOrderId, site: currentSite,
-            clientName: clientName,
+            clientName: effName,
             clientEmail: clientEmail,
             clientPhone: selectedOrder?.telephone || '',
             hasOrderToday: !!selectedOrder,
@@ -1918,6 +1883,7 @@
             anomalyTypes, actions,
             amountRefund: parseFloat(amountRefund) || 0,
             amountCredit: parseFloat(amountCredit) || 0,
+            retourQty: parseInt(retourQty, 10) || 1,
             remark,
             createdBy: session.name,
             createdAt: editing?.createdAt || new Date().toISOString(),
@@ -1948,6 +1914,25 @@
             await storage.deleteDoc('forgotten_items', `forg_${id}`);
           }
 
+          // Type "retour_pdp" : produit non attribué à renvoyer → entrée dans la liste prépa Retours PDP
+          if (isRetourPdp) {
+            await storage.setDoc('pdp_returns', `pdpret_${id}`, {
+              id: `pdpret_${id}`, anomalyId: id, site: currentSite,
+              productKey, productLabel,
+              produit: prodName, producteur: prodProducer,
+              qty: parseInt(retourQty, 10) || 1,
+              clientName: effName,
+              remark,
+              day: activeDay(),
+              status: 'pending',
+              createdBy: session.name,
+              createdAt: editing?.createdAt || new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          } else if (editing && editing.anomalyTypes && editing.anomalyTypes.includes('retour_pdp')) {
+            await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
+          }
+
           showToast(editing ? '✓ Mise à jour' : '✓ Anomalie enregistrée');
           onClose();
         } catch (err) {
@@ -1962,7 +1947,7 @@
               <button className="modal-close" onClick={onClose}>×</button>
             </div>
             <div className="field">
-              <label>Client</label>
+              <label>Client{isRetourPdp ? ' (facultatif)' : ''}</label>
               <ConsigneClientPicker
                 orders={orders}
                 consumersByEmail={consumersByEmail}
@@ -1971,6 +1956,9 @@
                 onPick={handlePickClient}
                 onClear={() => { setSelectedKey(''); setClientName(''); setClientEmail(''); }}
               />
+              {isRetourPdp && (
+                <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>Produit non attribué : tu peux laisser le client vide.</p>
+              )}
             </div>
             <div className="field">
               <label>Produit concerné</label>
@@ -1984,6 +1972,14 @@
                 ))}
               </div>
             </div>
+            {isRetourPdp && (
+              <div className="field">
+                <label>Quantité à renvoyer à PDP</label>
+                <input type="text" inputMode="numeric" value={retourQty}
+                  onChange={e => setRetourQty(e.target.value.replace(/[^0-9]/g, ''))} placeholder="1" />
+                <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>Apparaîtra dans la liste <strong>Retours PDP</strong> de la prépa.</p>
+              </div>
+            )}
             <div className="field">
               <label>Action apportée</label>
               <div className="chip-group">
@@ -2281,6 +2277,10 @@
       // Si journée clôturée et distrib (non master), on cache les noms
       const hideNames = isClosed && !session.isMaster;
 
+      // Données chargées via la méthode JSON (V4) : casiers/pain/ND déjà inclus dans la commande.
+      // Dans ce cas, plus besoin des anciens bandeaux "dispatch PDF".
+      const isV4Data = orders.some(o => Array.isArray(o.items) || Array.isArray(o.casiersFrais) || Array.isArray(o.pains));
+
       return (
         <div className="stack">
           <h1>Clients · {currentSite}</h1>
@@ -2293,16 +2293,16 @@
 
           {orders.length === 0 && !isClosed && (
             <div className="alert-warning">
-              ⚠️ Aucune commande chargée. Va dans <strong>Admin</strong> pour uploader le CSV du jour.
+              ⚠️ Aucune commande chargée. Va dans <strong>Admin</strong> pour charger les données du jour.
             </div>
           )}
 
-          {!dispatch && orders.length > 0 && (
+          {!isV4Data && !dispatch && orders.length > 0 && (
             <div className="alert-info">
-              📦 Pas de dispatch chargé pour {currentSite}. Charge le Master + Dispatch frais/sec dans <strong>Admin</strong> pour voir le détail par casier.
+              📦 Pas de dispatch chargé pour {currentSite}. Charge les données du jour dans <strong>Admin</strong> pour voir le détail par casier.
             </div>
           )}
-          {dispatch && (
+          {!isV4Data && dispatch && (
             <div className="alert-success">
               📦 Dispatch chargé{dispatch.meta?.parts?.length ? ` (${dispatch.meta.parts.join(' · ')})` : ''}{dispatch.meta?.uploadedBy ? ` · par ${dispatch.meta.uploadedBy}` : ''} — clique un client pour voir ses casiers.
             </div>
@@ -2604,6 +2604,8 @@
       const handleDelete = async (id) => {
         if (!confirm('Supprimer cette anomalie ?')) return;
         await storage.deleteDoc(`day_${activeDay()}_anomalies`, id);
+        try { await storage.deleteDoc('pdp_returns', `pdpret_${id}`); } catch (e) {}
+        try { await storage.deleteDoc('forgotten_items', `forg_${id}`); } catch (e) {}
         showToast('Supprimée');
       };
 
@@ -3629,25 +3631,6 @@
     const FL_SHEET_TAB = 'S10';
 
     // Parseur CSV minimal robuste (gère les champs entre guillemets contenant des virgules)
-    function parseCSV(text) {
-      const rows = []; let row = []; let cur = ''; let inQ = false;
-      for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        if (inQ) {
-          if (c === '"') { if (text[i+1] === '"') { cur += '"'; i++; } else inQ = false; }
-          else cur += c;
-        } else {
-          if (c === '"') inQ = true;
-          else if (c === ',') { row.push(cur); cur = ''; }
-          else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
-          else if (c === '\r') { /* ignore */ }
-          else cur += c;
-        }
-      }
-      if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
-      return rows;
-    }
-
     function FLInventoryPage({ session, invDate }) {
       const showToast = React.useContext(ToastContext);
       const [items, setItems] = React.useState(null);   // [{key, producer, produit, uv}]
@@ -6683,11 +6666,13 @@
       const showToast = React.useContext(ToastContext);
       const [followups, setFollowups] = React.useState([]);
       const [treatments, setTreatments] = React.useState([]);
+      const [manualReturns, setManualReturns] = React.useState([]);
 
       React.useEffect(() => {
         const u1 = storage.subscribe('followups', setFollowups);
         const u2 = storage.subscribe('pdp_treatments', setTreatments);
-        return () => { u1(); u2(); };
+        const u3 = storage.subscribe('pdp_returns', setManualReturns);
+        return () => { u1(); u2(); u3(); };
       }, []);
 
       const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
@@ -6742,22 +6727,98 @@
       const treatedLines = returns.reduce((s, f) =>
         s + f.items.filter((it, idx) => treatMap[lineId(f, it, idx)]).length, 0);
 
+      // Retours manuels (produits non attribués signalés en distrib via Qualité → "Retour PDP")
+      // On affiche les non traités, + ceux traités le jour même (pour confirmation visuelle).
+      const manual = manualReturns
+        .filter(r => {
+          const t = treatMap[r.id];
+          return !t || (t.treatedAt && t.treatedAt.slice(0, 10) === activeDay());
+        })
+        .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      const manualTreated = manual.filter(r => treatMap[r.id]).length;
+
+      const setManualDestination = async (r, destination) => {
+        await storage.setDoc('pdp_treatments', r.id, {
+          id: r.id, orderId: r.id, site: r.site,
+          produit: r.produit, producteur: r.producteur, qty: r.qty || 1,
+          destination, manual: true,
+          treatedBy: session.name, treatedAt: new Date().toISOString(),
+        });
+        if (destination !== 'rayon') {
+          const prod = (catalogue || []).find(p => p.produit === r.produit && p.producteur === r.producteur);
+          const unitPrice = prod ? (prod.prixAchat || prod.prixHT || 0) : 0;
+          const qty = r.qty || 1;
+          await storage.setDoc('losses', `lossret_${r.id}`, {
+            id: `lossret_${r.id}`,
+            productKey: prod ? `${prod.producteur}|${prod.produit}` : (r.productKey || `${r.producteur}|${r.produit}`),
+            producteur: r.producteur, produit: r.produit,
+            unite: prod?.unite || '',
+            destination, reason: 'erreur_prepa',
+            usingWeight: false, quantity: qty, weight: 0,
+            unitPrice, totalValue: unitPrice * qty,
+            remark: `Retour PDP non attribué — ${r.site}${r.remark ? ' · ' + r.remark : ''}`,
+            day: activeDay(), fromReturn: true,
+            createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+          });
+        } else {
+          try { await storage.deleteDoc('losses', `lossret_${r.id}`); } catch (e) {}
+        }
+        showToast('✓ Destination enregistrée');
+      };
+
+      const nothing = returns.length === 0 && manual.length === 0;
+
       return (
         <div className="stack">
           <h1>Retours PDP</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Produits des commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j. Choisis une destination pour chacun.
-            Montreuil, partage équipe et jeté sont comptés en perte ; « remettre en rayon » non.
+            Produits à traiter : non attribués signalés en distrib (↩️) + commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j.
+            Choisis une destination pour chacun. Montreuil, partage équipe et jeté sont comptés en perte ; « remettre en rayon » non.
           </p>
 
-          {returns.length === 0 ? (
+          {nothing ? (
             <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Aucun retour PDP en attente. 👍</p></div>
           ) : (
             <>
-              <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
-                <strong>{treatedLines}/{totalLines}</strong> produits traités · {returns.length} commande{returns.length>1?'s':''}
-              </div>
-              {returns.map(f => (
+              {manual.length > 0 && (
+                <>
+                  <div className="card" style={{borderLeft:`3px solid ${manualTreated===manual.length?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
+                    <strong>↩️ Produits non attribués</strong> · {manualTreated}/{manual.length} traité{manual.length>1?'s':''}
+                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>Signalés en distribution (en trop / sans propriétaire). Choisis une destination pour chacun.</div>
+                  </div>
+                  {manual.map(r => {
+                    const t = treatMap[r.id];
+                    return (
+                      <div key={r.id} className="card" style={{background: t ? 'transparent' : 'var(--warn-soft)'}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:6}}>
+                          <h3 style={{margin:0,fontSize:15}}>{r.produit || r.productLabel}{r.qty>1?` ×${r.qty}`:''}</h3>
+                          <span style={{fontSize:12,color:'var(--ink-mute)'}}>{r.site}</span>
+                        </div>
+                        {r.producteur && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:2}}>{r.producteur}</div>}
+                        {r.remark && <div style={{fontSize:12,color:'var(--ink-soft)',fontStyle:'italic',marginBottom:6}}>« {r.remark} »</div>}
+                        {t && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>✓ {RETURN_DESTINATIONS.find(d=>d.id===t.destination)?.label || t.destination} · {t.treatedBy}</div>}
+                        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                          {RETURN_DESTINATIONS.map(d => (
+                            <div key={d.id}
+                              className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
+                              style={{fontSize:12}}
+                              onClick={() => setManualDestination(r, d.id)}>
+                              {d.label}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
+              {returns.length > 0 && (
+                <>
+                  <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
+                    <strong>📦 Commandes non récupérées</strong> · {treatedLines}/{totalLines} produits traités · {returns.length} commande{returns.length>1?'s':''}
+                  </div>
+                  {returns.map(f => (
                 <div key={f.orderId} className="card">
                   <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
                     <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
@@ -6787,6 +6848,8 @@
                   </div>
                 </div>
               ))}
+                </>
+              )}
             </>
           )}
         </div>
