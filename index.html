@@ -783,6 +783,8 @@
       const aggRemises = {};
       const caBySite = {}; // { SITE: { reel_cents, manquant_cents, remise_cents } }
       const salesByProduct = {}; // { pid: { id, produit, producteur, cat, qty, ca_cents } }
+      const consumerSet = new Set();           // clients uniques (toute la journée)
+      const consumersBySiteSet = {};           // { SITE: Set(cid) }
       const out = [];
       let dateKey = null;
 
@@ -795,6 +797,11 @@
         const cid = oid(o.consumer_id);
         const cons = consById[cid];
         if (!cons) missingConsumers.add(cid);
+        if (cid) {
+          consumerSet.add(cid);
+          const cSite = (o.locale || '').trim().toUpperCase();
+          if (cSite) { (consumersBySiteSet[cSite] || (consumersBySiteSet[cSite] = new Set())).add(cid); }
+        }
 
         // Date de distribution → clé jour (YYYYMMDD)
         const dIso = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date;
@@ -900,6 +907,8 @@
         remises: Object.values(aggRemises),
         caBySite,
         salesByProduct: Object.values(salesByProduct).sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 300),
+        consumerIds: [...consumerSet],
+        consumersBySite: Object.fromEntries(Object.entries(consumersBySiteSet).map(([s, set]) => [s, set.size])),
       };
     }
 
@@ -923,7 +932,7 @@
         remise: a.remise + (s.remise_cents || 0),
       }), { reel: 0, manquant: 0, remise: 0 });
     }
-    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source) {
+    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source, consumers) {
       return {
         date: dateKey,
         dow: new Date(dateKey + 'T12:00:00').getDay(), // 0=dim … 6=sam
@@ -931,6 +940,7 @@
         salesByProduct: (salesByProduct || []).slice(0, 300),
         totals: totalsFromCaBySite(caBySite),
         ordersCount: ordersCount || 0,
+        consumers: (consumers || []).slice(0, 2000), // clients uniques du jour (pour fréquence / churn)
         source: source || 'daily',
         updatedAt: new Date().toISOString(),
       };
@@ -953,9 +963,10 @@
         if (fromKey && dateKey < fromKey) continue;
         if (toKey && dateKey > toKey) continue;
 
-        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0 };
+        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0, consumers: new Set() };
         const b = byDate[dateKey];
         b.ordersCount++;
+        const cid = oid(o.consumer_id); if (cid) b.consumers.add(cid);
         const oSite = (o.locale || '').trim().toUpperCase();
         if (oSite && !b.caBySite[oSite]) b.caBySite[oSite] = { reel_cents: 0, manquant_cents: 0, remise_cents: 0 };
 
@@ -990,7 +1001,7 @@
       const docs = {};
       for (const [dateKey, b] of Object.entries(byDate)) {
         const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 300);
-        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk');
+        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk', [...b.consumers]);
       }
       return docs;
     }
@@ -3594,18 +3605,18 @@
               ))}
             </div>
           )}
-            <div className="stack" style={{gap:10}}>
-              <div style={{fontSize:13}}><strong>{learnStats.total}</strong> code(s) appris au total.</div>
+            <div className="stack" style={{gap:10, display: tab==='learn' ? undefined : 'none'}}>
+              <div style={{fontSize:13}}><strong>{(learnStats && learnStats.total) || 0}</strong> code(s) appris au total.</div>
               <div>
                 <div style={{fontWeight:600,fontSize:12,marginBottom:3}}>Par personne</div>
-                {Object.entries(learnStats.byPerson).sort((a,b)=>b[1]-a[1]).map(([who,n]) => (
+                {Object.entries((learnStats && learnStats.byPerson) || {}).sort((a,b)=>b[1]-a[1]).map(([who,n]) => (
                   <div key={who} style={{display:'flex',justifyContent:'space-between',fontSize:13,padding:'2px 0',borderBottom:'1px solid var(--border)'}}><span>{who}</span><span>{n}</span></div>
                 ))}
               </div>
               <div>
                 <div style={{fontWeight:600,fontSize:12,marginBottom:3}}>Derniers codes associés</div>
                 <div className="stack" style={{gap:2,maxHeight:'40vh',overflowY:'auto'}}>
-                  {learnStats.recent.map(e => (
+                  {((learnStats && learnStats.recent) || []).map(e => (
                     <div key={e.id || e.ean} style={{fontSize:12,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
                       <div style={{display:'flex',justifyContent:'space-between',gap:8}}>
                         <span style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{prodById[e.productId]?.name || e.productId}</span>
@@ -6340,10 +6351,13 @@
       let reel = 0, manquant = 0, remise = 0, orders = 0;
       const bySite = {}, byDow = {}, byWeek = {}, byCat = { frais: 0, pain: 0, nd: 0 };
       const products = {};
+      const consumers = new Set();
+      let hasConsumerData = false;
       for (const d of docs) {
         const t = d.totals || totalsFromCaBySite(d.caBySite);
         reel += t.reel || 0; manquant += t.manquant || 0; remise += t.remise || 0;
         orders += d.ordersCount || 0;
+        if (Array.isArray(d.consumers)) { hasConsumerData = true; for (const c of d.consumers) consumers.add(c); }
         for (const [s, v] of Object.entries(d.caBySite || {})) bySite[s] = (bySite[s] || 0) + (v.reel_cents || 0);
         byDow[d.dow] = (byDow[d.dow] || 0) + (t.reel || 0);
         const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + (t.reel || 0);
@@ -6355,12 +6369,15 @@
         }
       }
       const nb = docs.length;
+      const uniqueClients = consumers.size;
       return {
         reel, manquant, remise, orders, nb,
         previsionnel: reel + manquant + remise,
         caMoyen: nb ? reel / nb : 0,
         panier: orders ? reel / orders : 0,
         bySite, byDow, byWeek, byCat, products: Object.values(products),
+        passages: orders, uniqueClients, hasConsumerData,
+        frequence: uniqueClients ? orders / uniqueClients : 0,
       };
     }
     function buildEvoPoints(docs, evoBy) {
@@ -6400,8 +6417,72 @@
       );
     }
 
+    // --- Helpers dates / libellés pour le tableau de bord ---
+    const dKey = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    function isoWeekRange(dateKey) {
+      const d = new Date(dateKey + 'T12:00:00');
+      const day = (d.getDay() + 6) % 7; // 0 = lundi
+      const mon = new Date(d); mon.setDate(d.getDate() - day);
+      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+      return { from: dKey(mon), to: dKey(sun) };
+    }
+    function monthRange(dateKey) {
+      const d = new Date(dateKey + 'T12:00:00');
+      const from = new Date(d.getFullYear(), d.getMonth(), 1);
+      const to = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      return { from: dKey(from), to: dKey(to) };
+    }
+    const siteLabel = (s) => s === 'DOM' ? 'Camion (livraison)' : s;
+
+    // Résumé automatique de tendance (règles, sans IA externe) entre deux agrégats A vs B.
+    function buildTrendSummary(A, B, labelB) {
+      if (!B || !B.nb) return `Pas de données sur la période de comparaison (${labelB}).`;
+      const out = [];
+      const pct = B.reel ? ((A.reel - B.reel) / B.reel * 100) : 0;
+      const dir = pct >= 1 ? 'en hausse' : (pct <= -1 ? 'en baisse' : 'stable');
+      out.push(`CA ${dir} de ${Math.abs(pct).toFixed(0)}% (${eurRound(A.reel)} vs ${eurRound(B.reel)} ${labelB}).`);
+      const sites = new Set([...Object.keys(A.bySite), ...Object.keys(B.bySite)]);
+      const deltas = [...sites].map(s => ({ s, d: (A.bySite[s] || 0) - (B.bySite[s] || 0) })).filter(x => Math.abs(x.d) >= 2000);
+      if (pct <= -1) {
+        const downs = deltas.filter(x => x.d < 0).sort((a, b) => a.d - b.d).slice(0, 3);
+        if (downs.length) out.push(`Recul porté surtout par ${downs.map(x => `${siteLabel(x.s)} (${eurRound(x.d)})`).join(', ')}.`);
+      } else if (pct >= 1) {
+        const ups = deltas.filter(x => x.d > 0).sort((a, b) => b.d - a.d).slice(0, 3);
+        if (ups.length) out.push(`Hausse portée surtout par ${ups.map(x => `${siteLabel(x.s)} (+${eurRound(x.d)})`).join(', ')}.`);
+      }
+      const catNames = { frais: 'le frais', pain: 'le pain/sec', nd: 'le non-dispatch' };
+      const catD = ['frais','pain','nd'].map(c => ({ c, d: (A.byCat[c]||0)-(B.byCat[c]||0), pct: B.byCat[c] ? (((A.byCat[c]||0)-(B.byCat[c]||0))/B.byCat[c]*100) : null }))
+        .filter(x => x.pct !== null && Math.abs(x.pct) >= 5);
+      if (catD.length) { const w = catD.sort((a,b)=>Math.abs(b.d)-Math.abs(a.d))[0]; const lbl = catNames[w.c]; out.push(`${lbl.charAt(0).toUpperCase()+lbl.slice(1)} ${w.pct>=0?'progresse':'recule'} de ${Math.abs(w.pct).toFixed(0)}%.`); }
+      if (A.hasConsumerData && B.hasConsumerData) {
+        const dc = A.uniqueClients - B.uniqueClients;
+        if (Math.abs(dc) >= 3) out.push(`${Math.abs(dc)} client${Math.abs(dc)>1?'s':''} ${dc<0?'de moins':'de plus'} (${A.uniqueClients} vs ${B.uniqueClients}).`);
+      }
+      const pb = B.panier ? ((A.panier - B.panier) / B.panier * 100) : null;
+      if (pb !== null && Math.abs(pb) >= 3) out.push(`Panier moyen ${pb>=0?'+':''}${pb.toFixed(0)}%.`);
+      return out.join(' ');
+    }
+
+    // Petite carte KPI avec 1 à 2 comparaisons (vs semaine dernière, vs N-1)
+    function KpiCompare({ label, value, sub, comps }) {
+      return (
+        <div className="kpi">
+          <div className="kpi-val">{value}</div>
+          <div className="kpi-label">{label}</div>
+          {sub && <div className="kpi-sub">{sub}</div>}
+          {(comps || []).map((c, i) => (
+            <div key={i} className="kpi-sub" style={{display:'flex',justifyContent:'space-between',gap:6}}>
+              <span>{c.label}</span>
+              <span><DeltaBadge a={c.a} b={c.b} goodUp={c.goodUp !== false} /></span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
     function CaDashboard() {
       const [all, setAll] = React.useState(null); // null = chargement
+      const showToast = React.useContext(ToastContext);
       const [from, setFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
       const [to, setTo] = React.useState(() => new Date().toISOString().slice(0,10));
       const [metric, setMetric] = React.useState('ca'); // ca | qty
@@ -6418,14 +6499,56 @@
       }, []);
 
       const filterRange = (f, t) => (all || []).filter(d => d.date && d.date >= f && d.date <= t).sort((a, b) => a.date.localeCompare(b.date));
+      const aggRange = (f, t) => computeCaAgg(filterRange(f, t));
+
+      // ===== VUE RAPIDE : jour / semaine / mois, avec comparaisons vs sem. dernière et N-1 =====
+      const quick = React.useMemo(() => {
+        if (!all || !all.length) return null;
+        const lastDate = all.map(d => d.date).filter(Boolean).sort().slice(-1)[0];
+        // Jour
+        const jour = aggRange(lastDate, lastDate);
+        const jourPrevW = aggRange(addDays(lastDate, -7), addDays(lastDate, -7));
+        // Semaine
+        const wk = isoWeekRange(lastDate);
+        const wkPrev = { from: addDays(wk.from, -7), to: addDays(wk.to, -7) };
+        const wkN1 = { from: addDays(wk.from, -364), to: addDays(wk.to, -364) }; // 52 semaines
+        const sem = aggRange(wk.from, wk.to);
+        const semPrev = aggRange(wkPrev.from, wkPrev.to);
+        const semN1 = aggRange(wkN1.from, wkN1.to);
+        // Mois
+        const mr = monthRange(lastDate);
+        const prevMonthDate = addDays(mr.from, -1);
+        const mrPrev = monthRange(prevMonthDate);
+        const n1 = new Date(mr.from + 'T12:00:00'); n1.setFullYear(n1.getFullYear() - 1);
+        const mrN1 = monthRange(dKey(n1));
+        const mois = aggRange(mr.from, mr.to);
+        const moisPrev = aggRange(mrPrev.from, mrPrev.to);
+        const moisN1 = aggRange(mrN1.from, mrN1.to);
+        return { lastDate, jour, jourPrevW, sem, semPrev, semN1, mois, moisPrev, moisN1 };
+      }, [all]);
+
       const inRange = React.useMemo(() => filterRange(from, to), [all, from, to]);
       const inRangeB = React.useMemo(() => compare ? filterRange(fromB, toB) : [], [all, compare, fromB, toB]);
-
       const agg = React.useMemo(() => computeCaAgg(inRange), [inRange]);
       const aggB = React.useMemo(() => computeCaAgg(inRangeB), [inRangeB]);
-
       const evoPoints = React.useMemo(() => buildEvoPoints(inRange, evoBy), [inRange, evoBy]);
       const evoPointsB = React.useMemo(() => compare ? buildEvoPoints(inRangeB, evoBy) : null, [inRangeB, evoBy, compare]);
+      const summary = React.useMemo(() => compare ? buildTrendSummary(agg, aggB, 'période B') : '', [agg, aggB, compare]);
+
+      // Churn / fidélité sur la période : régliers du début absents sur la fin
+      const churn = React.useMemo(() => {
+        if (!agg.hasConsumerData || inRange.length < 4) return null;
+        const mid = Math.floor(inRange.length / 2);
+        const early = inRange.slice(0, mid), late = inRange.slice(mid);
+        const earlyCount = {};
+        for (const d of early) for (const c of (d.consumers || [])) earlyCount[c] = (earlyCount[c] || 0) + 1;
+        const lateSet = new Set();
+        for (const d of late) for (const c of (d.consumers || [])) lateSet.add(c);
+        const regulars = Object.keys(earlyCount).filter(c => earlyCount[c] >= 2);
+        if (regulars.length < 5) return null;
+        const lost = regulars.filter(c => !lateSet.has(c));
+        return { pct: lost.length / regulars.length * 100, lost: lost.length, regulars: regulars.length };
+      }, [inRange, agg.hasConsumerData]);
 
       const bestSellers = React.useMemo(() => {
         let list = agg.products;
@@ -6433,16 +6556,8 @@
         return list.sort((a, b) => metric === 'qty' ? (b.qty - a.qty) : (b.ca_cents - a.ca_cents)).slice(0, 20);
       }, [agg.products, metric, catFilter]);
 
-      const setPreset = (days) => {
-        const t = new Date(); const f = new Date(); f.setDate(f.getDate() - days);
-        setFrom(f.toISOString().slice(0,10)); setTo(t.toISOString().slice(0,10));
-      };
-      const setAllTime = () => {
-        if (!all || !all.length) return;
-        const dates = all.map(d => d.date).filter(Boolean).sort();
-        setFrom(dates[0]); setTo(dates[dates.length-1]);
-      };
-      // Période B = fenêtre de même durée, juste avant la période A.
+      const setPreset = (days) => { const t = new Date(); const f = new Date(); f.setDate(f.getDate() - days); setFrom(f.toISOString().slice(0,10)); setTo(t.toISOString().slice(0,10)); };
+      const setAllTime = () => { if (!all || !all.length) return; const dates = all.map(d => d.date).filter(Boolean).sort(); setFrom(dates[0]); setTo(dates[dates.length-1]); };
       const setPrevPeriod = () => {
         const f = new Date(from + 'T12:00:00'), t = new Date(to + 'T12:00:00');
         const len = Math.round((t - f) / 86400000);
@@ -6451,6 +6566,50 @@
         setFromB(bFrom.toISOString().slice(0,10)); setToB(bTo.toISOString().slice(0,10));
       };
       const toggleCompare = () => { const nv = !compare; setCompare(nv); if (nv) setPrevPeriod(); };
+
+      const exportComparePDF = () => {
+        try {
+          if (!window.jspdf) { showToast && showToast('PDF non disponible, recharge la page'); return; }
+          const { jsPDF } = window.jspdf;
+          const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+          const M = 14; let y = 16;
+          const pct = (a, b) => b ? (((a - b) / b * 100) >= 0 ? '+' : '') + ((a - b) / b * 100).toFixed(0) + '%' : '—';
+          doc.setFontSize(15); doc.setFont(undefined, 'bold');
+          doc.text('Comparaison CA — Kelbongoo', M, y); y += 7;
+          doc.setFontSize(10); doc.setFont(undefined, 'normal');
+          doc.text(`Période A : ${formatDateShort(from)} → ${formatDateShort(to)}`, M, y); y += 5;
+          doc.text(`Période B : ${formatDateShort(fromB)} → ${formatDateShort(toB)}`, M, y); y += 7;
+          doc.setFont(undefined, 'bold'); doc.text('Tendance', M, y); y += 5;
+          doc.setFont(undefined, 'normal');
+          const lines = doc.splitTextToSize(summary || '—', 182);
+          doc.text(lines, M, y); y += lines.length * 5 + 4;
+          doc.autoTable({
+            startY: y, margin: { left: M, right: M },
+            head: [['Indicateur', 'Période A', 'Période B', 'Δ']],
+            body: [
+              ['CA réel', eurRound(agg.reel), eurRound(aggB.reel), pct(agg.reel, aggB.reel)],
+              ['Net après remises', eurRound(agg.reel - agg.remise), eurRound(aggB.reel - aggB.remise), pct(agg.reel - agg.remise, aggB.reel - aggB.remise)],
+              ['Manque à gagner', eurRound(agg.manquant + agg.remise), eurRound(aggB.manquant + aggB.remise), pct(agg.manquant + agg.remise, aggB.manquant + aggB.remise)],
+              ['Passages', agg.passages.toLocaleString('fr-FR'), aggB.passages.toLocaleString('fr-FR'), pct(agg.passages, aggB.passages)],
+              ['Clients uniques', agg.hasConsumerData ? String(agg.uniqueClients) : '—', aggB.hasConsumerData ? String(aggB.uniqueClients) : '—', (agg.hasConsumerData && aggB.hasConsumerData) ? pct(agg.uniqueClients, aggB.uniqueClients) : '—'],
+              ['Panier moyen', (agg.panier / 100).toFixed(2) + ' €', (aggB.panier / 100).toFixed(2) + ' €', pct(agg.panier, aggB.panier)],
+            ],
+            styles: { fontSize: 9 }, headStyles: { fillColor: [74, 124, 59] },
+          });
+          y = doc.lastAutoTable.finalY + 8;
+          const sites = [...new Set([...Object.keys(agg.bySite), ...Object.keys(aggB.bySite)])].sort((a, b) => (agg.bySite[b] || 0) - (agg.bySite[a] || 0));
+          doc.autoTable({
+            startY: y, margin: { left: M, right: M },
+            head: [['Local', 'CA période A', 'CA période B', 'Δ']],
+            body: sites.map(s => [siteLabel(s), eurRound(agg.bySite[s] || 0), eurRound(aggB.bySite[s] || 0), pct(agg.bySite[s] || 0, aggB.bySite[s] || 0)]),
+            styles: { fontSize: 9 }, headStyles: { fillColor: [74, 124, 59] },
+          });
+          doc.setFontSize(8); doc.setTextColor(140);
+          doc.text(`Généré le ${formatDateShort(new Date().toISOString().slice(0,10))} · Kelbongoo`, M, doc.internal.pageSize.getHeight() - 8);
+          doc.save(`comparaison-CA_${from}_${to}.pdf`);
+          showToast && showToast('PDF généré ✓');
+        } catch (e) { showToast && showToast('Erreur PDF : ' + e.message); }
+      };
 
       if (all === null) return <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Chargement de l'historique…</p></div>;
       if (all.length === 0) return (
@@ -6463,10 +6622,45 @@
       );
 
       const maxProd = Math.max(...bestSellers.map(p => metric === 'qty' ? p.qty : p.ca_cents), 1);
+      const siteEntries = Object.entries(agg.bySite).filter(([s]) => s !== 'DOM').sort((a, b) => b[1] - a[1]);
+      const camion = agg.bySite['DOM'] || 0;
 
       return (
         <div className="stack">
-          {/* Période */}
+
+          {/* ===== VUE RAPIDE ===== */}
+          {quick && (
+            <>
+              <div style={{fontSize:12,fontWeight:700,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.05em'}}>
+                Vue rapide · dernier jour : {formatDateShort(quick.lastDate)}
+              </div>
+              <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
+                <KpiCompare label="CA du jour" value={eurRound(quick.jour.reel)}
+                  comps={[{ label:'vs sem. -1', a:quick.jour.reel, b:quick.jourPrevW.reel }]} />
+                <KpiCompare label="Semaine en cours" value={eurRound(quick.sem.reel)}
+                  comps={[
+                    { label:'vs sem. -1', a:quick.sem.reel, b:quick.semPrev.reel },
+                    { label:'vs N-1', a:quick.sem.reel, b:quick.semN1.reel },
+                  ]} />
+                <KpiCompare label="Mois en cours" value={eurRound(quick.mois.reel)}
+                  comps={[
+                    { label:'vs mois -1', a:quick.mois.reel, b:quick.moisPrev.reel },
+                    { label:'vs N-1', a:quick.mois.reel, b:quick.moisN1.reel },
+                  ]} />
+              </div>
+              <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
+                <div className="kpi"><div className="kpi-val">{quick.sem.panier ? (quick.sem.panier/100).toFixed(2)+' €' : '—'}</div><div className="kpi-label">Panier moyen (sem.)</div></div>
+                <div className="kpi"><div className="kpi-val">{quick.sem.passages.toLocaleString('fr-FR')}</div><div className="kpi-label">Passages (sem.)</div></div>
+                <div className="kpi"><div className="kpi-val">{quick.sem.hasConsumerData ? quick.sem.uniqueClients.toLocaleString('fr-FR') : '—'}</div><div className="kpi-label">Clients (sem.)</div></div>
+              </div>
+            </>
+          )}
+
+          {/* ===== EXPLORATEUR DE PÉRIODE ===== */}
+          <div style={{fontSize:12,fontWeight:700,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.05em',marginTop:4}}>
+            Explorer une période
+          </div>
+
           <div className="card">
             <div className="date-range">
               <div style={{flex:1}}><label>Du</label><input type="date" value={from} onChange={e => setFrom(e.target.value)} /></div>
@@ -6480,7 +6674,7 @@
               <div className="chip" onClick={setAllTime}>Tout</div>
             </div>
             <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
-              {agg.nb} distribution{agg.nb>1?'s':''} sur la période · <strong>CA réel</strong> = produits livrés à prix plein (après manquants de prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
+              {(() => { const days = new Set(inRange.map(d=>d.date)).size; const locs = inRange.reduce((a,d)=>a+Object.keys(d.caBySite||{}).length,0); return `${days} jour${days>1?'s':''} de distribution · ${locs} distribution${locs>1?'s':''} de local`; })()} · <strong>CA réel</strong> = produits livrés à prix plein (après manquants prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
             </p>
 
             <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--line)'}}>
@@ -6497,25 +6691,68 @@
                   <div className="chip-group" style={{marginTop:8}}>
                     <div className="chip" onClick={setPrevPeriod}>↩ Période précédente (même durée)</div>
                   </div>
-                  <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
-                    B : {aggB.nb} distribution{aggB.nb>1?'s':''}. <span style={{color:'#4a7c3b',fontWeight:700}}>━ A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>┄ B</span>
-                  </p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Comparaison A vs B */}
+          {/* Résumé auto en comparaison */}
+          {compare && (
+            <div className="card" style={{borderLeft:'3px solid var(--master)',background:'var(--master-soft)'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:4}}>
+                <div style={{fontWeight:700}}>🧭 Tendance</div>
+                <button onClick={exportComparePDF} style={{whiteSpace:'nowrap',fontSize:12,fontWeight:600,padding:'6px 10px',borderRadius:8,border:'1px solid var(--master)',background:'#fff',color:'var(--master)',cursor:'pointer'}}>📄 Exporter en PDF</button>
+              </div>
+              <div style={{fontSize:13,lineHeight:1.5}}>{summary}</div>
+            </div>
+          )}
+
+          {/* KPIs période */}
+          <div className="kpi-grid">
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.reel} b={aggB.reel} /> : 'après manquants prépa'}</div></div>
+            <div className="kpi"><div className="kpi-val">{agg.panier ? (agg.panier/100).toFixed(2)+' €' : '—'}</div><div className="kpi-label">Panier moyen</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.panier} b={aggB.panier} /> : 'par passage'}</div></div>
+            <div className="kpi"><div className="kpi-val">{agg.passages.toLocaleString('fr-FR')}</div><div className="kpi-label">Passages</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.passages} b={aggB.passages} /> : 'commandes servies'}</div></div>
+            <div className="kpi"><div className="kpi-val">{agg.hasConsumerData ? agg.uniqueClients.toLocaleString('fr-FR') : '—'}</div><div className="kpi-label">Clients uniques</div><div className="kpi-sub">{agg.hasConsumerData ? (compare ? <DeltaBadge a={agg.uniqueClients} b={aggB.uniqueClients} /> : `fréquence ${agg.frequence.toFixed(1)}×`) : 'recharger l\'historique'}</div></div>
+          </div>
+
+          {/* Fidélité / churn */}
+          {churn && (
+            <div className="card">
+              <h3 style={{marginBottom:6}}>Fidélité clients</h3>
+              <div style={{display:'flex',alignItems:'baseline',gap:10}}>
+                <div style={{fontSize:24,fontWeight:800,color: churn.pct>=20?'var(--danger)':(churn.pct>=10?'var(--warn)':'var(--accent-dark,#2e7d32)')}}>{churn.pct.toFixed(0)}%</div>
+                <div style={{fontSize:13,color:'var(--ink-soft)'}}>de perte estimée</div>
+              </div>
+              <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>
+                {churn.lost} client{churn.lost>1?'s':''} réguliers de la 1ʳᵉ moitié de la période (≥2 passages) ne sont pas revenus sur la 2ᵉ moitié, sur {churn.regulars} réguliers. Fréquence moyenne : {agg.frequence.toFixed(1)} passages/client.
+              </p>
+            </div>
+          )}
+
+          {/* Évolution */}
+          <div className="card">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <h3 style={{margin:0}}>Évolution du CA</h3>
+              <div className="seg">
+                <button className={evoBy==='day'?'active':''} onClick={()=>setEvoBy('day')}>Jour</button>
+                <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
+              </div>
+            </div>
+            {evoPoints.length ? <MiniLineChart points={evoPoints} pointsB={compare ? evoPointsB : null} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
+              : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
+            {compare && <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4,textAlign:'center'}}>Courbes alignées par rang. <span style={{color:'#4a7c3b',fontWeight:700}}>A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>B</span></p>}
+          </div>
+
+          {/* Comparaison A vs B détaillée */}
           {compare && (
             <div className="card">
               <h3 style={{marginBottom:4}}>Comparaison A vs B</h3>
               <p style={{fontSize:11,color:'var(--ink-mute)',marginBottom:10}}>A = {formatDateShort(from)} → {formatDateShort(to)} · B = {formatDateShort(fromB)} → {formatDateShort(toB)}</p>
               {[
                 { label:'CA réel', a:agg.reel, b:aggB.reel, fmt:eurRound, goodUp:true },
-                { label:'CA prévisionnel', a:agg.previsionnel, b:aggB.previsionnel, fmt:eurRound, goodUp:true },
                 { label:'Manque à gagner', a:agg.manquant+agg.remise, b:aggB.manquant+aggB.remise, fmt:eurRound, goodUp:false },
-                { label:'Nb distributions', a:agg.nb, b:aggB.nb, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
-                { label:'CA moyen / distrib', a:agg.caMoyen, b:aggB.caMoyen, fmt:eurRound, goodUp:true },
+                { label:'Passages', a:agg.passages, b:aggB.passages, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
+                { label:'Clients uniques', a:agg.uniqueClients, b:aggB.uniqueClients, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
                 { label:'Panier moyen', a:agg.panier, b:aggB.panier, fmt:(v)=>(v/100).toFixed(2)+' €', goodUp:true },
               ].map((r, i) => (
                 <div key={i} style={{display:'flex',alignItems:'center',padding:'7px 0',borderTop: i ? '1px solid var(--line)' : 'none'}}>
@@ -6531,32 +6768,14 @@
             </div>
           )}
 
-          {/* KPIs */}
-          <div className="kpi-grid">
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.reel} b={aggB.reel} /> : 'après manquants prépa'}</div></div>
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.previsionnel)}</div><div className="kpi-label">CA prévisionnel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.previsionnel} b={aggB.previsionnel} /> : 'commandé au départ'}</div></div>
-            <div className="kpi"><div className="kpi-val" style={{color:'var(--danger)'}}>{eurRound(agg.manquant + agg.remise)}</div><div className="kpi-label">Manque à gagner</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.manquant + agg.remise} b={aggB.manquant + aggB.remise} goodUp={false} /> : `${eurRound(agg.manquant)} manq. · ${eurRound(agg.remise)} remises`}</div></div>
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.caMoyen)}</div><div className="kpi-label">CA moyen / distrib</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.caMoyen} b={aggB.caMoyen} /> : `${agg.orders.toLocaleString('fr-FR')} cmd · panier ${agg.panier ? (agg.panier/100).toFixed(2) : '0'} €`}</div></div>
-          </div>
-
-          {/* Évolution */}
+          {/* CA par local */}
           <div className="card">
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-              <h3 style={{margin:0}}>Évolution du CA</h3>
-              <div className="seg">
-                <button className={evoBy==='day'?'active':''} onClick={()=>setEvoBy('day')}>Jour</button>
-                <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
-              </div>
+            <h3 style={{marginBottom:10}}>CA par local</h3>
+            {siteEntries.length ? <HBars data={siteEntries} fmt={eurRound} /> : <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun local sur la période.</p>}
+            <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--line)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <span style={{fontWeight:600}}>🚚 Camion (livraison à domicile)</span>
+              <strong>{eurRound(camion)}</strong>
             </div>
-            {evoPoints.length ? <MiniLineChart points={evoPoints} pointsB={compare ? evoPointsB : null} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
-              : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
-            {compare && <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4,textAlign:'center'}}>Courbes alignées par rang (1ᵉʳ jour A vs 1ᵉʳ jour B…). <span style={{color:'#4a7c3b',fontWeight:700}}>A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>B</span></p>}
-          </div>
-
-          {/* Par site */}
-          <div className="card">
-            <h3 style={{marginBottom:10}}>CA par site</h3>
-            <HBars data={Object.entries(agg.bySite).sort((a,b)=>b[1]-a[1])} fmt={eurRound} />
           </div>
 
           {/* Par jour de semaine */}
@@ -7541,7 +7760,7 @@
           // Historique CA (1 doc/date) — alimente le tableau de bord Bilan
           await storage.setDoc(
             'ca_history', dayKey,
-            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily'),
+            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily', res.consumerIds),
             { replace: true }
           );
           setActiveDay(dayKey);
