@@ -6578,46 +6578,156 @@
       };
       const toggleCompare = () => { const nv = !compare; setCompare(nv); if (nv) setPrevPeriod(); };
 
-      const exportComparePDF = () => {
+      const exportPDF = () => {
         try {
           if (!window.jspdf) { showToast && showToast('PDF non disponible, recharge la page'); return; }
           const { jsPDF } = window.jspdf;
           const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-          const M = 14; let y = 16;
-          const pct = (a, b) => b ? (((a - b) / b * 100) >= 0 ? '+' : '') + ((a - b) / b * 100).toFixed(0) + '%' : '—';
-          doc.setFontSize(15); doc.setFont(undefined, 'bold');
-          doc.text('Comparaison CA — Kelbongoo', M, y); y += 7;
-          doc.setFontSize(10); doc.setFont(undefined, 'normal');
-          doc.text(`Période A : ${formatDateShort(from)} → ${formatDateShort(to)}`, M, y); y += 5;
-          doc.text(`Période B : ${formatDateShort(fromB)} → ${formatDateShort(toB)}`, M, y); y += 7;
-          doc.setFont(undefined, 'bold'); doc.text('Tendance', M, y); y += 5;
-          doc.setFont(undefined, 'normal');
-          const lines = doc.splitTextToSize(summary || '—', 182);
-          doc.text(lines, M, y); y += lines.length * 5 + 4;
-          doc.autoTable({
-            startY: y, margin: { left: M, right: M },
-            head: [['Indicateur', 'Période A', 'Période B', 'Δ']],
-            body: [
-              ['CA réel', eurRound(agg.reel), eurRound(aggB.reel), pct(agg.reel, aggB.reel)],
-              ['Net après remises', eurRound(agg.reel - agg.remise), eurRound(aggB.reel - aggB.remise), pct(agg.reel - agg.remise, aggB.reel - aggB.remise)],
-              ['Manque à gagner', eurRound(agg.manquant + agg.remise), eurRound(aggB.manquant + aggB.remise), pct(agg.manquant + agg.remise, aggB.manquant + aggB.remise)],
-              ['Passages', agg.passages.toLocaleString('fr-FR'), aggB.passages.toLocaleString('fr-FR'), pct(agg.passages, aggB.passages)],
-              ['Clients uniques', agg.hasConsumerData ? String(agg.uniqueClients) : '—', aggB.hasConsumerData ? String(aggB.uniqueClients) : '—', (agg.hasConsumerData && aggB.hasConsumerData) ? pct(agg.uniqueClients, aggB.uniqueClients) : '—'],
-              ['Panier moyen', (agg.panier / 100).toFixed(2) + ' €', (aggB.panier / 100).toFixed(2) + ' €', pct(agg.panier, aggB.panier)],
-            ],
-            styles: { fontSize: 9 }, headStyles: { fillColor: [74, 124, 59] },
-          });
+          const M = 14, W = 182, PH = doc.internal.pageSize.getHeight();
+          let y = 16, page = 1;
+          const GREEN = [74, 124, 59], BLUE = [54, 102, 156], GREY = [120, 120, 120];
+          // Assainit le texte pour la police PDF (WinAnsi) : espaces insécables/fins -> espace,
+          // tirets longs -> "-", apostrophes/flèches/Δ non gérés -> équivalents ASCII.
+          const clean = (s) => String(s)
+            .replace(/[\u00A0\u202F\u2009\u2007\u2008]/g, ' ')
+            .replace(/[—–]/g, '-')
+            .replace(/[\u2018\u2019]/g, "'")
+            .replace(/→/g, '->')
+            .replace(/Δ/g, 'Var.');
+          const san = (rows) => rows.map(r => r.map(c => clean(c)));
+          const eur = (cents) => clean(eurRound(cents));
+          const pctTxt = (a, b) => b ? (((a - b) / b * 100) >= 0 ? '+' : '') + ((a - b) / b * 100).toFixed(0) + '%' : '-';
+          const footer = () => { doc.setFontSize(8); doc.setTextColor(150); doc.text(clean('Kelbongoo - Bilan CA · page ' + page), M, PH - 8); doc.setTextColor(0); };
+          const np = () => { footer(); doc.addPage(); page++; y = 16; };
+          const need = (h) => { if (y + h > PH - 14) np(); };
+          const heading = (t) => { need(12); doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.setTextColor(...GREEN); doc.text(clean(t), M, y); doc.setTextColor(0); doc.setFont(undefined, 'normal'); y += 6; };
+
+          // Barres horizontales dessinées
+          const drawBars = (entries, color) => {
+            if (!entries.length) { doc.setFontSize(9); doc.setTextColor(140); doc.text('Aucune donnée.', M, y); doc.setTextColor(0); y += 6; return; }
+            const max = Math.max(...entries.map(e => e[1]), 1);
+            doc.setFontSize(9);
+            for (const [label, val] of entries) {
+              need(7);
+              doc.setTextColor(40); doc.text(clean(label).slice(0, 34), M, y + 3);
+              const bx = M + 60, bw = 78;
+              doc.setFillColor(238, 238, 238); doc.rect(bx, y, bw, 4.2, 'F');
+              doc.setFillColor(...color); doc.rect(bx, y, Math.max(1, bw * (val / max)), 4.2, 'F');
+              doc.setTextColor(20); doc.text(eur(val), M + W, y + 3, { align: 'right' });
+              y += 7;
+            }
+            doc.setTextColor(0);
+          };
+
+          // Graphe linéaire dessiné (A + B optionnel)
+          const drawLine = (ptsA, ptsB) => {
+            const h = 52, x0 = M + 12, x1 = M + W, top = y, bot = y + h - 8;
+            need(h + 4);
+            const allV = [...ptsA.map(p => p.value), ...(ptsB || []).map(p => p.value)];
+            const max = Math.max(...allV, 1), min = Math.min(...allV, 0);
+            const span = (max - min) || 1;
+            doc.setDrawColor(210); doc.setLineWidth(0.2);
+            doc.line(x0, top, x0, bot); doc.line(x0, bot, x1, bot);
+            doc.setFontSize(7); doc.setTextColor(120);
+            doc.text(Math.round(max / 1000) + 'k', x0 - 2, top + 2, { align: 'right' });
+            doc.text(Math.round(min / 1000) + 'k', x0 - 2, bot, { align: 'right' });
+            const plot = (pts, rgb, dash) => {
+              if (pts.length < 1) return;
+              doc.setDrawColor(...rgb); doc.setLineWidth(0.6);
+              const px = (i) => pts.length === 1 ? (x0 + x1) / 2 : x0 + (x1 - x0) * (i / (pts.length - 1));
+              const py = (v) => bot - (bot - top) * ((v - min) / span);
+              for (let i = 1; i < pts.length; i++) { doc.line(px(i - 1), py(pts[i - 1].value), px(i), py(pts[i].value)); }
+              doc.setFillColor(...rgb);
+              for (let i = 0; i < pts.length; i++) doc.circle(px(i), py(pts[i].value), 0.7, 'F');
+            };
+            if (ptsB) plot(ptsB, GREY);
+            plot(ptsA, GREEN);
+            doc.setFontSize(7); doc.setTextColor(120);
+            if (ptsA.length) { doc.text(clean(ptsA[0].label), x0, bot + 4); doc.text(clean(ptsA[ptsA.length - 1].label), x1, bot + 4, { align: 'right' }); }
+            doc.setTextColor(0); doc.setDrawColor(0);
+            y += h;
+            if (ptsB) { doc.setFontSize(7); doc.setTextColor(...GREEN); doc.text('- Période A', M, y); doc.setTextColor(...GREY); doc.text('- Période B', M + 28, y); doc.setTextColor(0); y += 5; }
+          };
+
+          // recalcul indépendant du split points fixes / camion / domicile
+          const cSet = new Set(CAMION_CODES);
+          const fx = Object.entries(agg.bySite).filter(([s]) => s !== 'DOM' && !cSet.has(s)).sort((a, b) => b[1] - a[1]);
+          const cam = Object.entries(agg.bySite).filter(([s]) => cSet.has(s)).sort((a, b) => b[1] - a[1]);
+          const camTot = cam.reduce((a, [, v]) => a + v, 0);
+          const dom = agg.bySite['DOM'] || 0;
+          const tops = [...agg.products].sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 20);
+
+          // ---- En-tête ----
+          doc.setFontSize(17); doc.setFont(undefined, 'bold'); doc.text('Bilan CA - Kelbongoo', M, y); y += 8;
+          doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.setTextColor(60);
+          doc.text(`Période : ${clean(formatDateShort(from))}  ->  ${clean(formatDateShort(to))}`, M, y); y += 5;
+          if (compare) { doc.text(`Comparée à : ${clean(formatDateShort(fromB))}  ->  ${clean(formatDateShort(toB))}`, M, y); y += 5; }
+          doc.text(`Édité le ${clean(formatDateShort(new Date().toISOString().slice(0,10)))}`, M, y); y += 5;
+          doc.setFontSize(8); doc.setTextColor(120);
+          doc.text(doc.splitTextToSize('CA réel = produits livrés à prix plein, après manquants de prépa, avant remises et avoirs.', W), M, y);
+          y += 6; doc.setTextColor(0);
+
+          // ---- KPIs ----
+          heading('Indicateurs clés');
+          const kRows = [
+            ['CA réel', eur(agg.reel)],
+            ['Net après remises', eur(agg.reel - agg.remise)],
+            ['Manque à gagner (manquants + remises)', eur(agg.manquant + agg.remise)],
+            ['Passages (commandes servies)', agg.passages.toLocaleString('fr-FR')],
+            ['Clients uniques', agg.hasConsumerData ? agg.uniqueClients.toLocaleString('fr-FR') : '- (recharger historique)'],
+            ['Fréquence de passage', agg.hasConsumerData ? agg.frequence.toFixed(1) + ' x' : '-'],
+            ['Panier moyen', (agg.panier / 100).toFixed(2) + ' €'],
+          ];
+          if (compare) {
+            const bRows = [eur(aggB.reel), eur(aggB.reel - aggB.remise), eur(aggB.manquant + aggB.remise), aggB.passages.toLocaleString('fr-FR'), aggB.hasConsumerData ? aggB.uniqueClients.toLocaleString('fr-FR') : '-', aggB.hasConsumerData ? aggB.frequence.toFixed(1) + ' x' : '-', (aggB.panier / 100).toFixed(2) + ' €'];
+            const deltaSrc = [[agg.reel, aggB.reel], [agg.reel - agg.remise, aggB.reel - aggB.remise], [agg.manquant + agg.remise, aggB.manquant + aggB.remise], [agg.passages, aggB.passages], [agg.uniqueClients, aggB.uniqueClients], [agg.frequence, aggB.frequence], [agg.panier, aggB.panier]];
+            doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Indicateur', 'Période A', 'Période B', 'Écart']]),
+              body: san(kRows.map((r, i) => [r[0], r[1], bRows[i], pctTxt(deltaSrc[i][0], deltaSrc[i][1])])),
+              styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
+          } else {
+            doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Indicateur', 'Valeur']]),
+              body: san(kRows), styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
+          }
           y = doc.lastAutoTable.finalY + 8;
-          const sites = [...new Set([...Object.keys(agg.bySite), ...Object.keys(aggB.bySite)])].sort((a, b) => (agg.bySite[b] || 0) - (agg.bySite[a] || 0));
-          doc.autoTable({
-            startY: y, margin: { left: M, right: M },
-            head: [['Local', 'CA période A', 'CA période B', 'Δ']],
-            body: sites.map(s => [siteLabel(s), eurRound(agg.bySite[s] || 0), eurRound(aggB.bySite[s] || 0), pct(agg.bySite[s] || 0, aggB.bySite[s] || 0)]),
-            styles: { fontSize: 9 }, headStyles: { fillColor: [74, 124, 59] },
-          });
-          doc.setFontSize(8); doc.setTextColor(140);
-          doc.text(`Généré le ${formatDateShort(new Date().toISOString().slice(0,10))} · Kelbongoo`, M, doc.internal.pageSize.getHeight() - 8);
-          doc.save(`comparaison-CA_${from}_${to}.pdf`);
+
+          // ---- Tendance ----
+          if (compare && summary) { heading('Tendance'); doc.setFontSize(9); const L = doc.splitTextToSize(clean(summary), W); need(L.length * 4.5 + 2); doc.text(L, M, y); y += L.length * 4.5 + 6; }
+
+          // ---- Évolution ----
+          heading(`Évolution du CA (par ${evoBy === 'week' ? 'semaine' : 'jour'})`);
+          if (evoPoints.length) drawLine(evoPoints, compare ? evoPointsB : null); else { doc.setFontSize(9); doc.text('Pas de données.', M, y); y += 6; }
+          y += 4;
+
+          // ---- CA par point ----
+          heading('CA par point de distribution');
+          doc.setFontSize(10); doc.setFont(undefined, 'bold'); need(6); doc.text('Points fixes (boutiques)', M, y); doc.setFont(undefined, 'normal'); y += 5;
+          drawBars(fx, GREEN);
+          need(8); doc.setFont(undefined, 'bold'); doc.setFontSize(10);
+          doc.text('Camion (tournées)', M, y); doc.text(eur(camTot), M + W, y, { align: 'right' }); doc.setFont(undefined, 'normal'); y += 5;
+          drawBars(cam.map(([s, v]) => [siteLabel(s), v]), BLUE);
+          need(8); doc.setFont(undefined, 'bold'); doc.setFontSize(10);
+          doc.text('Livraison à domicile', M, y); doc.text(eur(dom), M + W, y, { align: 'right' }); doc.setFont(undefined, 'normal'); y += 8;
+
+          // ---- CA par jour ----
+          heading('CA par jour de semaine');
+          drawBars(DOW_ORDER.filter(dw => agg.byDow[dw]).map(dw => [DOW_LABELS[dw], agg.byDow[dw]]), GREY);
+          y += 2;
+
+          // ---- CA par catégorie ----
+          heading('CA par catégorie');
+          doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Catégorie', 'CA']]),
+            body: san(['frais', 'pain', 'nd'].map(c => [CAT_LABELS[c], eur(agg.byCat[c] || 0)])),
+            styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
+          y = doc.lastAutoTable.finalY + 8;
+
+          // ---- Meilleures ventes ----
+          heading('Meilleures ventes (top 20, en CA)');
+          doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['#', 'Produit', 'Producteur', 'Qté', 'CA']]),
+            body: san(tops.map((p, i) => [i + 1, clean(p.produit).slice(0, 40), clean(p.producteur || '').slice(0, 24), (p.qty || 0).toLocaleString('fr-FR'), eur(p.ca_cents)])),
+            styles: { fontSize: 8 }, headStyles: { fillColor: GREEN }, columnStyles: { 0: { cellWidth: 8 }, 3: { halign: 'right' }, 4: { halign: 'right' } } });
+
+          footer();
+          doc.save(`bilan-CA_${from}_${to}.pdf`);
           showToast && showToast('PDF généré ✓');
         } catch (e) { showToast && showToast('Erreur PDF : ' + e.message); }
       };
@@ -6691,6 +6801,8 @@
               {(() => { const days = new Set(inRange.map(d=>d.date)).size; const locs = inRange.reduce((a,d)=>a+Object.keys(d.caBySite||{}).length,0); return `${days} jour${days>1?'s':''} de distribution · ${locs} distribution${locs>1?'s':''} de local`; })()} · <strong>CA réel</strong> = produits livrés à prix plein (après manquants prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
             </p>
 
+            <button onClick={exportPDF} style={{marginTop:10,width:'100%',fontSize:14,fontWeight:700,padding:'10px',borderRadius:10,border:'none',background:'var(--master)',color:'#fff',cursor:'pointer'}}>📄 Exporter le bilan complet en PDF</button>
+
             <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--line)'}}>
               <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:14,fontWeight:600}}>
                 <input type="checkbox" checked={compare} onChange={toggleCompare} style={{width:18,height:18}} />
@@ -6715,7 +6827,7 @@
             <div className="card" style={{borderLeft:'3px solid var(--master)',background:'var(--master-soft)'}}>
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:4}}>
                 <div style={{fontWeight:700}}>🧭 Tendance</div>
-                <button onClick={exportComparePDF} style={{whiteSpace:'nowrap',fontSize:12,fontWeight:600,padding:'6px 10px',borderRadius:8,border:'1px solid var(--master)',background:'#fff',color:'var(--master)',cursor:'pointer'}}>📄 Exporter en PDF</button>
+                <button onClick={exportPDF} style={{whiteSpace:'nowrap',fontSize:12,fontWeight:600,padding:'6px 10px',borderRadius:8,border:'1px solid var(--master)',background:'#fff',color:'var(--master)',cursor:'pointer'}}>📄 Exporter le bilan PDF</button>
               </div>
               <div style={{fontSize:13,lineHeight:1.5}}>{summary}</div>
             </div>
