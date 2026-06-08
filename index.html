@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V7</title>
+  <title>Kelbongoo — Distribution V8</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -443,18 +443,31 @@
     const PREP_PASSWORD = "Prepa2026";   // mot de passe préparateurs
     const DISTRIB_PASSWORD = "Distrib2026";  // mot de passe distributeurs (partagé)
     const SITES = ["BAR","BIC","BOR","CES","CHA","DOM","FOR","LIL","NCA","NCC","PAD","PDC","PDP","ROB","ROM","STB","TOL"];
-    // Codes des points desservis par les tournées CAMION (≠ boutiques fixes, ≠ livraison à domicile).
-    // Déduits du planning tournées : CHA=Montreuil Croix de Chavaux, CES=Montreuil Mairie,
-    // BAR=Montreuil Pl. H. Barbusse, LIL=Les Lilas Marché, NCC/NCA=Noisy (Charlie Chaplin / Canal),
-    // ROM=Romainville Mairie, PAD=Romainville Bas Pays, FOR=Pantin Fort d'Aubervilliers.
-    const CAMION_CODES = ["CHA","CES","BAR","LIL","NCC","NCA","ROM","PAD","FOR"];
-    const SITE_FULL = {
+    // Nom long de chaque local — pour les mails CLIENTS (le code court "PDP" est incompréhensible
+    // pour eux). Le proxy Freshdesk peut s'appuyer sur `siteName` envoyé dans le payload.
+    // À COMPLÉTER pour les boutiques fixes (laissées sur le code court pour l'instant).
+    const SITE_NAMES = {
+      BAR: "Montreuil Place Henri Barbusse",
+      BIC: "Bichat",
+      BOR: "Borrego",
+      CES: "Montreuil Mairie",
+      CHA: "Montreuil Croix de Chavaux",
       DOM: "Livraison à domicile",
-      CHA: "Montreuil — Croix de Chavaux", CES: "Montreuil — Mairie", BAR: "Montreuil — Pl. H. Barbusse",
-      LIL: "Les Lilas — Marché", NCC: "Noisy-le-Sec — Charlie Chaplin", NCA: "Noisy-le-Sec — Canal",
-      ROM: "Romainville — Mairie (Pl. Laïcité)", PAD: "Romainville — Bas Pays", FOR: "Pantin — Fort d'Aubervilliers",
+      FOR: "Pantin Fort d'Aubervilliers",
+      LIL: "Les Lilas Marché",
+      NCA: "Noisy Canal",
+      NCC: "Noisy Charlie Chaplin",
+      PAD: "Romainville Bas Pays",
+      PDC: "Place de Clichy",
+      PDP: "Porte de Pantin",
+      ROB: "Robespierre",
+      ROM: "Romainville Mairie / Place de la Laïcité",
+      STB: "Saint-Blaise",
+      TOL: "Tolbiac",
     };
-    const APP_VERSION = 'V7';
+    // Renvoie le nom lisible d'un local, sinon le code (fallback).
+    function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
+    const APP_VERSION = 'V8';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -463,9 +476,14 @@
       1: [],                                                           // lundi
       2: [],                                                           // mardi
       3: ["BIC","BOR","STB","PDP","TOL"],                              // mercredi
-      4: ["CHA","CES","BAR","LIL","NCC","NCA","BOR","DOM","PDC","PDP","ROB"], // jeudi
+      4: ["CHA","CES","BAR","LIL","NCC","NCA","BOR","DOM","PDC","PDP","ROB","BIC"], // jeudi (BIC ajouté V8)
       5: ["BIC","BOR","PDP","STB"],                                    // vendredi
       6: ["DOM","CHA","CES","BAR","ROM","PAD","FOR","BIC","BOR","STB","ROB","TOL"], // samedi (PDP retiré)
+    };
+    // Horaires d'ouverture par local (info affichée, ne pilote pas le calendrier).
+    // BIC (V8) : mercredi→vendredi 14h-20h, samedi 10h-20h.
+    const SITE_HOURS = {
+      BIC: "Mer→Ven 14h-20h · Sam 10h-20h",
     };
     // Locaux distribuant à une dayKey donnée
     function sitesForDate(dayKey) {
@@ -484,6 +502,91 @@
         d = addDays(d, 1);
       }
       return null;
+    }
+    // Prochaine date de distribution pour UN local précis, STRICTEMENT après fromDayKey.
+    // C'est la date à laquelle le chauffeur-préparateur peut récupérer un retour PDP.
+    function nextDistribDateForSite(site, fromDayKey) {
+      let d = addDays(fromDayKey, 1);
+      for (let i = 0; i < 14; i++) {
+        if (sitesForDate(d).includes(site)) return d;
+        d = addDays(d, 1);
+      }
+      return null;
+    }
+    // ── Navette vers l'entrepôt ROB (Montreuil) : jeudi ~13h et vendredi ~18h. ──
+    // Jour JS : 4 = jeudi, 5 = vendredi.
+    const NAVETTE_ROB = [
+      { dow: 4, hour: 13, label: 'jeudi 13h' },
+      { dow: 5, hour: 18, label: 'vendredi 18h' },
+    ];
+    // Renvoie la DERNIÈRE navette ROB qui part un jour STRICTEMENT antérieur à la DLC
+    // et encore à venir par rapport à "now". null si aucune → le produit doit être partagé.
+    function lastNavetteBeforeDLC(dlcKey, now) {
+      if (!dlcKey) return null;
+      now = now || new Date();
+      const dlc = new Date(dlcKey + 'T00:00:00');
+      let best = null;
+      for (let i = 0; i < 12; i++) {
+        const d = new Date(now); d.setHours(0,0,0,0); d.setDate(d.getDate() + i);
+        const nav = NAVETTE_ROB.find(n => n.dow === d.getDay());
+        if (!nav) continue;
+        const dep = new Date(d); dep.setHours(nav.hour, 0, 0, 0);
+        if (dep > now && d < dlc) {
+          best = {
+            date: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`,
+            label: nav.label, dep,
+          };
+        }
+      }
+      return best; // la plus tardive trouvée = la dernière navette utile avant la DLC
+    }
+    // Décision de routage d'un produit selon sa DLC, à la date de traitement (now).
+    // → { dest:'partage'|'pribon', navette:{label,date}|null, reason:string }
+    function routeByDLC(dlcKey, now) {
+      now = now || new Date();
+      if (!dlcKey) return { dest: 'pribon', navette: null, reason: 'DLC non renseignée' };
+      const today = new Date(now); today.setHours(0,0,0,0);
+      const dlc = new Date(dlcKey + 'T00:00:00');
+      if (dlc <= today) return { dest: 'partage', navette: null, reason: "DLC aujourd'hui ou dépassée → partage équipe" };
+      const nav = lastNavetteBeforeDLC(dlcKey, now);
+      if (nav) return { dest: 'pribon', navette: nav, reason: `Envoi ROB — navette ${nav.label}` };
+      return { dest: 'partage', navette: null, reason: 'Navette ROB déjà partie avant la DLC → partage équipe' };
+    }
+    // Le jour de DLC tombe-t-il aujourd'hui (par rapport à la journée active) ?
+    function isDlcToday(dlcKey, refDayKey) {
+      if (!dlcKey) return false;
+      return dlcKey === (refDayKey || activeDay());
+    }
+    // Retours PDP en retard de traitement (V8).
+    // Un retour est récupéré par le chauffeur à la prochaine distribution du lieu, puis
+    // traité à l'entrepôt le lendemain au plus tard. Au-delà → en retard (déclenche l'alerte).
+    // Ex : STB signalé samedi → récup mercredi → alerte si non traité dès jeudi.
+    function computeOverduePdpReturns(manualReturns) {
+      const today = todayKey();
+      const out = [];
+      for (const r of (manualReturns || [])) {
+        if (r.status === 'treated') continue;
+        // « missing » = produit introuvable à la récup → problème immédiat, toujours alerté.
+        if (r.status === 'missing') {
+          out.push({
+            id: r.id, site: r.site, produit: r.produit || r.productLabel,
+            qty: r.qty || 1, dlc: r.dlc || '', day: r.day,
+            status: 'missing', recovery: null, deadline: today,
+          });
+          continue;
+        }
+        const recovery = r.pickupDate || nextDistribDateForSite(r.site, r.day);
+        if (!recovery) continue;
+        const deadline = addDays(recovery, 1); // lendemain de la récup
+        if (today >= deadline) {
+          out.push({
+            id: r.id, site: r.site, produit: r.produit || r.productLabel,
+            qty: r.qty || 1, dlc: r.dlc || '', day: r.day,
+            status: r.status || 'pending', recovery, deadline,
+          });
+        }
+      }
+      return out;
     }
     // Libellé court "samedi 30 mai"
     function dayLabelShort(dayKey) {
@@ -526,6 +629,11 @@
 
     // PERTES
     const MANAGER_EMAIL = "ga@pribon.org"; // ← Email du gérant
+    // Destinataires de l'alerte « retours PDP non traités » (V8)
+    const PDP_ALERT_EMAILS = ["rr@pribon.org", "hg@pribon.org"];
+    // Proxy Apps Script qui envoie le mail d'alerte (déploiement séparé — voir le .gs fourni).
+    // Tant qu'il n'est pas renseigné, on bascule sur un mailto: de secours.
+    const PDP_ALERT_PROXY_URL = ""; // ← colle ici l'URL /exec du script d'alerte une fois déployé
 
     // FRESHDESK (relance clients non récupérés)
     // L'URL du proxy Apps Script déployé (Application Web /exec)
@@ -544,6 +652,40 @@
         const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
         throw new Error(`réponse non-JSON (déploiement en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
       }
+    }
+
+    // Envoie l'alerte « retours PDP non traités » à rr@ + hg@.
+    // Si le proxy Apps Script est configuré → envoi serveur (MailApp). Sinon → mailto: de secours.
+    // `items` : [{ site, produit, dlc, day, status, age }]
+    async function sendPdpAlert(items) {
+      const lines = items.map(it =>
+        `• ${it.site} — ${it.produit}${it.qty > 1 ? ' ×' + it.qty : ''}` +
+        ` · signalé le ${formatDateShort(it.day)}` +
+        (it.dlc ? ` · DLC ${formatDateShort(it.dlc)}` : '') +
+        ` · statut : ${it.status === 'missing' ? '❌ NON RÉCUPÉRÉ (introuvable aux boutiques)' : (it.status === 'recovered' ? 'récupéré (à traiter entrepôt)' : 'en attente récupération')}`
+      ).join('\n');
+      const subject = `⚠️ Retours PDP non traités (${items.length})`;
+      const body =
+        `Bonjour,\n\nLes retours PDP suivants n'ont pas été traités par les préparateurs dans les délais ` +
+        `(récupération attendue à la distribution suivante du lieu, traitement entrepôt le lendemain max) :\n\n` +
+        `${lines}\n\nMerci de les traiter (remise en rayon, envoi ROB, partage équipe ou perte).\n\n— App Distribution Kelbongoo`;
+
+      if (PDP_ALERT_PROXY_URL && !PDP_ALERT_PROXY_URL.includes('TON_')) {
+        const res = await fetch(PDP_ALERT_PROXY_URL, {
+          method: 'POST',
+          body: JSON.stringify({ secret: FRESHDESK_SECRET, to: PDP_ALERT_EMAILS, subject, body, items }),
+        });
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch (e) {
+          const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
+          throw new Error(`réponse non-JSON — ${snippet || 'vide'}`);
+        }
+      }
+      // Secours : ouvre le client mail de l'utilisateur
+      window.location.href =
+        `mailto:${PDP_ALERT_EMAILS.join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      return { ok: true, fallback: true };
     }
     const LOSS_REASONS = [
       { id:"casse_fournisseur", label:"Casse fournisseur" },
@@ -794,8 +936,6 @@
       const aggRemises = {};
       const caBySite = {}; // { SITE: { reel_cents, manquant_cents, remise_cents } }
       const salesByProduct = {}; // { pid: { id, produit, producteur, cat, qty, ca_cents } }
-      const consumerSet = new Set();           // clients uniques (toute la journée)
-      const consumersBySiteSet = {};           // { SITE: Set(cid) }
       const out = [];
       let dateKey = null;
 
@@ -808,11 +948,6 @@
         const cid = oid(o.consumer_id);
         const cons = consById[cid];
         if (!cons) missingConsumers.add(cid);
-        if (cid) {
-          consumerSet.add(cid);
-          const cSite = (o.locale || '').trim().toUpperCase();
-          if (cSite) { (consumersBySiteSet[cSite] || (consumersBySiteSet[cSite] = new Set())).add(cid); }
-        }
 
         // Date de distribution → clé jour (YYYYMMDD)
         const dIso = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date;
@@ -918,8 +1053,6 @@
         remises: Object.values(aggRemises),
         caBySite,
         salesByProduct: Object.values(salesByProduct).sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 300),
-        consumerIds: [...consumerSet],
-        consumersBySite: Object.fromEntries(Object.entries(consumersBySiteSet).map(([s, set]) => [s, set.size])),
       };
     }
 
@@ -943,7 +1076,7 @@
         remise: a.remise + (s.remise_cents || 0),
       }), { reel: 0, manquant: 0, remise: 0 });
     }
-    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source, consumers) {
+    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source) {
       return {
         date: dateKey,
         dow: new Date(dateKey + 'T12:00:00').getDay(), // 0=dim … 6=sam
@@ -951,7 +1084,6 @@
         salesByProduct: (salesByProduct || []).slice(0, 300),
         totals: totalsFromCaBySite(caBySite),
         ordersCount: ordersCount || 0,
-        consumers: (consumers || []).slice(0, 2000), // clients uniques du jour (pour fréquence / churn)
         source: source || 'daily',
         updatedAt: new Date().toISOString(),
       };
@@ -974,10 +1106,9 @@
         if (fromKey && dateKey < fromKey) continue;
         if (toKey && dateKey > toKey) continue;
 
-        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0, consumers: new Set() };
+        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0 };
         const b = byDate[dateKey];
         b.ordersCount++;
-        const cid = oid(o.consumer_id); if (cid) b.consumers.add(cid);
         const oSite = (o.locale || '').trim().toUpperCase();
         if (oSite && !b.caBySite[oSite]) b.caBySite[oSite] = { reel_cents: 0, manquant_cents: 0, remise_cents: 0 };
 
@@ -1012,7 +1143,7 @@
       const docs = {};
       for (const [dateKey, b] of Object.entries(byDate)) {
         const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 300);
-        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk', [...b.consumers]);
+        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk');
       }
       return docs;
     }
@@ -1866,8 +1997,18 @@
       const [amountCredit, setAmountCredit] = React.useState(editing?.amountCredit || '');
       const [remark, setRemark] = React.useState(editing?.remark || '');
       const [retourQty, setRetourQty] = React.useState(editing?.retourQty ? String(editing.retourQty) : '1');
+      const [retourDlc, setRetourDlc] = React.useState(editing?.retourDlc || '');
+      const [perteRecupPerso, setPerteRecupPerso] = React.useState(editing?.retourRecupPerso || false);
       const [busy, setBusy] = React.useState(false);
       const isRetourPdp = anomalyTypes.includes('retour_pdp');
+      // Problème de qualité (fruit/légume abîmé, casse…) → invendable, donc perte sèche même si DLC longue.
+      const isQualityIssue = anomalyTypes.some(t => ['pourri', 'casse', 'dlc'].includes(t));
+      // Décision distrib : que devient le produit en retour PDP ?
+      const nextDelivForSite = isRetourPdp ? nextDistribDateForSite(currentSite, activeDay()) : null;
+      const dlcBeforePickup = retourDlc && nextDelivForSite && retourDlc < nextDelivForSite;
+      const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
+      // Perte sèche (le produit ne survit pas jusqu'à la récup prépa, ou qualité) → garder pour soi
+      const isPerteSeche = isRetourPdp && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
       const selectedOrder = orders.find(o => o.orderId === selectedKey);
       const toggle = (list, setList, id) => {
         if (list.includes(id)) setList(list.filter(x => x !== id));
@@ -1882,6 +2023,7 @@
         if (!isRetourPdp && (!selectedKey || !clientName)) { showToast('Choisis un client'); return; }
         if (!productKey) { showToast('Choisis un produit'); return; }
         if (anomalyTypes.length === 0) { showToast("Au moins un type d'anomalie"); return; }
+        if (isRetourPdp && !retourDlc) { showToast('Indique la DLC du produit'); return; }
         setBusy(true);
         try {
           const id = editing?.id || `anom_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
@@ -1908,6 +2050,9 @@
             amountRefund: parseFloat(amountRefund) || 0,
             amountCredit: parseFloat(amountCredit) || 0,
             retourQty: parseInt(retourQty, 10) || 1,
+            retourDlc: isRetourPdp ? retourDlc : '',
+            retourPerteSeche: !!isPerteSeche,
+            retourRecupPerso: !!(isPerteSeche && perteRecupPerso),
             remark,
             createdBy: session.name,
             createdAt: editing?.createdAt || new Date().toISOString(),
@@ -1938,23 +2083,53 @@
             await storage.deleteDoc('forgotten_items', `forg_${id}`);
           }
 
-          // Type "retour_pdp" : produit non attribué à renvoyer → entrée dans la liste prépa Retours PDP
+          // Type "retour_pdp" : selon la DLC, soit PERTE SÈCHE (le produit ne tiendra pas
+          // jusqu'à la récup prépa → le distributeur garde pour lui), soit RETOUR PDP normal.
           if (isRetourPdp) {
-            await storage.setDoc('pdp_returns', `pdpret_${id}`, {
-              id: `pdpret_${id}`, anomalyId: id, site: currentSite,
-              productKey, productLabel,
-              produit: prodName, producteur: prodProducer,
-              qty: parseInt(retourQty, 10) || 1,
-              clientName: effName,
-              remark,
-              day: activeDay(),
-              status: 'pending',
-              createdBy: session.name,
-              createdAt: editing?.createdAt || new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            });
+            const qty = parseInt(retourQty, 10) || 1;
+            if (isPerteSeche) {
+              // Pas de retour PDP : on crée directement une perte sèche (jetée) côté distrib.
+              // Apparaît dans le récap des pertes de la prépa (collection 'losses').
+              await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
+              await storage.setDoc('losses', `lossret_${id}`, {
+                id: `lossret_${id}`,
+                productKey, producteur: prodProducer, produit: prodName,
+                unite: '',
+                destination: 'jete',
+                reason: isQualityIssue ? 'abime' : 'dlc',
+                usingWeight: false, quantity: qty, weight: 0,
+                unitPrice: 0, totalValue: 0,
+                dlc: retourDlc,
+                recupPerso: !!perteRecupPerso,
+                remark: `Perte sèche distrib ${currentSite}${perteRecupPerso ? ' · récupéré par le distributeur' : ''}${remark ? ' · ' + remark : ''}`,
+                day: activeDay(), fromReturn: true, fromDistrib: true,
+                createdBy: session.name, createdAt: editing?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString(),
+              });
+              showToast(isQualityIssue
+                ? '⚠️ Perte sèche (qualité) — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi'
+                : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi');
+            } else {
+              // Retour PDP normal : le produit tiendra jusqu'à la récup prépa.
+              await storage.deleteDoc('losses', `lossret_${id}`);
+              await storage.setDoc('pdp_returns', `pdpret_${id}`, {
+                id: `pdpret_${id}`, anomalyId: id, site: currentSite,
+                productKey, productLabel,
+                produit: prodName, producteur: prodProducer,
+                qty,
+                clientName: effName,
+                dlc: retourDlc,
+                pickupDate: nextDelivForSite || '',
+                remark,
+                day: activeDay(),
+                status: 'pending', // pending → recovered (chauffeur) → treated (entrepôt)
+                createdBy: session.name,
+                createdAt: editing?.createdAt || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
           } else if (editing && editing.anomalyTypes && editing.anomalyTypes.includes('retour_pdp')) {
             await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
+            try { await storage.deleteDoc('losses', `lossret_${id}`); } catch (e) {}
           }
 
           showToast(editing ? '✓ Mise à jour' : '✓ Anomalie enregistrée');
@@ -2002,6 +2177,39 @@
                 <input type="text" inputMode="numeric" value={retourQty}
                   onChange={e => setRetourQty(e.target.value.replace(/[^0-9]/g, ''))} placeholder="1" />
                 <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>Apparaîtra dans la liste <strong>Retours PDP</strong> de la prépa.</p>
+              </div>
+            )}
+            {isRetourPdp && (
+              <div className="field">
+                <label>DLC du produit <span style={{color:'var(--danger)'}}>*</span></label>
+                <input type="date" value={retourDlc} onChange={e => setRetourDlc(e.target.value)} />
+                {nextDelivForSite && (
+                  <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>
+                    Prochaine récup prépa sur {currentSite} : <strong>{dayLabelShort(nextDelivForSite)}</strong>.
+                  </p>
+                )}
+                {retourDlc && (
+                  isPerteSeche ? (
+                    <div className="alert-warning" style={{marginTop:8,fontSize:12}}>
+                      {isQualityIssue
+                        ? '🟠 Problème de qualité → perte sèche. Garde-le pour chez toi, il ne part pas à PDP.'
+                        : (dlcToday
+                            ? '🟠 DLC aujourd\'hui → perte sèche. Garde-le pour chez toi, il ne part pas à PDP.'
+                            : '🟠 DLC trop courte (avant la prochaine récup) → perte sèche. Garde-le pour chez toi.')}
+                      <div style={{marginTop:8}}>
+                        <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontWeight:600}}>
+                          <input type="checkbox" checked={perteRecupPerso} onChange={e => setPerteRecupPerso(e.target.checked)} style={{width:16,height:16}} />
+                          Je le récupère personnellement (chez moi)
+                        </label>
+                        <div style={{fontSize:11,fontWeight:'normal',marginTop:4}}>Dans tous les cas, le produit est ajouté aux <strong>pertes de la prépa</strong>.</div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="alert-info" style={{marginTop:8,fontSize:12}}>
+                      ✅ DLC OK → part en <strong>Retour PDP</strong>. La prépa le récupérera le {dayLabelShort(nextDelivForSite)}.
+                    </div>
+                  )
+                )}
               </div>
             )}
             <div className="field">
@@ -2905,8 +3113,10 @@
             clients: [{
               email: f.email,
               name: f.consumer_name || f.clientName || '',
+              site: f.site,
+              siteName: siteLabel(f.site),
               subject: 'Votre commande Kelbongoo à récupérer',
-              body: `Bonjour ${f.consumer_name || ''},\n\nVotre commande Kelbongoo n'a pas pu être récupérée sur le point ${f.site}. Vous pouvez venir la chercher dès la prochaine distribution.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
+              body: `Bonjour ${f.consumer_name || ''},\n\nVotre commande Kelbongoo n'a pas pu être récupérée sur le point ${siteLabel(f.site)}. Vous pouvez venir la chercher dès la prochaine distribution.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
               tag: 'non-recupere',
             }],
           };
@@ -3085,8 +3295,10 @@
             clients: clients.map(c => ({
               email: c.email,
               name: c.consumer_name || c.clientName || '',
+              site: c.site,
+              siteName: siteLabel(c.site),
               subject: 'Votre commande Kelbongoo à récupérer',
-              body: `Bonjour ${c.consumer_name || ''},\n\nVotre commande Kelbongoo n'a pas encore été récupérée sur le point ${c.site}. Merci de nous indiquer quand vous pourrez venir la chercher, ou de nous recontacter.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
+              body: `Bonjour ${c.consumer_name || ''},\n\nVotre commande Kelbongoo n'a pas encore été récupérée sur le point ${siteLabel(c.site)}. Merci de nous indiquer quand vous pourrez venir la chercher, ou de nous recontacter.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
             })),
           };
           // Apps Script Web App nécessite un POST sans en-tête custom (sinon préflight CORS)
@@ -3288,8 +3500,10 @@
             clients: [{
               email: client.email,
               name: client.clientName || '',
+              site: client.site,
+              siteName: siteLabel(client.site),
               subject: 'Article oublié dans votre casier Kelbongoo',
-              body: `Bonjour ${client.clientName || ''},\n\nVous avez oublié un article dans votre casier lors de la distribution sur le point ${client.site} :\n- ${client.productLabel || 'article'}\n\nMerci de venir le récupérer dans les prochains jours. Sans nouvelles de votre part sous 3 jours, l'article sera retourné à l'entrepôt.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
+              body: `Bonjour ${client.clientName || ''},\n\nVous avez oublié un article dans votre casier lors de la distribution sur le point ${siteLabel(client.site)} :\n- ${client.productLabel || 'article'}\n\nMerci de venir le récupérer dans les prochains jours. Sans nouvelles de votre part sous 3 jours, l'article sera retourné à l'entrepôt.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
             }],
           };
           const data = await freshdeskPost(payload);
@@ -3616,18 +3830,18 @@
               ))}
             </div>
           )}
-            <div className="stack" style={{gap:10, display: tab==='learn' ? undefined : 'none'}}>
-              <div style={{fontSize:13}}><strong>{(learnStats && learnStats.total) || 0}</strong> code(s) appris au total.</div>
+            <div className="stack" style={{gap:10}}>
+              <div style={{fontSize:13}}><strong>{learnStats.total}</strong> code(s) appris au total.</div>
               <div>
                 <div style={{fontWeight:600,fontSize:12,marginBottom:3}}>Par personne</div>
-                {Object.entries((learnStats && learnStats.byPerson) || {}).sort((a,b)=>b[1]-a[1]).map(([who,n]) => (
+                {Object.entries(learnStats.byPerson).sort((a,b)=>b[1]-a[1]).map(([who,n]) => (
                   <div key={who} style={{display:'flex',justifyContent:'space-between',fontSize:13,padding:'2px 0',borderBottom:'1px solid var(--border)'}}><span>{who}</span><span>{n}</span></div>
                 ))}
               </div>
               <div>
                 <div style={{fontWeight:600,fontSize:12,marginBottom:3}}>Derniers codes associés</div>
                 <div className="stack" style={{gap:2,maxHeight:'40vh',overflowY:'auto'}}>
-                  {((learnStats && learnStats.recent) || []).map(e => (
+                  {learnStats.recent.map(e => (
                     <div key={e.id || e.ean} style={{fontSize:12,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
                       <div style={{display:'flex',justifyContent:'space-between',gap:8}}>
                         <span style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{prodById[e.productId]?.name || e.productId}</span>
@@ -4334,10 +4548,12 @@
             clients: [{
               email,
               name: client.consumer_name || client.clientName || '',
+              site: client.site,
+              siteName: siteLabel(client.site),
               subject: isOubli ? 'Article oublié dans votre casier Kelbongoo' : 'Votre commande Kelbongoo à récupérer',
               body: isOubli
-                ? `Bonjour ${client.clientName || client.consumer_name || ''},\n\nVous avez oublié un article dans votre casier lors de la distribution sur le point ${client.site} :\n- ${client.productLabel || 'article'}\n\nMerci de venir le récupérer dans les prochains jours. Sans nouvelles de votre part sous 3 jours, l'article sera retourné à l'entrepôt.\n\nÀ bientôt,\nL'équipe Kelbongoo`
-                : `Bonjour ${client.consumer_name || client.clientName || ''},\n\nVotre commande Kelbongoo n'a pas encore été récupérée sur le point ${client.site}. Vous pouvez venir la chercher dès la prochaine distribution, ou nous recontacter.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
+                ? `Bonjour ${client.clientName || client.consumer_name || ''},\n\nVous avez oublié un article dans votre casier lors de la distribution sur le point ${siteLabel(client.site)} :\n- ${client.productLabel || 'article'}\n\nMerci de venir le récupérer dans les prochains jours. Sans nouvelles de votre part sous 3 jours, l'article sera retourné à l'entrepôt.\n\nÀ bientôt,\nL'équipe Kelbongoo`
+                : `Bonjour ${client.consumer_name || client.clientName || ''},\n\nVotre commande Kelbongoo n'a pas encore été récupérée sur le point ${siteLabel(client.site)}. Vous pouvez venir la chercher dès la prochaine distribution, ou nous recontacter.\n\nÀ bientôt,\nL'équipe Kelbongoo`,
               tag: isOubli ? 'oubli-casier' : 'non-recupere',
             }],
           };
@@ -4365,6 +4581,7 @@
       const [consignes, setConsignes] = React.useState([]);
       const [followups, setFollowups] = React.useState([]);
       const [forgottens, setForgottens] = React.useState([]);
+      const [pdpReturns, setPdpReturns] = React.useState([]);
       const [siteFilter, setSiteFilter] = React.useState('TOUS');
       const [section, setSection] = React.useState('followups'); // followups | consignes | oublis
 
@@ -4372,8 +4589,22 @@
         const u1 = storage.subscribe('consignes', setConsignes);
         const u2 = storage.subscribe('followups', setFollowups);
         const u3 = storage.subscribe('forgotten_items', setForgottens);
-        return () => { u1 && u1(); u2 && u2(); u3 && u3(); };
+        const u4 = storage.subscribe('pdp_returns', setPdpReturns);
+        return () => { u1 && u1(); u2 && u2(); u3 && u3(); u4 && u4(); };
       }, []);
+
+      const [alerting, setAlerting] = React.useState(false);
+      const overduePdp = computeOverduePdpReturns(pdpReturns);
+      const sendOverdueAlert = async () => {
+        if (overduePdp.length === 0) { showToast('Aucun retour en retard'); return; }
+        if (!confirm(`Envoyer l'alerte (${overduePdp.length} retour(s) non traité(s)) à rr@ + hg@ ?`)) return;
+        setAlerting(true);
+        try {
+          const res = await sendPdpAlert(overduePdp);
+          showToast(res && res.fallback ? '✉️ Ouvre ta messagerie' : '✓ Alerte envoyée');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setAlerting(false); }
+      };
 
       const phoneOf = (email, fallback) => {
         if (fallback) return fallback;
@@ -4440,6 +4671,21 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Vue globale pour traiter sans changer de local : clients à rappeler, consignes en attente, oublis casier.
           </p>
+
+          {overduePdp.length > 0 && (
+            <div className="alert-red" style={{display:'flex',flexDirection:'column',gap:8}}>
+              <div>⏰ <strong>{overduePdp.length} retour{overduePdp.length>1?'s':''} PDP non traité{overduePdp.length>1?'s':''}</strong> par les préparateurs (délai dépassé).</div>
+              <div style={{fontSize:12,fontWeight:'normal'}}>
+                {overduePdp.slice(0,6).map(o => (
+                  <div key={o.id}>• {o.site} — {o.produit} · signalé {formatDateShort(o.day)}{o.dlc ? ` · DLC ${formatDateShort(o.dlc)}` : ''}</div>
+                ))}
+                {overduePdp.length > 6 && <div>… +{overduePdp.length-6} autre(s)</div>}
+              </div>
+              <button className="btn-primary" style={{alignSelf:'flex-start',padding:'6px 12px',fontSize:13}} disabled={alerting} onClick={sendOverdueAlert}>
+                {alerting ? 'Envoi…' : '✉️ Envoyer l\'alerte (rr@ + hg@)'}
+              </button>
+            </div>
+          )}
 
           {/* Filtre local */}
           <div className="row" style={{flexWrap:'wrap',gap:8}}>
@@ -6362,13 +6608,10 @@
       let reel = 0, manquant = 0, remise = 0, orders = 0;
       const bySite = {}, byDow = {}, byWeek = {}, byCat = { frais: 0, pain: 0, nd: 0 };
       const products = {};
-      const consumers = new Set();
-      let hasConsumerData = false;
       for (const d of docs) {
         const t = d.totals || totalsFromCaBySite(d.caBySite);
         reel += t.reel || 0; manquant += t.manquant || 0; remise += t.remise || 0;
         orders += d.ordersCount || 0;
-        if (Array.isArray(d.consumers)) { hasConsumerData = true; for (const c of d.consumers) consumers.add(c); }
         for (const [s, v] of Object.entries(d.caBySite || {})) bySite[s] = (bySite[s] || 0) + (v.reel_cents || 0);
         byDow[d.dow] = (byDow[d.dow] || 0) + (t.reel || 0);
         const wk = isoWeekKey(d.date); byWeek[wk] = (byWeek[wk] || 0) + (t.reel || 0);
@@ -6380,15 +6623,12 @@
         }
       }
       const nb = docs.length;
-      const uniqueClients = consumers.size;
       return {
         reel, manquant, remise, orders, nb,
         previsionnel: reel + manquant + remise,
         caMoyen: nb ? reel / nb : 0,
         panier: orders ? reel / orders : 0,
         bySite, byDow, byWeek, byCat, products: Object.values(products),
-        passages: orders, uniqueClients, hasConsumerData,
-        frequence: uniqueClients ? orders / uniqueClients : 0,
       };
     }
     function buildEvoPoints(docs, evoBy) {
@@ -6428,72 +6668,8 @@
       );
     }
 
-    // --- Helpers dates / libellés pour le tableau de bord ---
-    const dKey = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    function isoWeekRange(dateKey) {
-      const d = new Date(dateKey + 'T12:00:00');
-      const day = (d.getDay() + 6) % 7; // 0 = lundi
-      const mon = new Date(d); mon.setDate(d.getDate() - day);
-      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-      return { from: dKey(mon), to: dKey(sun) };
-    }
-    function monthRange(dateKey) {
-      const d = new Date(dateKey + 'T12:00:00');
-      const from = new Date(d.getFullYear(), d.getMonth(), 1);
-      const to = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-      return { from: dKey(from), to: dKey(to) };
-    }
-    const siteLabel = (s) => SITE_FULL[s] || s;
-
-    // Résumé automatique de tendance (règles, sans IA externe) entre deux agrégats A vs B.
-    function buildTrendSummary(A, B, labelB) {
-      if (!B || !B.nb) return `Pas de données sur la période de comparaison (${labelB}).`;
-      const out = [];
-      const pct = B.reel ? ((A.reel - B.reel) / B.reel * 100) : 0;
-      const dir = pct >= 1 ? 'en hausse' : (pct <= -1 ? 'en baisse' : 'stable');
-      out.push(`CA ${dir} de ${Math.abs(pct).toFixed(0)}% (${eurRound(A.reel)} vs ${eurRound(B.reel)} ${labelB}).`);
-      const sites = new Set([...Object.keys(A.bySite), ...Object.keys(B.bySite)]);
-      const deltas = [...sites].map(s => ({ s, d: (A.bySite[s] || 0) - (B.bySite[s] || 0) })).filter(x => Math.abs(x.d) >= 2000);
-      if (pct <= -1) {
-        const downs = deltas.filter(x => x.d < 0).sort((a, b) => a.d - b.d).slice(0, 3);
-        if (downs.length) out.push(`Recul porté surtout par ${downs.map(x => `${siteLabel(x.s)} (${eurRound(x.d)})`).join(', ')}.`);
-      } else if (pct >= 1) {
-        const ups = deltas.filter(x => x.d > 0).sort((a, b) => b.d - a.d).slice(0, 3);
-        if (ups.length) out.push(`Hausse portée surtout par ${ups.map(x => `${siteLabel(x.s)} (+${eurRound(x.d)})`).join(', ')}.`);
-      }
-      const catNames = { frais: 'le frais', pain: 'le pain/sec', nd: 'le non-dispatch' };
-      const catD = ['frais','pain','nd'].map(c => ({ c, d: (A.byCat[c]||0)-(B.byCat[c]||0), pct: B.byCat[c] ? (((A.byCat[c]||0)-(B.byCat[c]||0))/B.byCat[c]*100) : null }))
-        .filter(x => x.pct !== null && Math.abs(x.pct) >= 5);
-      if (catD.length) { const w = catD.sort((a,b)=>Math.abs(b.d)-Math.abs(a.d))[0]; const lbl = catNames[w.c]; out.push(`${lbl.charAt(0).toUpperCase()+lbl.slice(1)} ${w.pct>=0?'progresse':'recule'} de ${Math.abs(w.pct).toFixed(0)}%.`); }
-      if (A.hasConsumerData && B.hasConsumerData) {
-        const dc = A.uniqueClients - B.uniqueClients;
-        if (Math.abs(dc) >= 3) out.push(`${Math.abs(dc)} client${Math.abs(dc)>1?'s':''} ${dc<0?'de moins':'de plus'} (${A.uniqueClients} vs ${B.uniqueClients}).`);
-      }
-      const pb = B.panier ? ((A.panier - B.panier) / B.panier * 100) : null;
-      if (pb !== null && Math.abs(pb) >= 3) out.push(`Panier moyen ${pb>=0?'+':''}${pb.toFixed(0)}%.`);
-      return out.join(' ');
-    }
-
-    // Petite carte KPI avec 1 à 2 comparaisons (vs semaine dernière, vs N-1)
-    function KpiCompare({ label, value, sub, comps }) {
-      return (
-        <div className="kpi">
-          <div className="kpi-val">{value}</div>
-          <div className="kpi-label">{label}</div>
-          {sub && <div className="kpi-sub">{sub}</div>}
-          {(comps || []).map((c, i) => (
-            <div key={i} className="kpi-sub" style={{display:'flex',justifyContent:'space-between',gap:6}}>
-              <span>{c.label}</span>
-              <span><DeltaBadge a={c.a} b={c.b} goodUp={c.goodUp !== false} /></span>
-            </div>
-          ))}
-        </div>
-      );
-    }
-
     function CaDashboard() {
       const [all, setAll] = React.useState(null); // null = chargement
-      const showToast = React.useContext(ToastContext);
       const [from, setFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
       const [to, setTo] = React.useState(() => new Date().toISOString().slice(0,10));
       const [metric, setMetric] = React.useState('ca'); // ca | qty
@@ -6510,56 +6686,14 @@
       }, []);
 
       const filterRange = (f, t) => (all || []).filter(d => d.date && d.date >= f && d.date <= t).sort((a, b) => a.date.localeCompare(b.date));
-      const aggRange = (f, t) => computeCaAgg(filterRange(f, t));
-
-      // ===== VUE RAPIDE : jour / semaine / mois, avec comparaisons vs sem. dernière et N-1 =====
-      const quick = React.useMemo(() => {
-        if (!all || !all.length) return null;
-        const lastDate = all.map(d => d.date).filter(Boolean).sort().slice(-1)[0];
-        // Jour
-        const jour = aggRange(lastDate, lastDate);
-        const jourPrevW = aggRange(addDays(lastDate, -7), addDays(lastDate, -7));
-        // Semaine
-        const wk = isoWeekRange(lastDate);
-        const wkPrev = { from: addDays(wk.from, -7), to: addDays(wk.to, -7) };
-        const wkN1 = { from: addDays(wk.from, -364), to: addDays(wk.to, -364) }; // 52 semaines
-        const sem = aggRange(wk.from, wk.to);
-        const semPrev = aggRange(wkPrev.from, wkPrev.to);
-        const semN1 = aggRange(wkN1.from, wkN1.to);
-        // Mois
-        const mr = monthRange(lastDate);
-        const prevMonthDate = addDays(mr.from, -1);
-        const mrPrev = monthRange(prevMonthDate);
-        const n1 = new Date(mr.from + 'T12:00:00'); n1.setFullYear(n1.getFullYear() - 1);
-        const mrN1 = monthRange(dKey(n1));
-        const mois = aggRange(mr.from, mr.to);
-        const moisPrev = aggRange(mrPrev.from, mrPrev.to);
-        const moisN1 = aggRange(mrN1.from, mrN1.to);
-        return { lastDate, jour, jourPrevW, sem, semPrev, semN1, mois, moisPrev, moisN1 };
-      }, [all]);
-
       const inRange = React.useMemo(() => filterRange(from, to), [all, from, to]);
       const inRangeB = React.useMemo(() => compare ? filterRange(fromB, toB) : [], [all, compare, fromB, toB]);
+
       const agg = React.useMemo(() => computeCaAgg(inRange), [inRange]);
       const aggB = React.useMemo(() => computeCaAgg(inRangeB), [inRangeB]);
+
       const evoPoints = React.useMemo(() => buildEvoPoints(inRange, evoBy), [inRange, evoBy]);
       const evoPointsB = React.useMemo(() => compare ? buildEvoPoints(inRangeB, evoBy) : null, [inRangeB, evoBy, compare]);
-      const summary = React.useMemo(() => compare ? buildTrendSummary(agg, aggB, 'période B') : '', [agg, aggB, compare]);
-
-      // Churn / fidélité sur la période : régliers du début absents sur la fin
-      const churn = React.useMemo(() => {
-        if (!agg.hasConsumerData || inRange.length < 4) return null;
-        const mid = Math.floor(inRange.length / 2);
-        const early = inRange.slice(0, mid), late = inRange.slice(mid);
-        const earlyCount = {};
-        for (const d of early) for (const c of (d.consumers || [])) earlyCount[c] = (earlyCount[c] || 0) + 1;
-        const lateSet = new Set();
-        for (const d of late) for (const c of (d.consumers || [])) lateSet.add(c);
-        const regulars = Object.keys(earlyCount).filter(c => earlyCount[c] >= 2);
-        if (regulars.length < 5) return null;
-        const lost = regulars.filter(c => !lateSet.has(c));
-        return { pct: lost.length / regulars.length * 100, lost: lost.length, regulars: regulars.length };
-      }, [inRange, agg.hasConsumerData]);
 
       const bestSellers = React.useMemo(() => {
         let list = agg.products;
@@ -6567,8 +6701,16 @@
         return list.sort((a, b) => metric === 'qty' ? (b.qty - a.qty) : (b.ca_cents - a.ca_cents)).slice(0, 20);
       }, [agg.products, metric, catFilter]);
 
-      const setPreset = (days) => { const t = new Date(); const f = new Date(); f.setDate(f.getDate() - days); setFrom(f.toISOString().slice(0,10)); setTo(t.toISOString().slice(0,10)); };
-      const setAllTime = () => { if (!all || !all.length) return; const dates = all.map(d => d.date).filter(Boolean).sort(); setFrom(dates[0]); setTo(dates[dates.length-1]); };
+      const setPreset = (days) => {
+        const t = new Date(); const f = new Date(); f.setDate(f.getDate() - days);
+        setFrom(f.toISOString().slice(0,10)); setTo(t.toISOString().slice(0,10));
+      };
+      const setAllTime = () => {
+        if (!all || !all.length) return;
+        const dates = all.map(d => d.date).filter(Boolean).sort();
+        setFrom(dates[0]); setTo(dates[dates.length-1]);
+      };
+      // Période B = fenêtre de même durée, juste avant la période A.
       const setPrevPeriod = () => {
         const f = new Date(from + 'T12:00:00'), t = new Date(to + 'T12:00:00');
         const len = Math.round((t - f) / 86400000);
@@ -6577,160 +6719,6 @@
         setFromB(bFrom.toISOString().slice(0,10)); setToB(bTo.toISOString().slice(0,10));
       };
       const toggleCompare = () => { const nv = !compare; setCompare(nv); if (nv) setPrevPeriod(); };
-
-      const exportPDF = () => {
-        try {
-          if (!window.jspdf) { showToast && showToast('PDF non disponible, recharge la page'); return; }
-          const { jsPDF } = window.jspdf;
-          const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-          const M = 14, W = 182, PH = doc.internal.pageSize.getHeight();
-          let y = 16, page = 1;
-          const GREEN = [74, 124, 59], BLUE = [54, 102, 156], GREY = [120, 120, 120];
-          // Assainit le texte pour la police PDF (WinAnsi) : espaces insécables/fins -> espace,
-          // tirets longs -> "-", apostrophes/flèches/Δ non gérés -> équivalents ASCII.
-          const clean = (s) => String(s)
-            .replace(/[\u00A0\u202F\u2009\u2007\u2008]/g, ' ')
-            .replace(/[—–]/g, '-')
-            .replace(/[\u2018\u2019]/g, "'")
-            .replace(/→/g, '->')
-            .replace(/Δ/g, 'Var.');
-          const san = (rows) => rows.map(r => r.map(c => clean(c)));
-          const eur = (cents) => clean(eurRound(cents));
-          const pctTxt = (a, b) => b ? (((a - b) / b * 100) >= 0 ? '+' : '') + ((a - b) / b * 100).toFixed(0) + '%' : '-';
-          const footer = () => { doc.setFontSize(8); doc.setTextColor(150); doc.text(clean('Kelbongoo - Bilan CA · page ' + page), M, PH - 8); doc.setTextColor(0); };
-          const np = () => { footer(); doc.addPage(); page++; y = 16; };
-          const need = (h) => { if (y + h > PH - 14) np(); };
-          const heading = (t) => { need(12); doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.setTextColor(...GREEN); doc.text(clean(t), M, y); doc.setTextColor(0); doc.setFont(undefined, 'normal'); y += 6; };
-
-          // Barres horizontales dessinées
-          const drawBars = (entries, color) => {
-            if (!entries.length) { doc.setFontSize(9); doc.setTextColor(140); doc.text('Aucune donnée.', M, y); doc.setTextColor(0); y += 6; return; }
-            const max = Math.max(...entries.map(e => e[1]), 1);
-            doc.setFontSize(9);
-            for (const [label, val] of entries) {
-              need(7);
-              doc.setTextColor(40); doc.text(clean(label).slice(0, 34), M, y + 3);
-              const bx = M + 60, bw = 78;
-              doc.setFillColor(238, 238, 238); doc.rect(bx, y, bw, 4.2, 'F');
-              doc.setFillColor(...color); doc.rect(bx, y, Math.max(1, bw * (val / max)), 4.2, 'F');
-              doc.setTextColor(20); doc.text(eur(val), M + W, y + 3, { align: 'right' });
-              y += 7;
-            }
-            doc.setTextColor(0);
-          };
-
-          // Graphe linéaire dessiné (A + B optionnel)
-          const drawLine = (ptsA, ptsB) => {
-            const h = 52, x0 = M + 12, x1 = M + W, top = y, bot = y + h - 8;
-            need(h + 4);
-            const allV = [...ptsA.map(p => p.value), ...(ptsB || []).map(p => p.value)];
-            const max = Math.max(...allV, 1), min = Math.min(...allV, 0);
-            const span = (max - min) || 1;
-            doc.setDrawColor(210); doc.setLineWidth(0.2);
-            doc.line(x0, top, x0, bot); doc.line(x0, bot, x1, bot);
-            doc.setFontSize(7); doc.setTextColor(120);
-            doc.text(Math.round(max / 1000) + 'k', x0 - 2, top + 2, { align: 'right' });
-            doc.text(Math.round(min / 1000) + 'k', x0 - 2, bot, { align: 'right' });
-            const plot = (pts, rgb, dash) => {
-              if (pts.length < 1) return;
-              doc.setDrawColor(...rgb); doc.setLineWidth(0.6);
-              const px = (i) => pts.length === 1 ? (x0 + x1) / 2 : x0 + (x1 - x0) * (i / (pts.length - 1));
-              const py = (v) => bot - (bot - top) * ((v - min) / span);
-              for (let i = 1; i < pts.length; i++) { doc.line(px(i - 1), py(pts[i - 1].value), px(i), py(pts[i].value)); }
-              doc.setFillColor(...rgb);
-              for (let i = 0; i < pts.length; i++) doc.circle(px(i), py(pts[i].value), 0.7, 'F');
-            };
-            if (ptsB) plot(ptsB, GREY);
-            plot(ptsA, GREEN);
-            doc.setFontSize(7); doc.setTextColor(120);
-            if (ptsA.length) { doc.text(clean(ptsA[0].label), x0, bot + 4); doc.text(clean(ptsA[ptsA.length - 1].label), x1, bot + 4, { align: 'right' }); }
-            doc.setTextColor(0); doc.setDrawColor(0);
-            y += h;
-            if (ptsB) { doc.setFontSize(7); doc.setTextColor(...GREEN); doc.text('- Période A', M, y); doc.setTextColor(...GREY); doc.text('- Période B', M + 28, y); doc.setTextColor(0); y += 5; }
-          };
-
-          // recalcul indépendant du split points fixes / camion / domicile
-          const cSet = new Set(CAMION_CODES);
-          const fx = Object.entries(agg.bySite).filter(([s]) => s !== 'DOM' && !cSet.has(s)).sort((a, b) => b[1] - a[1]);
-          const cam = Object.entries(agg.bySite).filter(([s]) => cSet.has(s)).sort((a, b) => b[1] - a[1]);
-          const camTot = cam.reduce((a, [, v]) => a + v, 0);
-          const dom = agg.bySite['DOM'] || 0;
-          const tops = [...agg.products].sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 20);
-
-          // ---- En-tête ----
-          doc.setFontSize(17); doc.setFont(undefined, 'bold'); doc.text('Bilan CA - Kelbongoo', M, y); y += 8;
-          doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.setTextColor(60);
-          doc.text(`Période : ${clean(formatDateShort(from))}  ->  ${clean(formatDateShort(to))}`, M, y); y += 5;
-          if (compare) { doc.text(`Comparée à : ${clean(formatDateShort(fromB))}  ->  ${clean(formatDateShort(toB))}`, M, y); y += 5; }
-          doc.text(`Édité le ${clean(formatDateShort(new Date().toISOString().slice(0,10)))}`, M, y); y += 5;
-          doc.setFontSize(8); doc.setTextColor(120);
-          doc.text(doc.splitTextToSize('CA réel = produits livrés à prix plein, après manquants de prépa, avant remises et avoirs.', W), M, y);
-          y += 6; doc.setTextColor(0);
-
-          // ---- KPIs ----
-          heading('Indicateurs clés');
-          const kRows = [
-            ['CA réel', eur(agg.reel)],
-            ['Net après remises', eur(agg.reel - agg.remise)],
-            ['Manque à gagner (manquants + remises)', eur(agg.manquant + agg.remise)],
-            ['Passages (commandes servies)', agg.passages.toLocaleString('fr-FR')],
-            ['Clients uniques', agg.hasConsumerData ? agg.uniqueClients.toLocaleString('fr-FR') : '- (recharger historique)'],
-            ['Fréquence de passage', agg.hasConsumerData ? agg.frequence.toFixed(1) + ' x' : '-'],
-            ['Panier moyen', (agg.panier / 100).toFixed(2) + ' €'],
-          ];
-          if (compare) {
-            const bRows = [eur(aggB.reel), eur(aggB.reel - aggB.remise), eur(aggB.manquant + aggB.remise), aggB.passages.toLocaleString('fr-FR'), aggB.hasConsumerData ? aggB.uniqueClients.toLocaleString('fr-FR') : '-', aggB.hasConsumerData ? aggB.frequence.toFixed(1) + ' x' : '-', (aggB.panier / 100).toFixed(2) + ' €'];
-            const deltaSrc = [[agg.reel, aggB.reel], [agg.reel - agg.remise, aggB.reel - aggB.remise], [agg.manquant + agg.remise, aggB.manquant + aggB.remise], [agg.passages, aggB.passages], [agg.uniqueClients, aggB.uniqueClients], [agg.frequence, aggB.frequence], [agg.panier, aggB.panier]];
-            doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Indicateur', 'Période A', 'Période B', 'Écart']]),
-              body: san(kRows.map((r, i) => [r[0], r[1], bRows[i], pctTxt(deltaSrc[i][0], deltaSrc[i][1])])),
-              styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
-          } else {
-            doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Indicateur', 'Valeur']]),
-              body: san(kRows), styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
-          }
-          y = doc.lastAutoTable.finalY + 8;
-
-          // ---- Tendance ----
-          if (compare && summary) { heading('Tendance'); doc.setFontSize(9); const L = doc.splitTextToSize(clean(summary), W); need(L.length * 4.5 + 2); doc.text(L, M, y); y += L.length * 4.5 + 6; }
-
-          // ---- Évolution ----
-          heading(`Évolution du CA (par ${evoBy === 'week' ? 'semaine' : 'jour'})`);
-          if (evoPoints.length) drawLine(evoPoints, compare ? evoPointsB : null); else { doc.setFontSize(9); doc.text('Pas de données.', M, y); y += 6; }
-          y += 4;
-
-          // ---- CA par point ----
-          heading('CA par point de distribution');
-          doc.setFontSize(10); doc.setFont(undefined, 'bold'); need(6); doc.text('Points fixes (boutiques)', M, y); doc.setFont(undefined, 'normal'); y += 5;
-          drawBars(fx, GREEN);
-          need(8); doc.setFont(undefined, 'bold'); doc.setFontSize(10);
-          doc.text('Camion (tournées)', M, y); doc.text(eur(camTot), M + W, y, { align: 'right' }); doc.setFont(undefined, 'normal'); y += 5;
-          drawBars(cam.map(([s, v]) => [siteLabel(s), v]), BLUE);
-          need(8); doc.setFont(undefined, 'bold'); doc.setFontSize(10);
-          doc.text('Livraison à domicile', M, y); doc.text(eur(dom), M + W, y, { align: 'right' }); doc.setFont(undefined, 'normal'); y += 8;
-
-          // ---- CA par jour ----
-          heading('CA par jour de semaine');
-          drawBars(DOW_ORDER.filter(dw => agg.byDow[dw]).map(dw => [DOW_LABELS[dw], agg.byDow[dw]]), GREY);
-          y += 2;
-
-          // ---- CA par catégorie ----
-          heading('CA par catégorie');
-          doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['Catégorie', 'CA']]),
-            body: san(['frais', 'pain', 'nd'].map(c => [CAT_LABELS[c], eur(agg.byCat[c] || 0)])),
-            styles: { fontSize: 9 }, headStyles: { fillColor: GREEN } });
-          y = doc.lastAutoTable.finalY + 8;
-
-          // ---- Meilleures ventes ----
-          heading('Meilleures ventes (top 20, en CA)');
-          doc.autoTable({ startY: y, margin: { left: M, right: M }, head: san([['#', 'Produit', 'Producteur', 'Qté', 'CA']]),
-            body: san(tops.map((p, i) => [i + 1, clean(p.produit).slice(0, 40), clean(p.producteur || '').slice(0, 24), (p.qty || 0).toLocaleString('fr-FR'), eur(p.ca_cents)])),
-            styles: { fontSize: 8 }, headStyles: { fillColor: GREEN }, columnStyles: { 0: { cellWidth: 8 }, 3: { halign: 'right' }, 4: { halign: 'right' } } });
-
-          footer();
-          doc.save(`bilan-CA_${from}_${to}.pdf`);
-          showToast && showToast('PDF généré ✓');
-        } catch (e) { showToast && showToast('Erreur PDF : ' + e.message); }
-      };
 
       if (all === null) return <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Chargement de l'historique…</p></div>;
       if (all.length === 0) return (
@@ -6743,48 +6731,10 @@
       );
 
       const maxProd = Math.max(...bestSellers.map(p => metric === 'qty' ? p.qty : p.ca_cents), 1);
-      const camionSet = new Set(CAMION_CODES);
-      const fixedEntries = Object.entries(agg.bySite).filter(([s]) => s !== 'DOM' && !camionSet.has(s)).sort((a, b) => b[1] - a[1]);
-      const camionEntries = Object.entries(agg.bySite).filter(([s]) => camionSet.has(s)).sort((a, b) => b[1] - a[1]);
-      const camionTotal = camionEntries.reduce((a, [, v]) => a + v, 0);
-      const domTotal = agg.bySite['DOM'] || 0;
 
       return (
         <div className="stack">
-
-          {/* ===== VUE RAPIDE ===== */}
-          {quick && (
-            <>
-              <div style={{fontSize:12,fontWeight:700,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.05em'}}>
-                Vue rapide · dernier jour : {formatDateShort(quick.lastDate)}
-              </div>
-              <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
-                <KpiCompare label="CA du jour" value={eurRound(quick.jour.reel)}
-                  comps={[{ label:'vs sem. -1', a:quick.jour.reel, b:quick.jourPrevW.reel }]} />
-                <KpiCompare label="Semaine en cours" value={eurRound(quick.sem.reel)}
-                  comps={[
-                    { label:'vs sem. -1', a:quick.sem.reel, b:quick.semPrev.reel },
-                    { label:'vs N-1', a:quick.sem.reel, b:quick.semN1.reel },
-                  ]} />
-                <KpiCompare label="Mois en cours" value={eurRound(quick.mois.reel)}
-                  comps={[
-                    { label:'vs mois -1', a:quick.mois.reel, b:quick.moisPrev.reel },
-                    { label:'vs N-1', a:quick.mois.reel, b:quick.moisN1.reel },
-                  ]} />
-              </div>
-              <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
-                <div className="kpi"><div className="kpi-val">{quick.sem.panier ? (quick.sem.panier/100).toFixed(2)+' €' : '—'}</div><div className="kpi-label">Panier moyen (sem.)</div></div>
-                <div className="kpi"><div className="kpi-val">{quick.sem.passages.toLocaleString('fr-FR')}</div><div className="kpi-label">Passages (sem.)</div></div>
-                <div className="kpi"><div className="kpi-val">{quick.sem.hasConsumerData ? quick.sem.uniqueClients.toLocaleString('fr-FR') : '—'}</div><div className="kpi-label">Clients (sem.)</div></div>
-              </div>
-            </>
-          )}
-
-          {/* ===== EXPLORATEUR DE PÉRIODE ===== */}
-          <div style={{fontSize:12,fontWeight:700,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.05em',marginTop:4}}>
-            Explorer une période
-          </div>
-
+          {/* Période */}
           <div className="card">
             <div className="date-range">
               <div style={{flex:1}}><label>Du</label><input type="date" value={from} onChange={e => setFrom(e.target.value)} /></div>
@@ -6798,10 +6748,8 @@
               <div className="chip" onClick={setAllTime}>Tout</div>
             </div>
             <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
-              {(() => { const days = new Set(inRange.map(d=>d.date)).size; const locs = inRange.reduce((a,d)=>a+Object.keys(d.caBySite||{}).length,0); return `${days} jour${days>1?'s':''} de distribution · ${locs} distribution${locs>1?'s':''} de local`; })()} · <strong>CA réel</strong> = produits livrés à prix plein (après manquants prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
+              {agg.nb} distribution{agg.nb>1?'s':''} sur la période · <strong>CA réel</strong> = produits livrés à prix plein (après manquants de prépa, avant remises/avoirs). Net après remises : <strong>{eurRound(agg.reel - agg.remise)}</strong>.
             </p>
-
-            <button onClick={exportPDF} style={{marginTop:10,width:'100%',fontSize:14,fontWeight:700,padding:'10px',borderRadius:10,border:'none',background:'var(--master)',color:'#fff',cursor:'pointer'}}>📄 Exporter le bilan complet en PDF</button>
 
             <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--line)'}}>
               <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:14,fontWeight:600}}>
@@ -6817,68 +6765,25 @@
                   <div className="chip-group" style={{marginTop:8}}>
                     <div className="chip" onClick={setPrevPeriod}>↩ Période précédente (même durée)</div>
                   </div>
+                  <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
+                    B : {aggB.nb} distribution{aggB.nb>1?'s':''}. <span style={{color:'#4a7c3b',fontWeight:700}}>━ A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>┄ B</span>
+                  </p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Résumé auto en comparaison */}
-          {compare && (
-            <div className="card" style={{borderLeft:'3px solid var(--master)',background:'var(--master-soft)'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:4}}>
-                <div style={{fontWeight:700}}>🧭 Tendance</div>
-                <button onClick={exportPDF} style={{whiteSpace:'nowrap',fontSize:12,fontWeight:600,padding:'6px 10px',borderRadius:8,border:'1px solid var(--master)',background:'#fff',color:'var(--master)',cursor:'pointer'}}>📄 Exporter le bilan PDF</button>
-              </div>
-              <div style={{fontSize:13,lineHeight:1.5}}>{summary}</div>
-            </div>
-          )}
-
-          {/* KPIs période */}
-          <div className="kpi-grid">
-            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.reel} b={aggB.reel} /> : 'après manquants prépa'}</div></div>
-            <div className="kpi"><div className="kpi-val">{agg.panier ? (agg.panier/100).toFixed(2)+' €' : '—'}</div><div className="kpi-label">Panier moyen</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.panier} b={aggB.panier} /> : 'par passage'}</div></div>
-            <div className="kpi"><div className="kpi-val">{agg.passages.toLocaleString('fr-FR')}</div><div className="kpi-label">Passages</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.passages} b={aggB.passages} /> : 'commandes servies'}</div></div>
-            <div className="kpi"><div className="kpi-val">{agg.hasConsumerData ? agg.uniqueClients.toLocaleString('fr-FR') : '—'}</div><div className="kpi-label">Clients uniques</div><div className="kpi-sub">{agg.hasConsumerData ? (compare ? <DeltaBadge a={agg.uniqueClients} b={aggB.uniqueClients} /> : `fréquence ${agg.frequence.toFixed(1)}×`) : 'recharger l\'historique'}</div></div>
-          </div>
-
-          {/* Fidélité / churn */}
-          {churn && (
-            <div className="card">
-              <h3 style={{marginBottom:6}}>Fidélité clients</h3>
-              <div style={{display:'flex',alignItems:'baseline',gap:10}}>
-                <div style={{fontSize:24,fontWeight:800,color: churn.pct>=20?'var(--danger)':(churn.pct>=10?'var(--warn)':'var(--accent-dark,#2e7d32)')}}>{churn.pct.toFixed(0)}%</div>
-                <div style={{fontSize:13,color:'var(--ink-soft)'}}>de perte estimée</div>
-              </div>
-              <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>
-                {churn.lost} client{churn.lost>1?'s':''} réguliers de la 1ʳᵉ moitié de la période (≥2 passages) ne sont pas revenus sur la 2ᵉ moitié, sur {churn.regulars} réguliers. Fréquence moyenne : {agg.frequence.toFixed(1)} passages/client.
-              </p>
-            </div>
-          )}
-
-          {/* Évolution */}
-          <div className="card">
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-              <h3 style={{margin:0}}>Évolution du CA</h3>
-              <div className="seg">
-                <button className={evoBy==='day'?'active':''} onClick={()=>setEvoBy('day')}>Jour</button>
-                <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
-              </div>
-            </div>
-            {evoPoints.length ? <MiniLineChart points={evoPoints} pointsB={compare ? evoPointsB : null} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
-              : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
-            {compare && <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4,textAlign:'center'}}>Courbes alignées par rang. <span style={{color:'#4a7c3b',fontWeight:700}}>A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>B</span></p>}
-          </div>
-
-          {/* Comparaison A vs B détaillée */}
+          {/* Comparaison A vs B */}
           {compare && (
             <div className="card">
               <h3 style={{marginBottom:4}}>Comparaison A vs B</h3>
               <p style={{fontSize:11,color:'var(--ink-mute)',marginBottom:10}}>A = {formatDateShort(from)} → {formatDateShort(to)} · B = {formatDateShort(fromB)} → {formatDateShort(toB)}</p>
               {[
                 { label:'CA réel', a:agg.reel, b:aggB.reel, fmt:eurRound, goodUp:true },
+                { label:'CA prévisionnel', a:agg.previsionnel, b:aggB.previsionnel, fmt:eurRound, goodUp:true },
                 { label:'Manque à gagner', a:agg.manquant+agg.remise, b:aggB.manquant+aggB.remise, fmt:eurRound, goodUp:false },
-                { label:'Passages', a:agg.passages, b:aggB.passages, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
-                { label:'Clients uniques', a:agg.uniqueClients, b:aggB.uniqueClients, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
+                { label:'Nb distributions', a:agg.nb, b:aggB.nb, fmt:(v)=>v.toLocaleString('fr-FR'), goodUp:true },
+                { label:'CA moyen / distrib', a:agg.caMoyen, b:aggB.caMoyen, fmt:eurRound, goodUp:true },
                 { label:'Panier moyen', a:agg.panier, b:aggB.panier, fmt:(v)=>(v/100).toFixed(2)+' €', goodUp:true },
               ].map((r, i) => (
                 <div key={i} style={{display:'flex',alignItems:'center',padding:'7px 0',borderTop: i ? '1px solid var(--line)' : 'none'}}>
@@ -6894,25 +6799,32 @@
             </div>
           )}
 
-          {/* CA par local */}
+          {/* KPIs */}
+          <div className="kpi-grid">
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.reel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.reel} b={aggB.reel} /> : 'après manquants prépa'}</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.previsionnel)}</div><div className="kpi-label">CA prévisionnel</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.previsionnel} b={aggB.previsionnel} /> : 'commandé au départ'}</div></div>
+            <div className="kpi"><div className="kpi-val" style={{color:'var(--danger)'}}>{eurRound(agg.manquant + agg.remise)}</div><div className="kpi-label">Manque à gagner</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.manquant + agg.remise} b={aggB.manquant + aggB.remise} goodUp={false} /> : `${eurRound(agg.manquant)} manq. · ${eurRound(agg.remise)} remises`}</div></div>
+            <div className="kpi"><div className="kpi-val">{eurRound(agg.caMoyen)}</div><div className="kpi-label">CA moyen / distrib</div><div className="kpi-sub">{compare ? <DeltaBadge a={agg.caMoyen} b={aggB.caMoyen} /> : `${agg.orders.toLocaleString('fr-FR')} cmd · panier ${agg.panier ? (agg.panier/100).toFixed(2) : '0'} €`}</div></div>
+          </div>
+
+          {/* Évolution */}
           <div className="card">
-            <h3 style={{marginBottom:10}}>CA par point de distribution</h3>
-
-            <div style={{fontSize:11,fontWeight:700,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:6}}>Points fixes (boutiques)</div>
-            {fixedEntries.length ? <HBars data={fixedEntries} fmt={eurRound} /> : <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun point fixe sur la période.</p>}
-
-            <div style={{marginTop:14,paddingTop:10,borderTop:'1px solid var(--line)'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-                <span style={{fontWeight:700}}>🚚 Camion (tournées)</span>
-                <strong>{eurRound(camionTotal)}</strong>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <h3 style={{margin:0}}>Évolution du CA</h3>
+              <div className="seg">
+                <button className={evoBy==='day'?'active':''} onClick={()=>setEvoBy('day')}>Jour</button>
+                <button className={evoBy==='week'?'active':''} onClick={()=>setEvoBy('week')}>Semaine</button>
               </div>
-              {camionEntries.length ? <HBars data={camionEntries.map(([s, v]) => [siteLabel(s), v])} fmt={eurRound} color="var(--master)" /> : <p style={{fontSize:12,color:'var(--ink-mute)'}}>Aucune tournée camion sur la période.</p>}
             </div>
+            {evoPoints.length ? <MiniLineChart points={evoPoints} pointsB={compare ? evoPointsB : null} color="#4a7c3b" valueFmt={v => Math.round(v/1000)+'k'} />
+              : <p style={{fontSize:13,color:'var(--ink-mute)',textAlign:'center',padding:'12px 0'}}>Pas de données.</p>}
+            {compare && <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:4,textAlign:'center'}}>Courbes alignées par rang (1ᵉʳ jour A vs 1ᵉʳ jour B…). <span style={{color:'#4a7c3b',fontWeight:700}}>A</span> · <span style={{color:'#9aa0a6',fontWeight:700}}>B</span></p>}
+          </div>
 
-            <div style={{marginTop:14,paddingTop:10,borderTop:'1px solid var(--line)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <span style={{fontWeight:700}}>🏠 Livraison à domicile</span>
-              <strong>{eurRound(domTotal)}</strong>
-            </div>
+          {/* Par site */}
+          <div className="card">
+            <h3 style={{marginBottom:10}}>CA par site</h3>
+            <HBars data={Object.entries(agg.bySite).sort((a,b)=>b[1]-a[1])} fmt={eurRound} />
           </div>
 
           {/* Par jour de semaine */}
@@ -7096,9 +7008,12 @@
       );
     }
 
-    // === RETOURS PDP (prépa) ===
-    // Liste auto des produits des commandes non récupérées depuis +7j (non résolues).
-    // Pour chaque produit, la prépa choisit une destination. Montreuil/partage/jeté → crée une perte.
+    // === RETOURS PDP (prépa) — V8 ===
+    // Deux sources :
+    //  1) Produits signalés en distribution (↩️) → collection pdp_returns.
+    //     Cycle : pending (en boutique) → recovered (chauffeur a récupéré) → treated (entrepôt).
+    //     Au traitement, la destination est recommandée selon la DLC (partage vs envoi ROB).
+    //  2) Commandes non récupérées depuis +7j (followups non terminales).
     function PdpReturnsPage({ session, catalogue }) {
       const showToast = React.useContext(ToastContext);
       const [followups, setFollowups] = React.useState([]);
@@ -7112,8 +7027,9 @@
         return () => { u1(); u2(); u3(); };
       }, []);
 
-      const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
-      // Commandes en retour PDP : +7j, non terminales, avec des items
+      // Statuts terminaux d'une commande non récupérée → JAMAIS d'alerte retour PDP.
+      // 'done' ajouté (V8) : corrige les commandes résolues qui réapparaissaient à +7j.
+      const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
       const returns = followups.filter(f =>
         !TERMINAL.includes(f.status) &&
         daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP &&
@@ -7127,6 +7043,20 @@
       // Clé unique d'une ligne produit dans un retour
       const lineId = (f, it, idx) => `${f.orderId}__${it.id || idx}`;
 
+      // Auto-clôture : quand toutes les lignes d'une commande non récup sont traitées,
+      // on passe la commande en 'returned' (terminal) → elle disparaît de l'alerte (fix V8).
+      React.useEffect(() => {
+        for (const f of returns) {
+          const allTreated = f.items.length > 0 && f.items.every((it, idx) => treatMap[lineId(f, it, idx)]);
+          if (allTreated) {
+            storage.setDoc('followups', f.id || f.orderId, {
+              ...f, status: 'returned', autoClosed: true, updatedAt: new Date().toISOString(),
+            });
+          }
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [returns, treatMap]);
+
       const setDestination = async (f, it, idx, destination) => {
         const id = lineId(f, it, idx);
         await storage.setDoc('pdp_treatments', id, {
@@ -7135,7 +7065,6 @@
           destination,
           treatedBy: session.name, treatedAt: new Date().toISOString(),
         });
-        // Destination ≠ rayon → crée une perte (sauf si déjà créée)
         if (destination !== 'rayon') {
           const prod = (catalogue || []).find(p => p.produit === it.produit && p.producteur === it.producteur);
           const unitPrice = prod ? (prod.prixAchat || prod.prixHT || 0) : 0;
@@ -7154,31 +7083,63 @@
             createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
           });
         } else {
-          // Si on repasse en "rayon", retirer la perte éventuellement créée avant
           try { await storage.deleteDoc('losses', `lossret_${id}`); } catch(e){}
         }
         showToast('✓ Destination enregistrée');
+      };
+
+      // Clôture manuelle d'une commande non récup (récupérée / dossier clos).
+      const closeReturn = async (f) => {
+        await storage.setDoc('followups', f.id || f.orderId, {
+          ...f, status: 'returned', updatedBy: session.name, updatedAt: new Date().toISOString(),
+        });
+        showToast('✓ Clôturé');
       };
 
       const totalLines = returns.reduce((s, f) => s + f.items.length, 0);
       const treatedLines = returns.reduce((s, f) =>
         s + f.items.filter((it, idx) => treatMap[lineId(f, it, idx)]).length, 0);
 
-      // Retours manuels (produits non attribués signalés en distrib via Qualité → "Retour PDP")
-      // On affiche les non traités, + ceux traités le jour même (pour confirmation visuelle).
+      // ── Retours manuels (produits signalés en distrib) ──
+      // On garde tout ce qui n'est pas encore traité, + ceux traités le jour même (confirmation visuelle).
       const manual = manualReturns
-        .filter(r => {
-          const t = treatMap[r.id];
-          return !t || (t.treatedAt && t.treatedAt.slice(0, 10) === activeDay());
-        })
+        .filter(r => r.status !== 'treated' || (r.treatedAt && r.treatedAt.slice(0, 10) === activeDay()))
         .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-      const manualTreated = manual.filter(r => treatMap[r.id]).length;
+      const manualTreated = manual.filter(r => r.status === 'treated').length;
+      const overdue = computeOverduePdpReturns(manualReturns);
+      const overdueIds = new Set(overdue.map(o => o.id));
 
+      // Chauffeur : marquer un produit récupéré aux boutiques.
+      const markRecovered = async (r) => {
+        await storage.setDoc('pdp_returns', r.id, {
+          status: 'recovered', recoveredBy: session.name, recoveredAt: new Date().toISOString(),
+        });
+        showToast('✓ Récupéré — à traiter à l\'entrepôt');
+      };
+      const unmarkRecovered = async (r) => {
+        await storage.setDoc('pdp_returns', r.id, {
+          status: 'pending', recoveredBy: '', recoveredAt: '',
+        });
+        showToast('Annulé');
+      };
+      // Produit introuvable aux boutiques → problème, déclenche l'alerte.
+      const markMissing = async (r) => {
+        await storage.setDoc('pdp_returns', r.id, {
+          status: 'missing', missingBy: session.name, missingAt: new Date().toISOString(),
+        });
+        showToast('❌ Marqué non récupéré — alerte');
+      };
+      const unmarkMissing = async (r) => {
+        await storage.setDoc('pdp_returns', r.id, {
+          status: 'pending', missingBy: '', missingAt: '',
+        });
+        showToast('Annulé');
+      };
+
+      // Traitement entrepôt : choisir la destination (crée une perte sauf « rayon »).
       const setManualDestination = async (r, destination) => {
-        await storage.setDoc('pdp_treatments', r.id, {
-          id: r.id, orderId: r.id, site: r.site,
-          produit: r.produit, producteur: r.producteur, qty: r.qty || 1,
-          destination, manual: true,
+        await storage.setDoc('pdp_returns', r.id, {
+          status: 'treated', destination,
           treatedBy: session.name, treatedAt: new Date().toISOString(),
         });
         if (destination !== 'rayon') {
@@ -7193,14 +7154,15 @@
             destination, reason: 'erreur_prepa',
             usingWeight: false, quantity: qty, weight: 0,
             unitPrice, totalValue: unitPrice * qty,
-            remark: `Retour PDP non attribué — ${r.site}${r.remark ? ' · ' + r.remark : ''}`,
+            dlc: r.dlc || '',
+            remark: `Retour PDP — ${r.site}${r.remark ? ' · ' + r.remark : ''}`,
             day: activeDay(), fromReturn: true,
             createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
           });
         } else {
           try { await storage.deleteDoc('losses', `lossret_${r.id}`); } catch (e) {}
         }
-        showToast('✓ Destination enregistrée');
+        showToast('✓ Traité');
       };
 
       const nothing = returns.length === 0 && manual.length === 0;
@@ -7209,9 +7171,15 @@
         <div className="stack">
           <h1>Retours PDP</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Produits à traiter : non attribués signalés en distrib (↩️) + commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j.
-            Choisis une destination pour chacun. Montreuil, partage équipe et jeté sont comptés en perte ; « remettre en rayon » non.
+            Produits signalés en distrib (↩️) à récupérer puis traiter, et commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j.
+            La destination conseillée dépend de la DLC : partage équipe si trop courte, sinon envoi ROB via la navette.
           </p>
+
+          {overdue.length > 0 && (
+            <div className="alert-red">
+              ⏰ {overdue.length} retour{overdue.length>1?'s':''} PDP en retard de traitement — alerte envoyée à rr@ + hg@.
+            </div>
+          )}
 
           {nothing ? (
             <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Aucun retour PDP en attente. 👍</p></div>
@@ -7220,30 +7188,86 @@
               {manual.length > 0 && (
                 <>
                   <div className="card" style={{borderLeft:`3px solid ${manualTreated===manual.length?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
-                    <strong>↩️ Produits non attribués</strong> · {manualTreated}/{manual.length} traité{manual.length>1?'s':''}
-                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>Signalés en distribution (en trop / sans propriétaire). Choisis une destination pour chacun.</div>
+                    <strong>↩️ Produits signalés en distribution</strong> · {manualTreated}/{manual.length} traité{manual.length>1?'s':''}
+                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>1) Le chauffeur coche « récupéré » aux boutiques. 2) À l'entrepôt, choisis la destination (conseil selon la DLC).</div>
                   </div>
                   {manual.map(r => {
-                    const t = treatMap[r.id];
+                    const isTreated = r.status === 'treated';
+                    const isMissing = r.status === 'missing';
+                    const isRecovered = r.status === 'recovered' || isTreated;
+                    const route = routeByDLC(r.dlc);
+                    const isLate = overdueIds.has(r.id);
                     return (
-                      <div key={r.id} className="card" style={{background: t ? 'transparent' : 'var(--warn-soft)'}}>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:6}}>
+                      <div key={r.id} className="card" style={{
+                        background: isTreated ? 'transparent' : (isMissing ? 'var(--danger-soft,#fdecea)' : 'var(--warn-soft)'),
+                        borderLeft: (isLate || isMissing) ? '3px solid var(--danger)' : undefined,
+                      }}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6,gap:8}}>
                           <h3 style={{margin:0,fontSize:15}}>{r.produit || r.productLabel}{r.qty>1?` ×${r.qty}`:''}</h3>
-                          <span style={{fontSize:12,color:'var(--ink-mute)'}}>{r.site}</span>
+                          <span className="badge badge-site" style={{fontSize:12,whiteSpace:'nowrap'}}>📍 {r.site}</span>
                         </div>
                         {r.producteur && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:2}}>{r.producteur}</div>}
-                        {r.remark && <div style={{fontSize:12,color:'var(--ink-soft)',fontStyle:'italic',marginBottom:6}}>« {r.remark} »</div>}
-                        {t && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>✓ {RETURN_DESTINATIONS.find(d=>d.id===t.destination)?.label || t.destination} · {t.treatedBy}</div>}
-                        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                          {RETURN_DESTINATIONS.map(d => (
-                            <div key={d.id}
-                              className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
-                              style={{fontSize:12}}
-                              onClick={() => setManualDestination(r, d.id)}>
-                              {d.label}
-                            </div>
-                          ))}
+                        <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:4}}>
+                          {r.dlc ? <>DLC <strong>{formatDateShort(r.dlc)}</strong></> : 'DLC non renseignée'}
+                          {' · '}signalé le {formatDateShort(r.day)}
                         </div>
+                        {r.remark && <div style={{fontSize:12,color:'var(--ink-soft)',fontStyle:'italic',marginBottom:6}}>« {r.remark} »</div>}
+                        {isLate && !isMissing && <div style={{fontSize:12,color:'var(--danger)',fontWeight:600,marginBottom:4}}>⏰ En retard — à traiter</div>}
+
+                        {/* Produit introuvable aux boutiques → problème signalé */}
+                        {isMissing && (
+                          <div style={{marginBottom:6}}>
+                            <div style={{fontSize:13,color:'var(--danger)',fontWeight:700,marginBottom:4}}>❌ Non récupéré — produit introuvable aux boutiques (alerte envoyée)</div>
+                            <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12}} onClick={() => markRecovered(r)}>✅ Finalement récupéré</button>
+                            <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12,marginLeft:6}} onClick={() => unmarkMissing(r)}>↩ Annuler</button>
+                          </div>
+                        )}
+
+                        {/* Étape 1 : récupération chauffeur (par produit) */}
+                        {!isRecovered && !isMissing && (
+                          <div style={{marginBottom:6}}>
+                            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                              <button className="btn-primary" style={{padding:'6px 12px',fontSize:13}} onClick={() => markRecovered(r)}>
+                                ✅ Récupéré
+                              </button>
+                              <button className="btn-secondary" style={{padding:'6px 12px',fontSize:13}} onClick={() => markMissing(r)}>
+                                ❌ Non récupéré
+                              </button>
+                            </div>
+                            <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>À récupérer à la prochaine distribution sur {r.site}. Si le produit est introuvable → « Non récupéré » (alerte).</div>
+                          </div>
+                        )}
+                        {isRecovered && (
+                          <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>
+                            ✅ Récupéré{r.recoveredBy ? ` · ${r.recoveredBy}` : ''}
+                            {!isTreated && <button className="btn-ghost" style={{padding:'2px 6px',fontSize:11,marginLeft:6}} onClick={() => unmarkRecovered(r)}>annuler</button>}
+                          </div>
+                        )}
+
+                        {/* Étape 2 : traitement entrepôt (après récupération) */}
+                        {isRecovered && (
+                          <>
+                            <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{fontSize:12,marginBottom:6}}>
+                              💡 Conseil DLC : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>
+                              {route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}
+                            </div>
+                            {isTreated && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>✓ Traité : {RETURN_DESTINATIONS.find(d=>d.id===r.destination)?.label || r.destination} · {r.treatedBy}</div>}
+                            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                              {RETURN_DESTINATIONS.map(d => {
+                                const isReco = !isTreated && d.id === route.dest;
+                                const isSel = isTreated && r.destination === d.id;
+                                return (
+                                  <div key={d.id}
+                                    className={`chip chip-${d.color} ${isSel ? 'selected' : ''}`}
+                                    style={{fontSize:12, ...(isReco ? {boxShadow:'0 0 0 2px var(--accent)'} : {})}}
+                                    onClick={() => setManualDestination(r, d.id)}>
+                                    {isReco ? '★ ' : ''}{d.label}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
                       </div>
                     );
                   })}
@@ -7255,36 +7279,45 @@
                   <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
                     <strong>📦 Commandes non récupérées</strong> · {treatedLines}/{totalLines} produits traités · {returns.length} commande{returns.length>1?'s':''}
                   </div>
-                  {returns.map(f => (
-                <div key={f.orderId} className="card">
-                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
-                    <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
-                    <span style={{fontSize:12,color:'var(--ink-mute)'}}>{f.site} · il y a {daysSince(f.distribDate || f.day)}j</span>
-                  </div>
-                  <div className="stack" style={{gap:0}}>
-                    {f.items.map((it, idx) => {
-                      const t = treatMap[lineId(f, it, idx)];
-                      return (
-                        <div key={idx} style={{padding:'8px 0',borderTop: idx ? '1px solid var(--line)' : 'none',
-                          background: t ? 'transparent' : 'var(--warn-soft)'}}>
-                          <div style={{fontWeight:600,fontSize:13}}>{it.produit}{it.qty>1?` ×${it.qty}`:''}</div>
-                          <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{it.producteur}</div>
-                          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                            {RETURN_DESTINATIONS.map(d => (
-                              <div key={d.id}
-                                className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
-                                style={{fontSize:12}}
-                                onClick={() => setDestination(f, it, idx, d.id)}>
-                                {d.label}
-                              </div>
-                            ))}
-                          </div>
+                  {returns.map(f => {
+                    const allTreated = f.items.length > 0 && f.items.every((it, idx) => treatMap[lineId(f, it, idx)]);
+                    return (
+                      <div key={f.orderId} className="card">
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
+                          <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
+                          <span style={{fontSize:12,color:'var(--ink-mute)'}}>{f.site} · il y a {daysSince(f.distribDate || f.day)}j</span>
                         </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
+                        <div className="stack" style={{gap:0}}>
+                          {f.items.map((it, idx) => {
+                            const t = treatMap[lineId(f, it, idx)];
+                            return (
+                              <div key={idx} style={{padding:'8px 0',borderTop: idx ? '1px solid var(--line)' : 'none',
+                                background: t ? 'transparent' : 'var(--warn-soft)'}}>
+                                <div style={{fontWeight:600,fontSize:13}}>{it.produit}{it.qty>1?` ×${it.qty}`:''}</div>
+                                <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{it.producteur}</div>
+                                {t && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:4}}>✓ {RETURN_DESTINATIONS.find(d=>d.id===t.destination)?.label || t.destination}</div>}
+                                <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                                  {RETURN_DESTINATIONS.map(d => (
+                                    <div key={d.id}
+                                      className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
+                                      style={{fontSize:12}}
+                                      onClick={() => setDestination(f, it, idx, d.id)}>
+                                      {d.label}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{marginTop:8,display:'flex',justifyContent:'flex-end'}}>
+                          <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={() => closeReturn(f)}>
+                            {allTreated ? '✓ Tout traité — clôturer' : '✓ Clôturer (récupéré / résolu)'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </>
               )}
             </>
@@ -7313,7 +7346,10 @@
       const alreadySent = sentWeeks.find(s => s.id === week.monday);
 
       // Pertes de la semaine courante
-      const weekLosses = losses.filter(l => l.day >= week.monday && l.day <= week.friday);
+      // Fenêtre semaine élargie au dimanche : les distributions (et pertes sèches distrib)
+      // ont lieu mer→sam, donc le samedi tombe APRÈS week.friday et était auparavant ignoré.
+      const weekEnd = addDays(week.monday, 6);
+      const weekLosses = losses.filter(l => l.day >= week.monday && l.day <= weekEnd);
       const allTimeLosses = losses;
 
       const jeteWeek = weekLosses.filter(l => l.destination === 'jete');
@@ -7531,7 +7567,10 @@
       const [quantity, setQuantity] = React.useState(editing?.quantity || '1');
       const [weight, setWeight] = React.useState(editing?.weight || '');
       const [remark, setRemark] = React.useState(editing?.remark || '');
+      const [dlc, setDlc] = React.useState(editing?.dlc || '');
       const [busy, setBusy] = React.useState(false);
+      // Reco partage vs ROB selon la DLC (même logique que les retours PDP).
+      const route = dlc ? routeByDLC(dlc) : null;
 
       const selectedProduct = (catalogue || []).find(p => `${p.producteur}|${p.produit}` === productKey);
       // Prix d'achat en euros (le CSV stocke en centimes /100)
@@ -7559,6 +7598,7 @@
             unitPrice,
             totalValue,
             remark,
+            dlc,
             day: activeDay(),
             createdBy: session.name,
             createdAt: editing?.createdAt || new Date().toISOString(),
@@ -7590,11 +7630,28 @@
             )}
 
             <div className="field">
+              <label>DLC (optionnel — pour le conseil partage / ROB)</label>
+              <input type="date" value={dlc} onChange={e => setDlc(e.target.value)} />
+              {route && (
+                <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{marginTop:8,fontSize:12,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                  <span>💡 Conseil : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>{route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}</span>
+                  <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12,whiteSpace:'nowrap'}}
+                    onClick={() => setDestination(route.dest === 'partage' ? 'partage' : 'pribon')}>Appliquer</button>
+                </div>
+              )}
+            </div>
+
+            <div className="field">
               <label>Destination</label>
               <div className="chip-group">
-                {LOSS_DESTINATIONS.map(d => (
-                  <div key={d.id} className={`chip chip-${d.color} ${destination === d.id ? 'selected' : ''}`} onClick={() => setDestination(d.id)}>{d.label}</div>
-                ))}
+                {LOSS_DESTINATIONS.map(d => {
+                  const isReco = route && ((route.dest==='partage' && d.id==='partage') || (route.dest==='pribon' && d.id==='pribon'));
+                  return (
+                    <div key={d.id} className={`chip chip-${d.color} ${destination === d.id ? 'selected' : ''}`}
+                      style={isReco ? {boxShadow:'0 0 0 2px var(--accent)'} : undefined}
+                      onClick={() => setDestination(d.id)}>{isReco ? '★ ' : ''}{d.label}</div>
+                  );
+                })}
               </div>
             </div>
 
@@ -7897,7 +7954,7 @@
           // Historique CA (1 doc/date) — alimente le tableau de bord Bilan
           await storage.setDoc(
             'ca_history', dayKey,
-            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily', res.consumerIds),
+            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily'),
             { replace: true }
           );
           setActiveDay(dayKey);
@@ -8562,6 +8619,7 @@
                 {session.name} · {activeDay() !== todayKey()
                   ? <span style={{color:'var(--warn)',fontWeight:600}}>📅 Distribution du {formatDateShort(activeDay())} (≠ aujourd'hui)</span>
                   : formatDateFR()}
+                {SITE_HOURS[currentSite] && <span style={{color:'var(--ink-mute)'}}> · 🕑 {SITE_HOURS[currentSite]}</span>}
               </small>
             </div>
             <div className="topbar-actions">
