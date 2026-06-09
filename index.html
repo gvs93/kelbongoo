@@ -517,11 +517,16 @@
     // Jour JS : 2=mardi, 3=mercredi, 4=jeudi, 5=vendredi.
     // Le mardi (ou mercredi si raté) = palette dispatch. Le jeudi = navette pour la distrib
     // ROB du jeudi. Le vendredi = LA grosse navette pertes (FL invendu inclus) pour samedi ROB.
+    // Réalité terrain :
+    //  - mardi 12h  : départ ROB SI la palette dispatch magasin part le mardi
+    //  - mercredi 13h : repli si on n'a pas pu envoyer la palette le mardi
+    //  - jeudi      : livraison hebdo des commandes Kelbongoo → on peut joindre ROB
+    //  - vendredi midi/soir : LA grosse navette pertes (FL invendu inclus)
     const NAVETTE_ROB = [
-      { dow: 2, hour: 17, label: 'mardi (palette dispatch)' },
-      { dow: 3, hour: 17, label: 'mercredi (palette dispatch)' },
-      { dow: 4, hour: 13, label: 'jeudi 13h' },
-      { dow: 5, hour: 18, label: 'vendredi 18h' },
+      { dow: 2, hour: 12, label: 'mardi 12h (palette dispatch)' },
+      { dow: 3, hour: 13, label: 'mercredi 13h (si pas de palette mardi)' },
+      { dow: 4, hour: 13, label: 'jeudi (livraison Kelbongoo)' },
+      { dow: 5, hour: 18, label: 'vendredi (navette pertes)' },
     ];
     // Renvoie la DERNIÈRE navette ROB qui part un jour STRICTEMENT antérieur à la DLC
     // et encore à venir par rapport à "now". null si aucune → le produit doit être partagé.
@@ -2013,6 +2018,12 @@
       const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
       // Perte sèche (le produit ne survit pas jusqu'à la récup prépa, ou qualité) → garder pour soi
       const isPerteSeche = isRetourPdp && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
+      // Nom du produit sélectionné (pour le conseil fragilité FL en boutique)
+      const retourProdName = productKey.startsWith('FREE:') ? productKey.slice(5) : (productKey.split('|')[1] || '');
+      // Heuristique « fruit/légume fragile » (salade & co) : ne tient pas longtemps en boutique.
+      const isFragileFL = isRetourPdp && /salade|m[âa]che|roquette|mesclun|cresson|[ée]pinard|herbe|aromat|basilic|coriandre|persil|ciboulette|menthe|aneth|estragon|fraise|framboise|m[ûu]re|myrtille|groseille|champignon|pleurote|shiitake|fleur|pousse|blette|fenouil|radis botte/i.test(retourProdName);
+      // Nombre de jours avant la prochaine récup prépa sur ce local.
+      const daysToPickup = (nextDelivForSite) ? Math.round((new Date(nextDelivForSite + 'T00:00:00') - new Date(activeDay() + 'T00:00:00')) / 86400000) : null;
       const selectedOrder = orders.find(o => o.orderId === selectedKey);
       const toggle = (list, setList, id) => {
         if (list.includes(id)) setList(list.filter(x => x !== id));
@@ -2091,7 +2102,10 @@
           // jusqu'à la récup prépa → le distributeur garde pour lui), soit RETOUR PDP normal.
           if (isRetourPdp) {
             const qty = parseInt(retourQty, 10) || 1;
-            if (isPerteSeche) {
+            // Produit fragile (salade…) à DLC techniquement OK mais que le distributeur
+            // choisit de récupérer plutôt que renvoyer à PDP → traité comme perte sèche perso.
+            const keepFragile = !isPerteSeche && isFragileFL && perteRecupPerso;
+            if (isPerteSeche || keepFragile) {
               // Pas de retour PDP : on crée directement une perte sèche (jetée) côté distrib.
               // Apparaît dans le récap des pertes de la prépa (collection 'losses').
               await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
@@ -2111,7 +2125,9 @@
               });
               showToast(isQualityIssue
                 ? '⚠️ Perte sèche (qualité) — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi'
-                : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi');
+                : (keepFragile
+                    ? '🥬 Produit fragile récupéré par toi — ajouté aux pertes prépa (pas de renvoi PDP)'
+                    : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi'));
             } else {
               // Retour PDP normal : le produit tiendra jusqu'à la récup prépa.
               await storage.deleteDoc('losses', `lossret_${id}`);
@@ -2210,7 +2226,17 @@
                     </div>
                   ) : (
                     <div className="alert-info" style={{marginTop:8,fontSize:12}}>
-                      ✅ DLC OK → part en <strong>Retour PDP</strong>. La prépa le récupérera le {dayLabelShort(nextDelivForSite)}.
+                      ✅ DLC OK → part en <strong>Retour PDP</strong>. La prépa le récupérera le {dayLabelShort(nextDelivForSite)}{daysToPickup!=null ? ` (dans ${daysToPickup} j)` : ''}.
+                      {isFragileFL && (
+                        <div style={{marginTop:6}}>
+                          🥬 Produit fragile (type salade) : il risque de ne pas tenir {daysToPickup!=null ? `${daysToPickup} j` : 'jusqu\'à la récup'} en boutique.
+                          Si tu le sens limite, <strong>récupère-le plutôt que de le renvoyer à PDP</strong> — coche ci-dessous.
+                          <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontWeight:600,marginTop:6}}>
+                            <input type="checkbox" checked={perteRecupPerso} onChange={e => setPerteRecupPerso(e.target.checked)} style={{width:16,height:16}} />
+                            Je le récupère personnellement (chez moi)
+                          </label>
+                        </div>
+                      )}
                     </div>
                   )
                 )}
@@ -3690,17 +3716,27 @@
 
     // Saisie de quantité : garde un état chaîne (autorise le champ vide pendant la frappe),
     // ne se fait pas écraser par une MAJ externe tant que le champ a le focus.
-    function QtyInput({ value, onCommit, style }) {
+    function QtyInput({ value, onCommit, style, allowDecimal }) {
       const [str, setStr] = React.useState(value ? String(value) : '');
       const focused = React.useRef(false);
       React.useEffect(() => { if (!focused.current) setStr(value ? String(value) : ''); }, [value]);
       const handle = (raw) => {
+        if (allowDecimal) {
+          // chiffres + une seule virgule/point ; stocké avec un point
+          let s = String(raw).replace(/[^\d.,]/g, '').replace(',', '.');
+          const parts = s.split('.');
+          if (parts.length > 2) s = parts[0] + '.' + parts.slice(1).join('');
+          setStr(s);
+          const n = parseFloat(s);
+          onCommit(s === '' || isNaN(n) ? 0 : n);
+          return;
+        }
         const s = String(raw).replace(/[^\d]/g, '');
         setStr(s);
         onCommit(s === '' ? 0 : parseInt(s, 10));
       };
       return (
-        <input type="number" inputMode="numeric" min="0" value={str} placeholder="0"
+        <input type={allowDecimal ? 'text' : 'number'} inputMode={allowDecimal ? 'decimal' : 'numeric'} min="0" value={str} placeholder="0"
           onFocus={e=>{ focused.current = true; e.target.select(); }}
           onBlur={()=>{ focused.current = false; }}
           onChange={e=>handle(e.target.value)}
@@ -3934,7 +3970,7 @@
       }, [invDate]);
 
       const setQty = async (item, field, value) => {
-        const v = Math.max(0, parseInt(value, 10) || 0);
+        const v = Math.max(0, parseFloat(value) || 0);
         const prev = counts[item.key] || { colis: 0, mu: 0 };
         const next = { ...prev, [field]: v };
         await storage.setDoc(`fl_inventory_${invDate}`, item.key, {
@@ -4019,7 +4055,7 @@
       for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
       const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
 
-      const nbColis = items.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
+      const nbColis = Math.round(items.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0) * 100) / 100;
       const nbMu = items.reduce((t,it)=>t + ((counts[it.key]?.mu)||0), 0);
       const nbSaisis = items.filter(it => { const c = counts[it.key]; return c && (c.colis>0 || c.mu>0); }).length;
 
@@ -4067,7 +4103,7 @@
                         <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{it.produit}</div>
                         {it.uv && <div style={{color:'var(--ink-mute)',fontSize:11}}>{it.uv}</div>}
                       </div>
-                      <QtyInput value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)}
+                      <QtyInput value={c.colis ?? 0} allowDecimal onCommit={(v)=>setQty(it,'colis',v)}
                         style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
                       <QtyInput value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)}
                         style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
@@ -4754,8 +4790,12 @@
                     <div key={c.id} className="list-item" style={{flexDirection:'column',alignItems:'stretch'}}>
                       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
                         <div className="list-item-main">
-                          <div className="list-item-name">{c.consumerName || c.consumer_name || '(client)'} · {c.nbPots||0} pot(s)</div>
-                          <div className="list-item-sub">{c.note ? `« ${c.note} »` : (c.day || '')}</div>
+                          <div className="list-item-name">{c.clientName || c.consumerName || c.consumer_name || '(client)'} · {c.nbPots||0} pot(s)</div>
+                          <div className="list-item-sub">
+                            {c.clientEmail ? <span>{c.clientEmail}</span> : null}
+                            {(c.remark || c.note) ? <span>{c.clientEmail ? ' · ' : ''}« {c.remark || c.note} »</span> : null}
+                            {!c.clientEmail && !(c.remark || c.note) ? (c.day || '') : null}
+                          </div>
                         </div>
                         {c.status && <span className="badge badge-info">{c.status}</span>}
                       </div>
