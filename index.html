@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V8</title>
+  <title>Kelbongoo — Distribution V9</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -467,7 +467,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V8';
+    const APP_VERSION = 'V9';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -4124,6 +4124,287 @@
       );
     }
 
+    // ============================================================
+    // V9 — INVENTAIRE COMPLET / TOURNANT DEPUIS LE FICHIER DE STOCK
+    // Lit la liste Producteur / Produit du DERNIER fichier de stock (lecture
+    // seule, via le proxy → action 'stock_list'). On saisit le stock du soir
+    // (décimales OK) + éventuellement une DLC marquée « sensible ».
+    // Validation → action 'inv_write' : écrit dans un SHEET DÉDIÉ (un onglet
+    // par jour). La feuille de stock du site n'est JAMAIS modifiée.
+    // Les produits à DLC sensible alimentent le suivi 'dlc_sensibles'.
+    // ============================================================
+    const DLC_SENSIBLE_DAYS = 3; // DLC à ≤ 3 j = courte/sensible (alerte)
+
+    function daysUntil(dateKey) {
+      if (!dateKey) return null;
+      const d = new Date(dateKey + 'T00:00:00');
+      const t = new Date(); t.setHours(0,0,0,0);
+      return Math.round((d - t) / 86400000);
+    }
+
+    function StockInventoryPage({ session, invDate, mode }) {
+      const showToast = React.useContext(ToastContext);
+      const [items, setItems] = React.useState(null);   // [{key, producer, produit}]
+      const [src, setSrc] = React.useState(null);        // {fileName, lastUpdated}
+      const [counts, setCounts] = React.useState({});    // key -> {qty, dlc, sensible}
+      const [loading, setLoading] = React.useState(true);
+      const [err, setErr] = React.useState('');
+      const [search, setSearch] = React.useState('');
+      const [scope, setScope] = React.useState('');      // producteur (mode tournant)
+      const [validating, setValidating] = React.useState(false);
+      const [reporting, setReporting] = React.useState(false);
+      const [lastValidated, setLastValidated] = React.useState(null);
+
+      const load = React.useCallback(async () => {
+        setLoading(true); setErr('');
+        try {
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'stock_list', ts: Date.now() });
+          if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
+          const list = (data.items || []).map(it => ({
+            key: `${it.producer}__${it.produit}`, producer: it.producer, produit: it.produit,
+          }));
+          setItems(list);
+          setSrc({ fileName: data.fileName, lastUpdated: data.lastUpdated });
+        } catch (e) { setErr(e.message || String(e)); }
+        finally { setLoading(false); }
+      }, []);
+      React.useEffect(() => { load(); }, [load]);
+
+      React.useEffect(() => {
+        setCounts({});
+        const u = storage.subscribe(`stock_inv_${invDate}`, (arr) => {
+          const c = {}; for (const e of arr) { c[e.id] = { qty: e.qty || 0, dlc: e.dlc || '', sensible: !!e.sensible }; }
+          setCounts(c);
+        });
+        return () => { u && u(); };
+      }, [invDate]);
+
+      React.useEffect(() => {
+        setLastValidated(null);
+        (async () => { try { const m = await storage.getDoc('stock_inv_meta', invDate); if (m) setLastValidated(m); } catch(e){} })();
+      }, [invDate]);
+
+      const writeRow = async (item, patch) => {
+        const prev = counts[item.key] || { qty: 0, dlc: '', sensible: false };
+        const next = { ...prev, ...patch };
+        // une DLC ≤ seuil bascule automatiquement « sensible »
+        if (patch.dlc !== undefined) {
+          const dleft = daysUntil(patch.dlc);
+          if (patch.dlc && dleft != null && dleft <= DLC_SENSIBLE_DAYS) next.sensible = true;
+        }
+        await storage.setDoc(`stock_inv_${invDate}`, item.key, {
+          id: item.key, producer: item.producer, produit: item.produit,
+          qty: next.qty || 0, dlc: next.dlc || '', sensible: !!next.sensible,
+          countedBy: session.name, countedAt: new Date().toISOString(),
+        });
+      };
+
+      const producers = React.useMemo(() => {
+        if (!items) return [];
+        const s = new Set(); for (const it of items) s.add(it.producer);
+        return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
+      }, [items]);
+
+      const validate = async () => {
+        if (!items) return;
+        const saisis = items.filter(it => { const c = counts[it.key]; return c && (c.qty > 0 || c.dlc); });
+        if (!saisis.length) { showToast('Rien à valider'); return; }
+        if (!confirm(`Valider l'inventaire stock du ${invDate} ?\n\n${saisis.length} produit(s) seront écrits dans un onglet « ${invDate} » du sheet d'inventaire dédié.\nLa feuille de stock du site n'est PAS modifiée.`)) return;
+        setValidating(true);
+        try {
+          const payload = saisis.map(it => { const c = counts[it.key] || {}; return {
+            producer: it.producer, produit: it.produit, qty: c.qty || 0, dlc: c.dlc || '', sensible: !!c.sensible,
+          }; });
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'inv_write', day: invDate, items: payload });
+          if (!data.ok) { showToast('Erreur écriture : ' + (data.error || 'inconnue')); setValidating(false); return; }
+          // Les DLC sensibles alimentent le suivi (collection 'dlc_sensibles')
+          for (const it of saisis) {
+            const c = counts[it.key] || {};
+            if (c.sensible && c.dlc) {
+              await storage.setDoc('dlc_sensibles', it.key, {
+                id: it.key, producer: it.producer, produit: it.produit,
+                dlc: c.dlc, qty: c.qty || 0, status: 'open',
+                source: invDate, createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+          const meta = { date: invDate, validatedBy: session.name, validatedAt: new Date().toISOString(),
+            written: data.written || 0, url: data.url || '', tab: data.tab || invDate, total: items.length };
+          await storage.setDoc('stock_inv_meta', invDate, meta, { replace: true });
+          setLastValidated(meta);
+          showToast(`✓ Inventaire écrit : onglet « ${data.tab} » (${data.written} produit(s))`);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setValidating(false); }
+      };
+
+      // ⚠️ Reporte l'inventaire dans la colonne « début de stock » du DERNIER
+      // fichier de stock (= la feuille du site). Geste explicite et confirmé.
+      const reportDebut = async () => {
+        if (!items) return;
+        const saisis = items.filter(it => (counts[it.key]?.qty || 0) > 0);
+        if (!saisis.length) { showToast('Rien à reporter (aucune quantité saisie)'); return; }
+        if (!confirm(`⚠️ ATTENTION — écriture sur le FICHIER DE STOCK DU SITE.\n\nReporter ${saisis.length} quantité(s) dans la colonne « début de stock » du dernier fichier de stock ?\n\nSeule cette colonne est écrite (lignes existantes). Aucune ligne ni autre colonne n'est modifiée.`)) return;
+        setReporting(true);
+        try {
+          const payload = saisis.map(it => ({ producer: it.producer, produit: it.produit, qty: counts[it.key]?.qty || 0 }));
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'stock_report', items: payload });
+          if (!data.ok) { showToast('Refus / erreur : ' + (data.error || 'inconnue')); setReporting(false); return; }
+          let msg = `✓ Reporté en début de stock : ${data.written} ligne(s) dans « ${data.fileName} »`;
+          if (data.notFound && data.notFound.length) msg += ` · ${data.notFound.length} non trouvée(s)`;
+          showToast(msg);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setReporting(false); }
+      };
+
+      if (loading) return <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste depuis le dernier fichier de stock…</p></div>;
+      if (err) return (
+        <div className="alert-warning">
+          Impossible de charger la liste de stock : {err}<br/>
+          <span style={{fontSize:12}}>Vérifie que l'action <code>stock_list</code> est branchée dans le proxy (et redéployée en « Nouvelle version »).</span>
+        </div>
+      );
+      if (!items || !items.length) return <div className="alert-warning">Aucun produit trouvé dans le fichier de stock.</div>;
+
+      const q = normalizeText(search);
+      let filtered = items;
+      if (mode === 'tournant' && scope) filtered = filtered.filter(it => it.producer === scope);
+      if (q) filtered = filtered.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q));
+      const byProducer = {};
+      for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
+      const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
+      const nbSaisis = items.filter(it => { const c = counts[it.key]; return c && (c.qty > 0 || c.dlc); }).length;
+      const nbSensibles = items.filter(it => counts[it.key]?.sensible && counts[it.key]?.dlc).length;
+
+      return (
+        <>
+          {src && (
+            <div className="alert-info" style={{fontSize:12}}>
+              📄 Source : <strong>{src.fileName}</strong> · maj {src.lastUpdated ? new Date(src.lastUpdated).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'}) : '—'}
+              <br/><span style={{color:'var(--ink-mute)'}}>L'inventaire est écrit dans un sheet dédié (onglet par jour). La feuille de stock n'est jamais modifiée.</span>
+            </div>
+          )}
+          <div className="stat-grid">
+            <div className="stat"><div className="stat-value">{nbSaisis}/{items.length}</div><div className="stat-label">Produits saisis</div></div>
+            <div className="stat"><div className="stat-value">{nbSensibles}</div><div className="stat-label">DLC sensibles</div></div>
+          </div>
+
+          {mode === 'tournant' && (
+            <div className="card" style={{paddingBottom:10}}>
+              <select value={scope} onChange={e=>setScope(e.target.value)} style={{width:'100%',fontSize:15,padding:'8px'}}>
+                <option value="">— Choisir un producteur ({producers.length}) —</option>
+                {producers.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+              </select>
+              {!scope && <div style={{fontSize:12,color:'var(--warn)',marginTop:6}}>Choisis un producteur pour démarrer.</div>}
+            </div>
+          )}
+
+          <div className="card" style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filtrer un produit ou producteur…" style={{flex:1,minWidth:160,fontSize:15,padding:'8px'}} />
+            <button className="btn-secondary" style={{fontSize:13}} disabled={loading} onClick={()=>load()}>🔄 Rafraîchir</button>
+            <button className="btn-primary" style={{fontSize:13}} disabled={validating} onClick={validate}>{validating ? 'Validation…' : '✅ Valider l\'inventaire'}</button>
+          </div>
+
+          <div className="card" style={{borderLeft:'3px solid var(--danger)'}}>
+            <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:8}}>
+              ⚠️ <strong>Report en début de stock</strong> — écrit l'inventaire dans la colonne « début de stock » du <strong>dernier fichier de stock du site</strong> (uniquement cette colonne). À faire une fois l'inventaire bien validé.
+            </div>
+            <button className="btn-secondary" style={{fontSize:13}} disabled={reporting} onClick={reportDebut}>
+              {reporting ? 'Report…' : '📥 Reporter en début de stock (fichier du site)'}
+            </button>
+          </div>
+
+          {lastValidated && (
+            <div className="alert-info" style={{borderLeft:'3px solid var(--ok,#2e7d32)',fontSize:13}}>
+              ✓ Validé le {new Date(lastValidated.validatedAt).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})} par {lastValidated.validatedBy} · onglet « {lastValidated.tab} » ({lastValidated.written} produit(s)).
+              {lastValidated.url && <span> · <a href={lastValidated.url} target="_blank" rel="noreferrer">ouvrir le sheet</a></span>}
+            </div>
+          )}
+
+          {(mode !== 'tournant' || scope) && producersSorted.map(prod => (
+            <div key={prod} className="card">
+              <h3 style={{marginBottom:8}}>{prod} · {byProducer[prod].length}</h3>
+              <div className="stack" style={{gap:6}}>
+                {byProducer[prod].map(it => {
+                  const c = counts[it.key] || {};
+                  const dleft = daysUntil(c.dlc);
+                  return (
+                    <div key={it.key} style={{borderTop:'1px solid var(--line)',paddingTop:6}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                        <div style={{flex:1,minWidth:140,fontSize:13,fontWeight:600}}>{it.produit}</div>
+                        <QtyInput value={c.qty ?? 0} allowDecimal onCommit={(v)=>writeRow(it,{qty:v})} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+                      </div>
+                      <div style={{display:'flex',alignItems:'center',gap:8,marginTop:4,flexWrap:'wrap'}}>
+                        <label style={{fontSize:11,color:'var(--ink-mute)'}}>DLC</label>
+                        <input type="date" value={c.dlc || ''} onChange={e=>writeRow(it,{dlc:e.target.value})} style={{fontSize:13,padding:'4px'}} />
+                        {c.dlc && (
+                          <label style={{display:'flex',alignItems:'center',gap:4,fontSize:12,cursor:'pointer',fontWeight:c.sensible?700:400,color:c.sensible?'var(--danger)':'inherit'}}>
+                            <input type="checkbox" checked={!!c.sensible} onChange={e=>writeRow(it,{sensible:e.target.checked})} />
+                            🟠 sensible
+                          </label>
+                        )}
+                        {c.dlc && dleft != null && (
+                          <span style={{fontSize:11,color: dleft<=DLC_SENSIBLE_DAYS ? 'var(--danger)' : 'var(--ink-mute)'}}>
+                            {dleft < 0 ? `dépassée (${-dleft} j)` : dleft === 0 ? "aujourd'hui" : `dans ${dleft} j`}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </>
+      );
+    }
+
+    // ============================================================
+    // V9 — SUIVI DES DLC SENSIBLES (produits à DLC courte à traiter vite)
+    // Alimenté par l'inventaire stock. Trié par DLC. « Traité » → disparaît.
+    // Bandeau « check du matin » : DLC à ≤ DLC_SENSIBLE_DAYS jours.
+    // ============================================================
+    function DlcSensiblesPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [rows, setRows] = React.useState([]);
+      React.useEffect(() => {
+        const u = storage.subscribe('dlc_sensibles', setRows);
+        return () => { u && u(); };
+      }, []);
+
+      const open = rows.filter(r => r.status !== 'treated')
+        .sort((a,b)=>(a.dlc||'').localeCompare(b.dlc||''));
+      const urgent = open.filter(r => { const d = daysUntil(r.dlc); return d != null && d <= DLC_SENSIBLE_DAYS; });
+
+      const markTreated = async (r) => {
+        await storage.setDoc('dlc_sensibles', r.id, { status: 'treated', treatedBy: session.name, treatedAt: new Date().toISOString() });
+        showToast('✓ Traité');
+      };
+
+      return (
+        <div style={{marginTop:10}}>
+          <div className={urgent.length ? 'alert-warning' : 'alert-info'} style={{fontSize:13}}>
+            🟠 <strong>Check du matin — DLC sensibles.</strong> {open.length} produit(s) en suivi
+            {urgent.length ? <> · <strong style={{color:'var(--danger)'}}>{urgent.length} à traiter au plus vite (≤ {DLC_SENSIBLE_DAYS} j)</strong></> : ' · rien d\'urgent'}.
+          </div>
+          {open.length === 0 ? (
+            <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucune DLC sensible en cours. (Elles arrivent depuis l'inventaire stock.)</p>
+          ) : open.map(r => {
+            const dleft = daysUntil(r.dlc);
+            const danger = dleft != null && dleft <= DLC_SENSIBLE_DAYS;
+            return (
+              <div key={r.id} className="card" style={{borderLeft:`3px solid ${danger?'var(--danger)':'var(--warn,#e0a800)'}`,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontWeight:600,fontSize:14}}>{r.produit}{r.qty>1?` ×${r.qty}`:''}</div>
+                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>{r.producer} · DLC {formatDateShort(r.dlc)} · {dleft<0?`dépassée (${-dleft} j)`:dleft===0?"aujourd'hui":`dans ${dleft} j`}</div>
+                </div>
+                <button className="btn-primary" style={{padding:'6px 12px',fontSize:13,whiteSpace:'nowrap'}} onClick={()=>markTreated(r)}>✅ Traité</button>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
     // PAGE INVENTAIRE (expérimental — saisie manuelle + scan qui apprend les EAN)
     // ============================================================
     function InventoryPage({ session }) {
@@ -4137,7 +4418,8 @@
       const [pendingEan, setPendingEan] = React.useState(null);
       const [scannedIds, setScannedIds] = React.useState([]); // produits touchés dans la session de scan (plus récent en tête)
       const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
-      const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
+      const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant' | 'fl' | 'stock' | 'dlc'
+      const [stockMode, setStockMode] = React.useState('complet'); // pour l'inventaire stock (sheet) : 'complet' | 'tournant'
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
       const [scopeValue, setScopeValue] = React.useState(''); // producteur / type / famille sélectionné
       const [showLearn, setShowLearn] = React.useState(false); // section apprentissage des codes (temps du test)
@@ -4411,7 +4693,27 @@
                 onClick={()=>{ setInvType('fl'); saveMeta({type:'fl'}); }}>
                 🥬 Fruits & Légumes (soir)
               </div>
+              <div className={`chip ${invType==='stock'?'selected':''}`}
+                onClick={()=>{ setInvType('stock'); }}>
+                📦 Stock (sheet)
+              </div>
+              <div className={`chip ${invType==='dlc'?'selected':''}`}
+                onClick={()=>{ setInvType('dlc'); }}>
+                🟠 DLC sensibles
+              </div>
             </div>
+            {invType === 'stock' && (
+              <div>
+                <div className="filter-row" style={{marginBottom:6}}>
+                  <div className={`chip ${stockMode==='complet'?'selected':''}`} onClick={()=>setStockMode('complet')}>📦 Complet</div>
+                  <div className={`chip ${stockMode==='tournant'?'selected':''}`} onClick={()=>setStockMode('tournant')}>🔄 Tournant (par producteur)</div>
+                </div>
+                <div style={{fontSize:12,color:'var(--ink-mute)'}}>Liste lue dans le dernier fichier de stock. Saisie du stock du soir (décimales OK) + DLC sensible si besoin. Écrit dans un sheet dédié (onglet par jour) — jamais la feuille de stock.</div>
+              </div>
+            )}
+            {invType === 'dlc' && (
+              <div style={{fontSize:12,color:'var(--ink-mute)'}}>Suivi des produits à DLC courte (alimenté par l'inventaire stock). Trié par DLC, « Traité » → disparaît.</div>
+            )}
             {invType === 'complet' && (
               <div style={{fontSize:12,color:'var(--ink-mute)'}}>Tout le catalogue. À faire au moins 1×/semaine — sert de référence.</div>
             )}
@@ -4460,6 +4762,10 @@
 
           {invType === 'fl' ? (
             <FLInventoryPage session={session} invDate={invDate} />
+          ) : invType === 'stock' ? (
+            <StockInventoryPage session={session} invDate={invDate} mode={stockMode} />
+          ) : invType === 'dlc' ? (
+            <DlcSensiblesPage session={session} />
           ) : products.length === 0 ? (
             <div className="alert-warning">Aucun produit en mémoire. Charge d'abord le fichier produits dans Admin.</div>
           ) : (
