@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9</title>
+  <title>Kelbongoo — Distribution V8</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -467,7 +467,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9';
+    const APP_VERSION = 'V8';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -517,16 +517,11 @@
     // Jour JS : 2=mardi, 3=mercredi, 4=jeudi, 5=vendredi.
     // Le mardi (ou mercredi si raté) = palette dispatch. Le jeudi = navette pour la distrib
     // ROB du jeudi. Le vendredi = LA grosse navette pertes (FL invendu inclus) pour samedi ROB.
-    // Réalité terrain :
-    //  - mardi 12h  : départ ROB SI la palette dispatch magasin part le mardi
-    //  - mercredi 13h : repli si on n'a pas pu envoyer la palette le mardi
-    //  - jeudi      : livraison hebdo des commandes Kelbongoo → on peut joindre ROB
-    //  - vendredi midi/soir : LA grosse navette pertes (FL invendu inclus)
     const NAVETTE_ROB = [
-      { dow: 2, hour: 12, label: 'mardi 12h (palette dispatch)' },
-      { dow: 3, hour: 13, label: 'mercredi 13h (si pas de palette mardi)' },
-      { dow: 4, hour: 13, label: 'jeudi (livraison Kelbongoo)' },
-      { dow: 5, hour: 18, label: 'vendredi (navette pertes)' },
+      { dow: 2, hour: 17, label: 'mardi (palette dispatch)' },
+      { dow: 3, hour: 17, label: 'mercredi (palette dispatch)' },
+      { dow: 4, hour: 13, label: 'jeudi 13h' },
+      { dow: 5, hour: 18, label: 'vendredi 18h' },
     ];
     // Renvoie la DERNIÈRE navette ROB qui part un jour STRICTEMENT antérieur à la DLC
     // et encore à venir par rapport à "now". null si aucune → le produit doit être partagé.
@@ -549,24 +544,17 @@
       }
       return best; // la plus tardive trouvée = la dernière navette utile avant la DLC
     }
-    // Au-delà de ce seuil de jours restants, la DLC est « large » → le produit tient,
-    // on le remet en rayon à l'entrepôt Kelbongoo (la base) plutôt que de l'envoyer ailleurs.
-    const DLC_RAYON_MIN_DAYS = 4; // strictement plus de 3 jours de DLC → rayon
     // Décision de routage d'un produit selon sa DLC, à la date de traitement (now).
-    // → { dest:'rayon'|'partage'|'pribon', navette:{label,date}|null, reason:string }
+    // → { dest:'partage'|'pribon', navette:{label,date}|null, reason:string }
     function routeByDLC(dlcKey, now) {
       now = now || new Date();
+      if (!dlcKey) return { dest: 'pribon', navette: null, reason: 'DLC non renseignée' };
       const today = new Date(now); today.setHours(0,0,0,0);
-      if (!dlcKey) return { dest: 'rayon', navette: null, reason: 'DLC non renseignée — à vérifier avant remise en rayon' };
       const dlc = new Date(dlcKey + 'T00:00:00');
-      const daysLeft = Math.round((dlc - today) / 86400000);
-      if (daysLeft <= 0) return { dest: 'partage', navette: null, reason: "DLC aujourd'hui ou dépassée → partage équipe" };
-      // DLC large → remise en rayon à l'entrepôt Kelbongoo (la base, revente normale).
-      if (daysLeft >= DLC_RAYON_MIN_DAYS) return { dest: 'rayon', navette: null, reason: `DLC large (${daysLeft} j) → remise en rayon à l'entrepôt Kelbongoo` };
-      // DLC courte (1 à 3 j) : si une navette ROB part avant la DLC → envoi ROB, sinon partage équipe.
+      if (dlc <= today) return { dest: 'partage', navette: null, reason: "DLC aujourd'hui ou dépassée → partage équipe" };
       const nav = lastNavetteBeforeDLC(dlcKey, now);
-      if (nav) return { dest: 'pribon', navette: nav, reason: `DLC courte (${daysLeft} j) → envoi ROB (navette ${nav.label})` };
-      return { dest: 'partage', navette: null, reason: `DLC courte (${daysLeft} j), pas de navette → partage équipe` };
+      if (nav) return { dest: 'pribon', navette: nav, reason: `Envoi ROB — navette ${nav.label}` };
+      return { dest: 'partage', navette: null, reason: 'Navette ROB déjà partie avant la DLC → partage équipe' };
     }
     // Le jour de DLC tombe-t-il aujourd'hui (par rapport à la journée active) ?
     function isDlcToday(dlcKey, refDayKey) {
@@ -1441,23 +1429,36 @@
     }
 
     // Besoin d'un produit manquant par local, à partir des COMMANDES retirées (V4 JSON).
-    // Pour chaque client qui avait ce produit en "removed" (manquant), on récupère SA quantité
-    // ET son casier (frais en priorité, sinon sec, sinon ND) → permet l'attribution automatique
-    // du dispatch dernière minute sur la fiche de chaque client concerné.
+    // Pour chaque client qui avait ce produit en "removed" (manquant prep), on récupère SA quantité.
+    // Cas SIGNALEMENT BAC ND (V9.1) : si le produit n'est PAS dans `removed` (extras arrivés en
+    // dernière minute), on retombe sur `items` — les clients qui l'ont commandé deviennent les
+    // candidats pour la redistribution. Sans ça, tout finit en bac ND.
     // Renvoie { [site]: { total, casiers:[{casier, qty}] } }
     function computeNeedFromOrders(manquant, orders, { excludeSites = [] } = {}) {
       const out = {};
       const targetId = manquant.id || null;
       const targetName = normalizeText(manquant.produit || '');
+      const targetNorm = dispatchNorm(manquant.produit || '');
+      // Matching robuste : ID, normalizeText (lowercase + sans accents), dispatchNorm (alphanumérique seul).
+      const matches = (r) => {
+        const sameId = targetId && r.id && r.id === targetId;
+        const sameName = !!targetName && normalizeText(r.produit || '') === targetName;
+        const sameNorm = !!targetNorm && dispatchNorm(r.produit || '') === targetNorm;
+        return sameId || sameName || sameNorm;
+      };
       for (const o of (orders || [])) {
         const site = (o.site || '').toUpperCase();
         if (!site || excludeSites.includes(site)) continue;
-        // quantité retirée (manquant) chez CE client pour CE produit
+        // 1) Priorité aux clients qui ont eu un manquant prep (vrai cas LM dispatch d'origine)
         let q = 0;
         for (const r of (o.removed || [])) {
-          const sameId = targetId && r.id && r.id === targetId;
-          const sameName = normalizeText(r.produit || '') === targetName;
-          if (sameId || sameName) q += (r.qty || 0);
+          if (matches(r)) q += (r.qty || 0);
+        }
+        // 2) Repli : clients qui ont commandé le produit normalement (cas signalement bac ND)
+        if (q === 0) {
+          for (const it of (o.items || [])) {
+            if (matches(it)) q += (it.qty || 0);
+          }
         }
         if (q <= 0) continue;
         // casier du client : frais d'abord, sinon sec, sinon bac ND
@@ -1658,13 +1659,12 @@
 
       doc.setTextColor(0,0,0);
 
-      // Stats globales — perte sèche = jeté + partage équipe (argent perdu).
-      // Pribon/ROB = envoi Montreuil (récupéré ailleurs, pas une perte sèche).
-      const seche = losses.filter(l => l.destination === 'jete' || l.destination === 'partage');
+      // Stats globales
+      const jete = losses.filter(l => l.destination === 'jete');
       const pribon = losses.filter(l => l.destination === 'pribon');
-      const totalSeche = seche.reduce((s, l) => s + (l.totalValue || 0), 0);
+      const totalJete = jete.reduce((s, l) => s + (l.totalValue || 0), 0);
       const totalPribon = pribon.reduce((s, l) => s + (l.totalValue || 0), 0);
-      const total = totalSeche + totalPribon;
+      const total = totalJete + totalPribon;
 
       doc.setFontSize(11);
       let y = 42;
@@ -1673,7 +1673,7 @@
       y += 6;
       doc.setFont(undefined, 'normal');
       doc.setFontSize(10);
-      doc.text(`Perte sèche (jeté + partage équipe) : ${seche.length} entrée${seche.length>1?'s':''} · ${totalSeche.toFixed(2)} €`, 14, y);
+      doc.text(`Pertes jetées : ${jete.length} entrée${jete.length>1?'s':''} · ${totalJete.toFixed(2)} €`, 14, y);
       y += 5;
       doc.text(`Envoyé à Pribon Montreuil (ROB) : ${pribon.length} entrée${pribon.length>1?'s':''} · ${totalPribon.toFixed(2)} €`, 14, y);
       y += 5;
@@ -1684,7 +1684,7 @@
       // Tableau des pertes
       const REASON_LABELS = {};
       LOSS_REASONS.forEach(r => REASON_LABELS[r.id] = r.label);
-      const DEST_LABELS = { jete: 'Jeté (sèche)', partage: 'Partage équipe (sèche)', pribon: 'Pribon ROB' };
+      const DEST_LABELS = { jete: 'Jeté', pribon: 'Pribon ROB' };
 
       const rows = losses.map(l => [
         formatDateShort(l.day),
@@ -2026,12 +2026,6 @@
       const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
       // Perte sèche (le produit ne survit pas jusqu'à la récup prépa, ou qualité) → garder pour soi
       const isPerteSeche = isRetourPdp && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
-      // Nom du produit sélectionné (pour le conseil fragilité FL en boutique)
-      const retourProdName = productKey.startsWith('FREE:') ? productKey.slice(5) : (productKey.split('|')[1] || '');
-      // Heuristique « fruit/légume fragile » (salade & co) : ne tient pas longtemps en boutique.
-      const isFragileFL = isRetourPdp && /salade|m[âa]che|roquette|mesclun|cresson|[ée]pinard|herbe|aromat|basilic|coriandre|persil|ciboulette|menthe|aneth|estragon|fraise|framboise|m[ûu]re|myrtille|groseille|champignon|pleurote|shiitake|fleur|pousse|blette|fenouil|radis botte/i.test(retourProdName);
-      // Nombre de jours avant la prochaine récup prépa sur ce local.
-      const daysToPickup = (nextDelivForSite) ? Math.round((new Date(nextDelivForSite + 'T00:00:00') - new Date(activeDay() + 'T00:00:00')) / 86400000) : null;
       const selectedOrder = orders.find(o => o.orderId === selectedKey);
       const toggle = (list, setList, id) => {
         if (list.includes(id)) setList(list.filter(x => x !== id));
@@ -2110,10 +2104,7 @@
           // jusqu'à la récup prépa → le distributeur garde pour lui), soit RETOUR PDP normal.
           if (isRetourPdp) {
             const qty = parseInt(retourQty, 10) || 1;
-            // Produit fragile (salade…) à DLC techniquement OK mais que le distributeur
-            // choisit de récupérer plutôt que renvoyer à PDP → traité comme perte sèche perso.
-            const keepFragile = !isPerteSeche && isFragileFL && perteRecupPerso;
-            if (isPerteSeche || keepFragile) {
+            if (isPerteSeche) {
               // Pas de retour PDP : on crée directement une perte sèche (jetée) côté distrib.
               // Apparaît dans le récap des pertes de la prépa (collection 'losses').
               await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
@@ -2133,9 +2124,7 @@
               });
               showToast(isQualityIssue
                 ? '⚠️ Perte sèche (qualité) — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi'
-                : (keepFragile
-                    ? '🥬 Produit fragile récupéré par toi — ajouté aux pertes prépa (pas de renvoi PDP)'
-                    : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi'));
+                : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi');
             } else {
               // Retour PDP normal : le produit tiendra jusqu'à la récup prépa.
               await storage.deleteDoc('losses', `lossret_${id}`);
@@ -2234,17 +2223,7 @@
                     </div>
                   ) : (
                     <div className="alert-info" style={{marginTop:8,fontSize:12}}>
-                      ✅ DLC OK → part en <strong>Retour PDP</strong>. La prépa le récupérera le {dayLabelShort(nextDelivForSite)}{daysToPickup!=null ? ` (dans ${daysToPickup} j)` : ''}.
-                      {isFragileFL && (
-                        <div style={{marginTop:6}}>
-                          🥬 Produit fragile (type salade) : il risque de ne pas tenir {daysToPickup!=null ? `${daysToPickup} j` : 'jusqu\'à la récup'} en boutique.
-                          Si tu le sens limite, <strong>récupère-le plutôt que de le renvoyer à PDP</strong> — coche ci-dessous.
-                          <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontWeight:600,marginTop:6}}>
-                            <input type="checkbox" checked={perteRecupPerso} onChange={e => setPerteRecupPerso(e.target.checked)} style={{width:16,height:16}} />
-                            Je le récupère personnellement (chez moi)
-                          </label>
-                        </div>
-                      )}
+                      ✅ DLC OK → part en <strong>Retour PDP</strong>. La prépa le récupérera le {dayLabelShort(nextDelivForSite)}.
                     </div>
                   )
                 )}
@@ -3724,27 +3703,17 @@
 
     // Saisie de quantité : garde un état chaîne (autorise le champ vide pendant la frappe),
     // ne se fait pas écraser par une MAJ externe tant que le champ a le focus.
-    function QtyInput({ value, onCommit, style, allowDecimal }) {
+    function QtyInput({ value, onCommit, style }) {
       const [str, setStr] = React.useState(value ? String(value) : '');
       const focused = React.useRef(false);
       React.useEffect(() => { if (!focused.current) setStr(value ? String(value) : ''); }, [value]);
       const handle = (raw) => {
-        if (allowDecimal) {
-          // chiffres + une seule virgule/point ; stocké avec un point
-          let s = String(raw).replace(/[^\d.,]/g, '').replace(',', '.');
-          const parts = s.split('.');
-          if (parts.length > 2) s = parts[0] + '.' + parts.slice(1).join('');
-          setStr(s);
-          const n = parseFloat(s);
-          onCommit(s === '' || isNaN(n) ? 0 : n);
-          return;
-        }
         const s = String(raw).replace(/[^\d]/g, '');
         setStr(s);
         onCommit(s === '' ? 0 : parseInt(s, 10));
       };
       return (
-        <input type={allowDecimal ? 'text' : 'number'} inputMode={allowDecimal ? 'decimal' : 'numeric'} min="0" value={str} placeholder="0"
+        <input type="number" inputMode="numeric" min="0" value={str} placeholder="0"
           onFocus={e=>{ focused.current = true; e.target.select(); }}
           onBlur={()=>{ focused.current = false; }}
           onChange={e=>handle(e.target.value)}
@@ -3978,7 +3947,7 @@
       }, [invDate]);
 
       const setQty = async (item, field, value) => {
-        const v = Math.max(0, parseFloat(value) || 0);
+        const v = Math.max(0, parseInt(value, 10) || 0);
         const prev = counts[item.key] || { colis: 0, mu: 0 };
         const next = { ...prev, [field]: v };
         await storage.setDoc(`fl_inventory_${invDate}`, item.key, {
@@ -4063,7 +4032,7 @@
       for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
       const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
 
-      const nbColis = Math.round(items.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0) * 100) / 100;
+      const nbColis = items.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
       const nbMu = items.reduce((t,it)=>t + ((counts[it.key]?.mu)||0), 0);
       const nbSaisis = items.filter(it => { const c = counts[it.key]; return c && (c.colis>0 || c.mu>0); }).length;
 
@@ -4111,7 +4080,7 @@
                         <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{it.produit}</div>
                         {it.uv && <div style={{color:'var(--ink-mute)',fontSize:11}}>{it.uv}</div>}
                       </div>
-                      <QtyInput value={c.colis ?? 0} allowDecimal onCommit={(v)=>setQty(it,'colis',v)}
+                      <QtyInput value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)}
                         style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
                       <QtyInput value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)}
                         style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
@@ -4122,287 +4091,6 @@
             </div>
           ))}
         </>
-      );
-    }
-
-    // ============================================================
-    // V9 — INVENTAIRE COMPLET / TOURNANT DEPUIS LE FICHIER DE STOCK
-    // Lit la liste Producteur / Produit du DERNIER fichier de stock (lecture
-    // seule, via le proxy → action 'stock_list'). On saisit le stock du soir
-    // (décimales OK) + éventuellement une DLC marquée « sensible ».
-    // Validation → action 'inv_write' : écrit dans un SHEET DÉDIÉ (un onglet
-    // par jour). La feuille de stock du site n'est JAMAIS modifiée.
-    // Les produits à DLC sensible alimentent le suivi 'dlc_sensibles'.
-    // ============================================================
-    const DLC_SENSIBLE_DAYS = 3; // DLC à ≤ 3 j = courte/sensible (alerte)
-
-    function daysUntil(dateKey) {
-      if (!dateKey) return null;
-      const d = new Date(dateKey + 'T00:00:00');
-      const t = new Date(); t.setHours(0,0,0,0);
-      return Math.round((d - t) / 86400000);
-    }
-
-    function StockInventoryPage({ session, invDate, mode }) {
-      const showToast = React.useContext(ToastContext);
-      const [items, setItems] = React.useState(null);   // [{key, producer, produit}]
-      const [src, setSrc] = React.useState(null);        // {fileName, lastUpdated}
-      const [counts, setCounts] = React.useState({});    // key -> {qty, dlc, sensible}
-      const [loading, setLoading] = React.useState(true);
-      const [err, setErr] = React.useState('');
-      const [search, setSearch] = React.useState('');
-      const [scope, setScope] = React.useState('');      // producteur (mode tournant)
-      const [validating, setValidating] = React.useState(false);
-      const [reporting, setReporting] = React.useState(false);
-      const [lastValidated, setLastValidated] = React.useState(null);
-
-      const load = React.useCallback(async () => {
-        setLoading(true); setErr('');
-        try {
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'stock_list', ts: Date.now() });
-          if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
-          const list = (data.items || []).map(it => ({
-            key: `${it.producer}__${it.produit}`, producer: it.producer, produit: it.produit,
-          }));
-          setItems(list);
-          setSrc({ fileName: data.fileName, lastUpdated: data.lastUpdated });
-        } catch (e) { setErr(e.message || String(e)); }
-        finally { setLoading(false); }
-      }, []);
-      React.useEffect(() => { load(); }, [load]);
-
-      React.useEffect(() => {
-        setCounts({});
-        const u = storage.subscribe(`stock_inv_${invDate}`, (arr) => {
-          const c = {}; for (const e of arr) { c[e.id] = { qty: e.qty || 0, dlc: e.dlc || '', sensible: !!e.sensible }; }
-          setCounts(c);
-        });
-        return () => { u && u(); };
-      }, [invDate]);
-
-      React.useEffect(() => {
-        setLastValidated(null);
-        (async () => { try { const m = await storage.getDoc('stock_inv_meta', invDate); if (m) setLastValidated(m); } catch(e){} })();
-      }, [invDate]);
-
-      const writeRow = async (item, patch) => {
-        const prev = counts[item.key] || { qty: 0, dlc: '', sensible: false };
-        const next = { ...prev, ...patch };
-        // une DLC ≤ seuil bascule automatiquement « sensible »
-        if (patch.dlc !== undefined) {
-          const dleft = daysUntil(patch.dlc);
-          if (patch.dlc && dleft != null && dleft <= DLC_SENSIBLE_DAYS) next.sensible = true;
-        }
-        await storage.setDoc(`stock_inv_${invDate}`, item.key, {
-          id: item.key, producer: item.producer, produit: item.produit,
-          qty: next.qty || 0, dlc: next.dlc || '', sensible: !!next.sensible,
-          countedBy: session.name, countedAt: new Date().toISOString(),
-        });
-      };
-
-      const producers = React.useMemo(() => {
-        if (!items) return [];
-        const s = new Set(); for (const it of items) s.add(it.producer);
-        return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
-      }, [items]);
-
-      const validate = async () => {
-        if (!items) return;
-        const saisis = items.filter(it => { const c = counts[it.key]; return c && (c.qty > 0 || c.dlc); });
-        if (!saisis.length) { showToast('Rien à valider'); return; }
-        if (!confirm(`Valider l'inventaire stock du ${invDate} ?\n\n${saisis.length} produit(s) seront écrits dans un onglet « ${invDate} » du sheet d'inventaire dédié.\nLa feuille de stock du site n'est PAS modifiée.`)) return;
-        setValidating(true);
-        try {
-          const payload = saisis.map(it => { const c = counts[it.key] || {}; return {
-            producer: it.producer, produit: it.produit, qty: c.qty || 0, dlc: c.dlc || '', sensible: !!c.sensible,
-          }; });
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'inv_write', day: invDate, items: payload });
-          if (!data.ok) { showToast('Erreur écriture : ' + (data.error || 'inconnue')); setValidating(false); return; }
-          // Les DLC sensibles alimentent le suivi (collection 'dlc_sensibles')
-          for (const it of saisis) {
-            const c = counts[it.key] || {};
-            if (c.sensible && c.dlc) {
-              await storage.setDoc('dlc_sensibles', it.key, {
-                id: it.key, producer: it.producer, produit: it.produit,
-                dlc: c.dlc, qty: c.qty || 0, status: 'open',
-                source: invDate, createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-              });
-            }
-          }
-          const meta = { date: invDate, validatedBy: session.name, validatedAt: new Date().toISOString(),
-            written: data.written || 0, url: data.url || '', tab: data.tab || invDate, total: items.length };
-          await storage.setDoc('stock_inv_meta', invDate, meta, { replace: true });
-          setLastValidated(meta);
-          showToast(`✓ Inventaire écrit : onglet « ${data.tab} » (${data.written} produit(s))`);
-        } catch (e) { showToast('Erreur réseau : ' + e.message); }
-        finally { setValidating(false); }
-      };
-
-      // ⚠️ Reporte l'inventaire dans la colonne « début de stock » du DERNIER
-      // fichier de stock (= la feuille du site). Geste explicite et confirmé.
-      const reportDebut = async () => {
-        if (!items) return;
-        const saisis = items.filter(it => (counts[it.key]?.qty || 0) > 0);
-        if (!saisis.length) { showToast('Rien à reporter (aucune quantité saisie)'); return; }
-        if (!confirm(`⚠️ ATTENTION — écriture sur le FICHIER DE STOCK DU SITE.\n\nReporter ${saisis.length} quantité(s) dans la colonne « début de stock » du dernier fichier de stock ?\n\nSeule cette colonne est écrite (lignes existantes). Aucune ligne ni autre colonne n'est modifiée.`)) return;
-        setReporting(true);
-        try {
-          const payload = saisis.map(it => ({ producer: it.producer, produit: it.produit, qty: counts[it.key]?.qty || 0 }));
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'stock_report', items: payload });
-          if (!data.ok) { showToast('Refus / erreur : ' + (data.error || 'inconnue')); setReporting(false); return; }
-          let msg = `✓ Reporté en début de stock : ${data.written} ligne(s) dans « ${data.fileName} »`;
-          if (data.notFound && data.notFound.length) msg += ` · ${data.notFound.length} non trouvée(s)`;
-          showToast(msg);
-        } catch (e) { showToast('Erreur réseau : ' + e.message); }
-        finally { setReporting(false); }
-      };
-
-      if (loading) return <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste depuis le dernier fichier de stock…</p></div>;
-      if (err) return (
-        <div className="alert-warning">
-          Impossible de charger la liste de stock : {err}<br/>
-          <span style={{fontSize:12}}>Vérifie que l'action <code>stock_list</code> est branchée dans le proxy (et redéployée en « Nouvelle version »).</span>
-        </div>
-      );
-      if (!items || !items.length) return <div className="alert-warning">Aucun produit trouvé dans le fichier de stock.</div>;
-
-      const q = normalizeText(search);
-      let filtered = items;
-      if (mode === 'tournant' && scope) filtered = filtered.filter(it => it.producer === scope);
-      if (q) filtered = filtered.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q));
-      const byProducer = {};
-      for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
-      const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
-      const nbSaisis = items.filter(it => { const c = counts[it.key]; return c && (c.qty > 0 || c.dlc); }).length;
-      const nbSensibles = items.filter(it => counts[it.key]?.sensible && counts[it.key]?.dlc).length;
-
-      return (
-        <>
-          {src && (
-            <div className="alert-info" style={{fontSize:12}}>
-              📄 Source : <strong>{src.fileName}</strong> · maj {src.lastUpdated ? new Date(src.lastUpdated).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'}) : '—'}
-              <br/><span style={{color:'var(--ink-mute)'}}>L'inventaire est écrit dans un sheet dédié (onglet par jour). La feuille de stock n'est jamais modifiée.</span>
-            </div>
-          )}
-          <div className="stat-grid">
-            <div className="stat"><div className="stat-value">{nbSaisis}/{items.length}</div><div className="stat-label">Produits saisis</div></div>
-            <div className="stat"><div className="stat-value">{nbSensibles}</div><div className="stat-label">DLC sensibles</div></div>
-          </div>
-
-          {mode === 'tournant' && (
-            <div className="card" style={{paddingBottom:10}}>
-              <select value={scope} onChange={e=>setScope(e.target.value)} style={{width:'100%',fontSize:15,padding:'8px'}}>
-                <option value="">— Choisir un producteur ({producers.length}) —</option>
-                {producers.map(pr => <option key={pr} value={pr}>{pr}</option>)}
-              </select>
-              {!scope && <div style={{fontSize:12,color:'var(--warn)',marginTop:6}}>Choisis un producteur pour démarrer.</div>}
-            </div>
-          )}
-
-          <div className="card" style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filtrer un produit ou producteur…" style={{flex:1,minWidth:160,fontSize:15,padding:'8px'}} />
-            <button className="btn-secondary" style={{fontSize:13}} disabled={loading} onClick={()=>load()}>🔄 Rafraîchir</button>
-            <button className="btn-primary" style={{fontSize:13}} disabled={validating} onClick={validate}>{validating ? 'Validation…' : '✅ Valider l\'inventaire'}</button>
-          </div>
-
-          <div className="card" style={{borderLeft:'3px solid var(--danger)'}}>
-            <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:8}}>
-              ⚠️ <strong>Report en début de stock</strong> — écrit l'inventaire dans la colonne « début de stock » du <strong>dernier fichier de stock du site</strong> (uniquement cette colonne). À faire une fois l'inventaire bien validé.
-            </div>
-            <button className="btn-secondary" style={{fontSize:13}} disabled={reporting} onClick={reportDebut}>
-              {reporting ? 'Report…' : '📥 Reporter en début de stock (fichier du site)'}
-            </button>
-          </div>
-
-          {lastValidated && (
-            <div className="alert-info" style={{borderLeft:'3px solid var(--ok,#2e7d32)',fontSize:13}}>
-              ✓ Validé le {new Date(lastValidated.validatedAt).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})} par {lastValidated.validatedBy} · onglet « {lastValidated.tab} » ({lastValidated.written} produit(s)).
-              {lastValidated.url && <span> · <a href={lastValidated.url} target="_blank" rel="noreferrer">ouvrir le sheet</a></span>}
-            </div>
-          )}
-
-          {(mode !== 'tournant' || scope) && producersSorted.map(prod => (
-            <div key={prod} className="card">
-              <h3 style={{marginBottom:8}}>{prod} · {byProducer[prod].length}</h3>
-              <div className="stack" style={{gap:6}}>
-                {byProducer[prod].map(it => {
-                  const c = counts[it.key] || {};
-                  const dleft = daysUntil(c.dlc);
-                  return (
-                    <div key={it.key} style={{borderTop:'1px solid var(--line)',paddingTop:6}}>
-                      <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-                        <div style={{flex:1,minWidth:140,fontSize:13,fontWeight:600}}>{it.produit}</div>
-                        <QtyInput value={c.qty ?? 0} allowDecimal onCommit={(v)=>writeRow(it,{qty:v})} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
-                      </div>
-                      <div style={{display:'flex',alignItems:'center',gap:8,marginTop:4,flexWrap:'wrap'}}>
-                        <label style={{fontSize:11,color:'var(--ink-mute)'}}>DLC</label>
-                        <input type="date" value={c.dlc || ''} onChange={e=>writeRow(it,{dlc:e.target.value})} style={{fontSize:13,padding:'4px'}} />
-                        {c.dlc && (
-                          <label style={{display:'flex',alignItems:'center',gap:4,fontSize:12,cursor:'pointer',fontWeight:c.sensible?700:400,color:c.sensible?'var(--danger)':'inherit'}}>
-                            <input type="checkbox" checked={!!c.sensible} onChange={e=>writeRow(it,{sensible:e.target.checked})} />
-                            🟠 sensible
-                          </label>
-                        )}
-                        {c.dlc && dleft != null && (
-                          <span style={{fontSize:11,color: dleft<=DLC_SENSIBLE_DAYS ? 'var(--danger)' : 'var(--ink-mute)'}}>
-                            {dleft < 0 ? `dépassée (${-dleft} j)` : dleft === 0 ? "aujourd'hui" : `dans ${dleft} j`}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-        </>
-      );
-    }
-
-    // ============================================================
-    // V9 — SUIVI DES DLC SENSIBLES (produits à DLC courte à traiter vite)
-    // Alimenté par l'inventaire stock. Trié par DLC. « Traité » → disparaît.
-    // Bandeau « check du matin » : DLC à ≤ DLC_SENSIBLE_DAYS jours.
-    // ============================================================
-    function DlcSensiblesPage({ session }) {
-      const showToast = React.useContext(ToastContext);
-      const [rows, setRows] = React.useState([]);
-      React.useEffect(() => {
-        const u = storage.subscribe('dlc_sensibles', setRows);
-        return () => { u && u(); };
-      }, []);
-
-      const open = rows.filter(r => r.status !== 'treated')
-        .sort((a,b)=>(a.dlc||'').localeCompare(b.dlc||''));
-      const urgent = open.filter(r => { const d = daysUntil(r.dlc); return d != null && d <= DLC_SENSIBLE_DAYS; });
-
-      const markTreated = async (r) => {
-        await storage.setDoc('dlc_sensibles', r.id, { status: 'treated', treatedBy: session.name, treatedAt: new Date().toISOString() });
-        showToast('✓ Traité');
-      };
-
-      return (
-        <div style={{marginTop:10}}>
-          <div className={urgent.length ? 'alert-warning' : 'alert-info'} style={{fontSize:13}}>
-            🟠 <strong>Check du matin — DLC sensibles.</strong> {open.length} produit(s) en suivi
-            {urgent.length ? <> · <strong style={{color:'var(--danger)'}}>{urgent.length} à traiter au plus vite (≤ {DLC_SENSIBLE_DAYS} j)</strong></> : ' · rien d\'urgent'}.
-          </div>
-          {open.length === 0 ? (
-            <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucune DLC sensible en cours. (Elles arrivent depuis l'inventaire stock.)</p>
-          ) : open.map(r => {
-            const dleft = daysUntil(r.dlc);
-            const danger = dleft != null && dleft <= DLC_SENSIBLE_DAYS;
-            return (
-              <div key={r.id} className="card" style={{borderLeft:`3px solid ${danger?'var(--danger)':'var(--warn,#e0a800)'}`,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-                <div style={{minWidth:0}}>
-                  <div style={{fontWeight:600,fontSize:14}}>{r.produit}{r.qty>1?` ×${r.qty}`:''}</div>
-                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>{r.producer} · DLC {formatDateShort(r.dlc)} · {dleft<0?`dépassée (${-dleft} j)`:dleft===0?"aujourd'hui":`dans ${dleft} j`}</div>
-                </div>
-                <button className="btn-primary" style={{padding:'6px 12px',fontSize:13,whiteSpace:'nowrap'}} onClick={()=>markTreated(r)}>✅ Traité</button>
-              </div>
-            );
-          })}
-        </div>
       );
     }
 
@@ -4419,8 +4107,7 @@
       const [pendingEan, setPendingEan] = React.useState(null);
       const [scannedIds, setScannedIds] = React.useState([]); // produits touchés dans la session de scan (plus récent en tête)
       const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
-      const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant' | 'fl' | 'stock' | 'dlc'
-      const [stockMode, setStockMode] = React.useState('complet'); // pour l'inventaire stock (sheet) : 'complet' | 'tournant'
+      const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
       const [scopeValue, setScopeValue] = React.useState(''); // producteur / type / famille sélectionné
       const [showLearn, setShowLearn] = React.useState(false); // section apprentissage des codes (temps du test)
@@ -4694,21 +4381,7 @@
                 onClick={()=>{ setInvType('fl'); saveMeta({type:'fl'}); }}>
                 🥬 Fruits & Légumes (soir)
               </div>
-              <div className={`chip ${invType==='stock'?'selected':''}`}
-                onClick={()=>{ setInvType('stock'); }}>
-                📦 Stock (sheet)
-              </div>
             </div>
-            {invType === 'stock' && (
-              <div>
-                <div className="filter-row" style={{marginBottom:6}}>
-                  <div className={`chip ${stockMode==='complet'?'selected':''}`} onClick={()=>setStockMode('complet')}>📦 Complet</div>
-                  <div className={`chip ${stockMode==='tournant'?'selected':''}`} onClick={()=>setStockMode('tournant')}>🔄 Tournant (par producteur)</div>
-                </div>
-                <div style={{fontSize:12,color:'var(--ink-mute)'}}>Liste lue dans le dernier fichier de stock. Saisie du stock du soir (décimales OK) + DLC sensible si besoin. Écrit dans un sheet dédié (onglet par jour) — jamais la feuille de stock.</div>
-              </div>
-            )}
-            {invType === 'dlc' && null}
             {invType === 'complet' && (
               <div style={{fontSize:12,color:'var(--ink-mute)'}}>Tout le catalogue. À faire au moins 1×/semaine — sert de référence.</div>
             )}
@@ -4757,8 +4430,6 @@
 
           {invType === 'fl' ? (
             <FLInventoryPage session={session} invDate={invDate} />
-          ) : invType === 'stock' ? (
-            <StockInventoryPage session={session} invDate={invDate} mode={stockMode} />
           ) : products.length === 0 ? (
             <div className="alert-warning">Aucun produit en mémoire. Charge d'abord le fichier produits dans Admin.</div>
           ) : (
@@ -5096,12 +4767,8 @@
                     <div key={c.id} className="list-item" style={{flexDirection:'column',alignItems:'stretch'}}>
                       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
                         <div className="list-item-main">
-                          <div className="list-item-name">{c.clientName || c.consumerName || c.consumer_name || '(client)'} · {c.nbPots||0} pot(s)</div>
-                          <div className="list-item-sub">
-                            {c.clientEmail ? <span>{c.clientEmail}</span> : null}
-                            {(c.remark || c.note) ? <span>{c.clientEmail ? ' · ' : ''}« {c.remark || c.note} »</span> : null}
-                            {!c.clientEmail && !(c.remark || c.note) ? (c.day || '') : null}
-                          </div>
+                          <div className="list-item-name">{c.consumerName || c.consumer_name || '(client)'} · {c.nbPots||0} pot(s)</div>
+                          <div className="list-item-sub">{c.note ? `« ${c.note} »` : (c.day || '')}</div>
                         </div>
                         {c.status && <span className="badge badge-info">{c.status}</span>}
                       </div>
@@ -7598,7 +7265,7 @@
                         {isRecovered && (
                           <>
                             <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{fontSize:12,marginBottom:6}}>
-                              💡 Conseil DLC : <strong>{route.dest==='rayon' ? 'Remettre en rayon (entrepôt)' : (route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB')}</strong>
+                              💡 Conseil DLC : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>
                               {route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}
                             </div>
                             {isTreated && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>✓ Traité : {RETURN_DESTINATIONS.find(d=>d.id===r.destination)?.label || r.destination} · {r.treatedBy}</div>}
@@ -7702,13 +7369,11 @@
       const weekLosses = losses.filter(l => l.day >= week.monday && l.day <= weekEnd);
       const allTimeLosses = losses;
 
-      // Perte sèche = jeté + partage équipe (argent perdu). Pribon/ROB à part.
-      const secheWeek = weekLosses.filter(l => l.destination === 'jete' || l.destination === 'partage');
+      const jeteWeek = weekLosses.filter(l => l.destination === 'jete');
       const pribonWeek = weekLosses.filter(l => l.destination === 'pribon');
-      const totalJete = secheWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
+      const totalJete = jeteWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
       const totalPribon = pribonWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
       const totalWeek = totalJete + totalPribon;
-      const jeteWeek = secheWeek; // alias conservé pour le reste du composant
 
       const handleDelete = async (id) => {
         if (!confirm('Supprimer cette entrée ?')) return;
@@ -7738,7 +7403,7 @@
             `Bonjour,\n\n` +
             `Rapport hebdomadaire des pertes en pièce jointe (déjà téléchargé sur ton ordinateur).\n\n` +
             `Récap :\n` +
-            `- Perte sèche (jeté + partage) : ${jeteWeek.length} entrées · ${totalJete.toFixed(2)} €\n` +
+            `- Jetées : ${jeteWeek.length} entrées · ${totalJete.toFixed(2)} €\n` +
             `- Envoyé Pribon ROB : ${pribonWeek.length} entrées · ${totalPribon.toFixed(2)} €\n` +
             `- TOTAL valorisé : ${totalWeek.toFixed(2)} €\n\n` +
             `Merci de joindre le PDF téléchargé.\n\n` +
@@ -7821,7 +7486,7 @@
 
           <div className="stat-grid">
             <div className="stat"><div className="stat-value">{weekLosses.length}</div><div className="stat-label">Cette semaine</div></div>
-            <div className="stat"><div className="stat-value" style={{color:'var(--danger)'}}>{totalJete.toFixed(0)}€</div><div className="stat-label">Perte sèche</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--danger)'}}>{totalJete.toFixed(0)}€</div><div className="stat-label">Jeté</div></div>
             <div className="stat"><div className="stat-value" style={{color:'var(--info)'}}>{totalPribon.toFixed(0)}€</div><div className="stat-label">Pribon ROB</div></div>
           </div>
 
@@ -7985,17 +7650,11 @@
               <label>DLC (optionnel — pour le conseil partage / ROB)</label>
               <input type="date" value={dlc} onChange={e => setDlc(e.target.value)} />
               {route && (
-                route.dest === 'rayon' ? (
-                  <div className="alert-warning" style={{marginTop:8,fontSize:12}}>
-                    💡 {route.reason}. Ce produit tient encore → <strong>remets-le en rayon</strong> plutôt que de le passer en perte.
-                  </div>
-                ) : (
-                  <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{marginTop:8,fontSize:12,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-                    <span>💡 Conseil : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>{route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}</span>
-                    <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12,whiteSpace:'nowrap'}}
-                      onClick={() => setDestination(route.dest === 'partage' ? 'partage' : 'pribon')}>Appliquer</button>
-                  </div>
-                )
+                <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{marginTop:8,fontSize:12,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                  <span>💡 Conseil : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>{route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}</span>
+                  <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12,whiteSpace:'nowrap'}}
+                    onClick={() => setDestination(route.dest === 'partage' ? 'partage' : 'pribon')}>Appliquer</button>
+                </div>
               )}
             </div>
 
@@ -8095,7 +7754,7 @@
             weeks.map(monday => {
               const items = byWeek[monday];
               const total = items.reduce((s,l) => s + (l.totalValue||0), 0);
-              const jete = items.filter(l => l.destination === 'jete' || l.destination === 'partage').reduce((s,l)=>s+(l.totalValue||0),0);
+              const jete = items.filter(l => l.destination === 'jete').reduce((s,l)=>s+(l.totalValue||0),0);
               const pribon = items.filter(l => l.destination === 'pribon').reduce((s,l)=>s+(l.totalValue||0),0);
               const isCurrent = monday === thisMonday;
               return (
@@ -8104,12 +7763,12 @@
                     Semaine du {formatDateShort(monday)} {isCurrent && '(en cours)'} · {items.length} entrée{items.length>1?'s':''} · <span style={{color:'var(--warn)'}}>{total.toFixed(2)} €</span>
                   </summary>
                   <div style={{fontSize:12,color:'var(--ink-soft)',margin:'6px 0'}}>
-                    Perte sèche : {jete.toFixed(2)} € · Pribon : {pribon.toFixed(2)} €
+                    Jetées : {jete.toFixed(2)} € · Pribon : {pribon.toFixed(2)} €
                   </div>
                   <div className="stack" style={{gap:3}}>
                     {items.sort((a,b)=>(a.day||'').localeCompare(b.day||'')).map(l => (
                       <div key={l.id} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'2px 0',borderBottom:'1px solid var(--border)'}}>
-                        <span>{formatDateShort(l.day)} · {l.produit || l.productName || l.product || '(produit)'} {l.destination==='pribon'?'♻️':'🗑️'}</span>
+                        <span>{formatDateShort(l.day)} · {l.produit || l.productName || l.product || '(produit)'} {l.destination==='jete'?'🗑️':'♻️'}</span>
                         <strong>{(l.totalValue||0).toFixed(2)} €</strong>
                       </div>
                     ))}
@@ -8938,7 +8597,6 @@
             {tab === 'prepdispatch' && <PrepDispatchPage session={session} />}
             {tab === 'pdpreturns' && <PdpReturnsPage session={session} catalogue={catalogue} />}
             {tab === 'losses' && <LossesPage session={session} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
-            {tab === 'dlcsensibles' && <DlcSensiblesPage session={session} />}
             {tab === 'inventory' && <InventoryPage session={session} />}
             {tab === 'admin' && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
             <div className="tab-bar">
@@ -8950,9 +8608,6 @@
               </button>
               <button className={tab==='losses'?'active':''} onClick={()=>setTab('losses')}>
                 <span className="tab-icon">🗑️</span>Pertes
-              </button>
-              <button className={tab==='dlcsensibles'?'active':''} onClick={()=>setTab('dlcsensibles')}>
-                <span className="tab-icon">🟠</span>DLC
               </button>
               <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
                 <span className="tab-icon">📋</span>Inventaire
@@ -9019,7 +8674,6 @@
           {tab === 'infos' && <InfosPage session={session} />}
           {tab === 'closure' && <ClosurePage session={session} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           {tab === 'inventory' && <InventoryPage session={session} />}
-          {tab === 'dlcsensibles' && <DlcSensiblesPage session={session} />}
           {tab === 'masterrecap' && session.isMaster && <MasterRecapPage session={session} consumersByEmail={consumersByEmail} />}
           {tab === 'casuivi' && session.isMaster && <CaSuiviPage session={session} />}
           {tab === 'stats' && session.isMaster && <StatsPage session={session} />}
@@ -9070,11 +8724,6 @@
             {session.isMaster && (
               <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
                 <span className="tab-icon">📋</span>Inventaire
-              </button>
-            )}
-            {session.isMaster && (
-              <button className={tab==='dlcsensibles'?'active':''} onClick={()=>setTab('dlcsensibles')}>
-                <span className="tab-icon">🟠</span>DLC
               </button>
             )}
             {session.isMaster && (
