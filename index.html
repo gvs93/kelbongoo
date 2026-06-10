@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V8</title>
+  <title>Kelbongoo — Distribution V9</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -467,7 +467,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V8';
+    const APP_VERSION = 'V9';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -2512,7 +2512,13 @@
         if (filter === 'not_passed' && passed) return false;
         if (search) {
           const s = normalizeText(search);
-          if (!normalizeText(displayName(o)).includes(s)) return false;
+          if (!s) return true;
+          // Match sur le nom du client OU sur les produits commandés (items)
+          // ou retirés (removed) — permet de retrouver « les clients qui ont une salade ».
+          const inName = normalizeText(displayName(o)).includes(s);
+          const inItems = (o.items || []).some(it => normalizeText(it.produit || '').includes(s));
+          const inRemoved = (o.removed || []).some(r => normalizeText(r.produit || '').includes(s));
+          if (!inName && !inItems && !inRemoved) return false;
         }
         return true;
       }).sort((a, b) => displayName(a).localeCompare(displayName(b)));
@@ -5395,8 +5401,17 @@
         await storage.setDoc(`day_${day}_manquants`, m.id, { ...m, reason, reasonNote: note ?? m.reasonNote ?? '' });
       };
       const deleteManquant = async (m) => {
-        if (!confirm('Retirer ce manquant ?')) return;
+        // V9 : un manquant peut avoir un dispatch dernière minute associé (day_X_lastminute) ;
+        // sans le supprimer aussi, il continuait à apparaître en bac ND côté distrib.
+        const linkedLm = (lastmin || []).filter(l => l.manquantId === m.id || l.id === m.id);
+        const msg = linkedLm.length > 0
+          ? 'Retirer ce manquant ET annuler son dispatch dernière minute ?'
+          : 'Retirer ce manquant ?';
+        if (!confirm(msg)) return;
         await storage.deleteDoc(`day_${day}_manquants`, m.id);
+        for (const l of linkedLm) {
+          try { await storage.deleteDoc(`day_${day}_lastminute`, l.id); } catch (e) {}
+        }
       };
 
       const withReason = manquants.filter(m => m.reason).length;
