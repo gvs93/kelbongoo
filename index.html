@@ -467,7 +467,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9';
+    const APP_VERSION = 'V9.4';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -631,6 +631,8 @@
     ];
     // Raisons qui signifient "le produit manque" → crée une entrée dans les manquants (dispatchable)
     const MANQUANT_REASONS = ["fin_saison", "rupture_appro", "non_livre", "bug_info", "surcommande"];
+    const _PREP_REASON_LABEL = {}; PREP_REASONS.forEach(r => { _PREP_REASON_LABEL[r.id] = r.label; });
+    function prepReasonLabel(id) { return id ? (_PREP_REASON_LABEL[id] || '') : ''; }
 
     // PERTES
     const MANAGER_EMAIL = "ga@pribon.org"; // ← Email du gérant
@@ -1005,18 +1007,21 @@
         for (const r of (o.removed || [])) {
           const pid = oid(r.producerproduct_id);
           const p = prodById[pid];
-          if (!aggManquants[pid]) aggManquants[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, bySite: {} };
+          if (!aggManquants[pid]) aggManquants[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, ca_cents: 0, bySite: {} };
           const qq = (r.quantity || 1);
           aggManquants[pid].qty += qq;
           aggManquants[pid].clients += 1;
+          aggManquants[pid].ca_cents += (r.consumer_price || 0) * qq;
           if (oSite) aggManquants[pid].bySite[oSite] = (aggManquants[pid].bySite[oSite] || 0) + qq;
         }
         for (const r of (o.reduced || [])) {
           const pid = oid(r.producerproduct_id);
           const p = prodById[pid];
-          if (!aggRemises[pid]) aggRemises[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, percentage: r.percentage };
-          aggRemises[pid].qty += (r.quantity || 1);
+          if (!aggRemises[pid]) aggRemises[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, percentage: r.percentage, ca_cents: 0 };
+          const rqq = (r.quantity || 1);
+          aggRemises[pid].qty += rqq;
           aggRemises[pid].clients += 1;
+          aggRemises[pid].ca_cents += Math.round((r.consumer_price || 0) * rqq * ((r.percentage || 0) / 100));
         }
 
         // Agrégation CA par site (en centimes TTC)
@@ -1081,12 +1086,14 @@
         remise: a.remise + (s.remise_cents || 0),
       }), { reel: 0, manquant: 0, remise: 0 });
     }
-    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source) {
+    function buildCaHistoryDoc(dateKey, caBySite, salesByProduct, ordersCount, source, manquantsByProduct, remisesByProduct) {
       return {
         date: dateKey,
         dow: new Date(dateKey + 'T12:00:00').getDay(), // 0=dim … 6=sam
         caBySite: caBySite || {},
         salesByProduct: (salesByProduct || []).slice(0, 300),
+        manquantsByProduct: (manquantsByProduct || []).slice(0, 400),
+        remisesByProduct: (remisesByProduct || []).slice(0, 400),
         totals: totalsFromCaBySite(caBySite),
         ordersCount: ordersCount || 0,
         source: source || 'daily',
@@ -1111,7 +1118,7 @@
         if (fromKey && dateKey < fromKey) continue;
         if (toKey && dateKey > toKey) continue;
 
-        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, ordersCount: 0 };
+        if (!byDate[dateKey]) byDate[dateKey] = { caBySite: {}, sales: {}, manq: {}, rem: {}, ordersCount: 0 };
         const b = byDate[dateKey];
         b.ordersCount++;
         const oSite = (o.locale || '').trim().toUpperCase();
@@ -1136,11 +1143,26 @@
         }
         if (oSite) {
           for (const r of (o.removed || [])) {
-            b.caBySite[oSite].manquant_cents += (r.consumer_price || 0) * (r.quantity || 1);
+            const qq = (r.quantity || 1);
+            b.caBySite[oSite].manquant_cents += (r.consumer_price || 0) * qq;
+            const pid = oid(r.producerproduct_id);
+            const p = prodById[pid];
+            if (!b.manq[pid]) b.manq[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, ca_cents: 0 };
+            b.manq[pid].qty += qq;
+            b.manq[pid].clients += 1;
+            b.manq[pid].ca_cents += (r.consumer_price || 0) * qq;
           }
           for (const r of (o.reduced || [])) {
-            const lineTTC = (r.consumer_price || 0) * (r.quantity || 1);
-            b.caBySite[oSite].remise_cents += Math.round(lineTTC * ((r.percentage || 0) / 100));
+            const qq = (r.quantity || 1);
+            const lineTTC = (r.consumer_price || 0) * qq;
+            const lost = Math.round(lineTTC * ((r.percentage || 0) / 100));
+            b.caBySite[oSite].remise_cents += lost;
+            const pid = oid(r.producerproduct_id);
+            const p = prodById[pid];
+            if (!b.rem[pid]) b.rem[pid] = { id: pid, produit: p ? p.name : '(produit inconnu)', producteur: p ? p.producer : '', qty: 0, clients: 0, percentage: r.percentage, ca_cents: 0 };
+            b.rem[pid].qty += qq;
+            b.rem[pid].clients += 1;
+            b.rem[pid].ca_cents += lost;
           }
         }
       }
@@ -1148,7 +1170,9 @@
       const docs = {};
       for (const [dateKey, b] of Object.entries(byDate)) {
         const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 300);
-        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk');
+        const manq = Object.values(b.manq).sort((a, z) => z.ca_cents - a.ca_cents);
+        const rem = Object.values(b.rem).sort((a, z) => z.ca_cents - a.ca_cents);
+        docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk', manq, rem);
       }
       return docs;
     }
@@ -8009,7 +8033,7 @@
           // Historique CA (1 doc/date) — alimente le tableau de bord Bilan
           await storage.setDoc(
             'ca_history', dayKey,
-            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily'),
+            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily', res.manquants, res.remises),
             { replace: true }
           );
           setActiveDay(dayKey);
@@ -8441,6 +8465,516 @@
     // ============================================================
     // APP ROOT
     // ============================================================
+    // ============================================================
+    // SURVEILLANCE DLC — check matinal des produits sensibles + priorisation paniers
+    // Collection Firebase : `dlc_watch` (NON liée à un jour : un produit suivi reste
+    // visible jusqu'à sa résolution écoulé/ROB/perte). N'interfère PAS avec la logique
+    // DLC existante (anomalies qualité, retours PDP, routeByDLC) : on la réutilise juste.
+    // ============================================================
+    function dlcDaysLeft(dlcKey, fromKey) {
+      if (!dlcKey) return null;
+      const a = new Date((fromKey || todayKey()) + 'T00:00:00');
+      const b = new Date(dlcKey + 'T00:00:00');
+      return Math.round((b - a) / 86400000);
+    }
+    // Niveau d'urgence selon les jours restants avant DLC (et la fenêtre d'alerte réglée).
+    function dlcWatchLevel(days, alertDays) {
+      if (days === null)  return { key:'none',  color:'var(--ink-mute)', soft:'var(--bg-muted)',   label:'DLC non renseignée', emoji:'⚪' };
+      if (days < 0)       return { key:'past',  color:'var(--danger)',   soft:'var(--danger-soft)', label:'DLC dépassée', emoji:'🔴' };
+      if (days === 0)     return { key:'today', color:'var(--danger)',   soft:'var(--danger-soft)', label:"DLC aujourd'hui", emoji:'🔴' };
+      if (days <= 2)      return { key:'crit',  color:'var(--danger)',   soft:'var(--danger-soft)', label:'Prioriser les paniers MAINTENANT', emoji:'🔴' };
+      if (days <= alertDays) return { key:'warn', color:'var(--warn)',   soft:'var(--warn-soft)',   label:'Anticiper — à pousser dans les paniers', emoji:'🟠' };
+      return { key:'ok', color:'var(--accent)', soft:'var(--accent-soft)', label:'Sous surveillance', emoji:'🟢' };
+    }
+
+    function DlcWatchForm({ products, session, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const [productKey, setProductKey] = React.useState('');
+      const [dlc, setDlc] = React.useState('');
+      const [qty, setQty] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const days = dlc ? dlcDaysLeft(dlc) : null;
+      const route = dlc ? routeByDLC(dlc) : null;
+
+      const submit = async () => {
+        if (!productKey) { showToast('Choisis un produit'); return; }
+        if (!dlc) { showToast('Indique la DLC'); return; }
+        const q = parseFloat(qty);
+        if (!q || q <= 0) { showToast('Indique la quantité'); return; }
+        let produit = productKey, producteur = '';
+        if (productKey.startsWith('FREE:')) { produit = productKey.slice(5); }
+        else { const [pr, pn] = productKey.split('|'); producteur = pr || ''; produit = pn || productKey; }
+        setBusy(true);
+        try {
+          const id = `dlcw_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+          const now = new Date().toISOString();
+          await storage.setDoc('dlc_watch', id, {
+            produit, producteur, dlc, qty: q, qtyInit: q,
+            status: 'watch',
+            createdBy: session.name, createdAt: now,
+            lastCheckAt: now, lastCheckBy: session.name,
+          });
+          showToast('✓ Ajouté à la surveillance DLC');
+          onClose();
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div className="card" style={{marginBottom:12, padding:'14px'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+            <strong style={{fontSize:14}}>Nouveau produit sensible</strong>
+            <button className="btn-ghost" style={{fontSize:12}} onClick={onClose}>Annuler</button>
+          </div>
+          <div style={{marginBottom:10}}>
+            <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>Produit</label>
+            <ProductPicker products={products} value={productKey} onChange={setProductKey} allowFreetext={true} />
+          </div>
+          <div style={{display:'flex',gap:10,marginBottom:10}}>
+            <div style={{flex:1}}>
+              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>DLC</label>
+              <input type="date" value={dlc} onChange={e=>setDlc(e.target.value)} />
+            </div>
+            <div style={{width:120}}>
+              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>Quantité</label>
+              <input type="number" min="0" step="1" value={qty} onChange={e=>setQty(e.target.value)} placeholder="paquets" />
+            </div>
+          </div>
+          {dlc && (
+            <div className="alert-info" style={{fontSize:12,marginBottom:10}}>
+              {days < 0 ? '🔴 DLC déjà dépassée.' : days === 0 ? "🔴 DLC aujourd'hui." : `${days} jour${days>1?'s':''} avant DLC.`}
+              {route && <> Si non écoulé : <strong>{route.dest==='partage'?'partage équipe (perte sèche)':route.dest==='pribon'?'envoi ROB':'—'}</strong>{route.navette?` — navette ${route.navette.label}`:''}.</>}
+            </div>
+          )}
+          <button className="btn-primary btn-block" disabled={busy} onClick={submit}>Ajouter à la surveillance</button>
+        </div>
+      );
+    }
+
+    function DlcWatchPage({ session, products }) {
+      const showToast = React.useContext(ToastContext);
+      const [items, setItems] = React.useState([]);
+      const [loaded, setLoaded] = React.useState(false);
+      const [showForm, setShowForm] = React.useState(false);
+      const [alertDays, setAlertDays] = React.useState(() => {
+        const v = parseInt(localStorage.getItem('kb_dlc_alertdays') || '4', 10);
+        return isNaN(v) ? 4 : v;
+      });
+
+      React.useEffect(() => {
+        const unsub = storage.subscribe('dlc_watch', (arr) => { setItems(arr); setLoaded(true); });
+        return () => { if (unsub) unsub(); };
+      }, []);
+
+      const setAlert = (n) => {
+        const v = Math.max(1, Math.min(14, n || 4));
+        setAlertDays(v);
+        try { localStorage.setItem('kb_dlc_alertdays', String(v)); } catch(e){}
+      };
+
+      const today = todayKey();
+      const active = items.filter(i => !i.status || i.status === 'watch');
+      const resolved = items.filter(i => i.status && i.status !== 'watch');
+
+      const enriched = active.map(i => {
+        const days = dlcDaysLeft(i.dlc, today);
+        const lvl = dlcWatchLevel(days, alertDays);
+        const route = i.dlc ? routeByDLC(i.dlc) : null;
+        const checkedToday = i.lastCheckAt && i.lastCheckAt.slice(0,10) === today;
+        return { ...i, days, lvl, route, checkedToday };
+      }).sort((a,b) => {
+        const da = a.days===null?999:a.days, db = b.days===null?999:b.days;
+        return da - db;
+      });
+
+      const needAttention = enriched.filter(i => i.days !== null && i.days <= alertDays);
+      const uncheckedToday = enriched.filter(i => !i.checkedToday);
+      const showMorningBanner = enriched.length > 0 && uncheckedToday.length > 0;
+
+      const markChecked = async (i) => {
+        await storage.setDoc('dlc_watch', i.id, { lastCheckAt: new Date().toISOString(), lastCheckBy: session.name });
+      };
+      const markAllChecked = async () => {
+        const now = new Date().toISOString();
+        for (const i of enriched) {
+          if (!i.checkedToday) await storage.setDoc('dlc_watch', i.id, { lastCheckAt: now, lastCheckBy: session.name });
+        }
+        showToast('✓ Check matinal enregistré');
+      };
+      const changeQty = async (i, delta) => {
+        const q = Math.max(0, (parseFloat(i.qty)||0) + delta);
+        await storage.setDoc('dlc_watch', i.id, { qty: q, lastCheckAt: new Date().toISOString(), lastCheckBy: session.name });
+      };
+      const setQty = async (i, val) => {
+        const q = Math.max(0, parseFloat(val)||0);
+        await storage.setDoc('dlc_watch', i.id, { qty: q });
+      };
+      const resolve = async (i, status) => {
+        await storage.setDoc('dlc_watch', i.id, { status, resolvedAt: new Date().toISOString(), resolvedBy: session.name });
+        const lbl = status==='done'?'écoulé ✅':status==='rob'?'parti ROB 🚚':'compté en perte 🗑️';
+        showToast(`${i.produit} → ${lbl}`);
+      };
+      const reopen = async (i) => { await storage.setDoc('dlc_watch', i.id, { status:'watch', resolvedAt:'', resolvedBy:'' }); };
+      const remove = async (i) => { await storage.deleteDoc('dlc_watch', i.id); };
+
+      return (
+        <div style={{marginTop:10}}>
+          {showMorningBanner && (
+            <div className="alert-warning" style={{marginBottom:10, display:'flex', flexDirection:'column', gap:8}}>
+              <div>🟠 <strong>Check DLC du matin</strong> — {uncheckedToday.length} produit{uncheckedToday.length>1?'s':''} pas encore vérifié{uncheckedToday.length>1?'s':''} aujourd'hui.{needAttention.length>0 && <> Dont <strong>{needAttention.length} à prioriser</strong> dans les paniers.</>}</div>
+              <button className="btn-primary" style={{padding:'8px 12px',fontSize:13}} onClick={markAllChecked}>✓ Tout vérifié ce matin</button>
+            </div>
+          )}
+
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,marginBottom:10}}>
+            <div style={{fontSize:12,color:'var(--ink-mute)',display:'flex',alignItems:'center',gap:6}}>
+              Alerte si DLC dans
+              <input type="number" min="1" max="14" value={alertDays} onChange={e=>setAlert(parseInt(e.target.value,10))} style={{width:54,padding:'4px 6px',fontSize:13}} />
+              j ou moins
+            </div>
+            <button className="btn-primary" style={{padding:'8px 14px',fontSize:13}} onClick={()=>setShowForm(s=>!s)}>+ Produit</button>
+          </div>
+
+          {showForm && <DlcWatchForm products={products} session={session} onClose={()=>setShowForm(false)} />}
+
+          <div className="stat-grid" style={{marginBottom:10}}>
+            <div className="stat"><div className="stat-value">{enriched.length}</div><div className="stat-label">En surveillance</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--warn)'}}>{needAttention.length}</div><div className="stat-label">À prioriser</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--accent)'}}>{enriched.length - uncheckedToday.length}</div><div className="stat-label">Vérifiés ce matin</div></div>
+          </div>
+
+          {!loaded ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p>
+           : enriched.length === 0 ? (
+             <div className="empty-state"><div className="icon">🟢</div><p>Aucun produit en surveillance DLC.<br/>Ajoute les produits sensibles repérés ce matin (poulet, poisson, frais…).</p></div>
+           ) : (
+             <div style={{display:'flex',flexDirection:'column',gap:8}}>
+               {enriched.map(i => {
+                 const r = i.route;
+                 const dl = i.dlc ? dlcDaysLeft(i.dlc) : null;
+                 return (
+                   <div key={i.id} className="card" style={{borderLeft:`4px solid ${i.lvl.color}`, padding:'12px 14px'}}>
+                     <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
+                       <div style={{minWidth:0}}>
+                         <div style={{fontWeight:700,fontSize:15}}>{i.produit}</div>
+                         {i.producteur && <div style={{fontSize:12,color:'var(--ink-mute)'}}>{i.producteur}</div>}
+                       </div>
+                       <span className="badge" style={{background:i.lvl.soft,color:i.lvl.color,whiteSpace:'nowrap',fontWeight:700}}>
+                         {i.lvl.emoji} {i.days===null?'DLC ?':i.days<0?`J+${-i.days}`:i.days===0?'Auj.':`J-${i.days}`}
+                       </span>
+                     </div>
+
+                     <div style={{fontSize:13,margin:'8px 0 6px',color:i.lvl.color,fontWeight:600}}>{i.lvl.label}</div>
+
+                     <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:8}}>
+                       DLC <strong>{i.dlc?formatDateShort(i.dlc):'—'}</strong>
+                       {dl!==null && <> · {dl>=0 ? `${dl} j restant${dl>1?'s':''}` : 'dépassée'}</>}
+                       {i.checkedToday && <> · <span style={{color:'var(--accent)'}}>✓ vérifié</span></>}
+                     </div>
+
+                     {r && i.days !== null && i.days <= alertDays && (
+                       <div className="alert-info" style={{fontSize:12,marginBottom:8}}>
+                         Si non écoulé : <strong>{r.dest==='partage'?'partage équipe (perte sèche)':r.dest==='pribon'?'envoi ROB':'—'}</strong>{r.navette?` — navette ${r.navette.label}`:''}. Pousse-le dans les paniers avant.
+                       </div>
+                     )}
+
+                     <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+                       <span style={{fontSize:12,color:'var(--ink-mute)'}}>Restant :</span>
+                       <button className="btn-secondary" style={{padding:'4px 10px',minWidth:36}} onClick={()=>changeQty(i,-1)}>−</button>
+                       <input type="number" min="0" value={i.qty} onChange={e=>setQty(i, e.target.value)} style={{width:64,padding:'4px 6px',textAlign:'center',fontSize:14,fontWeight:600}} />
+                       <button className="btn-secondary" style={{padding:'4px 10px',minWidth:36}} onClick={()=>changeQty(i,1)}>+</button>
+                       {i.qtyInit ? <span style={{fontSize:11,color:'var(--ink-mute)'}}>/ {i.qtyInit} au départ</span> : null}
+                     </div>
+
+                     <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                       {!i.checkedToday && <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px'}} onClick={()=>markChecked(i)}>✓ Vérifié</button>}
+                       <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',color:'var(--accent)'}} onClick={()=>resolve(i,'done')}>Écoulé ✅</button>
+                       <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',color:'var(--info)'}} onClick={()=>resolve(i,'rob')}>Parti ROB 🚚</button>
+                       <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',color:'var(--danger)'}} onClick={()=>resolve(i,'perte')}>Perte 🗑️</button>
+                       <button className="btn-ghost" style={{fontSize:12,padding:'6px 8px',color:'var(--ink-mute)'}} onClick={()=>remove(i)}>Suppr.</button>
+                     </div>
+                   </div>
+                 );
+               })}
+             </div>
+           )}
+
+          {resolved.length > 0 && (
+            <details style={{marginTop:14}}>
+              <summary style={{fontSize:13,color:'var(--ink-mute)',cursor:'pointer'}}>Historique résolu ({resolved.length})</summary>
+              <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:6}}>
+                {resolved.sort((a,b)=>(b.resolvedAt||'').localeCompare(a.resolvedAt||'')).map(i => (
+                  <div key={i.id} className="card-flat" style={{padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                    <div style={{minWidth:0,fontSize:13}}>
+                      <strong>{i.produit}</strong> <span style={{color:'var(--ink-mute)'}}>· {i.status==='done'?'écoulé':i.status==='rob'?'ROB':'perte'}{i.qty?` · ${i.qty} rest.`:''}</span>
+                    </div>
+                    <button className="btn-ghost" style={{fontSize:11,padding:'4px 8px'}} onClick={()=>reopen(i)}>Rouvrir</button>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // MAILS MANQUANTS 13h — l'appli DÉPOSE le lot du jour via le proxy Freshdesk
+    // (onglet Sheet MANQUANTS_OUTBOX). Un déclencheur Apps Script à 13h envoie ensuite
+    // chaque mail. Source : commandes du jour avec `removed[]` (client → manquants + email).
+    // Mode TEST (défaut) : les mails partent uniquement vers hg@pribon.org.
+    // ============================================================
+    function ManquantsMailPanel({ orders, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [open, setOpen] = React.useState(false);
+      const [testMode, setTestMode] = React.useState(true);
+      const [busy, setBusy] = React.useState(false);
+      const [status, setStatus] = React.useState(null);
+      const day = activeDay();
+
+      React.useEffect(() => {
+        const unsub = storage.subscribe('manquants_outbox', (arr) => {
+          setStatus(arr.find(x => x.id === day) || null);
+        });
+        return () => { if (unsub) unsub(); };
+      }, [day]);
+
+      const recipients = React.useMemo(() => {
+        return (orders || [])
+          .filter(o => o.email && (o.removed || []).length > 0)
+          .map(o => ({
+            email: o.email,
+            name: o.name || o.email,
+            site: o.site || '',
+            items: (o.removed || []).map(r => ({ produit: r.produit, qty: r.qty || 1, reason: prepReasonLabel(r.reason) })),
+          }));
+      }, [orders]);
+
+      const totalProducts = recipients.reduce((s, r) => s + r.items.reduce((a, i) => a + (i.qty || 1), 0), 0);
+
+      const stage = async () => {
+        if (recipients.length === 0) { showToast('Aucun manquant client aujourd\'hui'); return; }
+        setBusy(true);
+        try {
+          const data = await freshdeskPost({
+            secret: FRESHDESK_SECRET, action: 'manquants_stage',
+            date: day, testMode: !!testMode, recipients,
+          });
+          if (data && data.ok === false) throw new Error(data.error || 'refus proxy');
+          await storage.setDoc('manquants_outbox', day, {
+            staged: true, at: new Date().toISOString(), by: session.name,
+            count: recipients.length, products: totalProducts, testMode: !!testMode,
+          }, { replace: true });
+          showToast(testMode ? '✓ Programmé en TEST (13h → toi seul)' : '✓ Programmé — envoi auto à 13h');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      const cancel = async () => {
+        setBusy(true);
+        try {
+          await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'manquants_cancel', date: day });
+          await storage.deleteDoc('manquants_outbox', day);
+          showToast('Envoi 13h annulé');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div className="card" style={{padding:'12px 14px', marginBottom:12, borderLeft:'4px solid var(--prep)'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+            <strong style={{fontSize:14}}>📧 Mails manquants — envoi auto 13h</strong>
+            <span className="badge" style={{background:'var(--prep-soft)',color:'var(--prep)',whiteSpace:'nowrap'}}>
+              {recipients.length} client{recipients.length>1?'s':''} · {totalProducts} art.
+            </span>
+          </div>
+
+          {status && status.staged ? (
+            <div className="alert-success" style={{marginTop:10,fontSize:13,display:'flex',flexDirection:'column',gap:8}}>
+              <div>
+                ✅ <strong>Programmé pour 13h</strong> — {status.count} client{status.count>1?'s':''}
+                {' '}<span className="badge" style={{background: status.testMode?'var(--warn-soft)':'var(--accent-soft)', color: status.testMode?'var(--warn)':'var(--accent-dark)'}}>{status.testMode?'TEST':'LIVE'}</span>
+                {status.by && <span style={{color:'var(--ink-mute)'}}> · par {status.by}</span>}
+              </div>
+              {status.testMode && <div style={{fontSize:12,color:'var(--warn)'}}>⚠️ Mode TEST : les mails partiront uniquement vers hg@pribon.org.</div>}
+              <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',alignSelf:'flex-start'}} disabled={busy} onClick={cancel}>Annuler l'envoi 13h</button>
+            </div>
+          ) : (
+            <>
+              <div style={{display:'flex',alignItems:'center',gap:8,margin:'10px 0'}}>
+                <label style={{fontSize:13,display:'flex',alignItems:'center',gap:6,cursor:'pointer'}}>
+                  <input type="checkbox" checked={testMode} onChange={e=>setTestMode(e.target.checked)} style={{width:'auto'}} />
+                  Mode TEST (envoi à moi seul)
+                </label>
+              </div>
+              <button className="btn-primary" style={{fontSize:13,padding:'8px 14px'}} disabled={busy || recipients.length===0} onClick={stage}>
+                {testMode ? 'Programmer l\'envoi 13h (TEST)' : 'Programmer l\'envoi 13h — VRAIS CLIENTS'}
+              </button>
+              {recipients.length===0 && <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>Aucun manquant client pour la distribution du jour.</p>}
+            </>
+          )}
+
+          {recipients.length>0 && (
+            <details style={{marginTop:10}} open={open} onToggle={e=>setOpen(e.target.open)}>
+              <summary style={{fontSize:12,color:'var(--ink-mute)',cursor:'pointer'}}>Aperçu des destinataires ({recipients.length})</summary>
+              <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:6,maxHeight:240,overflowY:'auto'}}>
+                {recipients.map((r,idx) => (
+                  <div key={idx} className="card-flat" style={{padding:'6px 10px',fontSize:12}}>
+                    <div style={{fontWeight:600}}>{r.name} <span style={{color:'var(--ink-mute)',fontWeight:400}}>· {r.site} · {r.email}</span></div>
+                    <div style={{color:'var(--ink-mute)'}}>{r.items.map(i=>i.produit+(i.qty>1?` ×${i.qty}`:'')+(i.reason?` (${i.reason})`:'')).join(', ')}</div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // MASTER — MANQUANTS & REMISES (historique jour par jour, perte HT/TTC)
+    // Lit `ca_history`. Montant par produit dispo pour les jours alimentés en V9.3+
+    // (réimporte l'historique CA pour backfiller le détail produit des jours anciens).
+    // HT estimé à un taux TVA uniforme (pas de TVA par produit dans les données).
+    // ============================================================
+    function ManquantsHistoryPage({ session }) {
+      const [docs, setDocs] = React.useState(null);
+      const [range, setRange] = React.useState('30');   // '7' | '30' | '90' | 'all'
+      const [mode, setMode] = React.useState('day');    // 'day' | 'product'
+      const [vat, setVat] = React.useState(5.5);
+      const [openDay, setOpenDay] = React.useState(null);
+
+      React.useEffect(() => {
+        let alive = true;
+        storage.getAll('ca_history').then(arr => { if (alive) setDocs(arr || []); });
+        return () => { alive = false; };
+      }, []);
+
+      const eur = (cents) => (((cents || 0) / 100)).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+      const ht = (cents) => Math.round((cents || 0) / (1 + vat / 100));
+
+      const filtered = React.useMemo(() => {
+        if (!docs) return [];
+        let list = docs.filter(d => d && d.date);
+        if (range !== 'all') {
+          const lim = new Date(); lim.setDate(lim.getDate() - parseInt(range, 10));
+          const limKey = `${lim.getFullYear()}-${String(lim.getMonth()+1).padStart(2,'0')}-${String(lim.getDate()).padStart(2,'0')}`;
+          list = list.filter(d => d.date >= limKey);
+        }
+        return list.sort((a, b) => b.date.localeCompare(a.date));
+      }, [docs, range]);
+
+      const totals = React.useMemo(() => {
+        return filtered.reduce((a, d) => {
+          a.manquant += (d.totals && d.totals.manquant) || 0;
+          a.remise += (d.totals && d.totals.remise) || 0;
+          return a;
+        }, { manquant: 0, remise: 0 });
+      }, [filtered]);
+
+      const byProduct = React.useMemo(() => {
+        const m = {};
+        for (const d of filtered) {
+          for (const p of (d.manquantsByProduct || [])) {
+            if (!m[p.id]) m[p.id] = { ...p, qty: 0, clients: 0, ca_cents: 0, kind: 'manquant' };
+            m[p.id].qty += p.qty || 0; m[p.id].clients += p.clients || 0; m[p.id].ca_cents += p.ca_cents || 0;
+          }
+        }
+        return Object.values(m).sort((a, z) => z.ca_cents - a.ca_cents);
+      }, [filtered]);
+
+      const dowName = (key) => {
+        try { return new Date(key + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long' }); } catch (e) { return ''; }
+      };
+      const dayHasDetail = (d) => (d.manquantsByProduct && d.manquantsByProduct.length) || (d.remisesByProduct && d.remisesByProduct.length);
+
+      return (
+        <div style={{marginTop:10}}>
+          <h2 style={{fontSize:18,margin:'0 0 4px'}}>💸 Manquants & Remises</h2>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0}}>Perte générée par les manquants (produits retirés) et les remises, jour par jour. HT estimé.</p>
+
+          <div style={{display:'flex',flexWrap:'wrap',gap:6,margin:'10px 0'}}>
+            {[['7','7 j'],['30','30 j'],['90','90 j'],['all','Tout']].map(([v,l]) => (
+              <div key={v} className={`chip ${range===v?'selected':''}`} onClick={()=>setRange(v)}>{l}</div>
+            ))}
+            <div style={{flex:1}} />
+            <div className={`chip ${mode==='day'?'selected':''}`} onClick={()=>setMode('day')}>📅 Par jour</div>
+            <div className={`chip ${mode==='product'?'selected':''}`} onClick={()=>setMode('product')}>📦 Par produit</div>
+          </div>
+
+          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:10,fontSize:12,color:'var(--ink-mute)'}}>
+            TVA pour le HT :
+            {[5.5, 10, 20].map(r => (
+              <div key={r} className={`chip ${vat===r?'selected':''}`} style={{padding:'2px 10px'}} onClick={()=>setVat(r)}>{r}%</div>
+            ))}
+          </div>
+
+          <div className="stat-grid" style={{marginBottom:12}}>
+            <div className="stat"><div className="stat-value" style={{color:'var(--danger)'}}>{eur(totals.manquant)}</div><div className="stat-label">Manquants TTC</div></div>
+            <div className="stat"><div className="stat-value">{eur(ht(totals.manquant))}</div><div className="stat-label">Manquants HT</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--warn)'}}>{eur(totals.remise)}</div><div className="stat-label">Remises TTC</div></div>
+            <div className="stat"><div className="stat-value">{eur(totals.manquant + totals.remise)}</div><div className="stat-label">Perte totale TTC</div></div>
+          </div>
+
+          {docs === null ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p>
+           : filtered.length === 0 ? <div className="empty-state"><div className="icon">📭</div><p>Aucune donnée sur la période.</p></div>
+           : mode === 'product' ? (
+             <div style={{display:'flex',flexDirection:'column',gap:6}}>
+               {byProduct.length === 0 ? <p style={{fontSize:12,color:'var(--ink-mute)'}}>Détail produit indisponible sur cette période (réimporte l'historique CA pour le backfiller).</p>
+                : byProduct.map(p => (
+                 <div key={p.id} className="card-flat" style={{padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                   <div style={{minWidth:0}}>
+                     <div style={{fontWeight:600,fontSize:13,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.produit}</div>
+                     <div style={{fontSize:11,color:'var(--ink-mute)'}}>{p.producteur} · {p.qty} unité{p.qty>1?'s':''} · {p.clients} client{p.clients>1?'s':''}</div>
+                   </div>
+                   <div style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                     <div style={{fontWeight:700,fontSize:13,color:'var(--danger)'}}>{eur(p.ca_cents)}</div>
+                     <div style={{fontSize:11,color:'var(--ink-mute)'}}>{eur(ht(p.ca_cents))} HT</div>
+                   </div>
+                 </div>
+               ))}
+             </div>
+           ) : (
+             <div style={{display:'flex',flexDirection:'column',gap:8}}>
+               {filtered.map(d => {
+                 const isOpen = openDay === d.date;
+                 const m = (d.totals && d.totals.manquant) || 0;
+                 const rem = (d.totals && d.totals.remise) || 0;
+                 return (
+                   <div key={d.date} className="card" style={{padding:'10px 12px'}}>
+                     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,cursor: dayHasDetail(d)?'pointer':'default'}} onClick={()=> dayHasDetail(d) && setOpenDay(isOpen?null:d.date)}>
+                       <div>
+                         <div style={{fontWeight:700,fontSize:14,textTransform:'capitalize'}}>{dowName(d.date)} {formatDateShort(d.date)}</div>
+                         <div style={{fontSize:11,color:'var(--ink-mute)'}}>{d.ordersCount||0} commandes{dayHasDetail(d) ? ` · ${(d.manquantsByProduct||[]).length} produits manquants` : ''}</div>
+                       </div>
+                       <div style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                         <div style={{fontWeight:700,fontSize:14,color:'var(--danger)'}}>{eur(m + rem)}</div>
+                         <div style={{fontSize:11,color:'var(--ink-mute)'}}>{eur(ht(m + rem))} HT</div>
+                       </div>
+                     </div>
+                     <div style={{display:'flex',gap:14,marginTop:6,fontSize:12}}>
+                       <span>Manquants : <strong style={{color:'var(--danger)'}}>{eur(m)}</strong> <span style={{color:'var(--ink-mute)'}}>({eur(ht(m))} HT)</span></span>
+                       {rem>0 && <span>Remises : <strong style={{color:'var(--warn)'}}>{eur(rem)}</strong></span>}
+                     </div>
+
+                     {isOpen && dayHasDetail(d) && (
+                       <div style={{marginTop:10,borderTop:'1px solid var(--line)',paddingTop:8,display:'flex',flexDirection:'column',gap:4}}>
+                         {(d.manquantsByProduct||[]).sort((a,z)=>(z.ca_cents||0)-(a.ca_cents||0)).map(p => (
+                           <div key={p.id} style={{display:'flex',justifyContent:'space-between',fontSize:12,gap:8}}>
+                             <span style={{minWidth:0,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.produit} <span style={{color:'var(--ink-mute)'}}>×{p.qty}</span></span>
+                             <span style={{whiteSpace:'nowrap'}}>{eur(p.ca_cents)} <span style={{color:'var(--ink-mute)'}}>· {eur(ht(p.ca_cents))} HT</span></span>
+                           </div>
+                         ))}
+                       </div>
+                     )}
+                   </div>
+                 );
+               })}
+             </div>
+           )}
+        </div>
+      );
+    }
+
     function App() {
       const [session, setSession] = React.useState(() => {
         const saved = sessionStorage.getItem('kb_session_v2');
@@ -8632,8 +9166,9 @@
               <button className="btn-ghost" onClick={handleLogout} style={{fontSize:13}}>Sortir</button>
             </div>
             {tab === 'prep' && <PrepPage session={session} products={products} dispatchData={dispatchData} />}
-            {tab === 'prepdispatch' && <PrepDispatchPage session={session} />}
+            {tab === 'prepdispatch' && <><ManquantsMailPanel orders={orders} session={session} /><PrepDispatchPage session={session} /></>}
             {tab === 'pdpreturns' && <PdpReturnsPage session={session} catalogue={catalogue} />}
+            {tab === 'dlcwatch' && <DlcWatchPage session={session} products={products} />}
             {tab === 'losses' && <LossesPage session={session} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
             {tab === 'inventory' && <InventoryPage session={session} />}
             {tab === 'admin' && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
@@ -8643,6 +9178,9 @@
               </button>
               <button className={tab==='pdpreturns'?'active':''} onClick={()=>setTab('pdpreturns')}>
                 <span className="tab-icon">↩️</span>Retours PDP
+              </button>
+              <button className={tab==='dlcwatch'?'active':''} onClick={()=>setTab('dlcwatch')}>
+                <span className="tab-icon">🟠</span>DLC
               </button>
               <button className={tab==='losses'?'active':''} onClick={()=>setTab('losses')}>
                 <span className="tab-icon">🗑️</span>Pertes
@@ -8711,9 +9249,9 @@
           {tab === 'followup' && <FollowUpPage session={session} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
           {tab === 'infos' && <InfosPage session={session} />}
           {tab === 'closure' && <ClosurePage session={session} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
-          {tab === 'inventory' && <InventoryPage session={session} />}
           {tab === 'masterrecap' && session.isMaster && <MasterRecapPage session={session} consumersByEmail={consumersByEmail} />}
           {tab === 'casuivi' && session.isMaster && <CaSuiviPage session={session} />}
+          {tab === 'manqhist' && session.isMaster && <ManquantsHistoryPage session={session} />}
           {tab === 'stats' && session.isMaster && <StatsPage session={session} />}
           {tab === 'admin' && session.isMaster && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
@@ -8760,8 +9298,8 @@
               </button>
             )}
             {session.isMaster && (
-              <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
-                <span className="tab-icon">📋</span>Inventaire
+              <button className={tab==='manqhist'?'active':''} onClick={()=>setTab('manqhist')}>
+                <span className="tab-icon">💸</span>Manq.&Rem.
               </button>
             )}
             {session.isMaster && (
