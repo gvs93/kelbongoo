@@ -647,6 +647,9 @@
     const FRESHDESK_PROXY_URL = "https://script.google.com/macros/s/AKfycbzCe9N3pn0fBcW-FiTBp-e_TYIIRr0xL29AaVloScbu7S6Exim-ErtQvpgtJmwapLU_6w/exec";
     const FRESHDESK_SECRET = "Lesmailspartent!"; // doit correspondre au SHARED_SECRET du script
 
+    // PROXY FL / PROBON (inventaire FL, stock, import Probon, mails) — script dédié
+    const FL_PROXY_URL = "https://script.google.com/macros/s/AKfycbyVvvafumNfLZ7RzseUvoHaghPK7c-_7KqthgtV_VY9ulXe7sJIYEclWnratDbBJeDd/exec";
+
     // Envoie au proxy Freshdesk et renvoie la réponse JSON. Si la réponse n'est pas du JSON
     // (typiquement une page de login HTML → déploiement pas en accès « Tout le monde »),
     // lève une erreur lisible avec le début de la réponse pour faciliter le diagnostic.
@@ -658,6 +661,17 @@
       } catch (e) {
         const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
         throw new Error(`réponse non-JSON (déploiement en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
+      }
+    }
+
+    // Même logique que freshdeskPost mais vers le proxy FL/Probon dédié.
+    async function flPost(payload) {
+      const res = await fetch(FL_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
+      const text = await res.text();
+      try { return JSON.parse(text); }
+      catch (e) {
+        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
+        throw new Error(`réponse non-JSON (proxy FL en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
       }
     }
 
@@ -3929,57 +3943,64 @@
     }
 
     // ============================================================
-    // INVENTAIRE FRUITS & LÉGUMES (soir / Rungis)
-    // Lit l'onglet "INVENTAIRE DU JOUR PDP" du Google Sheet (producteur / produit / uv,
-    // alimentés par TON lien depuis l'ancienne S10 renommée), et saisit 2 quantités par produit :
-    //   - Colis en stock (cagettes)  → colonne "stock colis"
-    //   - Stock Mu (sachets préparés) → colonne "stock mu"
-    // À la validation, SEULES ces 2 colonnes sont écrites, ligne par ligne (jamais d'ajout
-    // de ligne, jamais d'écriture sur les autres colonnes → les formules restent intactes).
+    // INVENTAIRE FRUITS & LÉGUMES — lit la liste FL du nouveau Sheet
+    // (onglet « FL SITE KBG »). Seuls les produits ACTIFS sont saisissables.
+    // 2 quantités par produit : Stock Cagette (colis) + Stock Mu (sachets µ).
+    // À la validation : écrit STOCK MU + STOCK CAGETTE (cellule par cellule,
+    // formules préservées) via l'action proxy fl_write_stock.
+    // Une section « Produits inactifs » permet de retrouver et saisir un
+    // produit même inactif ; toute quantité saisie sur un inactif déclenche
+    // un mail d'alerte à Raimbaud (rr@pribon.org).
     // ============================================================
-    const FL_SHEET_ID = '1euOgP9n0j_F0XH_kOfb_jFLWkcYy7-Cg6WcTrihPLRI';
-    const FL_SHEET_TAB = 'INVENTAIRE DU JOUR PDP';
+    const FL_SHEET_ID = '1ggJBwtwXUYwLq4bKvlDarCBTm2jCFFGx4c3y24tvYYQ';
+    const FL_SHEET_TAB = 'UNIQUEMENT STOCK A REMPLIR PAR PDP';
 
-    // Parseur CSV minimal robuste (gère les champs entre guillemets contenant des virgules)
     function FLInventoryPage({ session, invDate }) {
       const showToast = React.useContext(ToastContext);
-      const [items, setItems] = React.useState(null);   // [{key, producer, produit, uv}]
-      const [counts, setCounts] = React.useState({});    // key -> {colis, mu}
+      const [items, setItems] = React.useState(null);          // actifs
+      const [inactiveItems, setInactiveItems] = React.useState([]); // inactifs (recherche)
+      const [counts, setCounts] = React.useState({});
       const [loading, setLoading] = React.useState(true);
       const [err, setErr] = React.useState('');
       const [search, setSearch] = React.useState('');
+      const [sortMode, setSortMode] = React.useState('fournisseur'); // 'fournisseur' | 'alpha'
       const [validating, setValidating] = React.useState(false);
       const [lastValidated, setLastValidated] = React.useState(null);
+      const [showInactive, setShowInactive] = React.useState(false);
+      const [inactiveSearch, setInactiveSearch] = React.useState('');
+      const [addedInactive, setAddedInactive] = React.useState({}); // key -> item
+      const alertedRef = React.useRef({});
 
-      // Charge la liste FL depuis l'onglet S10 via le proxy Apps Script.
-      // Extrait dans un useCallback pour pouvoir rafraîchir à la demande.
       const loadFL = React.useCallback(async () => {
         setLoading(true); setErr('');
         try {
-          // ts = anti-cache, force une lecture fraîche du Sheet à chaque appel
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
           if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
           const rows = data.rows || [];
           if (!rows.length) throw new Error('Feuille vide');
           const header = rows[0].map(h => String(h || '').trim().toLowerCase());
-          const idxProd = header.findIndex(h => h === 'producteur');
-          const idxName = header.findIndex(h => h === 'produit');
-          const idxCol  = header.findIndex(h => h === 'col');
-          const idxUv   = header.findIndex(h => h === 'uv');
-          const list = [];
+          const find = (aliases) => { for (const a of aliases) { const i = header.indexOf(a); if (i >= 0) return i; } return -1; };
+          const iProd = find(['producteur']);
+          const iName = find(['designation site kelbongoo','désignation site kelbongoo','produit','designation']);
+          const iUv   = find(['unite de vente','unité de vente','uv']);
+          const iType = find(['type']);
+          const iAct  = find(['actif ?','actif','actif?']);
+          const iCode = find(['code interne probon','code probon','code']);
+          const actifs = [], inactifs = [];
           for (let r = 1; r < rows.length; r++) {
             const row = rows[r];
-            const producer = String(row[idxProd] || '').trim();
-            const produit = String(row[idxName] || '').trim();
-            // Un produit est dans la liste dès qu'il a une ligne (producteur + produit).
-            // Quand le responsable FL retire un produit, il supprime la ligne → il disparaît ici.
+            const producer = String(row[iProd] || '').trim();
+            const produit  = String((iName >= 0 ? row[iName] : '') || '').trim();
             if (!producer || !produit) continue;
-            const colRaw = String(idxCol >= 0 ? row[idxCol] : '').replace(',', '.').trim();
-            const col = parseFloat(colRaw);
-            const uv = String(idxUv >= 0 ? (row[idxUv] || '') : '').trim();
-            list.push({ key: `${producer}__${produit}`, producer, produit, uv, col: isFinite(col) ? col : '' });
+            const uv   = String((iUv   >= 0 ? row[iUv]   : '') || '').trim();
+            const type = String((iType >= 0 ? row[iType] : '') || '').trim();
+            const code = String((iCode >= 0 ? row[iCode] : '') || '').trim();
+            const actRaw = iAct >= 0 ? String(row[iAct] || '').trim().toLowerCase() : '';
+            const isActive = iAct < 0 ? true : (actRaw === '' ? true : (actRaw.indexOf('non') !== 0 && actRaw !== 'inactif'));
+            const it = { key: `${producer}__${produit}`, producer, produit, uv, type, code, actif: isActive };
+            (isActive ? actifs : inactifs).push(it);
           }
-          setItems(list);
+          setItems(actifs); setInactiveItems(inactifs);
         } catch (e) {
           setErr(e.message || String(e));
         } finally {
@@ -3989,7 +4010,6 @@
 
       React.useEffect(() => { loadFL(); }, [loadFL]);
 
-      // Comptages de la date (collection séparée fl_inventory_<date>)
       React.useEffect(() => {
         setCounts({});
         const u = storage.subscribe(`fl_inventory_${invDate}`, (arr) => {
@@ -3998,6 +4018,15 @@
         });
         return () => { u && u(); };
       }, [invDate]);
+
+      // Liste de saisie = actifs + inactifs explicitement ajoutés
+      const entryItems = React.useMemo(() => {
+        const base = items || [];
+        const extra = Object.keys(addedInactive).map(k => addedInactive[k]);
+        const seen = {}, all = [];
+        for (const it of base.concat(extra)) { if (!seen[it.key]) { seen[it.key] = 1; all.push(it); } }
+        return all;
+      }, [items, addedInactive]);
 
       const setQty = async (item, field, value) => {
         const v = Math.max(0, parseInt(value, 10) || 0);
@@ -4008,14 +4037,28 @@
           colis: next.colis || 0, mu: next.mu || 0,
           countedBy: session.name, countedAt: new Date().toISOString(),
         });
+        // Alerte stock inactif → Raimbaud (une seule fois par produit / session)
+        if (item.actif === false && v > 0 && !alertedRef.current[item.key]) {
+          alertedRef.current[item.key] = true;
+          try {
+            await flPost({ secret: FRESHDESK_SECRET, action: 'mail_inactive_stock',
+              items: [{ producer: item.producer, produit: item.produit, colis: next.colis || 0, mu: next.mu || 0 }] });
+            showToast('⚠️ Produit inactif en stock — Raimbaud a été prévenu');
+          } catch (e) { showToast('Produit inactif noté (mail non parti : ' + e.message + ')'); }
+        }
+      };
+
+      const addInactive = (it) => {
+        setAddedInactive(prev => ({ ...prev, [it.key]: Object.assign({}, it, { actif: false }) }));
+        showToast(`« ${it.produit} » ajouté à la saisie (inactif)`);
       };
 
       const exportCSV = () => {
-        if (!items) return;
-        const lines = [['Producteur','Produit','UV','Colis en stock','Stock Mu']];
-        for (const it of items) {
+        if (!entryItems.length) return;
+        const lines = [['Producteur','Produit','UV','Actif','Colis en stock','Stock Mu']];
+        for (const it of entryItems) {
           const c = counts[it.key] || {};
-          lines.push([it.producer, it.produit, it.uv, c.colis ?? '', c.mu ?? '']);
+          lines.push([it.producer, it.produit, it.uv, it.actif ? 'Actif' : 'Inactif', c.colis ?? '', c.mu ?? '']);
         }
         const csv = lines.map(r => r.map(v => {
           const s = String(v ?? '');
@@ -4029,34 +4072,31 @@
         URL.revokeObjectURL(a.href);
       };
 
-      // Charge l'éventuel instantané déjà validé pour cette date
       React.useEffect(() => {
         setLastValidated(null);
         (async () => {
           try {
             const meta = await storage.getDoc('fl_inventory_meta', invDate);
             if (meta) setLastValidated(meta);
-          } catch(e){}
+          } catch (e) {}
         })();
       }, [invDate]);
 
-      // Validation : écrit dans le Sheet (via proxy) + fige un instantané daté
       const validate = async () => {
-        if (!items) return;
-        const payloadItems = items.map(it => {
+        if (!entryItems.length) return;
+        const payloadItems = entryItems.map(it => {
           const c = counts[it.key] || {};
           return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: c.mu || 0 };
         });
-        if (!confirm(`Valider l'inventaire FL du ${invDate} ?\n\nLes quantités (stock colis + stock mu) seront écrites dans l'onglet « ${FL_SHEET_TAB} » et l'inventaire sera archivé.`)) return;
+        if (!confirm(`Valider l'inventaire FL du ${invDate} ?\n\nLes quantités (stock colis + stock mu) seront écrites dans l'onglet « ${FL_SHEET_TAB} ».`)) return;
         setValidating(true);
         try {
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fl_write', tab: FL_SHEET_TAB, items: payloadItems });
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_write_stock', tab: FL_SHEET_TAB, items: payloadItems });
           if (!data.ok) { showToast('Erreur écriture Sheet : ' + (data.error || 'inconnue')); setValidating(false); return; }
-          // Instantané daté (consultable en master)
           const meta = {
             date: invDate, validatedBy: session.name, validatedAt: new Date().toISOString(),
             written: data.written || 0, notFound: (data.notFound || []).length,
-            nbColis, nbMu, nbSaisis, total: items.length,
+            nbColis, nbMu, nbSaisis, total: entryItems.length,
           };
           await storage.setDoc('fl_inventory_meta', invDate, meta, { replace: true });
           setLastValidated(meta);
@@ -4070,79 +4110,127 @@
         }
       };
 
-      if (loading) return <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste FL depuis le Sheet…</p></div>;
+      if (loading) return <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste FL…</p></div>;
       if (err) return (
         <div className="alert-warning">
           Impossible de charger l'onglet « {FL_SHEET_TAB} » : {err}<br/>
-          <span style={{fontSize:12}}>Vérifie que le proxy Apps Script est déployé (accès « Tout le monde »), que l'action <code>fl_read</code> y est branchée, et que l'onglet s'appelle bien « {FL_SHEET_TAB} ».</span>
+          <span style={{fontSize:12}}>Vérifie que le proxy lit bien le Sheet <code>{FL_SHEET_ID}</code>, onglet « {FL_SHEET_TAB} », avec l'action <code>fl_read</code>.</span>
         </div>
       );
-      if (!items || items.length === 0) return <div className="alert-warning">Aucune ligne trouvée dans l'onglet « {FL_SHEET_TAB} » (il faut au moins une colonne « producteur » et « produit » remplies).</div>;
+      if (!items || items.length === 0) return <div className="alert-warning">Aucun produit FL actif trouvé dans « {FL_SHEET_TAB} ».</div>;
 
       const q = normalizeText(search);
-      const filtered = q ? items.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q)) : items;
-      const byProducer = {};
-      for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
-      const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
+      const filtered = (q ? entryItems.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q)) : entryItems);
 
-      const nbColis = items.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
-      const nbMu = items.reduce((t,it)=>t + ((counts[it.key]?.mu)||0), 0);
-      const nbSaisis = items.filter(it => { const c = counts[it.key]; return c && (c.colis>0 || c.mu>0); }).length;
+      const nbColis = entryItems.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
+      const nbMu = entryItems.reduce((t,it)=>t + ((counts[it.key]?.mu)||0), 0);
+      const nbSaisis = entryItems.filter(it => { const c = counts[it.key]; return c && (c.colis>0 || c.mu>0); }).length;
+
+      const renderRow = (it) => {
+        const c = counts[it.key] || {};
+        return (
+          <div key={it.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 4px',borderBottom:'1px solid var(--border)',background: it.actif===false ? 'rgba(242,130,63,0.08)' : 'transparent'}}>
+            <div style={{fontSize:13,minWidth:0,flex:1}}>
+              <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                {it.actif===false && <span title="Inactif" style={{color:'var(--warn,#F2823F)'}}>🔒 </span>}{it.produit}
+              </div>
+              <div style={{color:'var(--ink-mute)',fontSize:11}}>
+                {sortMode==='alpha' && <span>{it.producer}{it.uv?' · ':''}</span>}{it.uv}
+              </div>
+            </div>
+            <QtyInput value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+            <QtyInput value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+          </div>
+        );
+      };
+
+      // tri / regroupement
+      let body;
+      if (sortMode === 'fournisseur') {
+        const byProducer = {};
+        for (const it of filtered) { (byProducer[it.producer] = byProducer[it.producer] || []).push(it); }
+        const producersSorted = Object.keys(byProducer).sort((a,b)=>a.localeCompare(b,'fr'));
+        body = producersSorted.map(prod => (
+          <div key={prod} className="card">
+            <h3 style={{marginBottom:8}}>{prod} · {byProducer[prod].length}</h3>
+            <div style={{display:'flex',fontSize:11,color:'var(--ink-mute)',gap:8,padding:'0 4px 4px',justifyContent:'flex-end'}}>
+              <span style={{width:70,textAlign:'center'}}>Colis</span><span style={{width:70,textAlign:'center'}}>Sachets µ</span>
+            </div>
+            <div className="stack" style={{gap:4}}>
+              {byProducer[prod].slice().sort((a,b)=>a.produit.localeCompare(b.produit,'fr')).map(renderRow)}
+            </div>
+          </div>
+        ));
+      } else {
+        const flat = filtered.slice().sort((a,b)=>a.produit.localeCompare(b.produit,'fr'));
+        body = (
+          <div className="card">
+            <div style={{display:'flex',fontSize:11,color:'var(--ink-mute)',gap:8,padding:'0 4px 4px',justifyContent:'flex-end'}}>
+              <span style={{width:70,textAlign:'center'}}>Colis</span><span style={{width:70,textAlign:'center'}}>Sachets µ</span>
+            </div>
+            <div className="stack" style={{gap:4}}>{flat.map(renderRow)}</div>
+          </div>
+        );
+      }
+
+      const qi = normalizeText(inactiveSearch);
+      const inactiveFiltered = qi ? inactiveItems.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(qi)) : [];
 
       return (
         <>
           <div className="stat-grid">
-            <div className="stat"><div className="stat-value">{nbSaisis}/{items.length}</div><div className="stat-label">Produits saisis</div></div>
+            <div className="stat"><div className="stat-value">{nbSaisis}/{entryItems.length}</div><div className="stat-label">Produits saisis</div></div>
             <div className="stat"><div className="stat-value">{nbColis}</div><div className="stat-label">Colis (cagettes)</div></div>
             <div className="stat"><div className="stat-value">{nbMu}</div><div className="stat-label">Sachets µ</div></div>
           </div>
 
           <div className="card" style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filtrer un produit ou producteur…"
-              style={{flex:1,minWidth:160,fontSize:15,padding:'8px'}} />
-            <button className="btn-secondary" style={{fontSize:13}} disabled={loading} onClick={() => loadFL()}>
-              {loading ? '⏳…' : '🔄 Rafraîchir'}
-            </button>
-            <button className="btn-secondary" style={{fontSize:13}} onClick={exportCSV}>⬇️ Exporter CSV</button>
-            <button className="btn-primary" style={{fontSize:13}} disabled={validating} onClick={validate}>
-              {validating ? 'Validation…' : '✅ Valider l\'inventaire'}
-            </button>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher un produit ou producteur…" style={{flex:1,minWidth:160,fontSize:15,padding:'8px'}} />
+            <div className="role-tabs" style={{display:'flex',gap:4}}>
+              <div className={`chip ${sortMode==='fournisseur'?'selected':''}`} onClick={()=>setSortMode('fournisseur')}>🧺 Fournisseur</div>
+              <div className={`chip ${sortMode==='alpha'?'selected':''}`} onClick={()=>setSortMode('alpha')}>🔤 A→Z</div>
+            </div>
+            <button className="btn-secondary" style={{fontSize:13}} disabled={loading} onClick={() => loadFL()}>{loading ? '⏳…' : '🔄'}</button>
+            <button className="btn-secondary" style={{fontSize:13}} onClick={exportCSV}>⬇️ CSV</button>
+            <button className="btn-primary" style={{fontSize:13}} disabled={validating} onClick={validate}>{validating ? 'Validation…' : '✅ Valider'}</button>
           </div>
 
           {lastValidated && (
             <div className="alert-info" style={{borderLeft:'3px solid var(--ok, #2e7d32)',fontSize:13}}>
-              ✓ Inventaire validé le {new Date(lastValidated.validatedAt).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})} par {lastValidated.validatedBy} · {lastValidated.written} ligne(s) écrites dans le Sheet.
-              {lastValidated.notFound > 0 && <span> ({lastValidated.notFound} produit(s) non trouvé(s) dans « {FL_SHEET_TAB} »)</span>}
-              <br/><span style={{fontSize:12,color:'var(--ink-mute)'}}>Tu peux re-saisir et re-valider : ça réécrit le Sheet.</span>
+              ✓ Validé le {new Date(lastValidated.validatedAt).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})} par {lastValidated.validatedBy} · {lastValidated.written} ligne(s) écrites.
+              {lastValidated.notFound > 0 && <span> ({lastValidated.notFound} non trouvée(s))</span>}
             </div>
           )}
 
-          {producersSorted.map(prod => (
-            <div key={prod} className="card">
-              <h3 style={{marginBottom:8}}>{prod} · {byProducer[prod].length}</h3>
-              <div style={{display:'flex',fontSize:11,color:'var(--ink-mute)',gap:8,padding:'0 4px 4px',justifyContent:'flex-end'}}>
-                <span style={{width:70,textAlign:'center'}}>Colis</span>
-                <span style={{width:70,textAlign:'center'}}>Sachets µ</span>
-              </div>
-              <div className="stack" style={{gap:4}}>
-                {byProducer[prod].sort((a,b)=>a.produit.localeCompare(b.produit,'fr')).map(it => {
-                  const c = counts[it.key] || {};
-                  return (
+          {body}
+
+          <div className="card">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer'}} onClick={()=>setShowInactive(s=>!s)}>
+              <div style={{fontWeight:600}}>🔒 Produits inactifs <span style={{fontWeight:400,fontSize:12,color:'var(--ink-mute)'}}>({inactiveItems.length})</span></div>
+              <span style={{color:'var(--ink-mute)'}}>{showInactive ? '▲' : '▼'}</span>
+            </div>
+            {showInactive && (
+              <div style={{marginTop:8}}>
+                <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0}}>Recherche un produit inactif pour le saisir quand même. Toute quantité saisie alerte Raimbaud.</p>
+                <input value={inactiveSearch} onChange={e=>setInactiveSearch(e.target.value)} placeholder="Rechercher un produit inactif…" style={{width:'100%',fontSize:15,padding:'8px',marginBottom:8}} />
+                {!qi && <p style={{fontSize:12,color:'var(--ink-mute)'}}>Tape un nom de produit pour l'afficher.</p>}
+                {qi && inactiveFiltered.length===0 && <p style={{fontSize:12,color:'var(--ink-mute)'}}>Aucun produit inactif ne correspond.</p>}
+                <div className="stack" style={{gap:4}}>
+                  {inactiveFiltered.map(it => (
                     <div key={it.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 4px',borderBottom:'1px solid var(--border)'}}>
                       <div style={{fontSize:13,minWidth:0,flex:1}}>
-                        <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{it.produit}</div>
-                        {it.uv && <div style={{color:'var(--ink-mute)',fontSize:11}}>{it.uv}</div>}
+                        <div style={{fontWeight:600}}>{it.produit}</div>
+                        <div style={{color:'var(--ink-mute)',fontSize:11}}>{it.producer}{it.uv?' · '+it.uv:''}</div>
                       </div>
-                      <QtyInput value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)}
-                        style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
-                      <QtyInput value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)}
-                        style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+                      {addedInactive[it.key]
+                        ? <span style={{fontSize:12,color:'var(--ok,#2e7d32)'}}>✓ ajouté</span>
+                        : <button className="btn-secondary" style={{fontSize:13}} onClick={()=>addInactive(it)}>➕ Ajouter</button>}
                     </div>
-                  );
-                })}
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
+            )}
+          </div>
         </>
       );
     }
