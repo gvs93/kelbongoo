@@ -7,6 +7,7 @@
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
@@ -3952,8 +3953,8 @@
     // produit même inactif ; toute quantité saisie sur un inactif déclenche
     // un mail d'alerte à Raimbaud (rr@pribon.org).
     // ============================================================
-    const FL_SHEET_ID = '1ggJBwtwXUYwLq4bKvlDarCBTm2jCFFGx4c3y24tvYYQ';
-    const FL_SHEET_TAB = 'UNIQUEMENT STOCK A REMPLIR PAR PDP';
+    const FL_SHEET_ID = '1PXQU4QP_bh_sRCEHonrMM7FkWmJWtNPyxDBPPRBlNVQ';
+    const FL_SHEET_TAB = 'UNIQUEMENT STOCK A REMPLIR PAR PDP ';
 
     function FLInventoryPage({ session, invDate }) {
       const showToast = React.useContext(ToastContext);
@@ -7932,6 +7933,175 @@
     }
 
     // ============================================================
+
+    // ============================================================
+    // CHARGEMENT PROBON FL (admin + master)
+    // Lit un fichier Excel Probon (colonnes CODE/DESIGNATION/COL/UV/PRIX PRO),
+    // appelle probon_import côté proxy, affiche :
+    //   - recap produits MAJ
+    //   - codes manquants → bouton mail à Probon
+    //   - correspondances à confirmer (produits actifs sans code)
+    // ============================================================
+    function ProbonImportCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [file, setFile] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [result, setResult] = React.useState(null);
+      const [sendingMail, setSendingMail] = React.useState(false);
+      const [lastImport, setLastImport] = React.useState(null);
+
+      React.useEffect(() => {
+        (async () => {
+          try { const m = await storage.getDoc('probon_import_meta','last'); if (m) setLastImport(m); } catch(e) {}
+        })();
+      }, []);
+
+      const parseXlsx = (file) => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+            if (!raw.length) { reject(new Error('Fichier vide')); return; }
+            // Trouve les indices des colonnes attendues (insensible à la casse/accents)
+            const norm = s => String(s||'').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ');
+            const header = raw[0].map(norm);
+            const find = (...aliases) => { for (const a of aliases) { const i = header.indexOf(norm(a)); if (i >= 0) return i; } return -1; };
+            const iCode = find('code','ref','reference');
+            const iDes  = find('designation','désignation','nom','produit','libelle','libellé','nom-fr');
+            const iCol  = find('col','colisage','colis');
+            const iUv   = find('uv','unite','unité','unite de vente','unité de vente');
+            const iPrix = find('prix pro','prix achat','prixpro','prix ht','prixht','prix');
+            if (iCode < 0) { reject(new Error('Colonne CODE introuvable (header: ' + raw[0].join(' | ') + ')')); return; }
+            const rows = [];
+            for (let r = 1; r < raw.length; r++) {
+              const row = raw[r];
+              const code = String(row[iCode] || '').trim();
+              if (!code) continue;
+              rows.push({
+                code,
+                designation: iDes  >= 0 ? String(row[iDes]  || '').trim() : '',
+                col:         iCol  >= 0 ? row[iCol]  : '',
+                uv:          iUv   >= 0 ? String(row[iUv]   || '').trim() : '',
+                prixHt:      iPrix >= 0 ? row[iPrix] : '',
+              });
+            }
+            if (!rows.length) { reject(new Error('Aucune ligne produit trouvée')); return; }
+            resolve(rows);
+          } catch(e) { reject(e); }
+        };
+        reader.onerror = () => reject(new Error('Erreur lecture fichier'));
+        reader.readAsArrayBuffer(file);
+      });
+
+      const handleImport = async () => {
+        if (!file) return;
+        setBusy(true); setResult(null);
+        try {
+          const rows = await parseXlsx(file);
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'probon_import', rows });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          setResult(data);
+          const meta = { at: new Date().toISOString(), by: session.name, file: file.name,
+            updated: data.updated, deactivated: data.deactivated,
+            missingCodes: data.missingCodes||[], unmatchedSite: data.unmatchedSite||[] };
+          await storage.setDoc('probon_import_meta', 'last', meta, { replace: true });
+          setLastImport(meta);
+          showToast(`✓ Probon chargé : ${data.updated} MAJ · ${data.deactivated} désactivé(s)`);
+        } catch(e) {
+          showToast('Erreur : ' + e.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const sendMailProbon = async () => {
+        if (!result || !result.missingCodes || !result.missingCodes.length) return;
+        setSendingMail(true);
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'mail_probon_missing', codes: result.missingCodes });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          showToast(`✉️ Mail envoyé à Probon (${data.sent} code(s) manquant(s))`);
+        } catch(e) {
+          showToast('Erreur envoi mail : ' + e.message);
+        } finally {
+          setSendingMail(false);
+        }
+      };
+
+      const missing  = result?.missingCodes   || [];
+      const unmatched= result?.unmatchedSite  || [];
+
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--brand,#4A7C59)'}}>
+          <h3 style={{marginBottom:4}}>🥬 Chargement fichier Probon FL</h3>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginBottom:10}}>
+            À charger <strong>2 fois par semaine</strong>. Met à jour colisage / UV / prix achat,
+            et désactive automatiquement tout produit absent du fichier.
+          </p>
+          {lastImport && (
+            <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:10,padding:'6px 8px',background:'var(--surface-alt,#f5f5f5)',borderRadius:6}}>
+              Dernier chargement : <strong>{new Date(lastImport.at).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})}</strong>
+              {' '}par {lastImport.by} · {lastImport.file} · {lastImport.updated} MAJ · {lastImport.deactivated} désactivé(s)
+              {lastImport.missingCodes?.length > 0 && <span style={{color:'var(--warn,#F2823F)'}}> · {lastImport.missingCodes.length} code(s) manquant(s)</span>}
+            </div>
+          )}
+          <label className={`upload-zone ${file ? 'has-file' : ''}`}>
+            <input type="file" accept=".xlsx,.xls" onChange={e => { setFile(e.target.files[0]); setResult(null); }} />
+            <div className="upload-icon">{file ? '✓' : '📂'}</div>
+            <div style={{fontWeight:500,fontSize:13}}>{file ? file.name : 'Choisir le fichier Excel Probon (.xlsx)'}</div>
+          </label>
+          <button className="btn-primary btn-block" disabled={busy || !file} onClick={handleImport} style={{marginTop:10}}>
+            {busy ? '⏳ Chargement…' : '📥 Charger et mettre à jour'}
+          </button>
+
+          {result && (
+            <div style={{marginTop:12}}>
+              <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:8}}>
+                <span style={{padding:'4px 10px',borderRadius:99,background:'#d6e8d5',fontSize:12,fontWeight:600}}>✓ {result.updated} produit(s) MAJ</span>
+                {result.deactivated > 0 && <span style={{padding:'4px 10px',borderRadius:99,background:'#fce4d6',fontSize:12,fontWeight:600}}>⛔ {result.deactivated} désactivé(s)</span>}
+                {missing.length > 0 && <span style={{padding:'4px 10px',borderRadius:99,background:'#fff2cc',fontSize:12,fontWeight:600}}>⚠️ {missing.length} code(s) manquant(s)</span>}
+                {unmatched.length > 0 && <span style={{padding:'4px 10px',borderRadius:99,background:'#dce6f1',fontSize:12,fontWeight:600}}>❓ {unmatched.length} sans code</span>}
+              </div>
+
+              {missing.length > 0 && (
+                <div style={{background:'#fffbe6',border:'1px solid #ffe58f',borderRadius:6,padding:10,marginBottom:8}}>
+                  <div style={{fontWeight:600,fontSize:13,marginBottom:6}}>⚠️ Codes présents sur le site mais absents du fichier Probon (désactivés automatiquement)</div>
+                  <div style={{fontSize:12,maxHeight:140,overflowY:'auto'}}>
+                    {missing.map((c,i) => (
+                      <div key={i} style={{padding:'2px 0',borderBottom:'1px solid #f0e68c'}}>
+                        <strong>{c.code}</strong> — {c.produit}{c.producer ? <span style={{color:'var(--ink-mute)'}}> ({c.producer})</span> : ''}
+                      </div>
+                    ))}
+                  </div>
+                  <button className="btn-secondary" style={{marginTop:8,fontSize:13}} disabled={sendingMail} onClick={sendMailProbon}>
+                    {sendingMail ? 'Envoi…' : '✉️ Envoyer la liste à Probon (st@pribon.org)'}
+                  </button>
+                </div>
+              )}
+
+              {unmatched.length > 0 && (
+                <div style={{background:'#f0f4f8',border:'1px solid #b8cce4',borderRadius:6,padding:10}}>
+                  <div style={{fontWeight:600,fontSize:13,marginBottom:6}}>❓ Produits actifs sur le site SANS code Probon (à renseigner dans le sheet)</div>
+                  <div style={{fontSize:12,maxHeight:120,overflowY:'auto'}}>
+                    {unmatched.map((u,i) => (
+                      <div key={i} style={{padding:'2px 0',borderBottom:'1px solid #cdd8e3'}}>
+                        {u.produit}{u.producer ? <span style={{color:'var(--ink-mute)'}}> — {u.producer}</span> : ''}
+                      </div>
+                    ))}
+                  </div>
+                  <p style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>
+                    Renseigne la colonne « CODE INTERNE PROBON » dans le sheet pour chaque correspondance, puis recharge le fichier.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // PAGE ADMIN
     // ============================================================
     // Encart "État du chargement" — visible par tous, lit la base partagée (Firebase)
@@ -8548,6 +8718,8 @@
           </div>
           </>
           )}
+
+          {session.isMaster && <ProbonImportCard session={session} />}
 
           <LossesHistory />
 
