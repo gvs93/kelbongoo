@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.6</title>
+  <title>Kelbongoo — Distribution V9.10</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -493,7 +493,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.6';
+    const APP_VERSION = 'V9.10';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -664,9 +664,8 @@
     const MANAGER_EMAIL = "ga@pribon.org"; // ← Email du gérant
     // Destinataires de l'alerte « retours PDP non traités » (V8)
     const PDP_ALERT_EMAILS = ["rr@pribon.org", "hg@pribon.org"];
-    // Proxy Apps Script qui envoie le mail d'alerte (déploiement séparé — voir le .gs fourni).
-    // Tant qu'il n'est pas renseigné, on bascule sur un mailto: de secours.
-    const PDP_ALERT_PROXY_URL = ""; // ← colle ici l'URL /exec du script d'alerte une fois déployé
+    // (Conservé pour compat — l'alerte PDP part désormais via le proxy stock, action send_mail.)
+    const PDP_ALERT_PROXY_URL = "";
 
     // FRESHDESK (relance clients non récupérés)
     // L'URL du proxy Apps Script déployé (Application Web /exec)
@@ -701,8 +700,23 @@
       }
     }
 
+    // PROXY STOCK (écriture inventaire matin/soir dans les feuilles de stock du jour,
+    // alerte article manquant) — KBG_Stock_Proxy.gs déployé séparément.
+    // ⚠️ Colle ici l'URL /exec après déploiement, sinon l'écriture feuille est désactivée.
+    const STOCK_PROXY_URL = "https://script.google.com/macros/s/AKfycbzwxqhnOw5XaRZXdth641X15_U0DTUU4VTu20xUZarZHRKKA-mtU6OOXOCfV1B7erVDLA/exec";
+    async function stockPost(payload) {
+      if (!STOCK_PROXY_URL) throw new Error('Proxy stock non configuré (STOCK_PROXY_URL vide)');
+      const res = await fetch(STOCK_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
+      const text = await res.text();
+      try { return JSON.parse(text); }
+      catch (e) {
+        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
+        throw new Error(`réponse non-JSON (proxy stock en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
+      }
+    }
+
     // Envoie l'alerte « retours PDP non traités » à rr@ + hg@.
-    // Si le proxy Apps Script est configuré → envoi serveur (MailApp). Sinon → mailto: de secours.
+    // Envoi 100% serveur via le proxy stock (action send_mail) — jamais d'ouverture de client mail.
     // `items` : [{ site, produit, dlc, day, status, age }]
     async function sendPdpAlert(items) {
       const lines = items.map(it =>
@@ -717,22 +731,8 @@
         `(récupération attendue à la distribution suivante du lieu, traitement entrepôt le lendemain max) :\n\n` +
         `${lines}\n\nMerci de les traiter (remise en rayon, envoi ROB, partage équipe ou perte).\n\n— App Distribution Kelbongoo`;
 
-      if (PDP_ALERT_PROXY_URL && !PDP_ALERT_PROXY_URL.includes('TON_')) {
-        const res = await fetch(PDP_ALERT_PROXY_URL, {
-          method: 'POST',
-          body: JSON.stringify({ secret: FRESHDESK_SECRET, to: PDP_ALERT_EMAILS, subject, body, items }),
-        });
-        const text = await res.text();
-        try { return JSON.parse(text); }
-        catch (e) {
-          const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-          throw new Error(`réponse non-JSON — ${snippet || 'vide'}`);
-        }
-      }
-      // Secours : ouvre le client mail de l'utilisateur
-      window.location.href =
-        `mailto:${PDP_ALERT_EMAILS.join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-      return { ok: true, fallback: true };
+      // Envoi SERVEUR uniquement (MailApp via proxy) — jamais de mailto / ouverture Gmail.
+      return await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: PDP_ALERT_EMAILS, subject, body });
     }
     const LOSS_REASONS = [
       { id:"casse_fournisseur", label:"Casse fournisseur" },
@@ -2692,6 +2692,8 @@
         <div className="stack">
           <h1>Clients · {currentSite}</h1>
 
+          {!isClosed && <DlcPushTasks session={session} orders={orders} dayKey={activeDay()} siteFilter={currentSite} />}
+
           {isClosed && (
             <div className="alert-info">
               🔒 Journée clôturée — modifications désactivées
@@ -3460,12 +3462,6 @@
               <div className="card" style={{display:'flex',flexDirection:'column',gap:8}}>
                 <div style={{fontSize:13,fontWeight:600}}>Relancer les {emailOnly.length} client(s) à contacter par email</div>
                 <FreshdeskRelanceButton clients={emailOnly} onDone={() => {}} />
-                <button className="btn-secondary" onClick={() => {
-                  const emails = emailOnly.map(f => f.email).join(',');
-                  window.location.href = `mailto:?bcc=${emails}&subject=Votre panier Kelbongoo non récupéré&body=Bonjour,%0A%0AVotre panier n'a pas été récupéré. Merci de nous recontacter.%0A%0AKelbongoo`;
-                }}>
-                  ✉️ Ou ouvrir mon client mail (sans Freshdesk)
-                </button>
               </div>
             );
           })()}
@@ -4143,7 +4139,7 @@
       }, [items, addedInactive]);
 
       const setQty = async (item, field, value) => {
-        const v = Math.max(0, parseInt(value, 10) || 0);
+        const v = Math.max(0, parseFloat(String(value).replace(',', '.')) || 0);
         const prev = counts[item.key] || { colis: 0, mu: 0 };
         const next = { ...prev, [field]: v };
         await storage.setDoc(`fl_inventory_${invDate}`, item.key, {
@@ -4252,8 +4248,8 @@
                 {sortMode==='alpha' && <span>{it.producer}{it.uv?' · ':''}</span>}{it.uv}
               </div>
             </div>
-            <QtyInput value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
-            <QtyInput value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+            <QtyInputDec value={c.colis ?? 0} onCommit={(v)=>setQty(it,'colis',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
+            <QtyInputDec value={c.mu ?? 0} onCommit={(v)=>setQty(it,'mu',v)} style={{width:70,textAlign:'center',fontSize:15,padding:'6px'}} />
           </div>
         );
       };
@@ -4370,6 +4366,15 @@
       const [learnSearch, setLearnSearch] = React.useState('');
       const [lastLearn, setLastLearn] = React.useState(null); // {ean, name, status:'known'|'new'}
       const [showHistory, setShowHistory] = React.useState(() => !!(session && session.isMaster)); // historique réservé master, ouvert par défaut
+      // Écriture feuille de stock (matin/soir) + article manquant
+      const [dispatchDone, setDispatchDone] = React.useState(false);
+      const [writing, setWriting] = React.useState(false);
+      const [writeResult, setWriteResult] = React.useState(null);
+      const [showManquant, setShowManquant] = React.useState(false);
+      const [mqProduit, setMqProduit] = React.useState('');
+      const [mqQty, setMqQty] = React.useState('');
+      const [mqDlc, setMqDlc] = React.useState('');
+      const [mqSending, setMqSending] = React.useState(false);
 
       React.useEffect(() => {
         (async () => {
@@ -4548,6 +4553,60 @@
       const counted = Object.keys(counts).filter(id => counts[id] > 0);
       const isTuesday = new Date().getDay() === 2;
       const scopeOk = invType !== 'tournant' || !!scopeValue;
+
+      // ── Porte horaire : complet du matin AVANT 10h ; après 10h = inventaire du soir ──
+      const nowHour = new Date().getHours();
+      const beforeTen = nowHour < 10;
+      // slot d'écriture : matin si avant 10h, sinon soir (après confirmation dispatch)
+      const writeSlot = beforeTen ? 'matin' : 'soir';
+      const completBlocked = invType === 'complet' && !beforeTen && !dispatchDone;
+
+      const validateStock = async () => {
+        if (!STOCK_PROXY_URL) { showToast('⚠️ Proxy stock non configuré (STOCK_PROXY_URL vide)'); return; }
+        if (writeSlot === 'soir' && !dispatchDone) { showToast('Confirme d\'abord la fin du dispatch'); return; }
+        const items = counted.map(id => ({ id, produit: prodById[id]?.name || '', qty: counts[id] }));
+        if (!items.length) { showToast('Rien à écrire'); return; }
+        const slotLbl = writeSlot === 'matin' ? 'Inventaire MATIN (col H)' : 'Inventaire SOIR (col X)';
+        if (!confirm(`Écrire ${items.length} article(s) dans la feuille de stock « ${invDate} » → ${slotLbl} ?`)) return;
+        setWriting(true); setWriteResult(null);
+        try {
+          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_inv_write', slot: writeSlot, date: invDate, items });
+          if (!data.ok) { showToast('Erreur écriture : ' + (data.error || 'inconnue')); setWriting(false); return; }
+          setWriteResult(data);
+          // Alerte Raimbaud si inventaire soir précédent déjà rempli (push partagé)
+          if (data.raimbaud && data.raimbaud.length) {
+            try {
+              await storage.setDoc('push_messages', `raimbaud_${Date.now()}`, {
+                title: '📞 Appeler Raimbaud',
+                body: `Inventaire ${invDate} : ${data.raimbaud.length} article(s) avec inventaire soir précédent déjà rempli — vérifier avec Raimbaud.`,
+                level: 'warn', createdBy: session.name, createdAt: new Date().toISOString(),
+              });
+            } catch (e) {}
+          }
+          let msg = `✓ Écrit : ${data.written} (matin) `;
+          if (data.writtenPrev) msg += `· ${data.writtenPrev} (soir feuille préc.) `;
+          if (data.notFound && data.notFound.length) msg += `· ${data.notFound.length} non trouvé(s) `;
+          if (data.raimbaud && data.raimbaud.length) msg += `· 📞 ${data.raimbaud.length} → Raimbaud`;
+          showToast(msg);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setWriting(false); }
+      };
+
+      const sendManquant = async () => {
+        const prod = (mqProduit || '').trim();
+        if (!prod) { showToast('Indique le produit'); return; }
+        if (!STOCK_PROXY_URL) { showToast('⚠️ Proxy stock non configuré'); return; }
+        setMqSending(true);
+        try {
+          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'mail_warehouse_only',
+            date: invDate, by: session.name,
+            items: [{ produit: prod, qty: parseFloat(String(mqQty).replace(',', '.')) || 0, dlc: mqDlc || '' }] });
+          if (!data.ok) { showToast('Erreur mail : ' + (data.error || 'inconnue')); setMqSending(false); return; }
+          showToast('✓ Mail envoyé à Raimbaud (produit dispo entrepôt, pas en vente)');
+          setMqProduit(''); setMqQty(''); setMqDlc(''); setShowManquant(false);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setMqSending(false); }
+      };
 
       return (
         <div className="stack">
@@ -4791,6 +4850,57 @@
               </div>
             </div>
           )}
+
+          {/* ── Porte horaire + écriture feuille de stock ── */}
+          <div className="card" style={{borderLeft:`3px solid ${completBlocked?'var(--danger)':'var(--info)'}`}}>
+            <h3 style={{marginBottom:6}}>💾 Écrire dans la feuille de stock</h3>
+            {beforeTen ? (
+              <div className="alert-info" style={{fontSize:12,marginBottom:8}}>🕗 Avant 10h → écriture sur <strong>Inventaire matin</strong> (colonne H) de la feuille « {invDate} ». Si H est déjà rempli pour un article, il bascule sur l'inventaire <strong>soir de la feuille précédente</strong>.</div>
+            ) : (
+              <div className="alert-warning" style={{fontSize:12,marginBottom:8}}>
+                ⛔ Après 10h, l'inventaire complet du matin est interdit (les ventes du site sont closes, le stock a bougé). On bascule sur <strong>l'inventaire du soir</strong> (colonne X), <strong>après le dispatch des commandes Kelbongoo</strong>.
+                <label style={{display:'flex',alignItems:'center',gap:6,marginTop:8,fontWeight:600}}>
+                  <input type="checkbox" checked={dispatchDone} onChange={e=>setDispatchDone(e.target.checked)} style={{width:'auto'}} />
+                  Le dispatch des commandes Kelbongoo du jour est terminé
+                </label>
+              </div>
+            )}
+            <button className="btn-primary btn-block" disabled={writing || completBlocked || counted.length===0}
+              onClick={validateStock}>
+              {writing ? 'Écriture…' : `Écrire ${counted.length} article(s) → ${writeSlot==='matin'?'Inventaire matin (H)':'Inventaire soir (X)'}`}
+            </button>
+            {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)',marginTop:6}}>⚠️ STOCK_PROXY_URL vide — colle l'URL /exec du proxy stock pour activer.</div>}
+            {writeResult && (
+              <div style={{marginTop:8,fontSize:12}}>
+                <div style={{color:'var(--ok,#2e7d32)'}}>✓ Écrit : {writeResult.written} (matin){writeResult.writtenPrev?` · ${writeResult.writtenPrev} (soir feuille préc. ${writeResult.prevSheet||''})`:''}</div>
+                {writeResult.notFound && writeResult.notFound.length>0 && (
+                  <div style={{color:'var(--ink-mute)',marginTop:4}}>{writeResult.notFound.length} article(s) non trouvé(s) dans la feuille (id absent) : {writeResult.notFound.slice(0,6).map(x=>x.produit||x.id).join(', ')}{writeResult.notFound.length>6?'…':''}</div>
+                )}
+                {writeResult.raimbaud && writeResult.raimbaud.length>0 && (
+                  <div className="alert-red" style={{marginTop:6,padding:'8px 10px'}}>📞 <strong>Appeler Raimbaud</strong> — {writeResult.raimbaud.length} article(s) : inventaire soir précédent déjà rempli, non écrasé.</div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── Article manquant (dispo entrepôt, pas en vente sur le site) ── */}
+          <div className="card">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer'}} onClick={()=>setShowManquant(s=>!s)}>
+              <div style={{fontWeight:600}}>➕ Article manquant <span style={{fontWeight:400,fontSize:12,color:'var(--ink-mute)'}}>(à l'entrepôt mais pas en vente)</span></div>
+              <span style={{color:'var(--ink-mute)'}}>{showManquant ? '▲' : '▼'}</span>
+            </div>
+            {showManquant && (
+              <div style={{marginTop:8}}>
+                <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0}}>Non écrit dans la feuille de stock. Un mail part à Raimbaud (copie HG).</p>
+                <input value={mqProduit} onChange={e=>setMqProduit(e.target.value)} placeholder="Nom du produit" style={{width:'100%',fontSize:15,padding:'8px',marginBottom:8}} />
+                <div style={{display:'flex',gap:8,marginBottom:8}}>
+                  <input value={mqQty} onChange={e=>setMqQty(e.target.value)} inputMode="decimal" placeholder="Qté" style={{flex:1,fontSize:15,padding:'8px'}} />
+                  <input type="date" value={mqDlc} onChange={e=>setMqDlc(e.target.value)} style={{flex:1,fontSize:15,padding:'8px'}} />
+                </div>
+                <button className="btn-secondary btn-block" disabled={mqSending} onClick={sendManquant}>{mqSending ? 'Envoi…' : '📧 Signaler à Raimbaud'}</button>
+              </div>
+            )}
+          </div>
           </>
           )}
         </div>
@@ -7658,25 +7768,26 @@
           const doc = generateLossesPDF(sorted, week);
           const filename = `Pertes_Kelbongoo_S${week.monday}.pdf`;
 
-          // Sauvegarder le PDF (téléchargement direct)
+          // Sauvegarder le PDF (copie locale)
           doc.save(filename);
 
-          // Ouvrir le client mail avec destinataire pré-rempli
-          const subject = encodeURIComponent(`Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total : ${totalWeek.toFixed(2)}€`);
-          const body = encodeURIComponent(
+          // Envoi SERVEUR avec PDF en pièce jointe — jamais de mailto / ouverture mail.
+          const b64 = doc.output('datauristring').split(',')[1];
+          const subject = `Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total : ${totalWeek.toFixed(2)}€`;
+          const body =
             `Bonjour,\n\n` +
-            `Rapport hebdomadaire des pertes en pièce jointe (déjà téléchargé sur ton ordinateur).\n\n` +
+            `Rapport hebdomadaire des pertes en pièce jointe.\n\n` +
             `Récap :\n` +
             `- Jetées : ${jeteWeek.length} entrées · ${totalJete.toFixed(2)} €\n` +
             `- Envoyé Pribon ROB : ${pribonWeek.length} entrées · ${totalPribon.toFixed(2)} €\n` +
             `- TOTAL valorisé : ${totalWeek.toFixed(2)} €\n\n` +
-            `Merci de joindre le PDF téléchargé.\n\n` +
-            `${session.name}\n` +
-            `Préparation Kelbongoo`
-          );
-          window.location.href = `mailto:${MANAGER_EMAIL}?subject=${subject}&body=${body}`;
+            `${session.name}\nPréparation Kelbongoo`;
+          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail',
+            to: MANAGER_EMAIL, subject, body,
+            attachment: { dataB64: b64, mimeType: 'application/pdf', name: filename } });
+          if (!r.ok) { showToast('Erreur envoi : ' + (r.error || 'inconnue')); setBusy(false); return; }
           setPdfGenerated(true);
-          showToast('PDF généré · ouvre ta messagerie');
+          showToast('✓ Rapport envoyé au gérant (PDF joint)');
         } catch (e) {
           showToast('Erreur : ' + e.message);
         } finally { setBusy(false); }
@@ -8874,19 +8985,149 @@
       return { key:'ok', color:'var(--accent)', soft:'var(--accent-soft)', label:'Sous surveillance', emoji:'🟢' };
     }
 
-    function DlcWatchForm({ products, session, onClose }) {
+    // ════════════════════════════════════════════════════════════════
+    // PROTOCOLE DLC SENSIBLE — calcul (jamais de seuil figé J+x)
+    // Règle de fraîcheur client : DLC ≥ jour_de_retrait + 3  (4 jours pleins,
+    // DLC incluse). Donc un produit est vendable un jour D si D ≤ DLC − 3.
+    // « Sensible » = il faut l'écouler CETTE semaine car il ne tiendra pas
+    // jusqu'à la première distrib « sûre » de la semaine suivante.
+    // ════════════════════════════════════════════════════════════════
+    // Samedi (fin de semaine de distrib) contenant `key`.
+    function _saturdayOfWeek(key) {
+      let d = key, i = 0;
+      while (new Date(d + 'T12:00:00').getDay() !== 6 && i < 7) { d = addDays(d, 1); i++; }
+      return d;
+    }
+    // 1er jour de distrib « sûr » de la semaine suivante (= mercredi suivant).
+    function _firstSafeNextWeek(key) {
+      const sat = _saturdayOfWeek(key);
+      let d = addDays(sat, 1);
+      for (let i = 0; i < 10; i++) { if (isDistribDay(d)) return d; d = addDays(d, 1); }
+      return null;
+    }
+    // Jours points-fixes éligibles cette semaine : D ≤ DLC−3 (hors DOM).
+    function dlcEligibleFixedDays(dlc, invDay) {
+      const sat = _saturdayOfWeek(invDay); const out = []; let d = invDay;
+      for (let i = 0; i < 10 && d <= sat; i++) {
+        if (isDistribDay(d) && dlcDaysLeft(dlc, d) >= 3) {
+          const sites = sitesForDate(d).filter(s => s !== 'DOM');
+          if (sites.length) out.push({ day: d, sites });
+        }
+        d = addDays(d, 1);
+      }
+      return out;
+    }
+    // DOM (jeu & sam) : D ≤ DLC−5 par défaut, ou D ≤ DLC−3 si produit « DOM dates courtes ».
+    function dlcEligibleDomDays(dlc, invDay, domShort) {
+      const need = domShort ? 3 : 5; const sat = _saturdayOfWeek(invDay); const out = []; let d = invDay;
+      for (let i = 0; i < 10 && d <= sat; i++) {
+        if (sitesForDate(d).includes('DOM') && dlcDaysLeft(dlc, d) >= need) out.push(d);
+        d = addDays(d, 1);
+      }
+      return out;
+    }
+    // Classement complet d'un produit selon sa DLC et le jour d'inventaire.
+    // → { cls:'normal'|'sensible'|'rob'|'perte'|'unknown', label, fixed[], dom[], rob, safe }
+    function dlcPlan(dlc, invDay, domShort, now) {
+      invDay = invDay || activeDay();
+      if (!dlc) return { cls: 'unknown', label: 'DLC non renseignée', fixed: [], dom: [], rob: null, safe: null };
+      const safe = _firstSafeNextWeek(invDay);
+      const fixed = dlcEligibleFixedDays(dlc, invDay);
+      const dom = dlcEligibleDomDays(dlc, invDay, domShort);
+      const rob = routeByDLC(dlc, now);
+      if (safe && dlcDaysLeft(dlc, safe) >= 3)
+        return { cls: 'normal', label: "Normal — FIFO, pas d'alerte", fixed, dom, rob, safe };
+      if (fixed.length || dom.length)
+        return { cls: 'sensible', label: 'DLC SENSIBLE — à écouler cette semaine', fixed, dom, rob, safe };
+      if (rob && rob.dest === 'pribon')
+        return { cls: 'rob', label: 'Trop court pour les points fixes — envoi ROB', fixed, dom, rob, safe };
+      return { cls: 'perte', label: 'Trop court — perte sèche / partage équipe', fixed, dom, rob, safe };
+    }
+    const DLC_CLS_META = {
+      normal:   { emoji: '🟢', color: 'var(--accent)', soft: 'var(--accent-soft)' },
+      sensible: { emoji: '🟠', color: 'var(--warn)',   soft: 'var(--warn-soft)' },
+      rob:      { emoji: '🚚', color: '#7c4dff',        soft: 'rgba(124,77,255,0.12)' },
+      perte:    { emoji: '🗑️', color: 'var(--danger)',  soft: 'var(--danger-soft)' },
+      unknown:  { emoji: '⚪', color: 'var(--ink-mute)', soft: 'var(--bg-muted)' },
+    };
+
+    // ── Lien JSON commandes ↔ produits sensibles ──────────────────────
+    // Pour chaque client qui a commandé un produit en DLC sensible ET dont la
+    // distribution a lieu ce jour sur un local éligible → tâche « placer ce
+    // produit court dans son panier ». Match par nom normalisé (producteur+produit).
+    function computeDlcTasks(orders, sensibleItems, dayKey) {
+      const byKey = {};
+      for (const s of (sensibleItems || [])) {
+        if (s.status && s.status !== 'watch') continue;
+        if (!s.dlc) continue;
+        const plan = dlcPlan(s.dlc, s.invDay || dayKey, s.domShort);
+        if (plan.cls !== 'sensible') continue;
+        const k = normalizeText((s.producteur || '') + ' ' + (s.produit || ''));
+        if (k.trim()) byKey[k] = { item: s, plan };
+      }
+      const tasks = [];
+      for (const o of (orders || [])) {
+        for (const it of (o.items || [])) {
+          const k = normalizeText((it.producteur || '') + ' ' + (it.produit || ''));
+          const hit = byKey[k];
+          if (!hit) continue;
+          const plan = hit.plan;
+          const fixedOk = plan.fixed.some(f => f.day === dayKey && f.sites.includes(o.site));
+          const domOk = (o.site === 'DOM') && plan.dom.includes(dayKey);
+          if (!fixedOk && !domOk) continue;
+          const casiers = (it.cat === 'frais') ? (o.casiersFrais || []) : (o.casiersSec || []);
+          tasks.push({
+            id: `${dayKey}_${o.orderId}_${it.id}`,
+            produit: it.produit, producteur: it.producteur, qty: it.qty,
+            site: o.site, client: o.name, casiers: casiers, cat: it.cat,
+            dlc: hit.item.dlc, dlcItemId: hit.item.id,
+          });
+        }
+      }
+      return tasks;
+    }
+    // Saisie quantité acceptant la virgule décimale (FL : 0,5 = ½ cagette).
+    function QtyInputDec({ value, onCommit, style }) {
+      const [str, setStr] = React.useState(value ? String(value).replace('.', ',') : '');
+      const focused = React.useRef(false);
+      React.useEffect(() => { if (!focused.current) setStr(value ? String(value).replace('.', ',') : ''); }, [value]);
+      const handle = (raw) => {
+        let s = String(raw).replace(/[^\d.,]/g, '').replace(/\./g, ',');
+        const firstComma = s.indexOf(',');
+        if (firstComma >= 0) s = s.slice(0, firstComma + 1) + s.slice(firstComma + 1).replace(/,/g, '');
+        setStr(s);
+        const num = s === '' ? 0 : parseFloat(s.replace(',', '.'));
+        onCommit(isNaN(num) ? 0 : num);
+      };
+      return (
+        <input type="text" inputMode="decimal" value={str} placeholder="0"
+          onFocus={e => { focused.current = true; e.target.select(); }}
+          onBlur={() => { focused.current = false; }}
+          onChange={e => handle(e.target.value)}
+          style={style} />
+      );
+    }
+
+    // ── AIGUILLEUR DLC : « Où l'envoyer ? » ──────────────────────────
+    // L'opérateur saisit produit + DLC + nb d'unités (+ DOM dates courtes).
+    // L'appli répond : niveau, jours/boutiques éligibles, instruction. À la
+    // validation → crée une entrée de surveillance (cases par jour).
+    function DlcWatchForm({ products, session, onClose, defaultInvDay }) {
       const showToast = React.useContext(ToastContext);
       const [productKey, setProductKey] = React.useState('');
       const [dlc, setDlc] = React.useState('');
       const [qty, setQty] = React.useState('');
+      const [domShort, setDomShort] = React.useState(false);
       const [busy, setBusy] = React.useState(false);
-      const days = dlc ? dlcDaysLeft(dlc) : null;
-      const route = dlc ? routeByDLC(dlc) : null;
+      const invDay = defaultInvDay || activeDay();
+      const plan = dlc ? dlcPlan(dlc, invDay, domShort) : null;
+      const days = dlc ? dlcDaysLeft(dlc, invDay) : null;
+      const meta = plan ? (DLC_CLS_META[plan.cls] || DLC_CLS_META.unknown) : null;
 
       const submit = async () => {
         if (!productKey) { showToast('Choisis un produit'); return; }
         if (!dlc) { showToast('Indique la DLC'); return; }
-        const q = parseFloat(qty);
+        const q = parseFloat(String(qty).replace(',', '.'));
         if (!q || q <= 0) { showToast('Indique la quantité'); return; }
         let produit = productKey, producteur = '';
         if (productKey.startsWith('FREE:')) { produit = productKey.slice(5); }
@@ -8897,11 +9138,12 @@
           const now = new Date().toISOString();
           await storage.setDoc('dlc_watch', id, {
             produit, producteur, dlc, qty: q, qtyInit: q,
+            invDay, domShort: !!domShort,
             status: 'watch',
             createdBy: session.name, createdAt: now,
             lastCheckAt: now, lastCheckBy: session.name,
           });
-          showToast('✓ Ajouté à la surveillance DLC');
+          showToast('✓ Ajouté aux cases DLC de la semaine');
           onClose();
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
@@ -8910,7 +9152,7 @@
       return (
         <div className="card" style={{marginBottom:12, padding:'14px'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-            <strong style={{fontSize:14}}>Nouveau produit sensible</strong>
+            <strong style={{fontSize:14}}>🧭 Aiguilleur DLC — où l'envoyer ?</strong>
             <button className="btn-ghost" style={{fontSize:12}} onClick={onClose}>Annuler</button>
           </div>
           <div style={{marginBottom:10}}>
@@ -8919,26 +9161,154 @@
           </div>
           <div style={{display:'flex',gap:10,marginBottom:10}}>
             <div style={{flex:1}}>
-              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>DLC</label>
+              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>DLC du produit</label>
               <input type="date" value={dlc} onChange={e=>setDlc(e.target.value)} />
             </div>
             <div style={{width:120}}>
-              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>Quantité</label>
-              <input type="number" min="0" step="1" value={qty} onChange={e=>setQty(e.target.value)} placeholder="paquets" />
+              <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>Nb d'unités</label>
+              <input type="number" min="0" step="1" value={qty} onChange={e=>setQty(e.target.value)} placeholder="à cette DLC" />
             </div>
           </div>
-          {dlc && (
-            <div className="alert-info" style={{fontSize:12,marginBottom:10}}>
-              {days < 0 ? '🔴 DLC déjà dépassée.' : days === 0 ? "🔴 DLC aujourd'hui." : `${days} jour${days>1?'s':''} avant DLC.`}
-              {route && <> Si non écoulé : <strong>{route.dest==='partage'?'partage équipe (perte sèche)':route.dest==='pribon'?'envoi ROB':'—'}</strong>{route.navette?` — navette ${route.navette.label}`:''}.</>}
+          <label style={{fontSize:12,display:'flex',alignItems:'center',gap:6,marginBottom:10,color:'var(--ink-mute)'}}>
+            <input type="checkbox" checked={domShort} onChange={e=>setDomShort(e.target.checked)} style={{width:'auto'}} />
+            Produit « DOM dates courtes » (haché, préparation… : DOM accepte J+3 au lieu de J+5)
+          </label>
+          {plan && meta && (
+            <div style={{background:meta.soft,border:`1px solid ${meta.color}`,borderRadius:10,padding:'10px 12px',marginBottom:10,fontSize:13}}>
+              <div style={{fontWeight:700,color:meta.color,marginBottom:4}}>{meta.emoji} {plan.label}</div>
+              <div style={{fontSize:12,color:'var(--ink)'}}>
+                {(() => {
+                  const lastFixed = plan.fixed.length ? plan.fixed[plan.fixed.length-1].day : null;
+                  if (days < 0) return 'DLC dépassée.';
+                  if (days === 0) return "DLC aujourd'hui.";
+                  return `${days} j avant DLC${lastFixed ? ` · dernière vente possible le ${dayLabelShort(lastFixed)}` : ''}.`;
+                })()}
+              </div>
+              {plan.cls === 'sensible' && (
+                <div style={{marginTop:6}}>
+                  <div style={{fontSize:12,fontWeight:600}}>Points fixes — à pousser dans les paniers :</div>
+                  {plan.fixed.length === 0 ? <div style={{fontSize:12,color:'var(--ink-mute)'}}>aucun jour points-fixes éligible.</div> :
+                    plan.fixed.map(f => (
+                      <div key={f.day} style={{fontSize:12,marginTop:2}}>• <strong>{dayLabelShort(f.day)}</strong> → {f.sites.join(', ')}</div>
+                    ))}
+                  {plan.dom.length > 0 && (
+                    <div style={{fontSize:12,marginTop:4}}>🏠 DOM possible : {plan.dom.map(d=>dayLabelShort(d)).join(' · ')}{domShort?' (dates courtes)':''}</div>
+                  )}
+                </div>
+              )}
+              {plan.cls === 'rob' && plan.rob && plan.rob.navette && (
+                <div style={{fontSize:12,marginTop:6}}>🚚 Navette ROB : <strong>{plan.rob.navette.label}</strong> ({dayLabelShort(plan.rob.navette.date)}) — dates courtes vendues à Robespierre.</div>
+              )}
+              {plan.cls === 'perte' && (
+                <div style={{fontSize:12,marginTop:6}}>Aucune fenêtre de vente / navette utile → compter en <strong>perte sèche</strong> (partage équipe).</div>
+              )}
+              {plan.cls === 'normal' && (
+                <div style={{fontSize:12,marginTop:6}}>Tient jusqu'à la semaine prochaine ({plan.safe ? dayLabelShort(plan.safe) : '—'}) — FIFO normal, pas besoin de cases.</div>
+              )}
             </div>
           )}
-          <button className="btn-primary btn-block" disabled={busy} onClick={submit}>Ajouter à la surveillance</button>
+          <button className="btn-primary btn-block" disabled={busy} onClick={submit}>
+            {plan && plan.cls === 'normal' ? 'Ajouter quand même à la surveillance' : 'Valider → placer dans les cases'}
+          </button>
         </div>
       );
     }
 
-    function DlcWatchPage({ session, products }) {
+    // ── Tâches « placer un produit sensible dans un panier » (lien JSON) ──
+    // Affiché en bannière : tab DLC (tous sites) ou page Clients distrib (son site).
+    // Validation Fait / Pas fait (+ raison). « Fait » décrémente le stock sensible.
+    function DlcPushTasks({ session, orders, dayKey, siteFilter }) {
+      const showToast = React.useContext(ToastContext);
+      const [watch, setWatch] = React.useState([]);
+      const [statuses, setStatuses] = React.useState({});
+      const day = dayKey || activeDay();
+
+      React.useEffect(() => {
+        const u = storage.subscribe('dlc_watch', setWatch);
+        return () => { u && u(); };
+      }, []);
+      React.useEffect(() => {
+        const u = storage.subscribe(`dlc_tasks_${day}`, (arr) => {
+          const m = {}; for (const e of arr) m[e.id] = e; setStatuses(m);
+        });
+        return () => { u && u(); };
+      }, [day]);
+
+      const allTasks = React.useMemo(() => computeDlcTasks(orders, watch, day), [orders, watch, day]);
+      const tasks = siteFilter ? allTasks.filter(t => t.site === siteFilter) : allTasks;
+      const pending = tasks.filter(t => !statuses[t.id] || statuses[t.id].status === 'pending');
+
+      if (tasks.length === 0) return null;
+
+      const markFait = async (t) => {
+        await storage.setDoc(`dlc_tasks_${day}`, t.id, {
+          id: t.id, status: 'fait', produit: t.produit, site: t.site, client: t.client,
+          qty: t.qty, by: session.name, at: new Date().toISOString(),
+        });
+        // Décrémente le stock sensible restant.
+        if (t.dlcItemId) {
+          const w = watch.find(x => x.id === t.dlcItemId);
+          if (w) {
+            const nq = Math.max(0, (parseFloat(w.qty) || 0) - (parseFloat(t.qty) || 0));
+            await storage.setDoc('dlc_watch', t.dlcItemId, { qty: nq, lastCheckAt: new Date().toISOString(), lastCheckBy: session.name });
+          }
+        }
+        showToast(`✓ ${t.produit} placé pour ${t.client}`);
+      };
+      const markPasFait = async (t) => {
+        const reason = (typeof prompt === 'function') ? prompt(`Pas fait — raison ? (${t.produit} / ${t.client})`, '') : '';
+        if (reason === null) return;
+        await storage.setDoc(`dlc_tasks_${day}`, t.id, {
+          id: t.id, status: 'pasfait', reason: reason || '', produit: t.produit, site: t.site,
+          client: t.client, qty: t.qty, by: session.name, at: new Date().toISOString(),
+        });
+        showToast(`Noté « pas fait » — ${t.produit}`);
+      };
+
+      // groupé par site (sauf si filtré sur un seul)
+      const bySite = {};
+      for (const t of tasks) { (bySite[t.site] = bySite[t.site] || []).push(t); }
+      const sites = Object.keys(bySite).sort();
+
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--warn)', marginBottom:10}}>
+          <div style={{fontWeight:700, fontSize:14, marginBottom:6}}>
+            🛒 Produits sensibles à placer dans les paniers du jour
+            {pending.length > 0 && <span className="badge" style={{marginLeft:6,background:'var(--warn-soft)',color:'var(--warn)'}}>{pending.length} à faire</span>}
+          </div>
+          <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>Ces clients ont commandé un produit en DLC courte : utilise le stock court en priorité.</div>
+          {sites.map(site => (
+            <div key={site} style={{marginBottom:8}}>
+              {!siteFilter && <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>{siteLabel(site)} <span style={{color:'var(--ink-mute)',fontWeight:400}}>({bySite[site].length})</span></div>}
+              {bySite[site].map(t => {
+                const st = statuses[t.id];
+                const done = st && st.status === 'fait';
+                const ko = st && st.status === 'pasfait';
+                return (
+                  <div key={t.id} style={{padding:'8px',borderTop:'1px solid var(--border)',opacity:done?0.55:1}}>
+                    <div style={{fontSize:13}}>
+                      <strong>{t.produit}</strong> × {t.qty} → <strong>{t.client}</strong>
+                      {t.casiers && t.casiers.length > 0 && <span style={{color:'var(--ink-mute)'}}> · casier {t.cat==='frais'?'frais':'sec'} {t.casiers.join(', ')}</span>}
+                      <span style={{color:'var(--ink-mute)'}}> · DLC {formatDateShort(t.dlc)}</span>
+                    </div>
+                    {done ? <div style={{fontSize:12,color:'var(--ok,#2e7d32)'}}>✓ Fait par {st.by}</div>
+                     : ko ? <div style={{fontSize:12,color:'var(--danger)'}}>✗ Pas fait{st.reason?` — ${st.reason}`:''} ({st.by}) <button className="btn-ghost" style={{fontSize:11}} onClick={()=>markFait(t)}>↩ Marquer fait</button></div>
+                     : (
+                       <div style={{display:'flex',gap:8,marginTop:6}}>
+                         <button className="btn-primary" style={{fontSize:12,padding:'5px 12px'}} onClick={()=>markFait(t)}>✓ Fait</button>
+                         <button className="btn-secondary" style={{fontSize:12,padding:'5px 12px'}} onClick={()=>markPasFait(t)}>✗ Pas fait</button>
+                       </div>
+                     )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function DlcWatchPage({ session, products, orders }) {
       const showToast = React.useContext(ToastContext);
       const [items, setItems] = React.useState([]);
       const [loaded, setLoaded] = React.useState(false);
@@ -8967,14 +9337,35 @@
         const days = dlcDaysLeft(i.dlc, today);
         const lvl = dlcWatchLevel(days, alertDays);
         const route = i.dlc ? routeByDLC(i.dlc) : null;
+        const plan = i.dlc ? dlcPlan(i.dlc, i.invDay || today, i.domShort) : null;
         const checkedToday = i.lastCheckAt && i.lastCheckAt.slice(0,10) === today;
-        return { ...i, days, lvl, route, checkedToday };
+        return { ...i, days, lvl, route, plan, checkedToday };
       }).sort((a,b) => {
         const da = a.days===null?999:a.days, db = b.days===null?999:b.days;
         return da - db;
       });
 
       const needAttention = enriched.filter(i => i.days !== null && i.days <= alertDays);
+
+      // ── Cases par jour : regroupe les produits sensibles par jour de vente éligible ──
+      const dayBuckets = {};   // dayKey -> { sites:Set, items:[{item, sites}] }
+      const domBuckets = {};   // dayKey -> [items]
+      const robItems = [];
+      const perteItems = [];
+      for (const i of enriched) {
+        const p = i.plan;
+        if (!p) continue;
+        if (p.cls === 'sensible') {
+          for (const f of p.fixed) {
+            if (!dayBuckets[f.day]) dayBuckets[f.day] = { sites: new Set(), items: [] };
+            f.sites.forEach(s => dayBuckets[f.day].sites.add(s));
+            dayBuckets[f.day].items.push({ item: i, sites: f.sites });
+          }
+          for (const d of p.dom) { (domBuckets[d] = domBuckets[d] || []).push(i); }
+        } else if (p.cls === 'rob') robItems.push(i);
+        else if (p.cls === 'perte') perteItems.push(i);
+      }
+      const bucketDays = Object.keys(dayBuckets).sort();
       const uncheckedToday = enriched.filter(i => !i.checkedToday);
       const showMorningBanner = enriched.length > 0 && uncheckedToday.length > 0;
 
@@ -9006,6 +9397,7 @@
 
       return (
         <div style={{marginTop:10}}>
+          <DlcPushTasks session={session} orders={orders} dayKey={today} />
           {showMorningBanner && (
             <div className="alert-warning" style={{marginBottom:10, display:'flex', flexDirection:'column', gap:8}}>
               <div>🟠 <strong>Check DLC du matin</strong> — {uncheckedToday.length} produit{uncheckedToday.length>1?'s':''} pas encore vérifié{uncheckedToday.length>1?'s':''} aujourd'hui.{needAttention.length>0 && <> Dont <strong>{needAttention.length} à prioriser</strong> dans les paniers.</>}</div>
@@ -9023,6 +9415,55 @@
           </div>
 
           {showForm && <DlcWatchForm products={products} session={session} onClose={()=>setShowForm(false)} />}
+
+          {(bucketDays.length > 0 || robItems.length > 0 || perteItems.length > 0) && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>📦 Cases de la semaine — où vendre chaque produit sensible</div>
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>Calculé pour garantir au client une DLC d'au moins J+3 (4 jours pleins) à la récupération.</div>
+              {bucketDays.map(day => {
+                const b = dayBuckets[day];
+                const dist = dlcDaysLeft(day, today);
+                return (
+                  <div key={day} className="card" style={{padding:'10px 12px',marginBottom:8,borderLeft:'4px solid var(--warn)'}}>
+                    <div style={{fontWeight:700,fontSize:14,textTransform:'capitalize'}}>
+                      {dayLabelShort(day)} {dist===0 ? '· aujourd\'hui' : dist>0 ? `· dans ${dist} j` : ''}
+                    </div>
+                    <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>Boutiques ce jour : {[...b.sites].join(', ')}</div>
+                    {b.items.map(({item, sites}) => (
+                      <div key={item.id} style={{fontSize:13,padding:'4px 0',borderTop:'1px solid var(--border)'}}>
+                        <strong>{item.produit}</strong> × {item.qty} <span style={{color:'var(--ink-mute)',fontSize:12}}>(DLC {formatDateShort(item.dlc)})</span>
+                        {sites.length>1 && <div style={{fontSize:11,color:'var(--ink-mute)'}}>→ {sites.join(', ')}</div>}
+                      </div>
+                    ))}
+                    {domBuckets[day] && domBuckets[day].length>0 && (
+                      <div style={{fontSize:12,marginTop:6,color:'var(--ink-mute)'}}>🏠 DOM : {domBuckets[day].map(i=>i.produit).join(', ')}</div>
+                    )}
+                  </div>
+                );
+              })}
+              {robItems.length > 0 && (
+                <div className="card" style={{padding:'10px 12px',marginBottom:8,borderLeft:'4px solid #7c4dff'}}>
+                  <div style={{fontWeight:700,fontSize:14}}>🚚 Navette ROB (dates courtes)</div>
+                  {robItems.map(i => (
+                    <div key={i.id} style={{fontSize:13,padding:'4px 0',borderTop:'1px solid var(--border)'}}>
+                      <strong>{i.produit}</strong> × {i.qty} <span style={{color:'var(--ink-mute)',fontSize:12}}>(DLC {formatDateShort(i.dlc)})</span>
+                      {i.plan && i.plan.rob && i.plan.rob.navette && <div style={{fontSize:11,color:'var(--ink-mute)'}}>→ {i.plan.rob.navette.label}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {perteItems.length > 0 && (
+                <div className="card" style={{padding:'10px 12px',marginBottom:8,borderLeft:'4px solid var(--danger)'}}>
+                  <div style={{fontWeight:700,fontSize:14}}>🗑️ Perte sèche / partage équipe</div>
+                  {perteItems.map(i => (
+                    <div key={i.id} style={{fontSize:13,padding:'4px 0',borderTop:'1px solid var(--border)'}}>
+                      <strong>{i.produit}</strong> × {i.qty} <span style={{color:'var(--ink-mute)',fontSize:12}}>(DLC {formatDateShort(i.dlc)})</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="stat-grid" style={{marginBottom:10}}>
             <div className="stat"><div className="stat-value">{enriched.length}</div><div className="stat-label">En surveillance</div></div>
@@ -9852,7 +10293,7 @@
             {tab === 'prep' && <PrepPage session={session} products={products} dispatchData={dispatchData} />}
             {tab === 'prepdispatch' && <><ManquantsMailPanel orders={orders} session={session} /><PrepDispatchPage session={session} /></>}
             {tab === 'pdpreturns' && <PdpReturnsPage session={session} catalogue={catalogue} />}
-            {tab === 'dlcwatch' && <DlcWatchPage session={session} products={products} />}
+            {tab === 'dlcwatch' && <DlcWatchPage session={session} products={products} orders={orders} />}
             {tab === 'losses' && <LossesPage session={session} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
             {tab === 'inventory' && <InventoryPage session={session} />}
             {tab === 'admin' && <AdminPage session={session} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
