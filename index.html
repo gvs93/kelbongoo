@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.11</title>
+  <title>Kelbongoo — Distribution V9.13</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -493,7 +493,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.11';
+    const APP_VERSION = 'V9.13';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -9847,7 +9847,99 @@
       );
     }
 
-    function PushComposerPage({ session, availableSites, pushMessages }) {
+    // ── Mail groupé aux clients des commandes du jour (par local ou tous) ──
+    // Envoi 100% serveur, en BCC (adresses masquées). Modèles préenregistrés modifiables.
+    const CLIENT_MAIL_TEMPLATES = [
+      { id: 'retard', label: '⏰ Retard ouverture', subject: 'Kelbongoo — léger retard à l\'ouverture',
+        body: "Bonjour,\n\nLa distribution{SITE} ouvrira avec un léger retard aujourd'hui. Merci de votre patience, nous vous accueillons dès que possible.\n\nÀ très vite,\nL'équipe Kelbongoo" },
+      { id: 'manquant', label: '📦 Produit manquant', subject: 'Kelbongoo — un produit manquant dans votre commande',
+        body: "Bonjour,\n\nUn produit de votre commande n'a pas pu être livré par le producteur. Il vous sera recrédité automatiquement.\n\nMerci de votre compréhension,\nL'équipe Kelbongoo" },
+      { id: 'lieu', label: '📍 Changement de lieu', subject: 'Kelbongoo — changement de point de retrait',
+        body: "Bonjour,\n\nLe point de retrait{SITE} est exceptionnellement déplacé aujourd'hui. Merci de vous présenter au lieu indiqué sur place / par SMS.\n\nL'équipe Kelbongoo" },
+      { id: 'fermeture', label: '🚫 Fermeture exceptionnelle', subject: 'Kelbongoo — fermeture exceptionnelle',
+        body: "Bonjour,\n\nLe point de distribution{SITE} est exceptionnellement fermé aujourd'hui. Nous revenons vers vous pour le retrait de votre commande.\n\nMerci de votre compréhension,\nL'équipe Kelbongoo" },
+      { id: 'prete', label: '✅ Commande prête', subject: 'Kelbongoo — votre commande est prête',
+        body: "Bonjour,\n\nVotre commande est prête et vous attend au point de retrait habituel aux horaires d'ouverture.\n\nÀ très vite,\nL'équipe Kelbongoo" },
+    ];
+    function ClientMailComposer({ session, orders }) {
+      const showToast = React.useContext(ToastContext);
+      const [scope, setScope] = React.useState('all'); // 'all' | 'site'
+      const [site, setSite] = React.useState('');
+      const [subject, setSubject] = React.useState('');
+      const [body, setBody] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+
+      // Sites présents dans les commandes du jour
+      const sitesOfDay = React.useMemo(() => {
+        const s = new Set();
+        for (const o of (orders || [])) if (o.site) s.add(o.site);
+        return [...s].sort();
+      }, [orders]);
+
+      // Emails uniques selon le périmètre
+      const emails = React.useMemo(() => {
+        const set = new Set();
+        for (const o of (orders || [])) {
+          if (scope === 'site' && o.site !== site) continue;
+          const e = (o.email || '').trim();
+          if (e && e.includes('@')) set.add(e.toLowerCase());
+        }
+        return [...set];
+      }, [orders, scope, site]);
+
+      const applyTemplate = (t) => {
+        const siteTxt = (scope === 'site' && site) ? ` de ${siteLabel(site)}` : '';
+        setSubject(t.subject);
+        setBody(t.body.replace(/\{SITE\}/g, siteTxt));
+      };
+
+      const send = async () => {
+        if (scope === 'site' && !site) { showToast('Choisis un local'); return; }
+        if (emails.length === 0) { showToast('Aucun client avec email dans ce périmètre'); return; }
+        if (!subject.trim() || !body.trim()) { showToast('Objet et message requis'); return; }
+        if (!confirm(`Envoyer ce mail à ${emails.length} client(s) en copie cachée (BCC) ?`)) return;
+        setBusy(true);
+        try {
+          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', bcc: emails, subject, body });
+          if (!data.ok) { showToast('Erreur : ' + (data.error || 'inconnue')); setBusy(false); return; }
+          showToast(`✓ Mail envoyé à ${emails.length} client(s) en BCC`);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div style={{display:'flex',flexDirection:'column',gap:10}}>
+          <p style={{color:'var(--ink-soft)',fontSize:12,margin:0}}>Clients ayant une commande aujourd'hui. Envoi côté serveur, en <strong>copie cachée (BCC)</strong> — les adresses ne sont jamais visibles entre clients, et rien n'ouvre votre messagerie.</p>
+          <div className="filter-row" style={{marginBottom:0}}>
+            <div className={`chip ${scope==='all'?'selected':''}`} onClick={()=>setScope('all')}>Tous ({(orders||[]).length} cmd)</div>
+            <div className={`chip ${scope==='site'?'selected':''}`} onClick={()=>setScope('site')}>Par local</div>
+          </div>
+          {scope === 'site' && (
+            <select value={site} onChange={e=>setSite(e.target.value)} style={{width:'100%',fontSize:15,padding:'8px'}}>
+              <option value="">— Choisir un local ({sitesOfDay.length}) —</option>
+              {sitesOfDay.map(s => <option key={s} value={s}>{siteLabel(s)}</option>)}
+            </select>
+          )}
+          <div style={{fontSize:12,color: emails.length? 'var(--accent)':'var(--ink-mute)'}}>{emails.length} destinataire(s) avec email{scope==='site'&&!site?' — choisis un local':''}</div>
+          <div>
+            <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>📋 Modèle préenregistré (modifiable)</label>
+            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+              {CLIENT_MAIL_TEMPLATES.map(t => (
+                <button key={t.id} type="button" className="chip" onClick={()=>applyTemplate(t)}>{t.label}</button>
+              ))}
+            </div>
+          </div>
+          <input value={subject} onChange={e=>setSubject(e.target.value)} placeholder="Objet du mail" style={{width:'100%',fontSize:15,padding:'8px'}} />
+          <textarea value={body} onChange={e=>setBody(e.target.value)} placeholder="Message…" rows={7} style={{width:'100%',fontSize:14,padding:'8px',resize:'vertical'}} />
+          <button className="btn-primary btn-block" disabled={busy || emails.length===0} onClick={send}>
+            {busy ? 'Envoi…' : `Envoyer à ${emails.length} client(s) (BCC)`}
+          </button>
+          {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)'}}>⚠️ STOCK_PROXY_URL vide.</div>}
+        </div>
+      );
+    }
+
+    function PushComposerPage({ session, availableSites, pushMessages, orders }) {
       const showToast = React.useContext(ToastContext);
       const [title, setTitle] = React.useState('');
       const [body, setBody] = React.useState('');
@@ -9855,6 +9947,7 @@
       const [target, setTarget] = React.useState('all'); // 'all' | 'some'
       const [sites, setSites] = React.useState([]);
       const [busy, setBusy] = React.useState(false);
+      const [channel, setChannel] = React.useState('push'); // 'push' | 'mail'
 
       const ICONS = ['📣','👤','📞','⚠️','📦','⏰','🛒'];
       const sitesList = (availableSites && availableSites.length) ? availableSites : SITES;
@@ -9907,12 +10000,20 @@
 
       return (
         <div className="stack">
-          <h1>📣 Push aux boutiques</h1>
+          <h1>📣 Push & mails</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Le message s'affiche en plein écran sur l'appli des boutiques ciblées. Elles doivent valider « Vu ».
+            Push = message plein écran sur l'appli des boutiques. Mail = email aux clients du jour (BCC, envoi serveur).
           </p>
 
           <div className="card" style={{display:'flex',flexDirection:'column',gap:12}}>
+            <div className="filter-row" style={{marginBottom:0}}>
+              <div className={`chip ${channel==='push'?'selected':''}`} onClick={()=>setChannel('push')}>📣 Push boutiques</div>
+              <div className={`chip ${channel==='mail'?'selected':''}`} onClick={()=>setChannel('mail')}>✉️ Mail clients</div>
+            </div>
+
+            {channel === 'mail' && <ClientMailComposer session={session} orders={orders} />}
+
+            {channel === 'push' && (<>
             <div className="field">
               <label>Icône</label>
               <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
@@ -9955,8 +10056,10 @@
             <button className="btn-primary btn-lg" disabled={busy} onClick={send}>
               {busy ? 'Envoi…' : '📤 Envoyer le message'}
             </button>
+            </>)}
           </div>
 
+          {channel === 'push' && (<>
           <h3 style={{marginTop:8}}>Historique & accusés de lecture</h3>
           {history.length === 0 ? (
             <div className="empty-state"><div className="icon">📭</div><p>Aucun message envoyé.</p></div>
@@ -9995,6 +10098,7 @@
               })}
             </div>
           )}
+          </>)}
         </div>
       );
     }
@@ -10403,7 +10507,7 @@
           {tab === 'infos' && <InfosPage session={session} />}
           {tab === 'closure' && <ClosurePage session={session} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           {tab === 'masterrecap' && session.isMaster && <MasterRecapPage session={session} consumersByEmail={consumersByEmail} />}
-          {tab === 'push' && session.isMaster && <PushComposerPage session={session} availableSites={availableSites} pushMessages={pushMessages} />}
+          {tab === 'push' && session.isMaster && <PushComposerPage session={session} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
           {tab === 'casuivi' && session.isMaster && <CaSuiviPage session={session} />}
           {tab === 'manqhist' && session.isMaster && <ManquantsHistoryPage session={session} />}
           {tab === 'stats' && session.isMaster && <StatsPage session={session} />}
