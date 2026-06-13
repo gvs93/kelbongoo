@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.10</title>
+  <title>Kelbongoo — Distribution V9.11</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -493,7 +493,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.10';
+    const APP_VERSION = 'V9.11';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -4353,6 +4353,7 @@
       const [eanMap, setEanMap] = React.useState({});
       const [counts, setCounts] = React.useState({});
       const [search, setSearch] = React.useState('');
+      const [invSort, setInvSort] = React.useState('fournisseur'); // 'nom' | 'famille' | 'fournisseur'
       const [scanMode, setScanMode] = React.useState(false);
       const [scanInput, setScanInput] = React.useState('');
       const [pendingEan, setPendingEan] = React.useState(null);
@@ -4476,9 +4477,20 @@
       const matches = React.useMemo(() => {
         const base = (invType === 'tournant') ? scopeProducts : products;
         const q = normalizeText(search);
-        if (!q) return (invType === 'tournant') ? base.slice(0, 300) : [];
-        return base.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)).slice(0, 50);
-      }, [search, products, invType, scopeProducts]);
+        const filtered = q ? base.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)) : base.slice();
+        const fam = p => (p.family || p.famille || '');
+        filtered.sort((a, b) => {
+          if (invSort === 'nom') return normalizeText(a.name).localeCompare(normalizeText(b.name));
+          if (invSort === 'famille') {
+            const c = normalizeText(fam(a)).localeCompare(normalizeText(fam(b)));
+            return c !== 0 ? c : normalizeText(a.name).localeCompare(normalizeText(b.name));
+          }
+          // fournisseur
+          const c = normalizeText(a.producer||'').localeCompare(normalizeText(b.producer||''));
+          return c !== 0 ? c : normalizeText(a.name).localeCompare(normalizeText(b.name));
+        });
+        return filtered.slice(0, 800);
+      }, [search, products, invType, scopeProducts, invSort]);
 
       // Pour associer un code inconnu : on cherche dans TOUT le catalogue (pas seulement le périmètre)
       const assocMatches = React.useMemo(() => {
@@ -4550,7 +4562,10 @@
         return products.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)).slice(0, 30);
       }, [learnSearch, products]);
 
-      const counted = Object.keys(counts).filter(id => counts[id] > 0);
+      const counted = Object.keys(counts).filter(id => counts[id] !== undefined && counts[id] !== null);
+      const clearCount = async (id) => {
+        try { await storage.deleteDoc(`inventory_${invDate}`, id); } catch(e){}
+      };
       const isTuesday = new Date().getDay() === 2;
       const scopeOk = invType !== 'tournant' || !!scopeValue;
 
@@ -4813,23 +4828,35 @@
           ) : (
             <div className="card">
               <input value={search} onChange={e=>setSearch(e.target.value)}
-                placeholder={invType==='tournant' ? "Filtrer dans le périmètre…" : "Chercher un produit (nom, producteur)…"}
+                placeholder={invType==='tournant' ? "Filtrer dans le périmètre…" : "Filtrer (nom, producteur)…"}
                 style={{width:'100%',fontSize:15,padding:'8px',marginBottom:8}} />
-              <div className="stack" style={{gap:4,maxHeight:'50vh',overflowY:'auto'}}>
-                {matches.map(p => (
-                  <div key={p.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 8px',border:'1px solid var(--border)',borderRadius:6}}>
-                    <div style={{fontSize:13,minWidth:0}}>
-                      <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.name}</div>
-                      <div style={{color:'var(--ink-mute)',fontSize:11}}>{p.producer}</div>
+              <div className="filter-row" style={{marginBottom:8}}>
+                <span style={{fontSize:12,color:'var(--ink-mute)',alignSelf:'center',marginRight:2}}>Trier :</span>
+                <div className={`chip ${invSort==='nom'?'selected':''}`} onClick={()=>setInvSort('nom')}>🔤 Nom</div>
+                <div className={`chip ${invSort==='fournisseur'?'selected':''}`} onClick={()=>setInvSort('fournisseur')}>🧺 Fournisseur</div>
+                {hasFamilies && <div className={`chip ${invSort==='famille'?'selected':''}`} onClick={()=>setInvSort('famille')}>🗂️ Famille</div>}
+              </div>
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{matches.length} produit(s) · tape la quantité, ou « 0 » si stock nul.</div>
+              <div className="stack" style={{gap:4,maxHeight:'55vh',overflowY:'auto'}}>
+                {matches.map(p => {
+                  const isCounted = counts[p.id] !== undefined && counts[p.id] !== null;
+                  const fam = p.family || p.famille || '';
+                  return (
+                  <div key={p.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 8px',border:`1px solid ${isCounted?'var(--accent)':'var(--border)'}`,background:isCounted?'var(--accent-soft)':'transparent',borderRadius:6}}>
+                    <div style={{fontSize:13,minWidth:0,flex:1}}>
+                      <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{isCounted?'✓ ':''}{p.name}</div>
+                      <div style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.producer}{fam?` · ${fam}`:''}</div>
                     </div>
-                    <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
-                      style={{width:64,textAlign:'center',fontSize:15,padding:'6px'}} />
+                    <div style={{display:'flex',alignItems:'center',gap:6}}>
+                      <button className="btn-ghost" style={{fontSize:13,padding:'4px 10px',border:'1px solid var(--border)',borderRadius:6}} onClick={()=>setCount(p.id, 0)}>0</button>
+                      <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
+                        style={{width:60,textAlign:'center',fontSize:15,padding:'6px'}} />
+                    </div>
                   </div>
-                ))}
-                {invType==='complet' && !search.trim() && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Cherche un produit pour le compter, ou utilise le scan caméra.</p>}
+                  );
+                })}
                 {invType==='tournant' && !scopeOk && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Choisis d'abord un périmètre ci-dessus.</p>}
-                {invType==='tournant' && scopeOk && matches.length===0 && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun produit dans ce périmètre.</p>}
-                {invType==='complet' && search.trim() && matches.length === 0 && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun produit trouvé.</p>}
+                {scopeOk && matches.length===0 && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun produit{search.trim()?' trouvé':''}.</p>}
               </div>
             </div>
           )}
@@ -4843,7 +4870,7 @@
                     <span>{prodById[id]?.name || id}</span>
                     <div style={{display:'flex',gap:8,alignItems:'center'}}>
                       <strong>{counts[id]}</strong>
-                      <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px'}} onClick={()=>setCount(id, 0)}>✕</button>
+                      <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px'}} onClick={()=>clearCount(id)}>✕</button>
                     </div>
                   </div>
                 ))}
