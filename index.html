@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.16</title>
+  <title>Kelbongoo — Distribution V9.17</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -493,7 +493,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.16';
+    const APP_VERSION = 'V9.17';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -3461,7 +3461,7 @@
             return (
               <div className="card" style={{display:'flex',flexDirection:'column',gap:8}}>
                 <div style={{fontSize:13,fontWeight:600}}>Relancer les {emailOnly.length} client(s) à contacter par email</div>
-                <FreshdeskRelanceButton clients={emailOnly} onDone={() => {}} />
+                <FreshdeskRelanceButton clients={emailOnly} onDone={() => {}} session={session} />
               </div>
             );
           })()}
@@ -3470,7 +3470,7 @@
     }
 
     // Bouton qui envoie les relances via le proxy Freshdesk (crée 1 ticket + mail par client)
-    function FreshdeskRelanceButton({ clients, onDone }) {
+    function FreshdeskRelanceButton({ clients, onDone, session }) {
       const showToast = React.useContext(ToastContext);
       const [busy, setBusy] = React.useState(false);
       const [result, setResult] = React.useState(null);
@@ -3498,6 +3498,20 @@
           // Apps Script Web App nécessite un POST sans en-tête custom (sinon préflight CORS)
           const data = await freshdeskPost(payload);
           if (data.ok) {
+            // Enregistre tous les envois
+            try {
+              for (const c of clients) {
+                await storage.setDoc('client_mail_history', `${c.email}_${Date.now()}_${Math.random()}`, {
+                  clientEmail: c.email,
+                  clientName: c.consumer_name || c.clientName || '',
+                  type: 'non_recup',
+                  subject: 'Votre commande Kelbongoo à récupérer',
+                  sentAt: new Date().toISOString(),
+                  sentBy: session?.name || 'anonyme',
+                  site: c.site,
+                });
+              }
+            } catch (e) { /* erreur log non-bloquante */ }
             setResult(data);
             showToast(`✓ ${data.success} ticket(s) créé(s)${data.failed ? `, ${data.failed} échec(s)` : ''}`);
             onDone && onDone();
@@ -3702,6 +3716,18 @@
           };
           const data = await freshdeskPost(payload);
           if (data.ok && data.success > 0) {
+            // Enregistre l'envoi
+            try {
+              await storage.setDoc('client_mail_history', `${client.email}_${Date.now()}`, {
+                clientEmail: client.email,
+                clientName: client.clientName || '',
+                type: 'oubli',
+                subject: 'Article oublié dans votre casier Kelbongoo',
+                sentAt: new Date().toISOString(),
+                sentBy: 'oubli-auto',
+                site: client.site,
+              });
+            } catch (e) { /* erreur log non-bloquante */ }
             setSent(true);
             showToast('✓ Ticket Freshdesk créé + mail envoyé');
           } else {
@@ -3713,9 +3739,12 @@
       };
 
       return (
-        <button className={sent ? 'btn-secondary' : 'btn-secondary'} style={{padding:'6px 10px',fontSize:12}} disabled={busy} onClick={handleSend}>
-          {busy ? 'Envoi…' : sent ? '🎫 Relance envoyée ✓' : '🎫 Relancer (Freshdesk)'}
-        </button>
+        <div>
+          <button className={sent ? 'btn-secondary' : 'btn-secondary'} style={{padding:'6px 10px',fontSize:12}} disabled={busy} onClick={handleSend}>
+            {busy ? 'Envoi…' : sent ? '🎫 Relance envoyée ✓' : '🎫 Relancer (Freshdesk)'}
+          </button>
+          <ClientMailHistory clientEmail={client.email} />
+        </div>
       );
     }
 
@@ -4376,8 +4405,6 @@
       const [mqQty, setMqQty] = React.useState('');
       const [mqDlc, setMqDlc] = React.useState('');
       const [mqSending, setMqSending] = React.useState(false);
-      // DLC à risque : produit qu'on signale depuis la liste d'inventaire
-      const [dlcTarget, setDlcTarget] = React.useState(null);
 
       React.useEffect(() => {
         (async () => {
@@ -4459,11 +4486,6 @@
       const prodById = React.useMemo(() => {
         const m = {}; for (const p of products) m[p.id] = p; return m;
       }, [products]);
-
-      // Catalogue au format attendu par DlcWatchForm / ProductPicker (produit/producteur)
-      const dlcProducts = React.useMemo(() =>
-        products.map(p => ({ id: p.id, produit: p.name, producteur: p.producer || '', unite: p.unite || '' })),
-      [products]);
 
       const setCount = async (productId, qty) => {
         const q = Math.max(0, parseInt(qty,10) || 0);
@@ -4855,7 +4877,6 @@
                       <div style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.producer}{fam?` · ${fam}`:''}</div>
                     </div>
                     <div style={{display:'flex',alignItems:'center',gap:6}}>
-                      <button title="Signaler une DLC à risque" className="btn-ghost" style={{fontSize:15,padding:'4px 8px',border:'1px solid var(--warn)',borderRadius:6,lineHeight:1}} onClick={()=>setDlcTarget(p)}>🟠</button>
                       <button className="btn-ghost" style={{fontSize:13,padding:'4px 10px',border:'1px solid var(--border)',borderRadius:6}} onClick={()=>setCount(p.id, 0)}>0</button>
                       <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
                         style={{width:60,textAlign:'center',fontSize:15,padding:'6px'}} />
@@ -4938,23 +4959,6 @@
           </div>
           </>
           )}
-
-          {dlcTarget && (
-            <div className="modal-backdrop" onClick={(e)=>{ if(e.target.className==='modal-backdrop') setDlcTarget(null); }}>
-              <div className="modal">
-                <div className="modal-header">
-                  <strong style={{fontSize:15}}>🟠 DLC à risque — {dlcTarget.name}</strong>
-                  <button className="modal-close" onClick={()=>setDlcTarget(null)}>×</button>
-                </div>
-                <DlcWatchForm
-                  products={dlcProducts}
-                  session={session}
-                  defaultInvDay={invDate}
-                  defaultProductKey={`${dlcTarget.producer||''}|${dlcTarget.name}`}
-                  onClose={()=>setDlcTarget(null)} />
-              </div>
-            </div>
-          )}
         </div>
       );
     }
@@ -4963,7 +4967,29 @@
     // PAGE RÉCAP MASTER — vue globale tous locaux (consignes + suivi + oublis)
     // ============================================================
     // Bouton Freshdesk générique pour relancer un client non récupéré (récap master)
-    function FreshdeskRecupButton({ client, mode }) {
+    // Affiche l'historique des mails envoyés à un client (via le bouton Relancer).
+    function ClientMailHistory({ clientEmail }) {
+      const [history, setHistory] = React.useState([]);
+      React.useEffect(() => {
+        if (!clientEmail) return;
+        const u = storage.subscribe('client_mail_history', (arr) => {
+          const filtered = arr.filter(h => h.clientEmail === clientEmail);
+          filtered.sort((a, b) => new Date(b.sentAt) - new Date(a.sentAt));
+          setHistory(filtered.slice(0, 3)); // 3 derniers
+        });
+        return () => { u && u(); };
+      }, [clientEmail]);
+      if (!history.length) return null;
+      return (
+        <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>
+          {history.map((h, i) => (
+            <div key={i}>📧 {h.type==='oubli'?'Oubli':h.type==='non_recup'?'Récup':'Mail'} · {formatDateShort(h.sentAt)} {h.sentBy ? `(${h.sentBy})` : ''}</div>
+          ))}
+        </div>
+      );
+    }
+
+    function FreshdeskRecupButton({ client, mode, session }) {
       const showToast = React.useContext(ToastContext);
       const [busy, setBusy] = React.useState(false);
       const [sent, setSent] = React.useState(false);
@@ -4993,6 +5019,18 @@
           };
           const data = await freshdeskPost(payload);
           if (data.ok && (data.success > 0 || data.success === undefined)) {
+            // Enregistre l'envoi dans l'historique
+            try {
+              await storage.setDoc('client_mail_history', `${email}_${Date.now()}`, {
+                clientEmail: email,
+                clientName: client.consumer_name || client.clientName || '',
+                type: isOubli ? 'oubli' : 'non_recup',
+                subject: isOubli ? 'Article oublié dans votre casier Kelbongoo' : 'Votre commande Kelbongoo à récupérer',
+                sentAt: new Date().toISOString(),
+                sentBy: session?.name || 'anonyme',
+                site: client.site,
+              });
+            } catch (e) { /* erreur log non-bloquante */ }
             setSent(true);
             showToast('✓ Ticket Freshdesk créé + mail envoyé');
           } else {
@@ -5004,9 +5042,12 @@
 
       if (!email) return null;
       return (
-        <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} disabled={busy} onClick={handleSend}>
-          {busy ? 'Envoi…' : sent ? '🎫 Mail envoyé ✓' : '🎫 Relancer par mail (Freshdesk)'}
-        </button>
+        <div>
+          <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} disabled={busy} onClick={handleSend}>
+            {busy ? 'Envoi…' : sent ? '🎫 Mail envoyé ✓' : '🎫 Relancer par mail (Freshdesk)'}
+          </button>
+          <ClientMailHistory clientEmail={email} />
+        </div>
       );
     }
 
@@ -9164,9 +9205,9 @@
     // L'opérateur saisit produit + DLC + nb d'unités (+ DOM dates courtes).
     // L'appli répond : niveau, jours/boutiques éligibles, instruction. À la
     // validation → crée une entrée de surveillance (cases par jour).
-    function DlcWatchForm({ products, session, onClose, defaultInvDay, defaultProductKey }) {
+    function DlcWatchForm({ products, session, onClose, defaultInvDay }) {
       const showToast = React.useContext(ToastContext);
-      const [productKey, setProductKey] = React.useState(defaultProductKey || '');
+      const [productKey, setProductKey] = React.useState('');
       const [dlc, setDlc] = React.useState('');
       const [qty, setQty] = React.useState('');
       const [domShort, setDomShort] = React.useState(false);
