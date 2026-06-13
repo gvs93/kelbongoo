@@ -733,7 +733,9 @@
         `${lines}\n\nMerci de les traiter (remise en rayon, envoi ROB, partage équipe ou perte).\n\n— App Distribution Kelbongoo`;
 
       // Envoi SERVEUR uniquement (MailApp via proxy) — jamais de mailto / ouverture Gmail.
-      return await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: PDP_ALERT_EMAILS, subject, body });
+      // ⚠️ `to` doit être une CHAÎNE (destinataires séparés par des virgules) : MailApp.sendEmail
+      // accepte une string « a@x, b@y » mais pas un tableau JS. Un tableau = envoi muet qui échoue.
+      return await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: PDP_ALERT_EMAILS.join(', '), subject, body });
     }
     const LOSS_REASONS = [
       { id:"casse_fournisseur", label:"Casse fournisseur" },
@@ -4516,7 +4518,9 @@
       };
 
       const matches = React.useMemo(() => {
-        const base = (invType === 'tournant') ? scopeProducts : products;
+        const baseAll = (invType === 'tournant') ? scopeProducts : products;
+        // Exclut les « lignes vides » : produits du catalogue sans nom (entrées fantômes du cache produits).
+        const base = baseAll.filter(p => (p.name || '').trim());
         const q = normalizeText(search);
         const filtered = q ? base.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)) : base.slice();
         const fam = p => (p.family || p.famille || '');
@@ -5084,14 +5088,42 @@
       const overduePdp = computeOverduePdpReturns(pdpReturns);
       const sendOverdueAlert = async () => {
         if (overduePdp.length === 0) { showToast('Aucun retour en retard'); return; }
-        if (!confirm(`Envoyer l'alerte (${overduePdp.length} retour(s) non traité(s)) à rr@ + hg@ ?`)) return;
+        if (!confirm(`Envoyer l'alerte (${overduePdp.length} retour(s) non traité(s)) à ${PDP_ALERT_EMAILS.join(' + ')} ?`)) return;
         setAlerting(true);
         try {
           const res = await sendPdpAlert(overduePdp);
-          showToast(res && res.fallback ? '✉️ Ouvre ta messagerie' : '✓ Alerte envoyée');
+          // Le proxy renvoie { ok:false, error } si MailApp échoue : on ne ment plus sur le succès.
+          if (res && res.ok === false) { showToast('❌ Échec envoi : ' + (res.error || 'action send_mail du proxy stock')); }
+          else if (res && res.fallback) { showToast('✉️ Ouvre ta messagerie'); }
+          else { showToast('✓ Alerte envoyée à ' + PDP_ALERT_EMAILS.join(' + ')); }
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setAlerting(false); }
       };
+
+      // ── Envoi AUTOMATIQUE de l'alerte (1×/jour) dès qu'un retour PDP est en retard ──
+      // Il n'existait aucun déclencheur auto : l'alerte ne partait QUE sur clic du bouton.
+      // Ici, le 1er master qui ouvre le récap avec des retours en retard déclenche l'envoi.
+      // Verrou quotidien partagé (collection pdp_alert_log/<jour>) → pas de doublon entre postes.
+      const autoSentRef = React.useRef(false);
+      React.useEffect(() => {
+        if (autoSentRef.current) return;
+        if (!firebaseConfigured) return;            // pas d'auto-envoi en mode local (1 seul poste)
+        if (overduePdp.length === 0) return;
+        autoSentRef.current = true;                 // verrou local immédiat (évite les rafales de re-render)
+        (async () => {
+          const dayK = todayKey();
+          try {
+            const flag = await storage.getDoc('pdp_alert_log', dayK);
+            if (flag && flag.sent) return;          // déjà envoyé aujourd'hui par un autre poste
+            const res = await sendPdpAlert(overduePdp);
+            if (res && res.ok === false) { autoSentRef.current = false; return; } // échec → réessai possible
+            await storage.setDoc('pdp_alert_log', dayK, {
+              sent: true, count: overduePdp.length, at: new Date().toISOString(), by: session.name,
+            }, { replace: true });
+            showToast('✉️ Alerte retours PDP envoyée automatiquement (' + overduePdp.length + ')');
+          } catch (e) { autoSentRef.current = false; } // réessai au prochain rendu
+        })();
+      }, [overduePdp.length]);
 
       const phoneOf = (email, fallback) => {
         if (fallback) return fallback;
