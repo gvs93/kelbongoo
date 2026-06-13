@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.14</title>
+  <title>Kelbongoo — Distribution V9.16</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -493,7 +493,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.14';
+    const APP_VERSION = 'V9.16';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -9863,13 +9863,14 @@
     ];
     // Mail groupé aux clients : copie cachée systématique à HG.
     const MAIL_BCC_SELF = 'hg@probon.fr';
-    function ClientMailComposer({ session, orders }) {
+    function ClientMailComposer({ session, orders, statusMap }) {
       const showToast = React.useContext(ToastContext);
       const [scope, setScope] = React.useState('all'); // 'all' | 'site'
       const [site, setSite] = React.useState('');
       const [subject, setSubject] = React.useState('');
       const [body, setBody] = React.useState('');
       const [busy, setBusy] = React.useState(false);
+      const [ignorePassed, setIgnorePassed] = React.useState(false);
 
       // Sites présents dans les commandes du jour
       const sitesOfDay = React.useMemo(() => {
@@ -9878,16 +9879,17 @@
         return [...s].sort();
       }, [orders]);
 
-      // Emails uniques selon le périmètre
+      // Emails uniques selon le périmètre (+ ignore passés si coché)
       const emails = React.useMemo(() => {
         const set = new Set();
         for (const o of (orders || [])) {
           if (scope === 'site' && o.site !== site) continue;
+          if (ignorePassed && statusMap && statusMap[o.orderId]?.passed) continue;
           const e = (o.email || '').trim();
           if (e && e.includes('@')) set.add(e.toLowerCase());
         }
         return [...set];
-      }, [orders, scope, site]);
+      }, [orders, scope, site, ignorePassed, statusMap]);
 
       const applyTemplate = (t) => {
         const siteTxt = (scope === 'site' && site) ? ` de ${siteLabel(site)}` : '';
@@ -9902,18 +9904,17 @@
         if (!confirm(`Envoyer ce mail à ${emails.length} client(s) en copie cachée (BCC) ?`)) return;
         setBusy(true);
         try {
-          const bcc = emails.slice();
-          if (!bcc.includes(MAIL_BCC_SELF)) bcc.push(MAIL_BCC_SELF);
-          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', bcc, subject, body });
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'client_bulk_mail',
+            subject, body, emails, bccSelf: MAIL_BCC_SELF });
           if (!data.ok) { showToast('Erreur : ' + (data.error || 'inconnue')); setBusy(false); return; }
-          showToast(`✓ Mail envoyé à ${emails.length} client(s) en BCC`);
+          showToast(`✓ Mail envoyé à ${emails.length} client(s) depuis contact@ (BCC)`);
         } catch (e) { showToast('Erreur réseau : ' + e.message); }
         finally { setBusy(false); }
       };
 
       return (
         <div style={{display:'flex',flexDirection:'column',gap:10}}>
-          <p style={{color:'var(--ink-soft)',fontSize:12,margin:0}}>Clients ayant une commande aujourd'hui. Envoi côté serveur, en <strong>copie cachée (BCC)</strong> — les adresses ne sont jamais visibles entre clients, et rien n'ouvre votre messagerie. Une copie cachée part aussi à <strong>hg@probon.fr</strong>.</p>
+          <p style={{color:'var(--ink-soft)',fontSize:12,margin:0}}>Clients ayant une commande aujourd'hui. Envoi depuis <strong>contact@kelbongoo.com</strong> (Freshdesk), clients en <strong>copie cachée (BCC)</strong> — ils ne voient jamais les adresses des autres (RGPD). Copie cachée aussi à <strong>hg@probon.fr</strong>.</p>
           <div className="filter-row" style={{marginBottom:0}}>
             <div className={`chip ${scope==='all'?'selected':''}`} onClick={()=>setScope('all')}>Tous ({(orders||[]).length} cmd)</div>
             <div className={`chip ${scope==='site'?'selected':''}`} onClick={()=>setScope('site')}>Par local</div>
@@ -9924,6 +9925,10 @@
               {sitesOfDay.map(s => <option key={s} value={s}>{siteLabel(s)}</option>)}
             </select>
           )}
+          <label style={{fontSize:12,display:'flex',alignItems:'center',gap:6,marginBottom:8}}>
+            <input type="checkbox" checked={ignorePassed} onChange={e=>setIgnorePassed(e.target.checked)} style={{width:'auto'}} />
+            Ignorer les clients passés ce jour
+          </label>
           <div style={{fontSize:12,color: emails.length? 'var(--accent)':'var(--ink-mute)'}}>{emails.length} destinataire(s) avec email{scope==='site'&&!site?' — choisis un local':''}</div>
           <div>
             <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4}}>📋 Modèle préenregistré (modifiable)</label>
@@ -9938,7 +9943,7 @@
           <button className="btn-primary btn-block" disabled={busy || emails.length===0} onClick={send}>
             {busy ? 'Envoi…' : `Envoyer à ${emails.length} client(s) (BCC)`}
           </button>
-          {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)'}}>⚠️ STOCK_PROXY_URL vide.</div>}
+          {!FRESHDESK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)'}}>⚠️ FRESHDESK_PROXY_URL vide.</div>}
         </div>
       );
     }
@@ -9952,6 +9957,19 @@
       const [sites, setSites] = React.useState([]);
       const [busy, setBusy] = React.useState(false);
       const [channel, setChannel] = React.useState('push'); // 'push' | 'mail'
+      const [statuses, setStatuses] = React.useState([]);
+      
+      React.useEffect(() => {
+        const day = activeDay();
+        const u = storage.subscribe(`day_${day}_statuses`, setStatuses);
+        return () => { u && u(); };
+      }, []);
+      
+      const statusMap = React.useMemo(() => {
+        const m = {};
+        for (const s of statuses) m[s.orderId] = s;
+        return m;
+      }, [statuses]);
 
       const ICONS = ['📣','👤','📞','⚠️','📦','⏰','🛒'];
       const sitesList = (availableSites && availableSites.length) ? availableSites : SITES;
@@ -10015,7 +10033,7 @@
               <div className={`chip ${channel==='mail'?'selected':''}`} onClick={()=>setChannel('mail')}>✉️ Mail clients</div>
             </div>
 
-            {channel === 'mail' && <ClientMailComposer session={session} orders={orders} />}
+            {channel === 'mail' && <ClientMailComposer session={session} orders={orders} statusMap={statusMap} />}
 
             {channel === 'push' && (<>
             <div className="field">
