@@ -4107,6 +4107,14 @@
     // ============================================================
     const FL_SHEET_ID = '1PXQU4QP_bh_sRCEHonrMM7FkWmJWtNPyxDBPPRBlNVQ';
     const FL_SHEET_TAB = 'UNIQUEMENT STOCK A REMPLIR PAR PDP ';
+    // Mots-clés de catégorie identifiant un produit « Fruits & Légumes » dans le cache produits.
+    // ⚠️ À CONFIRMER : ajuste selon la valeur réelle de la catégorie FL dans le JSON produits
+    //    (la prévisualisation de synchro montre exactement ce qui est capté avant toute écriture).
+    const FL_CATEGORY_KEYWORDS = ['fruit', 'legume'];
+    function isFLProduct(p) {
+      const c = normalizeText(p && (p.category || p.family || p.famille) || '');
+      return FL_CATEGORY_KEYWORDS.some(k => c.includes(k));
+    }
 
     function FLInventoryPage({ session, invDate }) {
       const showToast = React.useContext(ToastContext);
@@ -4419,6 +4427,10 @@
       const [mqQty, setMqQty] = React.useState('');
       const [mqDlc, setMqDlc] = React.useState('');
       const [mqSending, setMqSending] = React.useState(false);
+      // Liste des produits ACTIFS = colonne E « produit » de la DERNIÈRE feuille de stock.
+      // null = non chargée → on retombe sur le cache produits (comportement historique).
+      const [stockProducts, setStockProducts] = React.useState(null);
+      const [stockNote, setStockNote] = React.useState('');
 
       React.useEffect(() => {
         (async () => {
@@ -4436,7 +4448,27 @@
         return () => { u1 && u1(); };
       }, []);
 
-      // Abonnement aux comptages de la date choisie (se réabonne si on change de date)
+      // Liste des produits réellement vendus = colonne E « produit » de la DERNIÈRE feuille
+      // de stock (les produits actifs du site). On la croise ensuite avec le cache produits
+      // pour récupérer fournisseur / famille / code-barres (scan & tri). Fallback cache si
+      // l'action proxy n'est pas déployée → l'inventaire ne casse jamais.
+      React.useEffect(() => {
+        (async () => {
+          try {
+            const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_products' });
+            if (data && data.ok && Array.isArray(data.products) && data.products.length) {
+              setStockProducts(data.products.map(s => String(s || '').trim()).filter(Boolean));
+              setStockNote(data.sheet ? `Liste issue de la feuille de stock « ${data.sheet} » (col E)` : 'Liste issue de la dernière feuille de stock (col E)');
+            } else {
+              setStockProducts(null);
+              setStockNote('⚠️ Action « stock_products » indisponible — liste basée sur le cache produits.');
+            }
+          } catch (e) {
+            setStockProducts(null);
+            setStockNote('⚠️ Lecture feuille de stock impossible — liste basée sur le cache produits.');
+          }
+        })();
+      }, []);
       React.useEffect(() => {
         setCounts({});
         const u = storage.subscribe(`inventory_${invDate}`, (arr) => {
@@ -4471,15 +4503,32 @@
         } catch(e){}
       };
 
+      // Univers d'inventaire : si la feuille de stock a été lue → uniquement ses produits
+      // (col E), enrichis depuis le cache par correspondance de nom (NFD/minuscule). Un produit
+      // de la feuille absent du cache reste saisissable (sans code-barres). Sinon → cache complet.
+      const universe = React.useMemo(() => {
+        if (!stockProducts) return products;
+        const byName = {};
+        for (const p of products) { const k = normalizeText(p.name || ''); if (k) byName[k] = p; }
+        const seen = new Set(); const out = [];
+        for (const name of stockProducts) {
+          const k = normalizeText(name);
+          if (!k || seen.has(k)) continue;
+          seen.add(k);
+          out.push(byName[k] || { id: 'stk_' + k.replace(/\s+/g, '_'), name, producer: '', category: '', _stockOnly: true });
+        }
+        return out;
+      }, [stockProducts, products]);
+
       const producers = React.useMemo(() => {
-        const s = new Set(); for (const p of products) if (p.producer) s.add(p.producer);
+        const s = new Set(); for (const p of universe) if (p.producer) s.add(p.producer);
         return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
-      }, [products]);
+      }, [universe]);
 
       const families = React.useMemo(() => {
-        const s = new Set(); for (const p of products) if (p.category) s.add(p.category);
+        const s = new Set(); for (const p of universe) if (p.category) s.add(p.category);
         return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
-      }, [products]);
+      }, [universe]);
       const hasFamilies = families.length > 0;
 
       const TYPE_LABELS = { frais: '🧊 Frais', pain: '🍞 Pain', nd: '🥬 Non-dispatch' };
@@ -4494,12 +4543,12 @@
 
       const scopeProducts = React.useMemo(() => {
         if (invType !== 'tournant' || !scopeValue) return [];
-        return products.filter(inScope);
-      }, [products, inScope, invType, scopeValue]);
+        return universe.filter(inScope);
+      }, [universe, inScope, invType, scopeValue]);
 
       const prodById = React.useMemo(() => {
-        const m = {}; for (const p of products) m[p.id] = p; return m;
-      }, [products]);
+        const m = {}; for (const p of products) m[p.id] = p; for (const p of universe) m[p.id] = p; return m;
+      }, [products, universe]);
 
       const setCount = async (productId, qty) => {
         const q = Math.max(0, parseInt(qty,10) || 0);
@@ -4518,8 +4567,8 @@
       };
 
       const matches = React.useMemo(() => {
-        const baseAll = (invType === 'tournant') ? scopeProducts : products;
-        // Exclut les « lignes vides » : produits du catalogue sans nom (entrées fantômes du cache produits).
+        const baseAll = (invType === 'tournant') ? scopeProducts : universe;
+        // Exclut les « lignes vides » : produits sans nom.
         const base = baseAll.filter(p => (p.name || '').trim());
         const q = normalizeText(search);
         const filtered = q ? base.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)) : base.slice();
@@ -4535,7 +4584,7 @@
           return c !== 0 ? c : normalizeText(a.name).localeCompare(normalizeText(b.name));
         });
         return filtered.slice(0, 800);
-      }, [search, products, invType, scopeProducts, invSort]);
+      }, [search, products, universe, invType, scopeProducts, invSort]);
 
       // Pour associer un code inconnu : on cherche dans TOUT le catalogue (pas seulement le périmètre)
       const assocMatches = React.useMemo(() => {
@@ -4758,6 +4807,11 @@
             </div>
             {invType === 'complet' && (
               <div style={{fontSize:12,color:'var(--ink-mute)'}}>Tout le catalogue. À faire au moins 1×/semaine — sert de référence.</div>
+            )}
+            {(invType === 'complet' || invType === 'tournant') && stockNote && (
+              <div style={{fontSize:11,color: stockNote.startsWith('⚠️') ? 'var(--danger)' : 'var(--ink-mute)', marginTop:4}}>
+                {stockProducts ? `📋 ${stockProducts.length} produits actifs · ` : ''}{stockNote}
+              </div>
             )}
             {invType === 'tournant' && (
               <div>
@@ -8544,6 +8598,147 @@
       );
     }
 
+    // Au-delà de ce nombre de désactivations, on N'APPLIQUE PAS automatiquement (critère FL
+    // peut-être faux) → on renvoie vers la synchro manuelle pour validation.
+    const FL_AUTOSYNC_MAX_INACTIVATE = 12;
+
+    // Construit la liste FL du catalogue (objet {id:produit}) → [{produit, producer}], dédupliquée.
+    function buildCatalogFLFrom(prodById) {
+      const arr = Object.entries(prodById || {}).map(([id, p]) => ({ id, ...p }));
+      const seen = new Set(); const out = [];
+      for (const p of arr) {
+        if (!(p.name || '').trim() || !isFLProduct(p)) continue;
+        const k = normalizeText(p.name); if (!k || seen.has(k)) continue; seen.add(k);
+        out.push({ produit: (p.name || '').trim(), producer: (p.producer || '').trim() });
+      }
+      return out;
+    }
+
+    // Synchro FL AUTOMATIQUE après chargement du catalogue : les nouveaux FL arrivent
+    // directement sur la feuille COMMANDE FL KBG x PROBON (= la liste de commande Probon),
+    // donc ils sont commandables sans recharger le fichier Probon. Lecture seule d'abord ;
+    // application seulement si le nombre de désactivations reste sous le garde-fou.
+    async function autoSyncFLAfterImport(prodById, showToast) {
+      try {
+        const catalog = buildCatalogFLFrom(prodById);
+        if (!catalog.length) return;
+        const prev = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', tab: FL_SHEET_TAB, apply: false, catalog });
+        if (!prev || !prev.ok) return;                       // action non déployée → silencieux
+        const nAdd = (prev.toAdd || []).length, nOff = (prev.toInactivate || []).length;
+        if (nAdd === 0 && nOff === 0) return;                // rien à faire
+        if (nOff > FL_AUTOSYNC_MAX_INACTIVATE) {
+          showToast && showToast(`⚠️ FL : +${nAdd} à ajouter mais ${nOff} désactivations → à valider dans Admin › Synchroniser FL`);
+          return;
+        }
+        const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', tab: FL_SHEET_TAB, apply: true, catalog });
+        if (res && res.ok) showToast && showToast(`🔄 FL auto-synchro : +${res.added || 0} ajouté(s) · −${res.inactivated || 0} désactivé(s)`);
+      } catch (e) { /* silencieux — ne bloque jamais l'import catalogue */ }
+    }
+
+    // ============================================================
+    // SYNCHRO LISTE FL (catalogue → feuille FL/Probon)
+    // Compare les produits FL du cache produits (JSON) à la feuille FL :
+    //   - FL présents au catalogue, absents de la feuille → À AJOUTER
+    //   - FL présents en feuille (actifs), absents du catalogue → À DÉSACTIVER (ACTIF? = NON)
+    // PRÉVISUALISATION D'ABORD : aucune écriture tant que « Appliquer » n'est pas cliqué.
+    // (Le chargement Probon Excel, lui, gère déjà add+désactivation pour la source Probon.)
+    // ============================================================
+    function FlSyncCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [busy, setBusy] = React.useState(false);
+      const [preview, setPreview] = React.useState(null); // { toAdd:[], toInactivate:[], currentActive }
+      const [applied, setApplied] = React.useState(null);
+
+      // Construit la liste FL du catalogue depuis le cache produits.
+      const buildCatalogFL = async () => {
+        const data = await readCache('products');
+        const arr = data ? Object.entries(data).map(([id, p]) => ({ id, ...p })) : [];
+        const fl = arr.filter(p => (p.name || '').trim() && isFLProduct(p))
+                      .map(p => ({ produit: (p.name || '').trim(), producer: (p.producer || '').trim() }));
+        // déduplique par nom normalisé
+        const seen = new Set(); const out = [];
+        for (const it of fl) { const k = normalizeText(it.produit); if (k && !seen.has(k)) { seen.add(k); out.push(it); } }
+        return out;
+      };
+
+      const runPreview = async () => {
+        setBusy(true); setApplied(null); setPreview(null);
+        try {
+          const catalog = await buildCatalogFL();
+          if (!catalog.length) { showToast('Aucun FL détecté au catalogue (vérifie FL_CATEGORY_KEYWORDS)'); setBusy(false); return; }
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', tab: FL_SHEET_TAB, apply: false, catalog });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          setPreview({ toAdd: data.toAdd || [], toInactivate: data.toInactivate || [], currentActive: data.currentActive });
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      const apply = async () => {
+        if (!preview) return;
+        const nAdd = preview.toAdd.length, nOff = preview.toInactivate.length;
+        if (!confirm(`Appliquer la synchro FL ?\n\n• ${nAdd} produit(s) ajouté(s)\n• ${nOff} produit(s) passé(s) en INACTIF\n\nÉcriture dans l'onglet « ${FL_SHEET_TAB} ».`)) return;
+        setBusy(true);
+        try {
+          const catalog = await buildCatalogFL();
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', tab: FL_SHEET_TAB, apply: true, catalog });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          setApplied({ added: data.added || 0, inactivated: data.inactivated || 0 });
+          setPreview(null);
+          showToast(`✓ Synchro FL : ${data.added||0} ajouté(s) · ${data.inactivated||0} désactivé(s)`);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--info,#2f6fc0)'}}>
+          <h3 style={{marginBottom:4}}>🔄 Synchroniser la liste FL (catalogue → feuille)</h3>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginBottom:10}}>
+            Ajoute les FL nouveaux du JSON produits et passe en <strong>inactif</strong> ceux qui n'y sont plus.
+            Prévisualisation obligatoire avant toute écriture. Mots-clés FL actuels : <code>{FL_CATEGORY_KEYWORDS.join(', ')}</code>.
+          </p>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            <button className="btn-ghost" disabled={busy} onClick={runPreview}>{busy && !preview ? 'Analyse…' : '🔍 Prévisualiser'}</button>
+            {preview && (
+              <button className="btn-primary" disabled={busy} onClick={apply}>
+                {busy ? 'Écriture…' : `✅ Appliquer (+${preview.toAdd.length} / −${preview.toInactivate.length})`}
+              </button>
+            )}
+          </div>
+
+          {preview && (
+            <div style={{marginTop:10,fontSize:13}}>
+              <div style={{color:'var(--ink-mute)',marginBottom:6}}>Feuille : {preview.currentActive ?? '?'} FL actifs · catalogue analysé.</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                <div>
+                  <div style={{fontWeight:700,color:'var(--ok,#2e7d32)'}}>➕ À ajouter ({preview.toAdd.length})</div>
+                  <div style={{maxHeight:160,overflowY:'auto',fontSize:12,marginTop:4}}>
+                    {preview.toAdd.length ? preview.toAdd.map((it,i)=>(
+                      <div key={i}>{it.produit}{it.producer?` · ${it.producer}`:''}</div>
+                    )) : <span style={{color:'var(--ink-mute)'}}>—</span>}
+                  </div>
+                </div>
+                <div>
+                  <div style={{fontWeight:700,color:'var(--danger,#c0392b)'}}>⏹️ À désactiver ({preview.toInactivate.length})</div>
+                  <div style={{maxHeight:160,overflowY:'auto',fontSize:12,marginTop:4}}>
+                    {preview.toInactivate.length ? preview.toInactivate.map((it,i)=>(
+                      <div key={i}>{it.produit}{it.producer?` · ${it.producer}`:''}</div>
+                    )) : <span style={{color:'var(--ink-mute)'}}>—</span>}
+                  </div>
+                </div>
+              </div>
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>⚠️ Vérifie les listes avant d'appliquer — l'écriture modifie la colonne ACTIF ? de la feuille FL.</div>
+            </div>
+          )}
+
+          {applied && (
+            <div style={{marginTop:10,fontSize:13,color:'var(--ok,#2e7d32)'}}>
+              ✓ Fait : {applied.added} ajouté(s) · {applied.inactivated} désactivé(s).
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta }) {
       const showToast = React.useContext(ToastContext);
       const [csvFile, setCsvFile] = React.useState(null);
@@ -8615,6 +8810,7 @@
           if (v4Prods) {
             prodById = parseProducersJSON(v4Prods);
             await writeCache('products', prodById);
+            autoSyncFLAfterImport(prodById, showToast); // nouveaux FL → liste commande Probon (auto)
           } else {
             const cd = await readCache('products');
             if (!cd) { showToast('Aucun fichier produits en mémoire : charge-le une première fois'); setBusy(false); return; }
@@ -8714,6 +8910,7 @@
           if (v4Prods) {
             const prodById = parseProducersJSON(v4Prods);
             await writeCache('products', prodById);
+            autoSyncFLAfterImport(prodById, showToast); // nouveaux FL → liste commande Probon (auto)
             msg.push(`${Object.keys(prodById).length} produits`);
           }
           if (v4Cons) {
@@ -9101,6 +9298,7 @@
           )}
 
           {session.isMaster && <ProbonImportCard session={session} />}
+          {session.isMaster && <FlSyncCard session={session} />}
 
           <LossesHistory />
 
