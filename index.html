@@ -4113,7 +4113,14 @@
     // ⚠️ À CONFIRMER : ajuste selon la valeur réelle de la catégorie FL dans le JSON produits
     //    (la prévisualisation de synchro montre exactement ce qui est capté avant toute écriture).
     const FL_CATEGORY_KEYWORDS = ['fruit', 'legume'];
+    // Si renseigné (ex. [2]), la détection FL se base sur le dispatch_type des produits —
+    // plus fiable que la catégorie quand l'export producerproduct n'a pas de nom de catégorie.
+    // PRIORITAIRE sur les mots-clés ci-dessus. Laisse vide [] pour utiliser la catégorie.
+    const FL_DISPATCH_TYPES = [];
     function isFLProduct(p) {
+      if (FL_DISPATCH_TYPES.length && p && p.dispatchType != null) {
+        return FL_DISPATCH_TYPES.indexOf(p.dispatchType) >= 0;
+      }
       const c = normalizeText(p && (p.category || p.family || p.famille) || '');
       return FL_CATEGORY_KEYWORDS.some(k => c.includes(k));
     }
@@ -8717,6 +8724,75 @@
       );
     }
 
+    // Diagnostic FL : pourquoi un produit est (ou non) détecté comme FL.
+    // Lecture seule sur le cache produits. Sert à régler FL_CATEGORY_KEYWORDS.
+    function FlDiagnosticCard() {
+      const [q, setQ] = React.useState('');
+      const [prods, setProds] = React.useState(null);
+      React.useEffect(() => {
+        (async () => {
+          const data = await readCache('products');
+          setProds(data ? Object.entries(data).map(([id, p]) => ({ id, ...p })) : []);
+        })();
+      }, []);
+      if (!prods) return null;
+      const flCount = prods.filter(isFLProduct).length;
+      const results = q.trim()
+        ? prods.filter(p => normalizeText(p.name || '').includes(normalizeText(q))).slice(0, 40)
+        : [];
+      const catMap = {};
+      for (const p of prods) { const c = p.category || '(vide)'; catMap[c] = (catMap[c] || 0) + 1; }
+      const cats = Object.entries(catMap).sort((a, b) => b[1] - a[1]);
+      const dispMap = {};
+      for (const p of prods) { const d = (p.dispatchType==null?'(vide)':String(p.dispatchType)); dispMap[d] = (dispMap[d] || 0) + 1; }
+      const disps = Object.entries(dispMap).sort((a, b) => b[1] - a[1]);
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--info,#2f6fc0)'}}>
+          <h3 style={{marginBottom:4}}>🔬 Diagnostic FL</h3>
+          <div style={{fontSize:12,color:'var(--ink-mute)'}}>
+            {prods.length} produits au catalogue · <strong>{flCount}</strong> détectés FL.
+            {' '}Critère : {FL_DISPATCH_TYPES.length ? <>dispatch_type ∈ <code>[{FL_DISPATCH_TYPES.join(', ')}]</code></> : <>catégorie contient <code>[{FL_CATEGORY_KEYWORDS.join(', ')}]</code></>}.
+          </div>
+          <input type="text" value={q} onChange={e=>setQ(e.target.value)}
+                 placeholder="Chercher un produit (ex. Tomate Cerise)" style={{width:'100%',marginTop:8,padding:'8px',fontSize:14}} />
+          {q.trim() && (
+            <div style={{maxHeight:220,overflowY:'auto',fontSize:12,marginTop:6}}>
+              {results.length ? results.map(p => (
+                <div key={p.id} style={{display:'flex',justifyContent:'space-between',gap:8,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
+                  <span>{p.name} <em style={{color:'var(--ink-mute)'}}>· cat : {p.category || '(vide)'} · <strong style={{color:'var(--info,#2f6fc0)'}}>dispatch : {p.dispatchType==null?'—':p.dispatchType}</strong></em></span>
+                  <strong style={{whiteSpace:'nowrap',color: isFLProduct(p)?'var(--ok,#2e7d32)':'var(--danger,#c0392b)'}}>{isFLProduct(p)?'FL ✓':'non FL ✗'}</strong>
+                </div>
+              )) : <div style={{color:'var(--ink-mute)'}}>Aucun produit trouvé pour « {q} ».</div>}
+            </div>
+          )}
+          <details style={{marginTop:8}} open>
+            <summary style={{cursor:'pointer',fontSize:12,fontWeight:600}}>Répartition par dispatch_type ({disps.length})</summary>
+            <div style={{maxHeight:160,overflowY:'auto',fontSize:12,marginTop:6}}>
+              {disps.map(([d,n]) => (
+                <div key={d} style={{display:'flex',justifyContent:'space-between'}}>
+                  <span>dispatch {d}{FL_DISPATCH_TYPES.indexOf(Number(d))>=0?' 🥬':''}</span><span style={{color:'var(--ink-mute)'}}>{n}</span>
+                </div>
+              ))}
+            </div>
+          </details>
+          <details style={{marginTop:8}}>
+            <summary style={{cursor:'pointer',fontSize:12,fontWeight:600}}>Voir les catégories du catalogue ({cats.length})</summary>
+            <div style={{maxHeight:200,overflowY:'auto',fontSize:12,marginTop:6}}>
+              {cats.map(([c,n]) => {
+                const isFl = FL_CATEGORY_KEYWORDS.some(k => normalizeText(c).includes(k));
+                return (
+                  <div key={c} style={{display:'flex',justifyContent:'space-between'}}>
+                    <span style={{color: isFl?'var(--ok,#2e7d32)':'inherit'}}>{isFl?'🥬 ':''}{c}</span>
+                    <span style={{color:'var(--ink-mute)'}}>{n}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </details>
+        </div>
+      );
+    }
+
     // ============================================================
     // SYNCHRO LISTE FL (catalogue → feuille FL/Probon)
     // Compare les produits FL du cache produits (JSON) à la feuille FL :
@@ -9381,6 +9457,7 @@
           )}
 
           {session.isMaster && <FlSyncResultPanel info={flSync} onClear={()=>setFlSync(null)} />}
+          {session.isMaster && <FlDiagnosticCard />}
           {session.isMaster && <ProbonImportCard session={session} />}
           {session.isMaster && <FlSyncCard session={session} />}
 
