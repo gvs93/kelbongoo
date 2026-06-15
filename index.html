@@ -4146,17 +4146,15 @@
     // plus fiable que la catégorie quand l'export producerproduct n'a pas de nom de catégorie.
     // PRIORITAIRE sur les mots-clés ci-dessus. Laisse vide [] pour utiliser la catégorie.
     const FL_DISPATCH_TYPES = [];
-    // Exceptions incluses sur la feuille Probon même hors catégorie « Fruits, Légumes » :
-    // les ŒUFS (catégorie « Basse Cour & Œufs ») font partie de Probon. Repérés par le nom.
-    const FL_NAME_INCLUDE = ['oeuf', 'œuf'];
+    // FL = catégorie « Fruits, Légumes ». Exception ŒUFS = catégorie « Basse Cour & Œufs »
+    // ET nom contenant « œuf » (→ vrais œufs de poule, PAS œufs de truite ni volaille).
+    // Critère basé sur la CATÉGORIE (fiable), jamais sur le seul nom.
     function isFLProduct(p) {
-      if (FL_DISPATCH_TYPES.length && p && p.dispatchType != null) {
-        return FL_DISPATCH_TYPES.indexOf(p.dispatchType) >= 0;
-      }
-      const c = normalizeText(p && (p.category || p.family || p.famille) || '');
-      if (FL_CATEGORY_KEYWORDS.some(k => c.includes(k))) return true;
-      const n = normalizeText(p && p.name || '');
-      return FL_NAME_INCLUDE.some(k => n.includes(k));   // exception œufs
+      const c = normalizeText((p && p.category) || '');
+      const n = normalizeText((p && p.name) || '');
+      if (c.indexOf('fruit') >= 0 && c.indexOf('legume') >= 0) return true;       // Fruits, Légumes
+      if (c.indexOf('basse cour') >= 0 && (n.indexOf('oeuf') >= 0 || n.indexOf('\u0153uf') >= 0)) return true; // œufs
+      return false;
     }
 
     function FLInventoryPage({ session, invDate }) {
@@ -8718,13 +8716,14 @@
           if (showToast) showToast('⚠️ ' + toAdd.length + ' FL à ajouter — trop pour un ajout auto, à vérifier');
           return;
         }
-        let added = 0;
-        if (toAdd.length) {
+        let added = 0, fixedUv = 0;
+        {
           const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false, catalog });
-          if (res && res.ok) added = res.added || 0;
+          if (res && res.ok) { added = res.added || 0; fixedUv = res.fixedUv || 0; }
         }
-        onResult && onResult({ added, toInactivate, possibleDuplicates, currentActive: prev.currentActive });
+        onResult && onResult({ added, fixedUv, toInactivate, possibleDuplicates, currentActive: prev.currentActive });
         if (showToast) showToast('🥬 FL : +' + added + ' ajouté(s)'
+          + (fixedUv ? ' · ' + fixedUv + ' UV complétée(s)' : '')
           + (possibleDuplicates.length ? ' · ' + possibleDuplicates.length + ' doublon(s) ?' : '')
           + (toInactivate.length ? ' · ' + toInactivate.length + ' à vérifier' : ''));
       } catch (e) { onResult && onResult({ error: e.message }); }
@@ -8779,7 +8778,7 @@
             <h3 style={{margin:0}}>🥬 Synchro FL (au chargement du catalogue)</h3>
             <button className="btn-ghost" style={{fontSize:12}} onClick={onClear}>✕</button>
           </div>
-          <div style={{fontSize:13,marginTop:6}}>✓ <strong>{info.added || 0}</strong> nouveau(x) FL ajouté(s) à la liste de commande Probon.</div>
+          <div style={{fontSize:13,marginTop:6}}>✓ <strong>{info.added || 0}</strong> nouveau(x) FL ajouté(s) à la liste de commande Probon.{info.fixedUv ? <span> · {info.fixedUv} unité(s) de vente complétée(s).</span> : null}</div>
           {dups.length > 0 && <FlDuplicatesBlock pairs={dups} />}
           {issues.length === 0 ? (
             (dups.length === 0 ? <div style={{fontSize:13,color:'var(--ink-mute)',marginTop:4}}>Aucun souci : rien à désactiver.</div> : null)
@@ -8877,6 +8876,18 @@
           else showToast('Erreur envoi : ' + ((r && r.error) || '?'));
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
+      const deleteRows = async () => {
+        const items = selectedItems();
+        const rows = items.map(it => it.row).filter(Boolean);
+        if (!rows.length) { showToast('Aucune ligne à supprimer (lignes inconnues)'); return; }
+        if (!confirm(`SUPPRIMER définitivement ${rows.length} ligne(s) de la feuille Probon ?\n\n(à utiliser pour les produits ajoutés par erreur : viande, etc.)`)) return;
+        setBusy(true);
+        try {
+          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'delete_rows', rows });
+          if (r && r.ok) { showToast(`🗑️ ${r.deleted || 0} ligne(s) supprimée(s)`); onDone && onDone(); }
+          else showToast('Erreur : ' + ((r && r.error) || '?'));
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
 
       return (
         <div style={{marginTop:8}}>
@@ -8890,11 +8901,12 @@
             ))}
           </div>
           <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>
-            Décoche ce qui doit rester (ex. les œufs). « Désactiver » passe les cochés en <strong>Non actif</strong>. Le mail part côté serveur (pas de Gmail).
+            Décoche ce qui doit rester (ex. les œufs). <strong>Désactiver</strong> = passe en Non actif. <strong>Supprimer</strong> = enlève la ligne (pour la viande/erreurs). Le mail part côté serveur.
           </div>
           <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
             <button className="btn-ghost" disabled={busy} onClick={mailReview}>✉️ Vérif Raimbaud (cochés)</button>
             <button className="btn-ghost" disabled={busy} onClick={deactivate}>⏹️ Désactiver les cochés</button>
+            <button className="btn-ghost" disabled={busy} onClick={deleteRows} style={{color:'var(--danger,#c0392b)'}}>🗑️ Supprimer les lignes cochées</button>
           </div>
         </div>
       );
