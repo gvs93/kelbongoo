@@ -4116,7 +4116,7 @@
     // Si renseigné (ex. [2]), la détection FL se base sur le dispatch_type des produits —
     // plus fiable que la catégorie quand l'export producerproduct n'a pas de nom de catégorie.
     // PRIORITAIRE sur les mots-clés ci-dessus. Laisse vide [] pour utiliser la catégorie.
-    const FL_DISPATCH_TYPES = [];
+    const FL_DISPATCH_TYPES = [0];
     function isFLProduct(p) {
       if (FL_DISPATCH_TYPES.length && p && p.dispatchType != null) {
         return FL_DISPATCH_TYPES.indexOf(p.dispatchType) >= 0;
@@ -8628,9 +8628,10 @@
       );
     }
 
-    // Au-delà de ce nombre de désactivations, on N'APPLIQUE PAS automatiquement (critère FL
-    // peut-être faux) → on renvoie vers la synchro manuelle pour validation.
+    // Au-delà de ce nombre, on N'APPLIQUE PAS automatiquement (critère FL sans doute trop
+    // large → ex. dispatch « tout le frais ») : on remonte la liste pour revue manuelle.
     const FL_AUTOSYNC_MAX_INACTIVATE = 12;
+    const FL_AUTOSYNC_MAX_ADD = 60;
 
     // Construit la liste FL du catalogue (objet {id:produit}) → [{produit, producer}], dédupliquée.
     function buildCatalogFLFrom(prodById) {
@@ -8651,12 +8652,19 @@
     async function autoSyncFLAfterImport(prodById, showToast, onResult) {
       try {
         const catalog = buildCatalogFLFrom(prodById);
-        if (!catalog.length) return;
+        if (!catalog.length) { onResult && onResult({ added: 0, toInactivate: [], note: 'Aucun FL détecté au catalogue (critère FL ?)' }); return; }
         const prev = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'preview', catalog });
         if (!prev || !prev.ok) { onResult && onResult({ error: (prev && prev.error) || 'action fl_sync indisponible (déployée ?)' }); return; }
+        const toAdd = prev.toAdd || [];
         const toInactivate = prev.toInactivate || [];
+        // Garde-fou : trop d'ajouts d'un coup → on n'écrit rien, on surface pour revue.
+        if (toAdd.length > FL_AUTOSYNC_MAX_ADD) {
+          onResult && onResult({ added: 0, toAddPending: toAdd, toInactivate, tooMany: true });
+          if (showToast) showToast('⚠️ ' + toAdd.length + ' FL à ajouter — trop pour un ajout auto, à vérifier');
+          return;
+        }
         let added = 0;
-        if ((prev.toAdd || []).length) {
+        if (toAdd.length) {
           const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false, catalog });
           if (res && res.ok) added = res.added || 0;
         }
@@ -8667,7 +8675,7 @@
 
     // Panneau affiché APRÈS un chargement du catalogue : récap de la synchro FL +
     // gestion des « soucis » (FL disparus du catalogue, à désactiver ou à vérifier).
-    function FlSyncResultPanel({ info, onClear }) {
+    function FlSyncResultPanel({ info, onClear, catalog }) {
       const showToast = React.useContext(ToastContext);
       const [busy, setBusy] = React.useState(false);
       if (!info) return null;
@@ -8675,6 +8683,34 @@
         return (
           <div className="card" style={{borderLeft:'4px solid var(--danger,#c0392b)'}}>
             <div style={{fontSize:13}}>🥬 Synchro FL non effectuée : {info.error}</div>
+          </div>
+        );
+      }
+      if (info.note) {
+        return (
+          <div className="card" style={{borderLeft:'4px solid var(--warn,#e0a800)'}}>
+            <div style={{fontSize:13}}>🥬 {info.note}</div>
+          </div>
+        );
+      }
+      // Trop d'ajouts d'un coup : rien n'a été écrit, on demande une revue.
+      if (info.tooMany) {
+        const pend = info.toAddPending || [];
+        return (
+          <div className="card" style={{borderLeft:'4px solid var(--danger,#c0392b)'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <h3 style={{margin:0}}>🥬 Synchro FL — ajout massif bloqué</h3>
+              <button className="btn-ghost" style={{fontSize:12}} onClick={onClear}>✕</button>
+            </div>
+            <div style={{fontSize:13,marginTop:6}}>
+              ⚠️ <strong>{pend.length}</strong> produits seraient ajoutés à la feuille Probon — c'est trop pour un ajout automatique.
+              Le critère FL est probablement trop large (ex. <code>dispatch 0</code> = tout le frais, pas seulement les FL).
+              <strong> Rien n'a été écrit.</strong> Vérifie le critère <code>FL_DISPATCH_TYPES</code> avant de relancer une synchro manuelle.
+            </div>
+            <div style={{maxHeight:140,overflowY:'auto',fontSize:12,marginTop:8}}>
+              {pend.slice(0,80).map((it,i)=>(<div key={i}>{it.produit}{it.producer?` · ${it.producer}`:''}</div>))}
+              {pend.length>80 && <div style={{color:'var(--ink-mute)'}}>… +{pend.length-80} autres</div>}
+            </div>
           </div>
         );
       }
@@ -8691,9 +8727,8 @@
         if (!confirm(`Désactiver ${issues.length} produit(s) sur la feuille Probon ?`)) return;
         setBusy(true);
         try {
-          const prod = await readCache('products');
-          const catalog = buildCatalogFLFrom(prod || {});
-          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: true, catalog });
+          const cat = catalog || buildCatalogFLFrom(await readCache('products') || {});
+          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: true, catalog: cat });
           if (r && r.ok) { showToast(`⏹️ ${r.inactivated || 0} désactivé(s)`); onClear && onClear(); }
           else showToast('Erreur : ' + ((r && r.error) || '?'));
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
@@ -8789,6 +8824,84 @@
               })}
             </div>
           </details>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // SYNCHRO FL DEPUIS L'EXPORT SITE (CSV « fiches produits »)
+    // Source fiable : le CSV du site contient la colonne « Catégorie » déjà résolue
+    // (Fruits, Légumes) + « Produit Actif ». FL = catégorie Fruits,Légumes ET actif.
+    // ============================================================
+    function FlCsvSyncCard() {
+      const showToast = React.useContext(ToastContext);
+      const [busy, setBusy] = React.useState(false);
+      const [fileName, setFileName] = React.useState('');
+      const [stats, setStats] = React.useState(null);
+      const [catalog, setCatalog] = React.useState(null);
+      const [result, setResult] = React.useState(null);
+
+      const handleFile = (file) => {
+        if (!file) return;
+        setBusy(true); setResult(null); setStats(null); setCatalog(null); setFileName(file.name);
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          try {
+            const parsed = Papa.parse(String(e.target.result || ''), { header: true, delimiter: ';', skipEmptyLines: true });
+            const rows = parsed.data || [];
+            const pick = (row, names) => { for (const n of names) { if (row[n] != null && row[n] !== '') return row[n]; } return ''; };
+            const fl = []; const seen = new Set();
+            for (const row of rows) {
+              const cat = normalizeText(pick(row, ['Catégorie', 'Categorie', 'catégorie', 'categorie']));
+              const actif = String(pick(row, ['Produit Actif', 'Produit actif', 'Actif']) || '').trim().toLowerCase();
+              if (!cat.includes('legume')) continue;     // FL = catégorie « Fruits, Légumes »
+              if (actif !== 'true') continue;             // produits actifs uniquement
+              const produit = String(pick(row, ['Produit', 'produit']) || '').trim();
+              const producer = String(pick(row, ['Producteur', 'producteur']) || '').trim();
+              if (!produit) continue;
+              const k = normalizeText(produit); if (seen.has(k)) continue; seen.add(k);
+              fl.push({ produit, producer });
+            }
+            setStats({ total: rows.length, flActive: fl.length });
+            setCatalog(fl);
+            if (!fl.length) { setResult({ note: 'Aucun FL actif trouvé dans le CSV (vérifie la colonne « Catégorie » / « Produit Actif »).' }); setBusy(false); return; }
+            const prev = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'preview', catalog: fl });
+            if (!prev || !prev.ok) { setResult({ error: (prev && prev.error) || 'action fl_sync indisponible (déployée ?)' }); setBusy(false); return; }
+            const toAdd = prev.toAdd || [], toInactivate = prev.toInactivate || [];
+            if (toAdd.length > FL_AUTOSYNC_MAX_ADD) { setResult({ tooMany: true, toAddPending: toAdd, toInactivate }); setBusy(false); return; }
+            let added = 0;
+            if (toAdd.length) {
+              const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false, catalog: fl });
+              if (res && res.ok) added = res.added || 0;
+            }
+            setResult({ added, toInactivate, currentActive: prev.currentActive });
+            showToast('🥬 FL : +' + added + ' ajouté(s)' + (toInactivate.length ? ' · ' + toInactivate.length + ' à vérifier' : ''));
+          } catch (err) { setResult({ error: err.message }); }
+          finally { setBusy(false); }
+        };
+        reader.onerror = () => { setResult({ error: 'lecture du fichier impossible' }); setBusy(false); };
+        reader.readAsText(file, 'UTF-8');
+      };
+
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--ok,#2e7d32)'}}>
+          <h3 style={{marginBottom:4}}>🥬 Synchroniser les FL (export site CSV)</h3>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginBottom:8}}>
+            Charge l'export « fiches produits » du site (CSV). On garde uniquement la catégorie <strong>Fruits, Légumes</strong> et les produits <strong>actifs</strong>, puis on ajoute les nouveaux à la feuille de commande Probon. Les disparus sont signalés (jamais désactivés automatiquement).
+          </p>
+          <label style={{display:'block',border:'1px dashed var(--border)',borderRadius:8,padding:'14px',textAlign:'center',cursor: busy?'default':'pointer',fontSize:14}}>
+            {busy ? 'Traitement…' : (fileName || '📄 Choisir le fichier CSV (fiches produits)')}
+            <input type="file" accept=".csv,text/csv" style={{display:'none'}} disabled={busy}
+                   onChange={e=>handleFile(e.target.files && e.target.files[0])} />
+          </label>
+          {stats && (
+            <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:8}}>
+              {stats.total} lignes lues · <strong>{stats.flActive}</strong> FL actifs détectés.
+            </div>
+          )}
+          <div style={{marginTop:10}}>
+            <FlSyncResultPanel info={result} catalog={catalog} onClear={()=>setResult(null)} />
+          </div>
         </div>
       );
     }
@@ -8968,9 +9081,7 @@
           let prodById;
           if (v4Prods) {
             prodById = parseProducersJSON(v4Prods);
-            await writeCache('products', prodById);
-            autoSyncFLAfterImport(prodById, showToast, setFlSync); // nouveaux FL → liste Probon + soucis remontés
-          } else {
+            await writeCache('products', prodById);          } else {
             const cd = await readCache('products');
             if (!cd) { showToast('Aucun fichier produits en mémoire : charge-le une première fois'); setBusy(false); return; }
             prodById = cd;
@@ -9068,9 +9179,7 @@
           let msg = [];
           if (v4Prods) {
             const prodById = parseProducersJSON(v4Prods);
-            await writeCache('products', prodById);
-            autoSyncFLAfterImport(prodById, showToast, setFlSync); // nouveaux FL → liste Probon + soucis remontés
-            msg.push(`${Object.keys(prodById).length} produits`);
+            await writeCache('products', prodById);            msg.push(`${Object.keys(prodById).length} produits`);
           }
           if (v4Cons) {
             const consById = parseConsumersById(v4Cons);
@@ -9456,10 +9565,8 @@
           </>
           )}
 
-          {session.isMaster && <FlSyncResultPanel info={flSync} onClear={()=>setFlSync(null)} />}
-          {session.isMaster && <FlDiagnosticCard />}
+          {session.isMaster && <FlCsvSyncCard />}
           {session.isMaster && <ProbonImportCard session={session} />}
-          {session.isMaster && <FlSyncCard session={session} />}
 
           <LossesHistory />
 
