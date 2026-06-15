@@ -958,7 +958,35 @@
       return byId;
     }
 
-    // Lit le JSON consommateurs → index par id { id: {nom, email, tel} }
+    // Lit le CSV « fiches produits » du site → index par ID, MÊME forme que parseProducersJSON,
+    // avec en plus la catégorie (résolue côté site) et l'actif. C'est ce qui permet la détection FL.
+    function parseProductsCsvById(csvText) {
+      const text = String(csvText || '').replace(/^\uFEFF/, '');
+      const parsed = Papa.parse(text, { header: true, delimiter: ';', skipEmptyLines: true });
+      const rows = parsed.data || [];
+      const pick = (row, names) => { for (const n of names) { if (row[n] != null && String(row[n]).trim() !== '') return row[n]; } return ''; };
+      const byId = {};
+      for (const row of rows) {
+        const id = String(pick(row, ['ID', 'Id', 'id', '_id'])).trim();
+        if (!id) continue;
+        const dt = pick(row, ['Dispatch type', 'Dispatch Type', 'dispatch_type']);
+        byId[id] = {
+          name: String(pick(row, ['Produit', 'product_name', 'name'])).trim(),
+          producer: String(pick(row, ['Producteur', 'producer_name'])).trim(),
+          dispatchType: (dt === '' ? null : Number(dt)),
+          category: String(pick(row, ['Catégorie', 'Categorie', 'catégorie', 'categorie', 'category'])).trim(),
+          active: String(pick(row, ['Produit Actif', 'Produit actif', 'Actif']) || '').trim().toLowerCase() === 'true',
+        };
+      }
+      return byId;
+    }
+
+    // Détecte automatiquement le format du fichier produits : JSON (commence par [ ou {) ou CSV.
+    function parseProductsFile(text) {
+      const t = String(text || '').replace(/^\uFEFF/, '').trimStart();
+      if (t[0] === '[' || t[0] === '{') return parseProducersJSON(text);
+      return parseProductsCsvById(text);
+    }
     function parseConsumersById(jsonTextOrArr) {
       const data = typeof jsonTextOrArr === 'string' ? JSON.parse(jsonTextOrArr) : jsonTextOrArr;
       const arr = Array.isArray(data) ? data : (data.consumers || []);
@@ -4116,7 +4144,7 @@
     // Si renseigné (ex. [2]), la détection FL se base sur le dispatch_type des produits —
     // plus fiable que la catégorie quand l'export producerproduct n'a pas de nom de catégorie.
     // PRIORITAIRE sur les mots-clés ci-dessus. Laisse vide [] pour utiliser la catégorie.
-    const FL_DISPATCH_TYPES = [0];
+    const FL_DISPATCH_TYPES = [];
     function isFLProduct(p) {
       if (FL_DISPATCH_TYPES.length && p && p.dispatchType != null) {
         return FL_DISPATCH_TYPES.indexOf(p.dispatchType) >= 0;
@@ -8638,7 +8666,7 @@
       const arr = Object.entries(prodById || {}).map(([id, p]) => ({ id, ...p }));
       const seen = new Set(); const out = [];
       for (const p of arr) {
-        if (!(p.name || '').trim() || !isFLProduct(p)) continue;
+        if (!(p.name || '').trim() || !isFLProduct(p) || p.active === false) continue;
         const k = normalizeText(p.name); if (!k || seen.has(k)) continue; seen.add(k);
         out.push({ produit: (p.name || '').trim(), producer: (p.producer || '').trim() });
       }
@@ -8652,7 +8680,7 @@
     async function autoSyncFLAfterImport(prodById, showToast, onResult) {
       try {
         const catalog = buildCatalogFLFrom(prodById);
-        if (!catalog.length) { onResult && onResult({ added: 0, toInactivate: [], note: 'Aucun FL détecté au catalogue (critère FL ?)' }); return; }
+        if (!catalog.length) { onResult && onResult(null); return; }
         const prev = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'preview', catalog });
         if (!prev || !prev.ok) { onResult && onResult({ error: (prev && prev.error) || 'action fl_sync indisponible (déployée ?)' }); return; }
         const toAdd = prev.toAdd || [];
@@ -9043,7 +9071,7 @@
         try {
           // Produits : fichier fourni, sinon cache
           let prodById;
-          if (histProds) { prodById = parseProducersJSON(histProds); await writeCache('products', prodById); }
+          if (histProds) { prodById = parseProductsFile(histProds); await writeCache('products', prodById); }
           else {
             const cd = await readCache('products');
             if (!cd) { showToast('Aucun fichier produits en mémoire : charge-le'); setHistBusy(false); return; }
@@ -9072,6 +9100,13 @@
         r.onload = () => { try { setter(JSON.parse(r.result)); showToast(`✓ ${file.name}`); } catch(e){ showToast('JSON invalide : ' + file.name); } };
         r.readAsText(file);
       };
+      // Fichier produits : on lit le TEXTE brut (JSON ou CSV) — la détection se fait au chargement.
+      const readText = (file, setter) => {
+        const r = new FileReader();
+        r.onload = () => { setter(r.result); showToast(`✓ ${file.name}`); };
+        r.onerror = () => showToast('Lecture impossible : ' + file.name);
+        r.readAsText(file);
+      };
 
       const handleV4Load = async () => {
         if (!v4Orders) { showToast('Charge au moins le fichier commandes'); return; }
@@ -9080,8 +9115,10 @@
           // Produits : nouveau fichier si fourni, sinon cache Firebase
           let prodById;
           if (v4Prods) {
-            prodById = parseProducersJSON(v4Prods);
-            await writeCache('products', prodById);          } else {
+            prodById = parseProductsFile(v4Prods);
+            await writeCache("products", prodById);
+            autoSyncFLAfterImport(prodById, showToast, setFlSync);
+          } else {
             const cd = await readCache('products');
             if (!cd) { showToast('Aucun fichier produits en mémoire : charge-le une première fois'); setBusy(false); return; }
             prodById = cd;
@@ -9178,8 +9215,10 @@
         try {
           let msg = [];
           if (v4Prods) {
-            const prodById = parseProducersJSON(v4Prods);
-            await writeCache('products', prodById);            msg.push(`${Object.keys(prodById).length} produits`);
+            const prodById = parseProductsFile(v4Prods);
+            await writeCache("products", prodById);
+            autoSyncFLAfterImport(prodById, showToast, setFlSync);
+            msg.push(`${Object.keys(prodById).length} produits`);
           }
           if (v4Cons) {
             const consById = parseConsumersById(v4Cons);
@@ -9336,9 +9375,9 @@
               <span>📦 Commandes / Préparation {v4Orders ? '✓' : '(obligatoire)'}</span>
             </label>
             <label className="upload-zone" style={{display:'block',marginBottom:6}}>
-              <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
-                onChange={e => e.target.files[0] && readJSON(e.target.files[0], setV4Prods)} />
-              <span>🏷️ Produits {v4Prods ? '✓' : '(optionnel)'}</span>
+              <input type="file" accept=".json,.csv,text/csv,application/json,*/*" style={{display:'none'}}
+                onChange={e => e.target.files[0] && readText(e.target.files[0], setV4Prods)} />
+              <span>🏷️ Produits (JSON ou CSV) {v4Prods ? '✓' : '(optionnel)'}</span>
             </label>
             <label className="upload-zone" style={{display:'block',marginBottom:10}}>
               <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
@@ -9386,8 +9425,8 @@
               <span>📦 Commandes multi-dates {histOrders ? '✓' : '(obligatoire)'}</span>
             </label>
             <label className="upload-zone" style={{display:'block',marginBottom:10}}>
-              <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
-                onChange={e => e.target.files[0] && readJSON(e.target.files[0], setHistProds)} />
+              <input type="file" accept=".json,.csv,text/csv,application/json,*/*" style={{display:'none'}}
+                onChange={e => e.target.files[0] && readText(e.target.files[0], setHistProds)} />
               <span>🏷️ Produits {histProds ? '✓' : '(optionnel — sinon dernier en mémoire)'}</span>
             </label>
 
@@ -9565,7 +9604,7 @@
           </>
           )}
 
-          {session.isMaster && <FlCsvSyncCard />}
+          {session.isMaster && <FlSyncResultPanel info={flSync} onClear={()=>setFlSync(null)} />}
           {session.isMaster && <ProbonImportCard session={session} />}
 
           <LossesHistory />
