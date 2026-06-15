@@ -973,6 +973,7 @@
         byId[id] = {
           name: String(pick(row, ['Produit', 'product_name', 'name'])).trim(),
           producer: String(pick(row, ['Producteur', 'producer_name'])).trim(),
+          uv: String(pick(row, ['Unité', 'Unite', 'unité', 'unite', 'Unité de vente', 'UV'])).trim(),
           dispatchType: (dt === '' ? null : Number(dt)),
           category: String(pick(row, ['Catégorie', 'Categorie', 'catégorie', 'categorie', 'category'])).trim(),
           active: String(pick(row, ['Produit Actif', 'Produit actif', 'Actif']) || '').trim().toLowerCase() === 'true',
@@ -4145,12 +4146,17 @@
     // plus fiable que la catégorie quand l'export producerproduct n'a pas de nom de catégorie.
     // PRIORITAIRE sur les mots-clés ci-dessus. Laisse vide [] pour utiliser la catégorie.
     const FL_DISPATCH_TYPES = [];
+    // Exceptions incluses sur la feuille Probon même hors catégorie « Fruits, Légumes » :
+    // les ŒUFS (catégorie « Basse Cour & Œufs ») font partie de Probon. Repérés par le nom.
+    const FL_NAME_INCLUDE = ['oeuf', 'œuf'];
     function isFLProduct(p) {
       if (FL_DISPATCH_TYPES.length && p && p.dispatchType != null) {
         return FL_DISPATCH_TYPES.indexOf(p.dispatchType) >= 0;
       }
       const c = normalizeText(p && (p.category || p.family || p.famille) || '');
-      return FL_CATEGORY_KEYWORDS.some(k => c.includes(k));
+      if (FL_CATEGORY_KEYWORDS.some(k => c.includes(k))) return true;
+      const n = normalizeText(p && p.name || '');
+      return FL_NAME_INCLUDE.some(k => n.includes(k));   // exception œufs
     }
 
     function FLInventoryPage({ session, invDate }) {
@@ -8668,7 +8674,7 @@
       for (const p of arr) {
         if (!(p.name || '').trim() || !isFLProduct(p) || p.active === false) continue;
         const k = normalizeText(p.name); if (!k || seen.has(k)) continue; seen.add(k);
-        out.push({ produit: (p.name || '').trim(), producer: (p.producer || '').trim() });
+        out.push({ id: String(p.id || '').trim(), produit: (p.name || '').trim(), producer: (p.producer || '').trim(), uv: (p.uv || '').trim() });
       }
       return out;
     }
@@ -8685,9 +8691,10 @@
         if (!prev || !prev.ok) { onResult && onResult({ error: (prev && prev.error) || 'action fl_sync indisponible (déployée ?)' }); return; }
         const toAdd = prev.toAdd || [];
         const toInactivate = prev.toInactivate || [];
+        const possibleDuplicates = prev.possibleDuplicates || [];
         // Garde-fou : trop d'ajouts d'un coup → on n'écrit rien, on surface pour revue.
         if (toAdd.length > FL_AUTOSYNC_MAX_ADD) {
-          onResult && onResult({ added: 0, toAddPending: toAdd, toInactivate, tooMany: true });
+          onResult && onResult({ added: 0, toAddPending: toAdd, toInactivate, possibleDuplicates, tooMany: true });
           if (showToast) showToast('⚠️ ' + toAdd.length + ' FL à ajouter — trop pour un ajout auto, à vérifier');
           return;
         }
@@ -8696,8 +8703,10 @@
           const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false, catalog });
           if (res && res.ok) added = res.added || 0;
         }
-        onResult && onResult({ added, toInactivate, currentActive: prev.currentActive });
-        if (showToast) showToast('🥬 FL : +' + added + ' ajouté(s)' + (toInactivate.length ? ' · ' + toInactivate.length + ' à vérifier' : ''));
+        onResult && onResult({ added, toInactivate, possibleDuplicates, currentActive: prev.currentActive });
+        if (showToast) showToast('🥬 FL : +' + added + ' ajouté(s)'
+          + (possibleDuplicates.length ? ' · ' + possibleDuplicates.length + ' doublon(s) ?' : '')
+          + (toInactivate.length ? ' · ' + toInactivate.length + ' à vérifier' : ''));
       } catch (e) { onResult && onResult({ error: e.message }); }
     }
 
@@ -8743,46 +8752,130 @@
         );
       }
       const issues = info.toInactivate || [];
-      const sendReview = async () => {
-        setBusy(true);
-        try {
-          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'mail_review', items: issues });
-          if (r && r.ok) { showToast(`✉️ Envoyé à Raimbaud (${r.sent} produit(s))`); onClear && onClear(); }
-          else showToast('Erreur envoi : ' + ((r && r.error) || '?'));
-        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
-      };
-      const applyInactivate = async () => {
-        if (!confirm(`Désactiver ${issues.length} produit(s) sur la feuille Probon ?`)) return;
-        setBusy(true);
-        try {
-          const cat = catalog || buildCatalogFLFrom(await readCache('products') || {});
-          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: true, catalog: cat });
-          if (r && r.ok) { showToast(`⏹️ ${r.inactivated || 0} désactivé(s)`); onClear && onClear(); }
-          else showToast('Erreur : ' + ((r && r.error) || '?'));
-        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
-      };
+      const dups = info.possibleDuplicates || [];
       return (
-        <div className="card" style={{borderLeft:`4px solid ${issues.length ? 'var(--warn,#e0a800)' : 'var(--ok,#2e7d32)'}`}}>
+        <div className="card" style={{borderLeft:`4px solid ${(issues.length || dups.length) ? 'var(--warn,#e0a800)' : 'var(--ok,#2e7d32)'}`}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <h3 style={{margin:0}}>🥬 Synchro FL (au chargement du catalogue)</h3>
             <button className="btn-ghost" style={{fontSize:12}} onClick={onClear}>✕</button>
           </div>
           <div style={{fontSize:13,marginTop:6}}>✓ <strong>{info.added || 0}</strong> nouveau(x) FL ajouté(s) à la liste de commande Probon.</div>
+          {dups.length > 0 && <FlDuplicatesBlock pairs={dups} />}
           {issues.length === 0 ? (
-            <div style={{fontSize:13,color:'var(--ink-mute)',marginTop:4}}>Aucun souci : rien à désactiver.</div>
+            (dups.length === 0 ? <div style={{fontSize:13,color:'var(--ink-mute)',marginTop:4}}>Aucun souci : rien à désactiver.</div> : null)
           ) : (
-            <div style={{marginTop:8}}>
-              <div style={{fontSize:13,fontWeight:600,color:'var(--warn,#b8860b)'}}>⚠️ {issues.length} FL ne sont plus au catalogue (à vérifier avant désactivation) :</div>
-              <div style={{maxHeight:140,overflowY:'auto',fontSize:12,margin:'6px 0'}}>
-                {issues.map((it,i)=>(<div key={i}>{it.produit}{it.producer?` · ${it.producer}`:''}</div>))}
-              </div>
-              <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-                <button className="btn-ghost" disabled={busy} onClick={sendReview}>✉️ Demander vérif à Raimbaud</button>
-                <button className="btn-ghost" disabled={busy} onClick={applyInactivate}>⏹️ Désactiver maintenant</button>
-              </div>
-              <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Le mail part en automatique côté serveur (pas d'ouverture de Gmail).</div>
-            </div>
+            <FlRemovalsBlock issues={issues} onDone={onClear} />
           )}
+        </div>
+      );
+    }
+
+    // Bloc « doublons possibles » : noms proches entre le site et la feuille → on demande si
+    // c'est le même produit. Si oui, on choisit quel nom garder ; l'ID est écrit sur la ligne
+    // (lien permanent → plus de question ensuite). Si non, on ajoute comme nouveau produit.
+    function FlDuplicatesBlock({ pairs }) {
+      const showToast = React.useContext(ToastContext);
+      const [done, setDone] = React.useState({});   // index -> libellé du choix
+      const [busy, setBusy] = React.useState(-1);
+
+      const resolve = async (i, kind) => {
+        const pr = pairs[i]; if (!pr) return;
+        setBusy(i);
+        try {
+          let r, label;
+          if (kind === 'site') {        // même produit, garder le nom du SITE (écrase la feuille)
+            r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'merge',
+              row: pr.sheet.row, id: pr.site.id, produit: pr.site.produit, producer: pr.site.producer, uv: pr.site.uv });
+            label = 'fusionné (nom site)';
+          } else if (kind === 'sheet') { // même produit, garder le nom FEUILLE (lien ID seulement)
+            r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'merge', row: pr.sheet.row, id: pr.site.id });
+            label = 'fusionné (nom feuille)';
+          } else {                       // produits DIFFÉRENTS → ajouter le produit du site
+            r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false,
+              catalog: [{ id: pr.site.id, produit: pr.site.produit, producer: pr.site.producer, uv: pr.site.uv }] });
+            label = 'ajouté (différent)';
+          }
+          if (r && r.ok) { setDone(d => ({ ...d, [i]: label })); showToast('✓ ' + label); }
+          else showToast('Erreur : ' + ((r && r.error) || '?'));
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(-1); }
+      };
+
+      return (
+        <div style={{marginTop:10}}>
+          <div style={{fontSize:13,fontWeight:600,color:'var(--warn,#b8860b)'}}>❓ {pairs.length} doublon(s) possible(s) — noms proches. Même produit ?</div>
+          <div style={{marginTop:6}}>
+            {pairs.map((pr, i) => (
+              <div key={i} style={{border:'1px solid var(--border)',borderRadius:8,padding:'8px 10px',marginBottom:6,fontSize:12}}>
+                <div><strong>Site :</strong> {pr.site.produit}{pr.site.producer?` · ${pr.site.producer}`:''}</div>
+                <div><strong>Feuille :</strong> {pr.sheet.produit}{pr.sheet.producer?` · ${pr.sheet.producer}`:''} <span style={{color:'var(--ink-mute)'}}>({pr.sim}% proche)</span></div>
+                {done[i] ? (
+                  <div style={{marginTop:6,color:'var(--ok,#2e7d32)'}}>✓ {done[i]}</div>
+                ) : (
+                  <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:8}}>
+                    <button className="btn-ghost" disabled={busy===i} onClick={()=>resolve(i,'site')}>Même → garder nom site</button>
+                    <button className="btn-ghost" disabled={busy===i} onClick={()=>resolve(i,'sheet')}>Même → garder nom feuille</button>
+                    <button className="btn-ghost" disabled={busy===i} onClick={()=>resolve(i,'diff')}>Différents → ajouter</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:11,color:'var(--ink-mute)'}}>« Même produit » écrit l'ID sur la ligne → plus de question la prochaine fois, même si le nom varie.</div>
+        </div>
+      );
+    }
+
+    // Bloc « produits à traiter » : sélection au cas par cas. On peut décocher ce qui doit
+    // rester (ex. un produit saisonnier de retour), puis désactiver UNIQUEMENT les cochés
+    // (statut → « Non actif » via fl_set_active) ou les envoyer à Raimbaud pour vérif.
+    function FlRemovalsBlock({ issues, onDone }) {
+      const showToast = React.useContext(ToastContext);
+      const [busy, setBusy] = React.useState(false);
+      const [sel, setSel] = React.useState(() => issues.map((_, i) => i)); // tous cochés au départ
+      const toggle = (i) => setSel(s => s.includes(i) ? s.filter(x => x !== i) : [...s, i]);
+      const selectedItems = () => sel.map(i => issues[i]).filter(Boolean);
+
+      const deactivate = async () => {
+        const items = selectedItems();
+        if (!items.length) { showToast('Aucun produit coché'); return; }
+        if (!confirm(`Passer ${items.length} produit(s) en « Non actif » sur la feuille Probon ?`)) return;
+        setBusy(true);
+        try {
+          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_set_active',
+            items: items.map(it => ({ producer: it.producer, produit: it.produit, actif: false })) });
+          if (r && r.ok) { showToast(`⏹️ ${r.changed || 0} désactivé(s)`); onDone && onDone(); }
+          else showToast('Erreur : ' + ((r && r.error) || '?'));
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const mailReview = async () => {
+        const items = selectedItems();
+        if (!items.length) { showToast('Aucun produit coché'); return; }
+        setBusy(true);
+        try {
+          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'mail_review', items });
+          if (r && r.ok) showToast(`✉️ Envoyé à Raimbaud (${r.sent} produit(s))`);
+          else showToast('Erreur envoi : ' + ((r && r.error) || '?'));
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+
+      return (
+        <div style={{marginTop:8}}>
+          <div style={{fontSize:13,fontWeight:600,color:'var(--warn,#b8860b)'}}>⚠️ {issues.length} produit(s) actifs sur la feuille mais plus au catalogue. Coche ceux à traiter :</div>
+          <div style={{maxHeight:180,overflowY:'auto',fontSize:12,margin:'6px 0'}}>
+            {issues.map((it, i) => (
+              <label key={i} style={{display:'flex',gap:8,alignItems:'center',padding:'2px 0',cursor:'pointer'}}>
+                <input type="checkbox" checked={sel.includes(i)} onChange={()=>toggle(i)} />
+                <span>{it.produit}{it.producer ? ` · ${it.producer}` : ''}</span>
+              </label>
+            ))}
+          </div>
+          <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>
+            Décoche ce qui doit rester (ex. les œufs). « Désactiver » passe les cochés en <strong>Non actif</strong>. Le mail part côté serveur (pas de Gmail).
+          </div>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            <button className="btn-ghost" disabled={busy} onClick={mailReview}>✉️ Vérif Raimbaud (cochés)</button>
+            <button className="btn-ghost" disabled={busy} onClick={deactivate}>⏹️ Désactiver les cochés</button>
+          </div>
         </div>
       );
     }
