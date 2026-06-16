@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Kelbongoo — Distribution V9.18</title>
+  <title>Kelbongoo — Distribution V9.19</title>
 
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -494,7 +494,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.18';
+    const APP_VERSION = 'V9.19';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -4472,6 +4472,8 @@
       const [scannedIds, setScannedIds] = React.useState([]); // produits touchés dans la session de scan (plus récent en tête)
       const [manuallyAddedIds, setManuallyAddedIds] = React.useState(new Set()); // produits choisis manuellement depuis le message "non trouvé"
       const [lastUnknownCode, setLastUnknownCode] = React.useState(null); // dernier code non trouvé
+      const [dlcInputs, setDlcInputs] = React.useState({}); // {productId: 'YYYY-MM-DD'} — DLC saisie pendant l'inventaire
+      const [dlcExpandedId, setDlcExpandedId] = React.useState(null); // produit dont le champ DLC est ouvert
       const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
       const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
@@ -4724,6 +4726,42 @@
         bumpScanned(productId);
         showToast(`✓ ${prodById[productId]?.name || ''} (saisie manuelle)`);
         setLastUnknownCode(null);
+      };
+
+      // Signaler une DLC pendant l'inventaire → crée une entrée dans dlc_watch
+      const saveDlcFromInventory = async (productId, dlcDate) => {
+        setDlcInputs(prev => ({ ...prev, [productId]: dlcDate }));
+        if (!dlcDate) return;
+        const p = prodById[productId];
+        const qty = counts[productId] || 1;
+        const days = Math.round((new Date(dlcDate) - new Date(todayKey())) / 86400000);
+        if (days > 7) {
+          showToast(`📅 DLC notée (${days}j) — pas d'alerte, DLC longue`);
+          return;
+        }
+        // Créer une entrée dlc_watch
+        const id = `dlcw_inv_${productId}_${dlcDate}`;
+        const now = new Date().toISOString();
+        try {
+          await storage.setDoc('dlc_watch', id, {
+            produit: p?.name || '', producteur: p?.producer || '',
+            dlc: dlcDate, qty, qtyInit: qty,
+            invDay: invDate, domShort: false,
+            status: 'watch',
+            createdBy: session.name, createdAt: now,
+            lastCheckAt: now, lastCheckBy: session.name,
+            fromInventory: true,
+          });
+          if (days <= 0) {
+            showToast(`⚠️ DLC dépassée ! Ajouté en vigilance DLC`);
+          } else if (days <= 3) {
+            showToast(`🔴 DLC courte (${days}j) → ajouté en vigilance DLC`);
+          } else {
+            showToast(`🟠 DLC à surveiller (${days}j) → ajouté en vigilance DLC`);
+          }
+        } catch (e) {
+          showToast('Erreur DLC : ' + e.message);
+        }
       };
 
       const learnMatches = React.useMemo(() => {
@@ -5044,17 +5082,42 @@
 
           {counted.length > 0 && (
             <div className="card">
-              <h3 style={{marginBottom:8}}>Comptés ({counted.length})</h3>
+              <h3 style={{marginBottom:4}}>Comptés ({counted.length})</h3>
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>📅 Clique « DLC » pour signaler une date limite courte — elle sera ajoutée automatiquement dans l'onglet DLC.</div>
               <div className="stack" style={{gap:3}}>
-                {counted.map(id => (
-                  <div key={id} style={{display:'flex',justifyContent:'space-between',fontSize:13,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
-                    <span>{prodById[id]?.name || id}</span>
-                    <div style={{display:'flex',gap:8,alignItems:'center'}}>
-                      <strong>{counts[id]}</strong>
-                      <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px'}} onClick={()=>clearCount(id)}>✕</button>
+                {counted.map(id => {
+                  const isManual = manuallyAddedIds.has(id);
+                  const hasDlc = !!dlcInputs[id];
+                  return (
+                  <div key={id} style={{borderBottom:'1px solid var(--border)',padding:'4px 0'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',fontSize:13,alignItems:'center'}}>
+                      <span style={{color: isManual ? 'var(--ink-mute)' : 'inherit'}}>
+                        {isManual ? '⚠️ ' : ''}{prodById[id]?.name || id}
+                        {isManual && <span style={{fontSize:10,color:'var(--warn)'}}> (hors feuille)</span>}
+                      </span>
+                      <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                        <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)'}}
+                          onClick={()=>setDlcExpandedId(prev => prev===id ? null : id)}>
+                          {hasDlc ? '✓ DLC' : '📅 DLC'}
+                        </button>
+                        <strong>{counts[id]}</strong>
+                        <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px'}} onClick={()=>clearCount(id)}>✕</button>
+                      </div>
                     </div>
+                    {dlcExpandedId === id && (
+                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:4,paddingLeft:8}}>
+                        <span style={{fontSize:11,color:'var(--ink-mute)'}}>DLC :</span>
+                        <input type="date" value={dlcInputs[id] || ''} onChange={e => saveDlcFromInventory(id, e.target.value)}
+                          style={{fontSize:13,padding:'4px 6px',flex:1}} />
+                        {dlcInputs[id] && (() => {
+                          const d = Math.round((new Date(dlcInputs[id]) - new Date(todayKey())) / 86400000);
+                          return <span style={{fontSize:11,fontWeight:600,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
+                        })()}
+                      </div>
+                    )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -7870,9 +7933,9 @@
             <>
               {manual.length > 0 && (
                 <>
-                  <div className="card" style={{borderLeft:`3px solid ${manualTreated===manual.length?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
-                    <strong>↩️ Produits signalés en distribution</strong> · {manualTreated}/{manual.length} traité{manual.length>1?'s':''}
-                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>1) Le chauffeur coche « récupéré » aux boutiques. 2) À l'entrepôt, choisis la destination (conseil selon la DLC).</div>
+                  <div className="card" style={{borderLeft:'3px solid var(--warn,#e0a800)'}}>
+                    <strong>↩️ Produits signalés en distribution</strong> · {manual.length} en attente
+                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>1) Le chauffeur coche « récupéré » aux boutiques. 2) À l'entrepôt, choisis la destination (conseil selon la DLC). Une fois traité, le produit disparaît.</div>
                   </div>
                   {manual.map(r => {
                     const isTreated = r.status === 'treated';
@@ -8197,51 +8260,69 @@
           {weekLosses.length === 0 ? (
             <div className="empty-state"><div className="icon">📋</div><p>Aucune perte pour faire le récap.</p></div>
           ) : (() => {
-            // Grouper les pertes par catégorie et par produit
-            const byCategory = {};
+            // Grouper les pertes par destination, puis par catégorie, puis par produit
+            const DEST_ORDER = ['jete', 'partage', 'pribon'];
+            const DEST_LABELS = { jete: '🗑️ Jeté (perte sèche)', partage: '👥 Partage équipe', pribon: '📦 Envoi Pribon/ROB' };
+            const DEST_COLORS = { jete: 'var(--danger)', partage: 'var(--accent)', pribon: 'var(--info)' };
+            const byDest = {};
             for (const loss of weekLosses) {
-              // Chercher la catégorie dans le catalogue
+              const dest = loss.destination || 'jete';
+              if (!byDest[dest]) byDest[dest] = { items: [], total: 0 };
               const prod = (catalogue || []).find(p => p.produit === loss.produit && p.producteur === loss.producteur);
-              const cat = prod?.famille || prod?.category || '(Catégorie inconnue)';
-              if (!byCategory[cat]) byCategory[cat] = {};
-              const key = loss.produit;
-              if (!byCategory[cat][key]) {
-                byCategory[cat][key] = { 
-                  produit: loss.produit, 
-                  producteur: loss.producteur,
-                  qty: 0, 
-                  value: 0,
-                  count: 0
-                };
-              }
-              byCategory[cat][key].qty += loss.usingWeight ? loss.weight : loss.quantity;
-              byCategory[cat][key].value += loss.totalValue || 0;
-              byCategory[cat][key].count += 1;
+              const cat = prod?.famille || prod?.category || 'Autre';
+              const reasonDef = LOSS_REASONS.find(r => r.id === loss.reason);
+              byDest[dest].items.push({
+                produit: loss.produit,
+                producteur: loss.producteur,
+                category: cat,
+                reason: reasonDef?.label || loss.reason || '',
+                qty: loss.usingWeight ? loss.weight : loss.quantity,
+                unit: loss.usingWeight ? 'kg' : 'u',
+                value: loss.totalValue || 0,
+                day: loss.day,
+                remark: loss.remark || '',
+              });
+              byDest[dest].total += loss.totalValue || 0;
             }
-            const cats = Object.keys(byCategory).sort();
             return (
-              <div className="stack" style={{gap:8}}>
-                {cats.map(cat => (
-                  <div key={cat} className="card" style={{border:'1px solid var(--line)'}}>
-                    <div style={{fontWeight:600,color:'var(--ink-soft)',fontSize:13,marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>
-                      {cat}
-                    </div>
-                    <div className="stack" style={{gap:4}}>
-                      {Object.values(byCategory[cat]).map(item => (
-                        <div key={item.produit} style={{display:'flex',justifyContent:'space-between',alignItems:'center',fontSize:13,padding:'6px 0',borderBottom:'1px solid var(--line)'}}>
-                          <div style={{flex:1,minWidth:0}}>
-                            <div style={{fontWeight:500}}>{item.produit}</div>
-                            <div style={{fontSize:11,color:'var(--ink-mute)'}}>{item.producteur}</div>
-                          </div>
-                          <div style={{textAlign:'right',whiteSpace:'nowrap'}}>
-                            <div style={{fontWeight:600}}>{item.qty.toFixed(1)} u</div>
-                            <div style={{fontSize:11,color:'var(--ink-soft)'}}>{item.count} entrée{item.count>1?'s':''}</div>
-                          </div>
+              <div className="stack" style={{gap:12}}>
+                {DEST_ORDER.filter(d => byDest[d]).map(dest => {
+                  const group = byDest[dest];
+                  // Sous-grouper par catégorie
+                  const byCat = {};
+                  for (const it of group.items) {
+                    if (!byCat[it.category]) byCat[it.category] = [];
+                    byCat[it.category].push(it);
+                  }
+                  const cats = Object.keys(byCat).sort();
+                  return (
+                    <div key={dest} className="card" style={{borderLeft:`3px solid ${DEST_COLORS[dest] || 'var(--line)'}`}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+                        <div style={{fontWeight:700,fontSize:14,color:DEST_COLORS[dest]}}>{DEST_LABELS[dest] || dest}</div>
+                        <div style={{fontWeight:700,fontSize:14}}>{group.total.toFixed(2)} €</div>
+                      </div>
+                      {cats.map(cat => (
+                        <div key={cat} style={{marginBottom:8}}>
+                          <div style={{fontSize:11,fontWeight:600,color:'var(--ink-mute)',textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:4}}>{cat}</div>
+                          {byCat[cat].map((item, i) => (
+                            <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',fontSize:13,padding:'5px 0',borderBottom:'1px solid var(--line)'}}>
+                              <div style={{flex:1,minWidth:0}}>
+                                <div style={{fontWeight:500}}>{item.produit}</div>
+                                <div style={{fontSize:11,color:'var(--ink-mute)'}}>
+                                  {item.producteur} · {item.reason}{item.remark ? ` · ${item.remark}` : ''} · {formatDateShort(item.day)}
+                                </div>
+                              </div>
+                              <div style={{textAlign:'right',whiteSpace:'nowrap',marginLeft:8}}>
+                                <div style={{fontWeight:600}}>{item.qty} {item.unit}</div>
+                                <div style={{fontSize:11,color:'var(--ink-soft)'}}>{item.value.toFixed(2)} €</div>
+                              </div>
+                            </div>
+                          ))}
                         </div>
                       ))}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             );
           })()}
