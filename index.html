@@ -4470,6 +4470,8 @@
       const [scanInput, setScanInput] = React.useState('');
       const [pendingEan, setPendingEan] = React.useState(null);
       const [scannedIds, setScannedIds] = React.useState([]); // produits touchés dans la session de scan (plus récent en tête)
+      const [manuallyAddedIds, setManuallyAddedIds] = React.useState(new Set()); // produits choisis manuellement depuis le message "non trouvé"
+      const [lastUnknownCode, setLastUnknownCode] = React.useState(null); // dernier code non trouvé
       const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
       const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
@@ -4629,8 +4631,11 @@
 
       const matches = React.useMemo(() => {
         const baseAll = (invType === 'tournant') ? scopeProducts : universe;
-        // Exclut les « lignes vides » : produits sans nom.
-        const base = baseAll.filter(p => (p.name || '').trim());
+        // Exclut les « lignes vides » : produits sans nom substantiel (après normalisation)
+        const base = baseAll.filter(p => {
+          const n = (p.name || '').trim();
+          return n && n.length > 0 && normalizeText(n).length > 0;
+        });
         const q = normalizeText(search);
         const filtered = q ? base.filter(p => normalizeText(p.name + ' ' + (p.producer||'')).includes(q)) : base.slice();
         const fam = p => (p.family || p.famille || '');
@@ -4668,11 +4673,12 @@
           const next = (counts[pid]||0) + 1;
           setCount(pid, next);
           bumpScanned(pid);
+          setManuallyAddedIds(prev => { const s = new Set(prev); s.delete(pid); return s; }); // enlever du manual si c'est un bon scan
           const outScope = (invType === 'tournant' && scopeValue && !inScope(prodById[pid] || {}));
           showToast(`+1 → ${next} · ${prodById[pid]?.name || ''}${outScope ? ' (hors périmètre)' : ''}`);
         } else {
-          setPendingEan(ean);
-          showToast('Code inconnu — associe-le à un produit');
+          setLastUnknownCode(ean);
+          showToast('Code inconnu — cherche dans la liste ci-dessous');
         }
         setScanInput('');
       };
@@ -4711,6 +4717,15 @@
         setLearnSearch('');
       };
 
+      // Sélection manuelle d'un produit quand le scan a échoué
+      const handleManualSelection = (productId) => {
+        setCount(productId, (counts[productId]||0) + 1);
+        setManuallyAddedIds(prev => new Set([...prev, productId])); // marquer comme ajout manuel
+        bumpScanned(productId);
+        showToast(`✓ ${prodById[productId]?.name || ''} (saisie manuelle)`);
+        setLastUnknownCode(null);
+      };
+
       const learnMatches = React.useMemo(() => {
         const q = normalizeText(learnSearch);
         if (!q) return [];
@@ -4734,10 +4749,15 @@
       const validateStock = async () => {
         if (!STOCK_PROXY_URL) { showToast('⚠️ Proxy stock non configuré (STOCK_PROXY_URL vide)'); return; }
         if (writeSlot === 'soir' && !dispatchDone) { showToast('Confirme d\'abord la fin du dispatch'); return; }
-        const items = counted.map(id => ({ id, produit: prodById[id]?.name || '', qty: counts[id] }));
-        if (!items.length) { showToast('Rien à écrire'); return; }
+        // Exclure les produits ajoutés manuellement (non-scan) de l'écriture sur la feuille
+        const items = counted
+          .filter(id => !manuallyAddedIds.has(id))
+          .map(id => ({ id, produit: prodById[id]?.name || '', qty: counts[id] }));
+        if (!items.length) { showToast('Rien à écrire (tous les articles comptés sont en saisie manuelle)'); return; }
         const slotLbl = writeSlot === 'matin' ? 'Inventaire MATIN (col H)' : 'Inventaire SOIR (col X)';
-        if (!confirm(`Écrire ${items.length} article(s) dans la feuille de stock « ${invDate} » → ${slotLbl} ?`)) return;
+        const manual = counted.filter(id => manuallyAddedIds.has(id)).length;
+        const msg = `Écrire ${items.length} article(s) (scannés) dans la feuille de stock « ${invDate} » → ${slotLbl}${manual > 0 ? ` · ${manual} en saisie manuelle non écrit` : ''}?`;
+        if (!confirm(msg)) return;
         setWriting(true); setWriteResult(null);
         try {
           const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_inv_write', slot: writeSlot, date: invDate, items });
@@ -4946,18 +4966,19 @@
                   onKeyDown={e=>{ if(e.key==='Enter') handleScan(scanInput); }}
                   placeholder="Code-barre puis Entrée…" style={{fontSize:16,padding:'10px',width:'100%'}} />
               </div>
-              {pendingEan && (
+              {lastUnknownCode && (
                 <div style={{marginTop:10,padding:10,background:'var(--warn-soft)',borderRadius:8}}>
-                  <div style={{fontSize:13,marginBottom:6}}>Code <strong>{pendingEan}</strong> inconnu. À quel produit l'associer ?</div>
+                  <div style={{fontSize:13,marginBottom:6}}>❌ Code <strong>{lastUnknownCode}</strong> non trouvé. Cherche le produit ci-dessous :</div>
                   <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Chercher le produit…" style={{width:'100%',marginBottom:6}} />
                   <div className="stack" style={{gap:3,maxHeight:200,overflowY:'auto'}}>
                     {assocMatches.map(p => (
-                      <div key={p.id} onClick={()=>learnEan(p.id)} style={{padding:'6px 8px',border:'1px solid var(--border)',borderRadius:6,cursor:'pointer',fontSize:13}}>
+                      <div key={p.id} onClick={()=>handleManualSelection(p.id)} style={{padding:'6px 8px',border:'1px solid var(--border)',borderRadius:6,cursor:'pointer',fontSize:13}}>
                         {p.name} <span style={{color:'var(--ink-mute)'}}>· {p.producer}</span>
                       </div>
                     ))}
+                    {search.trim() && assocMatches.length===0 && <p style={{fontSize:12,color:'var(--ink-mute)'}}>Aucun produit trouvé.</p>}
                   </div>
-                  <button className="btn-ghost" style={{marginTop:6,fontSize:12}} onClick={()=>setPendingEan(null)}>Annuler</button>
+                  <button className="btn-ghost" style={{marginTop:6,fontSize:12}} onClick={()=>setLastUnknownCode(null)}>Annuler</button>
                 </div>
               )}
 
@@ -7764,11 +7785,10 @@
         s + f.items.filter((it, idx) => treatMap[lineId(f, it, idx)]).length, 0);
 
       // ── Retours manuels (produits signalés en distrib) ──
-      // On garde tout ce qui n'est pas encore traité, + ceux traités le jour même (confirmation visuelle).
+      // On garde tout ce qui n'est pas encore traité. Les produits traités disparaissent complètement.
       const manual = manualReturns
-        .filter(r => r.status !== 'treated' || (r.treatedAt && r.treatedAt.slice(0, 10) === activeDay()))
+        .filter(r => r.status !== 'treated')
         .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-      const manualTreated = manual.filter(r => r.status === 'treated').length;
       const overdue = computeOverduePdpReturns(manualReturns);
       const overdueIds = new Set(overdue.map(o => o.id));
 
@@ -8172,6 +8192,59 @@
               )}
             </div>
           )}
+
+          <h3 style={{marginTop:16}}>📊 Récapitulatif par catégorie</h3>
+          {weekLosses.length === 0 ? (
+            <div className="empty-state"><div className="icon">📋</div><p>Aucune perte pour faire le récap.</p></div>
+          ) : (() => {
+            // Grouper les pertes par catégorie et par produit
+            const byCategory = {};
+            for (const loss of weekLosses) {
+              // Chercher la catégorie dans le catalogue
+              const prod = (catalogue || []).find(p => p.produit === loss.produit && p.producteur === loss.producteur);
+              const cat = prod?.famille || prod?.category || '(Catégorie inconnue)';
+              if (!byCategory[cat]) byCategory[cat] = {};
+              const key = loss.produit;
+              if (!byCategory[cat][key]) {
+                byCategory[cat][key] = { 
+                  produit: loss.produit, 
+                  producteur: loss.producteur,
+                  qty: 0, 
+                  value: 0,
+                  count: 0
+                };
+              }
+              byCategory[cat][key].qty += loss.usingWeight ? loss.weight : loss.quantity;
+              byCategory[cat][key].value += loss.totalValue || 0;
+              byCategory[cat][key].count += 1;
+            }
+            const cats = Object.keys(byCategory).sort();
+            return (
+              <div className="stack" style={{gap:8}}>
+                {cats.map(cat => (
+                  <div key={cat} className="card" style={{border:'1px solid var(--line)'}}>
+                    <div style={{fontWeight:600,color:'var(--ink-soft)',fontSize:13,marginBottom:8,textTransform:'uppercase',letterSpacing:'0.05em'}}>
+                      {cat}
+                    </div>
+                    <div className="stack" style={{gap:4}}>
+                      {Object.values(byCategory[cat]).map(item => (
+                        <div key={item.produit} style={{display:'flex',justifyContent:'space-between',alignItems:'center',fontSize:13,padding:'6px 0',borderBottom:'1px solid var(--line)'}}>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:500}}>{item.produit}</div>
+                            <div style={{fontSize:11,color:'var(--ink-mute)'}}>{item.producteur}</div>
+                          </div>
+                          <div style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                            <div style={{fontWeight:600}}>{item.qty.toFixed(1)} u</div>
+                            <div style={{fontSize:11,color:'var(--ink-soft)'}}>{item.count} entrée{item.count>1?'s':''}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
 
           <h3 style={{marginTop:16}}>Entrées de la semaine</h3>
           {weekLosses.length === 0 ? (
