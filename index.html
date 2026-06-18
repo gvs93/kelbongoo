@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.27</title>
+  <title>Kelbongoo — Distribution V9.28</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -526,7 +526,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.27';
+    const APP_VERSION = 'V9.28';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -984,7 +984,8 @@
           name: p.product_name || p.name || '',
           producer: p.producer_name || '',
           dispatchType: (p.dispatch_type === 0 || p.dispatch_type) ? p.dispatch_type : null,
-          category: p.category_name || p.category || p.product_category || p.family || p.rayon || '',
+          category: p.category_name || p.category || p.product_category || p.rayon || '',
+          family: String(p.family_name || p.family || p.subcategory_name || p.subcategory || '').trim().replace(/^[\s\-–—]+|[\s\-–—]+$/g, ''),
         };
       }
       return byId;
@@ -1008,6 +1009,7 @@
           uv: String(pick(row, ['Unité', 'Unite', 'unité', 'unite', 'Unité de vente', 'UV'])).trim(),
           dispatchType: (dt === '' ? null : Number(dt)),
           category: String(pick(row, ['Catégorie', 'Categorie', 'catégorie', 'categorie', 'category'])).trim(),
+          family: String(pick(row, ['Famille', 'famille', 'Famille produit', 'Famille de produit', 'family', 'Sous-catégorie', 'Sous-categorie'])).trim().replace(/^[\s\-–—]+|[\s\-–—]+$/g, ''),
           active: String(pick(row, ['Produit Actif', 'Produit actif', 'Actif']) || '').trim().toLowerCase() === 'true',
         };
       }
@@ -4509,6 +4511,7 @@
       const [products, setProducts] = React.useState([]);
       const [eanMap, setEanMap] = React.useState({});
       const [counts, setCounts] = React.useState({});
+      const [countMeta, setCountMeta] = React.useState({}); // {id: {by, at}} — qui a compté (multi-utilisateur)
       const [search, setSearch] = React.useState('');
       const [invSort, setInvSort] = React.useState('fournisseur'); // 'nom' | 'famille' | 'fournisseur'
       const [scanMode, setScanMode] = React.useState(false);
@@ -4567,7 +4570,32 @@
           try {
             const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_products' });
             if (data && data.ok && Array.isArray(data.products) && data.products.length) {
-              setStockProducts(data.products.map(s => String(s || '').trim()).filter(Boolean));
+              // La feuille de stock peut renvoyer soit des chaînes (nom seul),
+              // soit des objets {produit/name, categorie, famille}. On normalise les deux
+              // pour ne JAMAIS retomber sur "[object Object]".
+              const pickStr = (o, keys) => {
+                for (const k of keys) { if (o && o[k] != null && String(o[k]).trim() !== '') return String(o[k]).trim(); }
+                return '';
+              };
+              const cleaned = data.products.map(s => {
+                if (s == null) return null;
+                if (typeof s === 'string' || typeof s === 'number') {
+                  const name = String(s).trim();
+                  return name ? { name, category: '', family: '' } : null;
+                }
+                if (typeof s === 'object') {
+                  const name = pickStr(s, ['produit', 'name', 'nom', 'product', 'product_name', 'libelle', 'Produit']);
+                  if (!name) return null;
+                  return {
+                    name,
+                    category: pickStr(s, ['categorie', 'category', 'catégorie', 'category_name', 'rayon', 'Catégorie', 'Categorie']),
+                    family: pickStr(s, ['famille', 'family', 'family_name', 'sous_categorie', 'subcategory', 'Famille'])
+                              .replace(/^[\s\-–—]+|[\s\-–—]+$/g, ''),
+                  };
+                }
+                return null;
+              }).filter(Boolean);
+              setStockProducts(cleaned);
               setStockNote(data.sheet ? `Liste issue de la feuille de stock « ${data.sheet} » (col E)` : 'Liste issue de la dernière feuille de stock (col E)');
             } else {
               setStockProducts(null);
@@ -4582,7 +4610,9 @@
       React.useEffect(() => {
         setCounts({});
         const u = storage.subscribe(`inventory_${invDate}`, (arr) => {
-          const c = {}; for (const e of arr) { c[e.id] = e.qty; } setCounts(c);
+          const c = {}; const meta = {};
+          for (const e of arr) { c[e.id] = e.qty; meta[e.id] = { by: e.countedBy || '', at: e.countedAt || '' }; }
+          setCounts(c); setCountMeta(meta);
         });
         return () => { u && u(); };
       }, [invDate]);
@@ -4594,7 +4624,9 @@
             const meta = await storage.getDoc('inventory_meta', invDate);
             if (meta) {
               setInvType(meta.type || 'complet');
-              setScopeKind(meta.scopeKind || 'producer');
+              // Avant, le périmètre « family » filtrait en réalité la catégorie.
+              // On le remappe vers « category » pour conserver le comportement.
+              setScopeKind(meta.scopeKind === 'family' && meta.scopeValueLevel !== 'family' ? 'category' : (meta.scopeKind || 'producer'));
               setScopeValue(meta.scopeValue || '');
             } else {
               setInvType('complet'); setScopeValue('');
@@ -4621,11 +4653,28 @@
         const byName = {};
         for (const p of products) { const k = normalizeText(p.name || ''); if (k) byName[k] = p; }
         const seen = new Set(); const out = [];
-        for (const name of stockProducts) {
+        for (const sp of stockProducts) {
+          const name = sp && sp.name ? sp.name : '';
           const k = normalizeText(name);
           if (!k || seen.has(k)) continue;
           seen.add(k);
-          out.push(byName[k] || { id: 'stk_' + k.replace(/\s+/g, '_'), name, producer: '', category: '', _stockOnly: true });
+          const match = byName[k];
+          if (match) {
+            // Produit du cache : on garde ses champs, en complétant catégorie/famille
+            // depuis la feuille si le cache ne les a pas.
+            out.push({
+              ...match,
+              category: match.category || (sp.category || ''),
+              family: match.family || (sp.family || ''),
+            });
+          } else {
+            // Produit présent dans la feuille mais absent du cache : saisissable quand même
+            // (sans code-barres), avec la catégorie/famille fournies par la feuille.
+            out.push({
+              id: 'stk_' + k.replace(/\s+/g, '_'), name,
+              producer: '', category: sp.category || '', family: sp.family || '', _stockOnly: true,
+            });
+          }
         }
         return out;
       }, [stockProducts, products]);
@@ -4635,11 +4684,33 @@
         return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
       }, [universe]);
 
-      const families = React.useMemo(() => {
+      // Catégories (niveau haut : « Produits laitiers », « Viandes »…)
+      const categories = React.useMemo(() => {
         const s = new Set(); for (const p of universe) if (p.category) s.add(p.category);
         return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
       }, [universe]);
+      const hasCategories = categories.length > 0;
+
+      // Familles (niveau fin : « Yaourt et desserts au lait de chèvre »…), groupées par catégorie
+      const families = React.useMemo(() => {
+        const s = new Set(); for (const p of universe) if (p.family) s.add(p.family);
+        return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
+      }, [universe]);
       const hasFamilies = families.length > 0;
+      const familiesByCat = React.useMemo(() => {
+        const m = {};
+        for (const p of universe) {
+          if (!p.family) continue;
+          const cat = p.category || '— Sans catégorie —';
+          if (!m[cat]) m[cat] = new Set();
+          m[cat].add(p.family);
+        }
+        const out = {};
+        for (const cat of Object.keys(m).sort((a,b)=>a.localeCompare(b,'fr'))) {
+          out[cat] = [...m[cat]].sort((a,b)=>a.localeCompare(b,'fr'));
+        }
+        return out;
+      }, [universe]);
 
       const TYPE_LABELS = { frais: '🧊 Frais', pain: '🍞 Pain', nd: '🥬 Non-dispatch' };
 
@@ -4647,7 +4718,8 @@
         if (invType !== 'tournant' || !scopeValue) return true;
         if (scopeKind === 'producer') return p.producer === scopeValue;
         if (scopeKind === 'type') return DISPATCH_TYPE[p.dispatchType] === scopeValue;
-        if (scopeKind === 'family') return p.category === scopeValue;
+        if (scopeKind === 'category') return p.category === scopeValue;
+        if (scopeKind === 'family') return p.family === scopeValue;
         return true;
       }, [invType, scopeKind, scopeValue]);
 
@@ -4984,9 +5056,13 @@
                     onClick={()=>{ setScopeKind('producer'); setScopeValue(''); saveMeta({scopeKind:'producer', scopeValue:''}); }}>Par producteur</div>
                   <div className={`chip ${scopeKind==='type'?'selected':''}`}
                     onClick={()=>{ setScopeKind('type'); setScopeValue(''); saveMeta({scopeKind:'type', scopeValue:''}); }}>Par type</div>
+                  {hasCategories && (
+                    <div className={`chip ${scopeKind==='category'?'selected':''}`}
+                      onClick={()=>{ setScopeKind('category'); setScopeValue(''); saveMeta({scopeKind:'category', scopeValue:''}); }}>Par catégorie</div>
+                  )}
                   {hasFamilies && (
                     <div className={`chip ${scopeKind==='family'?'selected':''}`}
-                      onClick={()=>{ setScopeKind('family'); setScopeValue(''); saveMeta({scopeKind:'family', scopeValue:''}); }}>Par famille</div>
+                      onClick={()=>{ setScopeKind('family'); setScopeValue(''); saveMeta({scopeKind:'family', scopeValue:'', scopeValueLevel:'family'}); }}>Par famille</div>
                   )}
                 </div>
                 {scopeKind === 'producer' && (
@@ -5004,14 +5080,25 @@
                     ))}
                   </div>
                 )}
-                {scopeKind === 'family' && hasFamilies && (
+                {scopeKind === 'category' && hasCategories && (
                   <select value={scopeValue} onChange={e=>{ setScopeValue(e.target.value); saveMeta({scopeValue:e.target.value}); }}
                     style={{width:'100%',fontSize:15,padding:'8px'}}>
-                    <option value="">— Choisir une famille ({families.length}) —</option>
-                    {families.map(f => <option key={f} value={f}>{f}</option>)}
+                    <option value="">— Choisir une catégorie ({categories.length}) —</option>
+                    {categories.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                 )}
-                {!scopeOk && <div style={{fontSize:12,color:'var(--warn)',marginTop:6}}>Choisis un {scopeKind==='producer'?'producteur':scopeKind==='family'?'famille':'type'} pour démarrer le comptage.</div>}
+                {scopeKind === 'family' && hasFamilies && (
+                  <select value={scopeValue} onChange={e=>{ setScopeValue(e.target.value); saveMeta({scopeValue:e.target.value, scopeValueLevel:'family'}); }}
+                    style={{width:'100%',fontSize:15,padding:'8px'}}>
+                    <option value="">— Choisir une famille ({families.length}) —</option>
+                    {Object.keys(familiesByCat).map(cat => (
+                      <optgroup key={cat} label={cat}>
+                        {familiesByCat[cat].map(f => <option key={cat+'|'+f} value={f}>{f}</option>)}
+                      </optgroup>
+                    ))}
+                  </select>
+                )}
+                {!scopeOk && <div style={{fontSize:12,color:'var(--warn)',marginTop:6}}>Choisis un {scopeKind==='producer'?'producteur':scopeKind==='category'?'catégorie':scopeKind==='family'?'famille':'type'} pour démarrer le comptage.</div>}
                 {scopeOk && <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>{scopeProducts.length} produit(s) dans ce périmètre.</div>}
               </div>
             )}
@@ -5105,17 +5192,37 @@
                 {matches.map(p => {
                   const isCounted = counts[p.id] !== undefined && counts[p.id] !== null;
                   const fam = p.family || p.famille || '';
+                  const cat = p.category || '';
+                  const sub = [p.producer, cat && fam ? `${cat} › ${fam}` : (cat || fam)].filter(Boolean).join(' · ');
+                  const hasDlc = !!dlcInputs[p.id];
+                  const dlcOpen = dlcExpandedId === p.id;
                   return (
-                  <div key={p.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 8px',border:`1px solid ${isCounted?'var(--accent)':'var(--border)'}`,background:isCounted?'var(--accent-soft)':'transparent',borderRadius:6}}>
-                    <div style={{fontSize:13,minWidth:0,flex:1}}>
-                      <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{isCounted?'✓ ':''}{p.name}</div>
-                      <div style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.producer}{fam?` · ${fam}`:''}</div>
+                  <div key={p.id} style={{padding:'6px 8px',border:`1px solid ${isCounted?'var(--accent)':'var(--border)'}`,background:isCounted?'var(--accent-soft)':'transparent',borderRadius:6}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+                      <div style={{fontSize:13,minWidth:0,flex:1}}>
+                        <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{isCounted?'✓ ':''}{p.name}</div>
+                        <div style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{sub}</div>
+                      </div>
+                      <div style={{display:'flex',alignItems:'center',gap:6}}>
+                        <button className="btn-ghost" title="Signaler une DLC courte"
+                          style={{fontSize:11,padding:'4px 8px',border:`1px solid ${hasDlc?'var(--accent)':'var(--border)'}`,borderRadius:6,color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)'}}
+                          onClick={()=>setDlcExpandedId(prev => prev===p.id ? null : p.id)}>{hasDlc ? '✓ DLC' : '📅'}</button>
+                        <button className="btn-ghost" style={{fontSize:13,padding:'4px 10px',border:'1px solid var(--border)',borderRadius:6}} onClick={()=>setCount(p.id, 0)}>0</button>
+                        <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
+                          style={{width:60,textAlign:'center',fontSize:15,padding:'6px'}} />
+                      </div>
                     </div>
-                    <div style={{display:'flex',alignItems:'center',gap:6}}>
-                      <button className="btn-ghost" style={{fontSize:13,padding:'4px 10px',border:'1px solid var(--border)',borderRadius:6}} onClick={()=>setCount(p.id, 0)}>0</button>
-                      <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
-                        style={{width:60,textAlign:'center',fontSize:15,padding:'6px'}} />
-                    </div>
+                    {dlcOpen && (
+                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:6,paddingTop:6,borderTop:'1px dashed var(--border)'}}>
+                        <span style={{fontSize:11,color:'var(--ink-mute)'}}>DLC :</span>
+                        <input type="date" value={dlcInputs[p.id] || ''} onChange={e => saveDlcFromInventory(p.id, e.target.value)}
+                          style={{fontSize:13,padding:'4px 6px',flex:1}} />
+                        {dlcInputs[p.id] && (() => {
+                          const d = Math.round((new Date(dlcInputs[p.id]) - new Date(todayKey())) / 86400000);
+                          return <span style={{fontSize:11,fontWeight:600,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
+                        })()}
+                      </div>
+                    )}
                   </div>
                   );
                 })}
@@ -5128,7 +5235,7 @@
           {counted.length > 0 && (
             <div className="card">
               <h3 style={{marginBottom:4}}>Comptés ({counted.length})</h3>
-              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>📅 Clique « DLC » pour signaler une date limite courte — elle sera ajoutée automatiquement dans l'onglet DLC.</div>
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>👥 Comptage <strong>collaboratif</strong> — plusieurs personnes peuvent compter en même temps, tout se synchronise en direct. 📅 Clique « DLC » pour signaler une date limite courte — elle sera ajoutée automatiquement dans l'onglet DLC.</div>
               <div className="stack" style={{gap:3}}>
                 {counted.map(id => {
                   const isManual = manuallyAddedIds.has(id);
@@ -5139,6 +5246,7 @@
                       <span style={{color: isManual ? 'var(--ink-mute)' : 'inherit'}}>
                         {isManual ? '⚠️ ' : ''}{prodById[id]?.name || id}
                         {isManual && <span style={{fontSize:10,color:'var(--warn)'}}> (hors feuille)</span>}
+                        {countMeta[id] && countMeta[id].by && <span style={{fontSize:10,color:'var(--ink-mute)'}}> · par {countMeta[id].by}</span>}
                       </span>
                       <div style={{display:'flex',gap:6,alignItems:'center'}}>
                         <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)'}}
