@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.26</title>
+  <title>Kelbongoo — Distribution V9.27</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -526,7 +526,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.26';
+    const APP_VERSION = 'V9.27';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -6329,30 +6329,37 @@
                 }
               }
             }
-            // ND normal de base : site -> [{produit, qty}]
+            // ND normal de base : site -> casier -> [{produit, qty}]
             const normalBySite = {};
-            // 1) V4 : agrégation des ND présents dans les commandes du jour
-            const aggNd = {};
+            // 1) V4 : chaque client a un casier (frais, sinon sec, sinon bac ND) → on y range ses ND
+            const aggNd = {}; // site -> casier -> { produit -> qty }
             for (const o of (dayOrders || [])) {
               const site = (o.site || '').toUpperCase();
               if (!site) continue;
-              for (const nd of (o.nds || [])) {
+              const nds = o.nds || [];
+              if (!nds.length) continue;
+              const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
+              for (const nd of nds) {
                 if (!nd || !nd.produit) continue;
                 if (!aggNd[site]) aggNd[site] = {};
-                aggNd[site][nd.produit] = (aggNd[site][nd.produit] || 0) + (nd.qty || 1);
+                if (!aggNd[site][casier]) aggNd[site][casier] = {};
+                aggNd[site][casier][nd.produit] = (aggNd[site][casier][nd.produit] || 0) + (nd.qty || 1);
               }
             }
-            for (const [site, m] of Object.entries(aggNd)) {
-              normalBySite[site] = Object.entries(m)
-                .map(([produit, qty]) => ({ produit, qty }))
-                .sort((a, b) => a.produit.localeCompare(b.produit));
+            for (const [site, casMap] of Object.entries(aggNd)) {
+              normalBySite[site] = {};
+              for (const [cas, m] of Object.entries(casMap)) {
+                normalBySite[site][cas] = Object.entries(m)
+                  .map(([produit, qty]) => ({ produit, qty }))
+                  .sort((a, b) => a.produit.localeCompare(b.produit));
+              }
             }
-            // 2) Repli ancien système : PDF ND chargé, pour les locaux sans commande V4
+            // 2) Repli ancien système : PDF ND chargé (sans casier → bac ND), pour les locaux sans commande V4
             for (const [site, d] of Object.entries(dispatchData || {})) {
               if (normalBySite[site]) continue;
               const nd = d && d.nd;
               if (Array.isArray(nd) && nd.length) {
-                normalBySite[site] = nd.map(p => ({ produit: p.produit, qty: p.total || 0 }));
+                normalBySite[site] = { ND: nd.map(p => ({ produit: p.produit, qty: p.total || 0 })) };
               }
             }
             const sitesWithND = new Set([...Object.keys(normalBySite), ...Object.keys(lmBySiteCasier)]);
@@ -6369,13 +6376,14 @@
               <div className="card">
                 <h3 style={{marginBottom:4}}>📦 ND du jour — par local</h3>
                 <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0,marginBottom:8}}>
-                  ND normal (feuille de base) en noir. <strong style={{color:'var(--danger)'}}>En rouge = dernière minute → à rajouter dans l'autre appli, sinon non facturé.</strong>
+                  Par local et par casier. ND normal en noir. <strong style={{color:'var(--danger)'}}>En rouge = dernière minute → à rajouter dans l'autre appli, sinon non facturé.</strong>
                 </p>
                 <div style={{display:'flex',flexDirection:'column',gap:10}}>
                   {ordered.map(site => {
                     const lbl = (typeof siteLabel === 'function') ? siteLabel(site) : site;
-                    const normal = normalBySite[site] || [];
+                    const normal = normalBySite[site] || null;
                     const lm = lmBySiteCasier[site] || null;
+                    const normalCasiers = normal ? Object.keys(normal).sort(casierSort) : [];
                     const casiers = lm ? Object.keys(lm).sort(casierSort) : [];
                     return (
                       <div key={site} className="card-flat" style={{padding:'8px 10px'}}>
@@ -6383,12 +6391,15 @@
                           {site}{lbl && lbl !== site && <span style={{fontWeight:400,color:'var(--ink-mute)',fontSize:12}}> · {lbl}</span>}
                         </div>
 
-                        {normal.length > 0 && (
+                        {normal && normalCasiers.length > 0 && (
                           <div style={{marginBottom: lm ? 8 : 0}}>
-                            <div style={{fontSize:11,fontWeight:700,color:'var(--ink-soft)',marginBottom:3}}>ND normal (feuille)</div>
-                            <div style={{display:'flex',flexDirection:'column',gap:2}}>
-                              {normal.map((p, i) => (
-                                <div key={i} style={{fontSize:13}}>• {p.produit}{p.qty > 1 ? ` ×${p.qty}` : ''}</div>
+                            <div style={{fontSize:11,fontWeight:700,color:'var(--ink-soft)',marginBottom:3}}>ND normal — par casier</div>
+                            <div style={{display:'flex',flexDirection:'column',gap:4}}>
+                              {normalCasiers.map(cas => (
+                                <div key={cas} style={{display:'flex',gap:8,fontSize:13,alignItems:'baseline'}}>
+                                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
+                                  <span style={{flex:1}}>{normal[cas].map(p => p.produit + (p.qty > 1 ? ` ×${p.qty}` : '')).join(', ')}</span>
+                                </div>
                               ))}
                             </div>
                           </div>
