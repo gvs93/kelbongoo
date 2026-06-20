@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.31</title>
+  <title>Kelbongoo — Distribution V9.36</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -526,7 +526,7 @@
     };
     // Renvoie le nom lisible d'un local, sinon le code (fallback).
     function siteLabel(code) { return (code && SITE_NAMES[code]) || code || ''; }
-    const APP_VERSION = 'V9.31';
+    const APP_VERSION = 'V9.36';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -616,6 +616,18 @@
       const nav = lastNavetteBeforeDLC(dlcKey, now);
       if (nav) return { dest: 'pribon', navette: nav, reason: `Envoi ROB — navette ${nav.label}` };
       return { dest: 'partage', navette: null, reason: 'Navette ROB déjà partie avant la DLC → partage équipe' };
+    }
+    // Routage d'un produit en RETOUR PDP (entrepôt) : remise en rayon si encore vendable,
+    // sinon envoi ROB si une navette rattrape la DLC, sinon partage équipe.
+    function routeReturn(dlcKey, now) {
+      now = now || new Date();
+      const days = dlcKey ? dlcDaysLeft(dlcKey, todayKey()) : null;
+      if (days === null) return { dest: 'rayon', navette: null, reason: 'DLC non renseignée — à vérifier, sinon remise en rayon' };
+      if (days <= 0) return { dest: 'partage', navette: null, reason: 'DLC dépassée → partage équipe' };
+      if (days >= 4) return { dest: 'rayon', navette: null, reason: `DLC encore longue (J-${days}) → remettre en rayon` };
+      const nav = lastNavetteBeforeDLC(dlcKey, now);
+      if (nav) return { dest: 'pribon', navette: nav, reason: `DLC courte (J-${days}) → envoi ROB (${nav.label})` };
+      return { dest: 'partage', navette: null, reason: `DLC courte (J-${days}) et plus de navette → partage équipe` };
     }
     // Le jour de DLC tombe-t-il aujourd'hui (par rapport à la journée active) ?
     function isDlcToday(dlcKey, refDayKey) {
@@ -1083,6 +1095,7 @@
             produit: p ? p.name : '(produit inconnu)',
             producteur: p ? p.producer : '',
             qty: it.quantity || 1,
+            consumer_price: it.consumer_price || 0,
             dispatchType: p ? p.dispatchType : null,
             cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais',
           };
@@ -1104,11 +1117,11 @@
           frais: items.filter(i => i.cat === 'frais'),
           removed: (o.removed || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
-            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', qty: r.quantity || 1, reason: r.reason };
+            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, reason: r.reason };
           }),
           reduced: (o.reduced || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
-            return { produit: p ? p.name : '(inconnu)', qty: r.quantity || 1, percentage: r.percentage };
+            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, percentage: r.percentage };
           }),
         });
 
@@ -1741,6 +1754,57 @@
       }
       return order.name || order.email;
     }
+
+    // Montants d'une commande (en centimes) :
+    //  • théorique = ce que le client paierait s'il avait TOUT (items livrés + manquants), prix plein
+    //  • réel = ce qu'il paie vraiment = items livrés − remises (ruptures déjà exclues des items)
+    function orderAmounts(o) {
+      const items = o.items || [];
+      const removed = o.removed || [];
+      const reduced = o.reduced || [];
+      const itemsTTC = items.reduce((s, it) => s + (it.consumer_price || 0) * (it.qty || it.quantity || 1), 0);
+      const manquant = removed.reduce((s, r) => s + (r.consumer_price || 0) * (r.qty || r.quantity || 1), 0);
+      const remise = reduced.reduce((s, r) => s + Math.round((r.consumer_price || 0) * (r.qty || r.quantity || 1) * ((r.percentage || 0) / 100)), 0);
+      return {
+        theorique: itemsTTC + manquant,
+        reel: itemsTTC - remise,
+        manquant, remise, itemsTTC,
+      };
+    }
+    const fmtEuro = (cents) => `${((cents || 0) / 100).toFixed(2).replace('.', ',')} €`;
+
+    // Fusionne plusieurs commandes d'un même client (course principale + ajouts « fusionnée »)
+    // en une seule, pour l'affichage distrib : items cumulés, casiers réunis, montants additionnés.
+    function mergeClientOrders(list) {
+      if (!list || list.length === 0) return null;
+      if (list.length === 1) return { ...list[0], _subOrderIds: [list[0].orderId], _mergedCount: 1 };
+      // Primaire = la commande au plus gros montant théorique (souvent la course principale)
+      const sorted = [...list].sort((a, b) => orderAmounts(b).theorique - orderAmounts(a).theorique);
+      const base = sorted[0];
+      const mergedItems = [];
+      const idx = {};
+      const pushItems = (arr) => {
+        for (const it of (arr || [])) {
+          const key = it.id || it.produit;
+          if (idx[key] != null) { mergedItems[idx[key]] = { ...mergedItems[idx[key]], qty: (mergedItems[idx[key]].qty || 1) + (it.qty || 1) }; }
+          else { idx[key] = mergedItems.length; mergedItems.push({ ...it }); }
+        }
+      };
+      for (const o of sorted) pushItems(o.items);
+      const cat = (c) => mergedItems.filter(i => i.cat === c);
+      const uniq = (a) => [...new Set(a)];
+      return {
+        ...base,
+        items: mergedItems,
+        pains: cat('pain'), nds: cat('nd'), frais: cat('frais'),
+        casiersFrais: uniq(sorted.flatMap(o => o.casiersFrais || [])),
+        casiersSec: uniq(sorted.flatMap(o => o.casiersSec || [])),
+        removed: sorted.flatMap(o => o.removed || []),
+        reduced: sorted.flatMap(o => o.reduced || []),
+        _subOrderIds: sorted.map(o => o.orderId),
+        _mergedCount: sorted.length,
+      };
+    }
     function normalizeText(s) {
       return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
     }
@@ -2116,11 +2180,13 @@
       );
     }
 
-    // ── Overlay : relance bloquante (non-récup ≥ 3j sans résolution) ────────
-    function OverdueBlockOverlay({ followup, count, onAck }) {
+    // ── Overlay : relance récurrente (non-récup ≥ 3j sans résolution) ────────
+    function OverdueBlockOverlay({ followup, count, onRelance, onResolve, onSnooze }) {
       const f = followup;
-      const ref = f.relanceAt || f.emailSentAt || f.distribDate || f.day;
+      const ref = f.relanceAt || f.distribDate || f.day;
       const refDay = ref && ref.length > 10 ? ref.slice(0,10) : ref;
+      const phone = (f.hasPhone && f.phone) ? f.phone : (f.telephone || '');
+      const alreadyRelance = !!f.relanceAt;
       return (
         <div className="fs-overlay">
           <div className="fs-card fs-block">
@@ -2128,12 +2194,16 @@
             <h2>À relancer</h2>
             <div className="fs-body">
               <strong>{f.consumer_name || 'Un client'}</strong> n'a toujours pas récupéré sa commande
-              {refDay ? ` depuis le ${formatDateShort(refDay)}` : ''} ({daysSince(refDay)} jours).
-              {'\n\n'}Merci de le relancer (appel ou mail) avant de continuer.
-              {f.hasPhone && f.phone ? `\n\n📞 ${f.phone}` : ''}
+              {refDay ? ` (depuis le ${formatDateShort(refDay)}, ${daysSince(refDay)} j)` : ''}.
+              {alreadyRelance ? '\n\nDéjà relancé une fois, toujours sans nouvelles — relance à nouveau.' : '\n\nMerci de le relancer (appel ou mail) avant de continuer.'}
             </div>
-            <div className="fs-actions">
-              <button className="btn-primary btn-lg" onClick={onAck}>✓ J'ai relancé, continuer</button>
+            {phone && (
+              <a href={`tel:${phone}`} className="btn-primary btn-lg" style={{display:'block',textDecoration:'none',marginBottom:8}}>📞 Appeler {phone}</a>
+            )}
+            <div className="fs-actions" style={{flexDirection:'column',gap:8}}>
+              <button className="btn-primary btn-lg" onClick={onRelance}>✓ J'ai relancé, continuer</button>
+              <button className="btn-secondary btn-lg" onClick={onResolve}>✅ Client venu / résolu</button>
+              <button className="btn-ghost" style={{fontSize:13}} onClick={onSnooze}>Plus tard (revient demain)</button>
             </div>
             {count > 1 && <div className="fs-count">{count - 1} autre(s) relance(s) à valider</div>}
           </div>
@@ -2720,33 +2790,47 @@
         return m;
       }, [statuses]);
 
-      const visible = orders.filter(o => o.site === currentSite);
+      const visibleRaw = orders.filter(o => o.site === currentSite);
+      // Fusion : un client = une ligne (course principale + ajouts « fusionnée »)
+      const visible = React.useMemo(() => {
+        const groups = {};
+        for (const o of visibleRaw) {
+          const key = o.consumerId || o.email || displayName(o);
+          (groups[key] = groups[key] || []).push(o);
+        }
+        return Object.values(groups).map(mergeClientOrders).filter(Boolean);
+      }, [orders, currentSite]);
+
+      const isPassed = (o) => {
+        const ids = o._subOrderIds || [o.orderId];
+        return ids.length > 0 && ids.every(id => statusMap[id]?.passed);
+      };
 
       const togglePassed = async (order) => {
         if (isClosed) return;
-        const cur = statusMap[order.orderId];
-        const newPassed = !(cur?.passed);
-        await storage.setDoc(`day_${activeDay()}_statuses`, order.orderId, {
-          orderId: order.orderId, site: currentSite,
-          passed: newPassed,
-          consumer_name: displayName(order),
-          email: order.email,
-          telephone: order.telephone || '',
-          hasPhone: order.hasPhone,
-          updatedBy: session.name,
-          updatedAt: new Date().toISOString(),
-        });
+        const newPassed = !isPassed(order);
+        const ids = order._subOrderIds || [order.orderId];
+        for (const id of ids) {
+          await storage.setDoc(`day_${activeDay()}_statuses`, id, {
+            orderId: id, site: currentSite,
+            passed: newPassed,
+            consumer_name: displayName(order),
+            email: order.email,
+            telephone: order.telephone || '',
+            hasPhone: order.hasPhone,
+            updatedBy: session.name,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       };
 
       const filtered = visible.filter(o => {
-        const passed = !!statusMap[o.orderId]?.passed;
+        const passed = isPassed(o);
         if (filter === 'passed' && !passed) return false;
         if (filter === 'not_passed' && passed) return false;
         if (search) {
           const s = normalizeText(search);
           if (!s) return true;
-          // Match sur le nom du client OU sur les produits commandés (items)
-          // ou retirés (removed) — permet de retrouver « les clients qui ont une salade ».
           const inName = normalizeText(displayName(o)).includes(s);
           const inItems = (o.items || []).some(it => normalizeText(it.produit || '').includes(s));
           const inRemoved = (o.removed || []).some(r => normalizeText(r.produit || '').includes(s));
@@ -2757,8 +2841,8 @@
 
       const stats = {
         total: visible.length,
-        passed: visible.filter(o => statusMap[o.orderId]?.passed).length,
-        notPassed: visible.filter(o => !statusMap[o.orderId]?.passed).length,
+        passed: visible.filter(isPassed).length,
+        notPassed: visible.filter(o => !isPassed(o)).length,
       };
 
       // Si journée clôturée et distrib (non master), on cache les noms
@@ -2843,7 +2927,8 @@
               ) : (
                 <div className="list">
                   {filtered.map(o => {
-                    const passed = !!statusMap[o.orderId]?.passed;
+                    const passed = isPassed(o);
+                    const amt = orderAmounts(o);
                     // V4 : les données pain/ND/casiers sont directement dans la commande chargée
                     const isV4 = Array.isArray(o.items) || Array.isArray(o.pains) || Array.isArray(o.casiersFrais);
                     const cd = (!isV4 && dispatch) ? buildClientDispatch(o, dispatch.master, dispatch.frais, dispatch.sec) : null;
@@ -2866,6 +2951,9 @@
                           <div className="list-item-name">
                             <span className={`indicator-dot ${passed ? 'passed' : 'not-passed'}`}></span>
                             {displayName(o)}
+                            {o._mergedCount > 1 && (
+                              <span className="badge" style={{marginLeft:6,background:'var(--info-soft)',color:'var(--info)',fontSize:10}}>🔗 fusionné ×{o._mergedCount}</span>
+                            )}
                             {allCasiers.length > 0 && (
                               <span style={{marginLeft:8,display:'inline-flex',gap:4,flexWrap:'wrap'}}>
                                 {allCasiers.map((x,i) => (
@@ -2899,12 +2987,22 @@
                               )}
                             </div>
                           )}
+                          <div className="list-item-sub" style={{marginTop:4,display:'flex',gap:10,alignItems:'baseline',flexWrap:'wrap'}}>
+                            <span style={{fontWeight:700,fontSize:13}}>{fmtEuro(amt.reel)}</span>
+                            {amt.reel !== amt.theorique && (
+                              <span style={{fontSize:11,color:'var(--ink-mute)'}}>
+                                / {fmtEuro(amt.theorique)} théorique
+                                {amt.manquant > 0 && <span style={{color:'var(--warn)'}}> · −{fmtEuro(amt.manquant)} rupture</span>}
+                                {amt.remise > 0 && <span style={{color:'var(--info)'}}> · −{fmtEuro(amt.remise)} remise</span>}
+                              </span>
+                            )}
+                          </div>
                           <div className="list-item-sub">
                             {o.hasPhone
                               ? <a href={`tel:${o.telephone}`} onClick={e=>e.stopPropagation()} style={{color:'var(--accent-dark)',fontWeight:600}}>📞 {o.telephone}</a>
                               : <span style={{color:'var(--warn)'}}>✉️ Email</span>}
                             {session.isMaster && o.email && <span style={{color:'var(--ink-mute)'}}>· {o.email}</span>}
-                            {cd && <span style={{color:'var(--info)',marginLeft:6}}>· détail ›</span>}
+                            <span style={{color:'var(--info)',marginLeft:6}}>· détail ›</span>
                           </div>
                         </div>
                         <button className={passed ? 'btn-secondary' : 'btn-primary'} onClick={() => togglePassed(o)} disabled={isClosed} style={{padding:'8px 12px',fontSize:13,minWidth:90}}>
@@ -2939,19 +3037,27 @@
     // ============================================================
     function ClientDetailV4({ order, lmByCasier, onClose }) {
       const o = order;
+      const amt = orderAmounts(o);
       const casiers = [...(o.casiersFrais||[]).map(c=>({c,t:'🧊'})), ...(o.casiersSec||[]).map(c=>({c,t:'🍞'}))];
       const lm = [...(o.casiersFrais||[]), ...(o.casiersSec||[])].flatMap(cas => (lmByCasier && lmByCasier[cas]) || []);
+      // % de remise par produit (pour annoter les lignes)
+      const reducedByKey = {};
+      for (const r of (o.reduced || [])) reducedByKey[r.id || r.produit] = r.percentage || 0;
+      const lineEuro = (p) => fmtEuro((p.consumer_price || 0) * (p.qty || 1));
       const Section = ({ emoji, titre, items, color }) => (
         items && items.length > 0 ? (
           <div style={{marginBottom:12}}>
             <h4 style={{margin:'0 0 6px',fontSize:13,color}}>{emoji} {titre}</h4>
             <div className="stack" style={{gap:3}}>
-              {items.map((p,i)=>(
-                <div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:13,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
-                  <span>{p.produit}{p.producteur?` · ${p.producteur}`:''}</span>
-                  <strong>×{p.qty}</strong>
-                </div>
-              ))}
+              {items.map((p,i)=>{
+                const pct = reducedByKey[p.id || p.produit] || 0;
+                return (
+                  <div key={i} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'3px 0',borderBottom:'1px solid var(--border)'}}>
+                    <span style={{minWidth:0}}>{p.produit}{p.producteur?` · ${p.producteur}`:''}{pct>0 && <span style={{color:'var(--info)',fontSize:11}}> · −{pct}%</span>}</span>
+                    <span style={{whiteSpace:'nowrap'}}><strong>×{p.qty}</strong> <span style={{color:'var(--ink-mute)'}}>{lineEuro(p)}</span></span>
+                  </div>
+                );
+              })}
             </div>
           </div>
         ) : null
@@ -2960,8 +3066,15 @@
         <div className="modal-backdrop" onClick={(e)=>{ if(e.target.className==='modal-backdrop') onClose(); }}>
           <div className="modal">
             <div className="modal-header">
-              <h2>{o.name || displayName(o)}</h2>
+              <h2>{o.name || displayName(o)}{o._mergedCount>1 && <span style={{fontSize:12,fontWeight:400,color:'var(--info)'}}> · 🔗 {o._mergedCount} commandes</span>}</h2>
               <button className="modal-close" onClick={onClose}>×</button>
+            </div>
+            {/* Totaux théorique / réel */}
+            <div style={{display:'flex',gap:12,alignItems:'baseline',marginBottom:10,padding:'8px 10px',background:'var(--bg-muted)',borderRadius:8,flexWrap:'wrap'}}>
+              <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Réel (à payer)</div><div style={{fontWeight:800,fontSize:18}}>{fmtEuro(amt.reel)}</div></div>
+              <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Théorique (tout)</div><div style={{fontWeight:600,fontSize:15,color:'var(--ink-soft)'}}>{fmtEuro(amt.theorique)}</div></div>
+              {amt.manquant>0 && <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Ruptures</div><div style={{fontWeight:600,fontSize:14,color:'var(--warn)'}}>−{fmtEuro(amt.manquant)}</div></div>}
+              {amt.remise>0 && <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Remises</div><div style={{fontWeight:600,fontSize:14,color:'var(--info)'}}>−{fmtEuro(amt.remise)}</div></div>}
             </div>
             <div style={{marginBottom:10}}>
               {casiers.length>0 && (
@@ -2989,8 +3102,16 @@
               </div>
             )}
             {o.removed && o.removed.length>0 && (
-              <div style={{marginTop:8,padding:8,background:'var(--warn-soft)',borderRadius:6,fontSize:12,color:'var(--warn)'}}>
-                Produits retirés : {o.removed.map(r=>r.produit+(r.qty>1?` ×${r.qty}`:'')).join(', ')}
+              <div style={{marginTop:8,marginBottom:4}}>
+                <h4 style={{margin:'0 0 6px',fontSize:13,color:'var(--warn)'}}>⚠️ Ruptures (non livré, non facturé)</h4>
+                <div className="stack" style={{gap:3}}>
+                  {o.removed.map((r,i)=>(
+                    <div key={i} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'3px 0',borderBottom:'1px dashed var(--border)',color:'var(--ink-soft)'}}>
+                      <span style={{minWidth:0}}>{r.produit}{r.producteur?` · ${r.producteur}`:''}</span>
+                      <span style={{whiteSpace:'nowrap'}}><strong>×{r.qty}</strong> <span style={{color:'var(--ink-mute)'}}>{lineEuro(r)}</span></span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -3352,12 +3473,24 @@
         return unsub;
       }, []);
 
+      // Statuts terminaux : client venu / dossier clos / retour PDP récupéré → sortent du suivi actif.
+      const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
       const visible = followUps.filter(f => {
         if (f.site !== currentSite) return false;
-        if (filter === 'pending') return !['resolved'].includes(f.status);
-        if (filter === 'resolved') return ['resolved'].includes(f.status);
+        if (filter === 'pending') return !TERMINAL.includes(f.status);
+        if (filter === 'resolved') return TERMINAL.includes(f.status);
         return true;
       });
+
+      // Envoyer un client en retour PDP AVANT les 7 jours (décision du distributeur).
+      const sendToPdpNow = async (f) => {
+        if (!confirm(`Envoyer la commande de ${f.consumer_name || 'ce client'} en retour PDP maintenant ?\n(au lieu d'attendre ${ALERT_DAYS_NON_RECUP} jours)`)) return;
+        await storage.setDoc('followups', f.id || f.orderId, {
+          ...f, forceReturnPdp: true, forceReturnPdpBy: session.name, forceReturnPdpAt: new Date().toISOString(),
+          updatedBy: session.name, updatedAt: new Date().toISOString(),
+        });
+        showToast('✓ Envoyé en retour PDP');
+      };
 
       const setStatus = async (f, newStatus) => {
         const docId = f.id || f.orderId;
@@ -3520,6 +3653,10 @@
                               : <span style={{fontSize:12,color:'var(--ink-mute)'}}>Pas de contact</span>
                           )}
                           <button className="btn-primary" style={{padding:'6px 10px',fontSize:12}} onClick={() => setStatus(f, 'resolved')}>✓ Résolu</button>
+                          {!f.forceReturnPdp && daysSince(f.distribDate || f.day) < ALERT_DAYS_NON_RECUP && (
+                            <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12,color:'var(--info)'}} onClick={() => sendToPdpNow(f)}>↩️ Retour PDP maintenant</button>
+                          )}
+                          {f.forceReturnPdp && <span style={{fontSize:11,color:'var(--info)',fontWeight:600,padding:'6px 0'}}>↩️ En retour PDP</span>}
                           {session.isMaster && (
                             <button className="btn-ghost" style={{padding:'6px 10px',fontSize:12}} onClick={() => removeFromFollowUp(f)}>🗑️</button>
                           )}
@@ -3753,10 +3890,13 @@
                           </div>
                         )}
 
-                        {/* Actions distrib (limité) */}
+                        {/* Actions distrib : peut clore un oubli déjà géré (ex. retiré par l'entrepôt) */}
                         {!session.isMaster && f.status !== 'done' && (
-                          <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap'}}>
-                            <span style={{fontSize:12,color:'var(--ink-soft)'}}>En attente de traitement par le master.</span>
+                          <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap',alignItems:'center'}}>
+                            <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={() => markDone(f)}>
+                              ✅ Déjà géré / retiré par l'entrepôt
+                            </button>
+                            <span style={{fontSize:11,color:'var(--ink-mute)'}}>(sinon, en attente du master)</span>
                           </div>
                         )}
                       </div>
@@ -8052,7 +8192,7 @@
       const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
       const returns = followups.filter(f =>
         !TERMINAL.includes(f.status) &&
-        daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP &&
+        (f.forceReturnPdp || daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP) &&
         Array.isArray(f.items) && f.items.length > 0
       );
 
@@ -8184,14 +8324,28 @@
         showToast('✓ Traité');
       };
 
-      const nothing = returns.length === 0 && manual.length === 0;
+      // Annuler un retour (déjà géré / retiré par l'entrepôt) → on supprime l'entrée + sa perte éventuelle.
+      const deleteManualReturn = async (r) => {
+        if (!confirm(`Annuler ce retour « ${r.produit || r.productLabel} » ?\n(déjà géré ou retiré par l'entrepôt)`)) return;
+        await storage.deleteDoc('pdp_returns', r.id);
+        try { await storage.deleteDoc('losses', `lossret_${r.id}`); } catch (e) {}
+        showToast('Retour annulé');
+      };
+
+      // Deux côtés : À RÉCUPÉRER (chauffeur, par boutique) et À TRAITER (entrepôt).
+      const toRecover = manual.filter(r => r.status === 'pending' || r.status === 'missing');
+      const toTreat   = manual.filter(r => r.status === 'recovered');
+      const recoverBySite = {};
+      for (const r of toRecover) { const s = r.site || '?'; (recoverBySite[s] = recoverBySite[s] || []).push(r); }
+      const recoverSites = Object.keys(recoverBySite).sort();
+
+      const DEST_LABEL = (id) => (RETURN_DESTINATIONS.find(d => d.id === id) || {}).label || id;
 
       return (
         <div className="stack">
-          <h1>Retours PDP</h1>
+          <h1>↩️ Retours PDP</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Produits signalés en distrib (↩️) à récupérer puis traiter, et commandes non récupérées depuis +{ALERT_DAYS_NON_RECUP}j.
-            La destination conseillée dépend de la DLC : partage équipe si trop courte, sinon envoi ROB via la navette.
+            <strong>À récupérer</strong> : le chauffeur ramasse aux boutiques (réparti par lieu). <strong>À traiter</strong> : à l'entrepôt, destination selon la DLC. Commandes non récupérées +{ALERT_DAYS_NON_RECUP}j incluses.
           </p>
 
           {overdue.length > 0 && (
@@ -8200,145 +8354,157 @@
             </div>
           )}
 
-          {nothing ? (
-            <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'12px 0'}}>Aucun retour PDP en attente. 👍</p></div>
-          ) : (
-            <>
-              {manual.length > 0 && (
-                <>
-                  <div className="card" style={{borderLeft:'3px solid var(--warn,#e0a800)'}}>
-                    <strong>↩️ Produits signalés en distribution</strong> · {manual.length} en attente
-                    <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>1) Le chauffeur coche « récupéré » aux boutiques. 2) À l'entrepôt, choisis la destination (conseil selon la DLC). Une fois traité, le produit disparaît.</div>
-                  </div>
-                  {manual.map(r => {
-                    const isTreated = r.status === 'treated';
-                    const isMissing = r.status === 'missing';
-                    const isRecovered = r.status === 'recovered' || isTreated;
-                    const route = routeByDLC(r.dlc);
-                    const isLate = overdueIds.has(r.id);
+          <div className="stat-grid">
+            <div className="stat"><div className="stat-value">{toRecover.length}</div><div className="stat-label">À récupérer</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--info)'}}>{toTreat.length}</div><div className="stat-label">À traiter</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--warn)'}}>{returns.length}</div><div className="stat-label">Cmd. non récup.</div></div>
+          </div>
+
+          {/* ===================== CÔTÉ 1 : À RÉCUPÉRER (chauffeur, par boutique) ===================== */}
+          <div className="card" style={{borderLeft:'4px solid var(--master)',background:'var(--master-soft)'}}>
+            <div style={{fontWeight:800,fontSize:16}}>🚚 À récupérer aux boutiques</div>
+            <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:2}}>Réparti par lieu pour la tournée du chauffeur. Coche « récupéré » au passage, ou « non récupéré » si introuvable (alerte).</div>
+          </div>
+          {toRecover.length === 0 ? (
+            <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'8px 0',margin:0}}>Rien à récupérer. 👍</p></div>
+          ) : recoverSites.map(site => (
+            <div key={site} className="card">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+                <h3 style={{margin:0,fontSize:15}}>📍 {siteLabel(site)}</h3>
+                <span className="badge badge-site">{recoverBySite[site].length}</span>
+              </div>
+              <div className="stack" style={{gap:8}}>
+                {recoverBySite[site].map(r => {
+                  const isMissing = r.status === 'missing';
+                  const isLate = overdueIds.has(r.id);
+                  return (
+                    <div key={r.id} style={{padding:'8px 10px',border:'1px solid var(--line)',borderRadius:8,
+                      background: isMissing ? 'var(--danger-soft,#fdecea)' : 'transparent',
+                      borderLeft: (isLate || isMissing) ? '3px solid var(--danger)' : '1px solid var(--line)'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',gap:8,alignItems:'baseline'}}>
+                        <div style={{fontWeight:600,fontSize:14}}>{r.produit || r.productLabel}{r.qty>1?` ×${r.qty}`:''}</div>
+                        <span style={{fontSize:11,color:'var(--ink-mute)',whiteSpace:'nowrap'}}>signalé le {formatDateShort(r.day)}</span>
+                      </div>
+                      <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:2}}>
+                        {r.producteur ? r.producteur+' · ' : ''}{r.dlc ? <>DLC <strong>{formatDateShort(r.dlc)}</strong></> : 'DLC non renseignée'}
+                        {r.clientName ? ` · ${r.clientName}` : ''}
+                      </div>
+                      {r.remark && <div style={{fontSize:12,color:'var(--ink-soft)',fontStyle:'italic',marginTop:2}}>« {r.remark} »</div>}
+                      {isMissing ? (
+                        <div style={{marginTop:8}}>
+                          <div style={{fontSize:12,color:'var(--danger)',fontWeight:700,marginBottom:4}}>❌ Non récupéré — introuvable (alerte envoyée)</div>
+                          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                            <button className="btn-secondary" style={{padding:'5px 10px',fontSize:12}} onClick={()=>markRecovered(r)}>✅ Finalement récupéré</button>
+                            <button className="btn-ghost" style={{padding:'5px 10px',fontSize:12}} onClick={()=>unmarkMissing(r)}>↩ Annuler statut</button>
+                            <button className="btn-ghost" style={{padding:'5px 10px',fontSize:12,color:'var(--ink-mute)'}} onClick={()=>deleteManualReturn(r)}>🗑️ Déjà géré</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:8}}>
+                          <button className="btn-primary" style={{padding:'6px 12px',fontSize:13}} onClick={()=>markRecovered(r)}>✅ Récupéré</button>
+                          <button className="btn-secondary" style={{padding:'6px 12px',fontSize:13}} onClick={()=>markMissing(r)}>❌ Non récupéré</button>
+                          <button className="btn-ghost" style={{padding:'6px 10px',fontSize:12,color:'var(--ink-mute)'}} onClick={()=>deleteManualReturn(r)}>🗑️ Déjà géré</button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+
+          {/* ===================== CÔTÉ 2 : À TRAITER (entrepôt) ===================== */}
+          <div className="card" style={{borderLeft:'4px solid var(--info)'}}>
+            <div style={{fontWeight:800,fontSize:16}}>🏭 À traiter (entrepôt)</div>
+            <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:2}}>Produits récupérés + commandes non récupérées. La destination conseillée (★) dépend de la DLC : remise en rayon si encore vendable, envoi ROB si une navette rattrape la DLC, sinon partage.</div>
+          </div>
+
+          {toTreat.length === 0 && returns.length === 0 ? (
+            <div className="card"><p style={{textAlign:'center',color:'var(--ink-mute)',padding:'8px 0',margin:0}}>Rien à traiter pour le moment.</p></div>
+          ) : null}
+
+          {/* Produits récupérés (signalés en distrib) */}
+          {toTreat.map(r => {
+            const route = routeReturn(r.dlc);
+            return (
+              <div key={r.id} className="card">
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4,gap:8}}>
+                  <h3 style={{margin:0,fontSize:15}}>{r.produit || r.productLabel}{r.qty>1?` ×${r.qty}`:''}</h3>
+                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>📍 {r.site}</span>
+                </div>
+                {r.producteur && <div style={{fontSize:12,color:'var(--ink-mute)'}}>{r.producteur}</div>}
+                <div style={{fontSize:12,color:'var(--ink-soft)',margin:'2px 0 6px'}}>
+                  {r.dlc ? <>DLC <strong>{formatDateShort(r.dlc)}</strong></> : 'DLC non renseignée'} · ✅ récupéré{r.recoveredBy?` · ${r.recoveredBy}`:''}
+                </div>
+                <div className={route.dest==='partage'?'alert-warning':route.dest==='rayon'?'alert-info':'alert-info'} style={{fontSize:12,marginBottom:6}}>
+                  💡 Conseil : <strong>{DEST_LABEL(route.dest)}</strong> — {route.reason}
+                </div>
+                <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                  {RETURN_DESTINATIONS.map(d => {
+                    const isReco = d.id === route.dest;
                     return (
-                      <div key={r.id} className="card" style={{
-                        background: isTreated ? 'transparent' : (isMissing ? 'var(--danger-soft,#fdecea)' : 'var(--warn-soft)'),
-                        borderLeft: (isLate || isMissing) ? '3px solid var(--danger)' : undefined,
-                      }}>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6,gap:8}}>
-                          <h3 style={{margin:0,fontSize:15}}>{r.produit || r.productLabel}{r.qty>1?` ×${r.qty}`:''}</h3>
-                          <span className="badge badge-site" style={{fontSize:12,whiteSpace:'nowrap'}}>📍 {r.site}</span>
-                        </div>
-                        {r.producteur && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:2}}>{r.producteur}</div>}
-                        <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:4}}>
-                          {r.dlc ? <>DLC <strong>{formatDateShort(r.dlc)}</strong></> : 'DLC non renseignée'}
-                          {' · '}signalé le {formatDateShort(r.day)}
-                        </div>
-                        {r.remark && <div style={{fontSize:12,color:'var(--ink-soft)',fontStyle:'italic',marginBottom:6}}>« {r.remark} »</div>}
-                        {isLate && !isMissing && <div style={{fontSize:12,color:'var(--danger)',fontWeight:600,marginBottom:4}}>⏰ En retard — à traiter</div>}
+                      <div key={d.id} className={`chip chip-${d.color}`}
+                        style={{fontSize:12, ...(isReco ? {boxShadow:'0 0 0 2px var(--accent)'} : {})}}
+                        onClick={()=>setManualDestination(r, d.id)}>
+                        {isReco ? '★ ' : ''}{d.label}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{marginTop:6}}>
+                  <button className="btn-ghost" style={{padding:'4px 8px',fontSize:11,color:'var(--ink-mute)'}} onClick={()=>unmarkRecovered(r)}>↩ pas encore récupéré</button>
+                </div>
+              </div>
+            );
+          })}
 
-                        {/* Produit introuvable aux boutiques → problème signalé */}
-                        {isMissing && (
-                          <div style={{marginBottom:6}}>
-                            <div style={{fontSize:13,color:'var(--danger)',fontWeight:700,marginBottom:4}}>❌ Non récupéré — produit introuvable aux boutiques (alerte envoyée)</div>
-                            <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12}} onClick={() => markRecovered(r)}>✅ Finalement récupéré</button>
-                            <button className="btn-ghost" style={{padding:'4px 8px',fontSize:12,marginLeft:6}} onClick={() => unmarkMissing(r)}>↩ Annuler</button>
-                          </div>
-                        )}
-
-                        {/* Étape 1 : récupération chauffeur (par produit) */}
-                        {!isRecovered && !isMissing && (
-                          <div style={{marginBottom:6}}>
-                            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                              <button className="btn-primary" style={{padding:'6px 12px',fontSize:13}} onClick={() => markRecovered(r)}>
-                                ✅ Récupéré
-                              </button>
-                              <button className="btn-secondary" style={{padding:'6px 12px',fontSize:13}} onClick={() => markMissing(r)}>
-                                ❌ Non récupéré
-                              </button>
-                            </div>
-                            <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>À récupérer à la prochaine distribution sur {r.site}. Si le produit est introuvable → « Non récupéré » (alerte).</div>
-                          </div>
-                        )}
-                        {isRecovered && (
-                          <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>
-                            ✅ Récupéré{r.recoveredBy ? ` · ${r.recoveredBy}` : ''}
-                            {!isTreated && <button className="btn-ghost" style={{padding:'2px 6px',fontSize:11,marginLeft:6}} onClick={() => unmarkRecovered(r)}>annuler</button>}
-                          </div>
-                        )}
-
-                        {/* Étape 2 : traitement entrepôt (après récupération) */}
-                        {isRecovered && (
-                          <>
-                            <div className={route.dest==='partage' ? 'alert-warning' : 'alert-info'} style={{fontSize:12,marginBottom:6}}>
-                              💡 Conseil DLC : <strong>{route.dest==='partage' ? 'Partage équipe' : 'Envoi ROB'}</strong>
-                              {route.navette ? ` (navette ${route.navette.label})` : ''} — {route.reason}
-                            </div>
-                            {isTreated && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:6}}>✓ Traité : {RETURN_DESTINATIONS.find(d=>d.id===r.destination)?.label || r.destination} · {r.treatedBy}</div>}
+          {/* Commandes non récupérées (+7j) — traitées ligne par ligne */}
+          {returns.length > 0 && (
+            <>
+              <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
+                <strong>📦 Commandes non récupérées</strong> · {treatedLines}/{totalLines} produits traités · {returns.length} commande{returns.length>1?'s':''}
+              </div>
+              {returns.map(f => {
+                const allTreated = f.items.length > 0 && f.items.every((it, idx) => treatMap[lineId(f, it, idx)]);
+                return (
+                  <div key={f.orderId} className="card">
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
+                      <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
+                      <span style={{fontSize:12,color:'var(--ink-mute)'}}>{f.site} · il y a {daysSince(f.distribDate || f.day)}j</span>
+                    </div>
+                    <div className="stack" style={{gap:0}}>
+                      {f.items.map((it, idx) => {
+                        const t = treatMap[lineId(f, it, idx)];
+                        const route = routeReturn(it.dlc);
+                        return (
+                          <div key={idx} style={{padding:'8px 0',borderTop: idx ? '1px solid var(--line)' : 'none', background: t ? 'transparent' : 'var(--warn-soft)'}}>
+                            <div style={{fontWeight:600,fontSize:13}}>{it.produit}{it.qty>1?` ×${it.qty}`:''}</div>
+                            <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{it.producteur}{it.dlc?` · DLC ${formatDateShort(it.dlc)}`:''}</div>
+                            {t && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:4}}>✓ {DEST_LABEL(t.destination)}</div>}
                             <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
                               {RETURN_DESTINATIONS.map(d => {
-                                const isReco = !isTreated && d.id === route.dest;
-                                const isSel = isTreated && r.destination === d.id;
+                                const isReco = !t && d.id === route.dest;
                                 return (
-                                  <div key={d.id}
-                                    className={`chip chip-${d.color} ${isSel ? 'selected' : ''}`}
+                                  <div key={d.id} className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
                                     style={{fontSize:12, ...(isReco ? {boxShadow:'0 0 0 2px var(--accent)'} : {})}}
-                                    onClick={() => setManualDestination(r, d.id)}>
+                                    onClick={() => setDestination(f, it, idx, d.id)}>
                                     {isReco ? '★ ' : ''}{d.label}
                                   </div>
                                 );
                               })}
                             </div>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })}
-                </>
-              )}
-
-              {returns.length > 0 && (
-                <>
-                  <div className="card" style={{borderLeft:`3px solid ${treatedLines===totalLines?'var(--ok,#2e7d32)':'var(--warn,#e0a800)'}`}}>
-                    <strong>📦 Commandes non récupérées</strong> · {treatedLines}/{totalLines} produits traités · {returns.length} commande{returns.length>1?'s':''}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{marginTop:8,display:'flex',justifyContent:'flex-end'}}>
+                      <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={() => closeReturn(f)}>
+                        {allTreated ? '✓ Tout traité — clôturer' : '✓ Clôturer (récupéré / résolu)'}
+                      </button>
+                    </div>
                   </div>
-                  {returns.map(f => {
-                    const allTreated = f.items.length > 0 && f.items.every((it, idx) => treatMap[lineId(f, it, idx)]);
-                    return (
-                      <div key={f.orderId} className="card">
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:8}}>
-                          <h3 style={{margin:0}}>{f.consumer_name || '(client)'}</h3>
-                          <span style={{fontSize:12,color:'var(--ink-mute)'}}>{f.site} · il y a {daysSince(f.distribDate || f.day)}j</span>
-                        </div>
-                        <div className="stack" style={{gap:0}}>
-                          {f.items.map((it, idx) => {
-                            const t = treatMap[lineId(f, it, idx)];
-                            return (
-                              <div key={idx} style={{padding:'8px 0',borderTop: idx ? '1px solid var(--line)' : 'none',
-                                background: t ? 'transparent' : 'var(--warn-soft)'}}>
-                                <div style={{fontWeight:600,fontSize:13}}>{it.produit}{it.qty>1?` ×${it.qty}`:''}</div>
-                                <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{it.producteur}</div>
-                                {t && <div style={{fontSize:12,color:'var(--ok,#2e7d32)',marginBottom:4}}>✓ {RETURN_DESTINATIONS.find(d=>d.id===t.destination)?.label || t.destination}</div>}
-                                <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                                  {RETURN_DESTINATIONS.map(d => (
-                                    <div key={d.id}
-                                      className={`chip chip-${d.color} ${t && t.destination===d.id ? 'selected' : ''}`}
-                                      style={{fontSize:12}}
-                                      onClick={() => setDestination(f, it, idx, d.id)}>
-                                      {d.label}
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        <div style={{marginTop:8,display:'flex',justifyContent:'flex-end'}}>
-                          <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={() => closeReturn(f)}>
-                            {allTreated ? '✓ Tout traité — clôturer' : '✓ Clôturer (récupéré / résolu)'}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </>
-              )}
+                );
+              })}
             </>
           )}
         </div>
@@ -10628,9 +10794,46 @@
 
       const navHint = (i) => i.lastNav ? `dernière navette utile : ${i.lastNav.label}` : 'plus de navette avant la DLC';
 
+      // Navette(s) ROB encore à venir aujourd'hui + prochaine navette (date) après aujourd'hui
+      const _now = new Date();
+      const todayNavs = NAVETTE_ROB.filter(n => {
+        if (n.dow !== _now.getDay()) return false;
+        const dep = new Date(_now); dep.setHours(n.hour, 0, 0, 0);
+        return dep > _now;
+      });
+      const hasNavToday = todayNavs.length > 0;
+      const nextNavDate = (() => {
+        for (let i = 1; i <= 12; i++) {
+          const d = new Date(_now); d.setHours(0,0,0,0); d.setDate(d.getDate() + i);
+          if (NAVETTE_ROB.some(n => n.dow === d.getDay()))
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        }
+        return null;
+      })();
+
       return (
         <div style={{marginTop:10}}>
           <h1>🟠 DLC</h1>
+
+          {/* ====== GRAND BANDEAU INSTRUCTION DU JOUR ====== */}
+          <div className="card" style={{borderLeft:'5px solid var(--master)',background:'var(--master-soft)',padding:'14px 16px'}}>
+            <div style={{fontSize:13,color:'var(--ink-soft)',textTransform:'capitalize'}}>Nous sommes le {dayLabelShort(today)}</div>
+            {hasNavToday ? (
+              <>
+                <div style={{fontSize:17,fontWeight:800,margin:'6px 0',lineHeight:1.3}}>
+                  🚚 Aujourd'hui, retire de la vente et envoie à ROB tous les produits qui ne tiendront pas jusqu'à la prochaine navette{nextNavDate?<> (<span style={{textTransform:'capitalize'}}>{dayLabelShort(nextNavDate)}</span>)</>:''}.
+                </div>
+                <div style={{fontSize:13,color:'var(--ink-soft)'}}>
+                  Navette ROB du jour : <strong>{todayNavs.map(n=>n.label).join(' / ')}</strong> · <strong>{robToday.length}</strong> produit(s) à envoyer (liste ci-dessous).
+                </div>
+              </>
+            ) : (
+              <div style={{fontSize:15,fontWeight:700,margin:'6px 0'}}>
+                Pas de navette ROB aujourd'hui. Prochaine navette : <strong style={{textTransform:'capitalize'}}>{nextNavDate?dayLabelShort(nextNavDate):'—'}</strong>.
+              </div>
+            )}
+          </div>
+
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-4}}>
             Uniquement les produits à <strong>retirer</strong> : envoi ROB sur la prochaine navette, ou cagette partage. Le rayon vendable normal n'apparaît pas ici.
           </p>
@@ -11905,27 +12108,52 @@
         await storage.setDoc('push_messages', m.id, { ...m, acks });
       };
 
-      // ── Blocage : non-récupéré non résolu depuis ≥ BLOCK_DAYS jours ────────
-      // Sur le site courant, un client « à relancer » depuis 3 jours bloque
-      // l'app du distributeur jusqu'à validation (status relance/résolu/etc.).
+      // ── Relance récurrente : non-récupéré non résolu, ré-affiché tous les 3 jours ──
+      // Sur le site courant, tant qu'un client n'est pas résolu, un push « à relancer »
+      // réapparaît tous les 3 jours (depuis la dernière relance, sinon depuis la distrib).
+      // « Plus tard » repousse à demain seulement ; « J'ai relancé » remet le compteur à zéro.
       const BLOCK_DAYS_RELANCE = 3;
       const overdueFollowups = React.useMemo(() => {
         if (!session || session.isMaster || session.role !== 'distrib') return [];
         const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
+        const today = todayKey();
         return (followUpsAll || []).filter(f => {
           if (f.site !== currentSite) return false;
           if (TERMINAL.includes(f.status)) return false;
-          // « à relancer » = mail envoyé OU déjà relancé, sans résolution
-          const ref = f.relanceAt || f.emailSentAt || f.distribDate || f.day;
+          if (f.snoozeUntil && f.snoozeUntil > today) return false; // repoussé à plus tard
+          // Horloge : dernière relance si elle existe, sinon la date de distribution.
+          const ref = f.relanceAt || f.distribDate || f.day;
           if (!ref) return false;
-          const refDay = (ref.length > 10) ? ref.slice(0,10) : ref;
-          return daysSince(refDay) >= BLOCK_DAYS_RELANCE && !f.blockAck;
+          const refDay = (ref.length > 10) ? ref.slice(0, 10) : ref;
+          return daysSince(refDay) >= BLOCK_DAYS_RELANCE;
+        }).sort((a, b) => {
+          const ra = (a.relanceAt || a.distribDate || a.day || '').slice(0, 10);
+          const rb = (b.relanceAt || b.distribDate || b.day || '').slice(0, 10);
+          return ra.localeCompare(rb); // le plus ancien d'abord
         });
       }, [followUpsAll, session, currentSite]);
 
-      const ackOverdue = async (f) => {
+      // J'ai relancé → enregistre la relance et remet le compteur à zéro (revient dans 3j si toujours pas résolu).
+      const relanceOverdue = async (f) => {
         await storage.setDoc('followups', f.id || f.orderId, {
-          ...f, blockAck: true, blockAckBy: session.name, blockAckAt: new Date().toISOString(),
+          ...f, status: 'relance', relanceAt: new Date().toISOString(),
+          snoozeUntil: '', relanceBy: session.name,
+          updatedBy: session.name, updatedAt: new Date().toISOString(),
+        });
+      };
+      // Client venu / dossier clos → sort définitivement du suivi.
+      const resolveOverdue = async (f) => {
+        await storage.setDoc('followups', f.id || f.orderId, {
+          ...f, status: 'resolved', resolvedBy: session.name, resolvedAt: new Date().toISOString(),
+          updatedBy: session.name, updatedAt: new Date().toISOString(),
+        });
+      };
+      // Plus tard → repoussé à demain seulement (réapparaît demain).
+      const snoozeOverdue = async (f) => {
+        const t = new Date(); t.setDate(t.getDate() + 1);
+        const tomorrow = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
+        await storage.setDoc('followups', f.id || f.orderId, {
+          ...f, snoozeUntil: tomorrow, updatedBy: session.name, updatedAt: new Date().toISOString(),
         });
       };
 
@@ -11942,7 +12170,8 @@
         }
         if (overdueFollowups.length > 0) {
           const f = overdueFollowups[0];
-          return <OverdueBlockOverlay followup={f} count={overdueFollowups.length} onAck={() => ackOverdue(f)} />;
+          return <OverdueBlockOverlay followup={f} count={overdueFollowups.length}
+            onRelance={() => relanceOverdue(f)} onResolve={() => resolveOverdue(f)} onSnooze={() => snoozeOverdue(f)} />;
         }
         return null;
       })();
