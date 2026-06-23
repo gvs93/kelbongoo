@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.51</title>
+  <title>Kelbongoo — Distribution V9.52</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.51';
+    const APP_VERSION = 'V9.52';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -4517,6 +4517,7 @@
       const [tab, setTab] = React.useState('inv'); // 'inv' | 'fl' | 'learn'
       const [expanded, setExpanded] = React.useState(null);
       const [detail, setDetail] = React.useState({});
+      const [logs, setLogs] = React.useState(null); // journal des clôtures (inventory_log)
 
       React.useEffect(() => {
         (async () => {
@@ -4529,6 +4530,11 @@
             m.sort((a,b)=>(b.id||'').localeCompare(a.id||''));
             setMetas(m);
           } catch(e){ setMetas([]); }
+          try {
+            const lg = await storage.getAll('inventory_log');
+            lg.sort((a,b)=>(b.at||'').localeCompare(a.at||''));
+            setLogs(lg);
+          } catch(e){ setLogs([]); }
           try {
             const fm = await storage.getAll('fl_inventory_meta');
             fm.sort((a,b)=>(b.id||'').localeCompare(a.id||''));
@@ -4578,6 +4584,20 @@
             <div className={`chip ${tab==='fl'?'selected':''}`} onClick={()=>setTab('fl')}>🥬 Fruits & Légumes</div>
             <div className={`chip ${tab==='learn'?'selected':''}`} onClick={()=>setTab('learn')}>🏷️ Apprentissage</div>
           </div>
+
+          {tab==='inv' && logs && logs.length>0 && (
+            <div style={{marginBottom:10}}>
+              <div style={{fontWeight:600,fontSize:13,marginBottom:4}}>✅ Clôtures récentes</div>
+              <div className="stack" style={{gap:4}}>
+                {logs.slice(0,15).map(l => (
+                  <div key={l.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:12,border:'1px solid var(--border)',borderRadius:6,padding:'5px 8px'}}>
+                    <span><strong>{l.date}</strong> · {l.mode==='matin'?'🌅 matin':'🌙 soir'} · {l.nbProducts} prod.{l.conflicts?` · ⚠️ ${l.conflicts}`:''}</span>
+                    <span style={{color:'var(--ink-mute)',textAlign:'right'}}>{l.initials||l.by||'—'} · {fmt(l.at)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {tab==='inv' && (
             metas===null ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p> :
@@ -5226,6 +5246,11 @@
       const [dlcInputs, setDlcInputs] = React.useState({}); // {productId: 'YYYY-MM-DD'} — DLC saisie pendant l'inventaire
       const [dlcExpandedId, setDlcExpandedId] = React.useState(null); // produit dont le champ DLC est ouvert
       const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
+      // Mode d'inventaire :
+      //   'matin' → mardi avant 10h uniquement → écrit "Inventaire soir" de la feuille de la VEILLE (vendredi), écrase
+      //   'soir'  → tous les jours après prépa → écrit "Inventaire soir" de la feuille DU JOUR, n'écrase pas (signale conflits)
+      const [mode, setMode] = React.useState(() => (new Date().getDay() === 2 && new Date().getHours() < 10) ? 'matin' : 'soir');
+      const [closingInv, setClosingInv] = React.useState(false); // état d'envoi à la clôture
       const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
       const [scopeValue, setScopeValue] = React.useState(''); // producteur / type / famille sélectionné
@@ -5314,13 +5339,13 @@
       }, []);
       React.useEffect(() => {
         setCounts({});
-        const u = storage.subscribe(`inventory_${invDate}`, (arr) => {
+        const u = storage.subscribe(`inventory_${invDate}_${mode}`, (arr) => {
           const c = {}; const meta = {};
           for (const e of arr) { c[e.id] = e.qty; meta[e.id] = { by: e.countedBy || '', at: e.countedAt || '' }; }
           setCounts(c); setCountMeta(meta);
         });
         return () => { u && u(); };
-      }, [invDate]);
+      }, [invDate, mode]);
 
       // Charge le type / périmètre mémorisés pour cette date (partagé entre opérateurs)
       React.useEffect(() => {
@@ -5439,7 +5464,7 @@
 
       const setCount = async (productId, qty) => {
         const q = Math.max(0, parseInt(qty,10) || 0);
-        await storage.setDoc(`inventory_${invDate}`, productId, {
+        await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
           id: productId, qty: q,
           produit: prodById[productId]?.name || '',
           countedBy: session.name, countedAt: new Date().toISOString(),
@@ -5594,52 +5619,83 @@
 
       const counted = Object.keys(counts).filter(id => counts[id] !== undefined && counts[id] !== null);
       const clearCount = async (id) => {
-        try { await storage.deleteDoc(`inventory_${invDate}`, id); } catch(e){}
+        try { await storage.deleteDoc(`inventory_${invDate}_${mode}`, id); } catch(e){}
       };
       const isTuesday = new Date().getDay() === 2;
+      const beforeTen = new Date().getHours() < 10;
+      const canMatin = isTuesday && beforeTen;            // inventaire matin : mardi avant 10h uniquement
+      const target = mode === 'matin' ? 'veille' : 'jour';
       const scopeOk = invType !== 'tournant' || !!scopeValue;
+      const completBlocked = false;                        // mode choisi explicitement (plus de porte horaire auto)
 
-      // ── Porte horaire : complet du matin AVANT 10h ; après 10h = inventaire du soir ──
-      const nowHour = new Date().getHours();
-      const beforeTen = nowHour < 10;
-      // slot d'écriture : matin si avant 10h, sinon soir (après confirmation dispatch)
-      const writeSlot = beforeTen ? 'matin' : 'soir';
-      const completBlocked = invType === 'complet' && !beforeTen && !dispatchDone;
+      // Récap visuel HTML envoyé à Raimbaud à la clôture
+      const buildRecapHtml = (data, initials) => {
+        const esc = s => String(s==null?'':s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+        const writtenItems = counted.filter(id => !manuallyAddedIds.has(id));
+        const byCat = {};
+        for (const id of writtenItems) { const p = prodById[id]||{}; const cat = (p.category||p.family||'—'); byCat[cat]=(byCat[cat]||0)+1; }
+        const catRows = Object.keys(byCat).sort().map(c => `<tr><td style="padding:3px 10px;border-bottom:1px solid #eee">${esc(c)}</td><td style="padding:3px 10px;border-bottom:1px solid #eee;text-align:right">${byCat[c]}</td></tr>`).join('');
+        const conflicts = data.conflicts || [];
+        const confRows = conflicts.map(c => `<tr><td style="padding:3px 10px;border-bottom:1px solid #f3d6d6">${esc(c.produit)}</td><td style="padding:3px 10px;border-bottom:1px solid #f3d6d6;text-align:right">feuille : <b>${esc(c.existing)}</b></td><td style="padding:3px 10px;border-bottom:1px solid #f3d6d6;text-align:right">inventaire : <b>${esc(c.counted)}</b></td></tr>`).join('');
+        const dlcRows = Object.keys(dlcInputs).filter(id => dlcInputs[id]).map(id => `<tr><td style="padding:3px 10px;border-bottom:1px solid #fde9c8">${esc((prodById[id]||{}).name||id)}</td><td style="padding:3px 10px;border-bottom:1px solid #fde9c8;text-align:right">${esc(dlcInputs[id])}</td></tr>`).join('');
+        const cible = mode==='matin' ? `feuille de la veille (${esc(data.sheet||'')})` : `feuille du jour (${esc(data.sheet||'')})`;
+        return `<div style="font-family:Arial,sans-serif;color:#222;max-width:640px">`
+          + `<h2 style="margin:0 0 4px">📋 Inventaire ${mode==='matin'?'du matin':'du soir'} — ${esc(invDate)}</h2>`
+          + `<p style="margin:0 0 12px;color:#666;font-size:13px">Clôturé par <b>${esc(initials)}</b> · ${esc(session.name)} · écrit dans « Inventaire soir » de la ${cible}</p>`
+          + `<table style="border-collapse:collapse;font-size:14px;margin-bottom:14px">`
+          + `<tr><td style="padding:3px 10px">Produits comptés</td><td style="padding:3px 10px;text-align:right"><b>${writtenItems.length}</b></td></tr>`
+          + `<tr><td style="padding:3px 10px">Écrits dans la feuille</td><td style="padding:3px 10px;text-align:right"><b>${data.written||0}</b></td></tr></table>`
+          + `<h3 style="margin:0 0 4px;font-size:15px">Par catégorie</h3>`
+          + `<table style="border-collapse:collapse;font-size:13px;margin-bottom:14px">${catRows||'<tr><td style="padding:3px 10px;color:#999">—</td></tr>'}</table>`
+          + (conflicts.length?`<h3 style="margin:0 0 4px;font-size:15px;color:#b23b3b">⚠️ Conflits — valeurs non écrasées (à corriger à la main)</h3><table style="border-collapse:collapse;font-size:13px;margin-bottom:14px">${confRows}</table>`:'')
+          + (dlcRows?`<h3 style="margin:0 0 4px;font-size:15px;color:#c47f17">🔴 DLC courte / produits à vigilance</h3><table style="border-collapse:collapse;font-size:13px;margin-bottom:14px">${dlcRows}</table>`:'')
+          + `</div>`;
+      };
 
       const validateStock = async () => {
         if (!STOCK_PROXY_URL) { showToast('⚠️ Proxy stock non configuré (STOCK_PROXY_URL vide)'); return; }
-        if (writeSlot === 'soir' && !dispatchDone) { showToast('Confirme d\'abord la fin du dispatch'); return; }
-        // Exclure les produits ajoutés manuellement (non-scan) de l'écriture sur la feuille
+        if (mode === 'matin' && !canMatin) { showToast('⛔ L\'inventaire du matin ne se fait que le mardi avant 10h.'); return; }
+        if (mode === 'soir' && !dispatchDone) {
+          if (!confirm('La prépa du jour n\'est pas marquée terminée.\nClôturer l\'inventaire du soir quand même ?')) return;
+        }
         const items = counted
           .filter(id => !manuallyAddedIds.has(id))
           .map(id => ({ id, produit: prodById[id]?.name || '', qty: counts[id] }));
         if (!items.length) { showToast('Rien à écrire (tous les articles comptés sont en saisie manuelle)'); return; }
-        const slotLbl = writeSlot === 'matin' ? 'Inventaire MATIN (col H)' : 'Inventaire SOIR (col X)';
+
+        const initials = (prompt('Tes initiales pour clôturer l\'inventaire :') || '').trim();
+        if (initials.length < 2) { showToast('Initiales requises (2 caractères min).'); return; }
+
         const manual = counted.filter(id => manuallyAddedIds.has(id)).length;
-        const msg = `Écrire ${items.length} article(s) (scannés) dans la feuille de stock « ${invDate} » → ${slotLbl}${manual > 0 ? ` · ${manual} en saisie manuelle non écrit` : ''}?`;
-        if (!confirm(msg)) return;
-        setWriting(true); setWriteResult(null);
+        const cibleLbl = mode==='matin' ? '« Inventaire soir » de la feuille de la VEILLE (vendredi)' : '« Inventaire soir » de la feuille DU JOUR';
+        if (!confirm(`Clôturer l'inventaire ${mode.toUpperCase()} ?\n\n${items.length} produit(s) → ${cibleLbl}.${manual?`\n${manual} en saisie manuelle (non écrits).`:''}\n\nUn récap part à rr@pribon.org.`)) return;
+
+        setClosingInv(true); setWriting(true); setWriteResult(null);
         try {
-          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_inv_write', slot: writeSlot, date: invDate, items });
-          if (!data.ok) { showToast('Erreur écriture : ' + (data.error || 'inconnue')); setWriting(false); return; }
+          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_inv_write', target, date: invDate, items });
+          if (!data.ok) { showToast('Erreur écriture : ' + (data.error || 'inconnue')); setWriting(false); setClosingInv(false); return; }
           setWriteResult(data);
-          // Alerte Raimbaud si inventaire soir précédent déjà rempli (push partagé)
-          if (data.raimbaud && data.raimbaud.length) {
-            try {
-              await storage.setDoc('push_messages', `raimbaud_${Date.now()}`, {
-                title: '📞 Appeler Raimbaud',
-                body: `Inventaire ${invDate} : ${data.raimbaud.length} article(s) avec inventaire soir précédent déjà rempli — vérifier avec Raimbaud.`,
-                level: 'warn', createdBy: session.name, createdAt: new Date().toISOString(),
-              });
-            } catch (e) {}
-          }
-          let msg = `✓ Écrit : ${data.written} (matin) `;
-          if (data.writtenPrev) msg += `· ${data.writtenPrev} (soir feuille préc.) `;
-          if (data.notFound && data.notFound.length) msg += `· ${data.notFound.length} non trouvé(s) `;
-          if (data.raimbaud && data.raimbaud.length) msg += `· 📞 ${data.raimbaud.length} → Raimbaud`;
-          showToast(msg);
+          // Historique inventaire (master)
+          try {
+            await storage.setDoc('inventory_log', `${invDate}_${mode}_${Date.now()}`, {
+              date: invDate, mode, target, by: session.name, initials,
+              at: new Date().toISOString(), nbProducts: items.length,
+              written: data.written||0, conflicts: (data.conflicts||[]).length, sheet: data.sheet||'',
+            });
+          } catch(e){}
+          // Mail récap visuel à Raimbaud
+          try {
+            await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail',
+              to: 'rr@pribon.org', cc: 'hg@probon.fr',
+              subject: `Inventaire ${mode} du ${invDate} — ${items.length} produit(s) (${initials})`,
+              htmlBody: buildRecapHtml(data, initials) });
+          } catch(e){}
+          let m = `✓ Inventaire ${mode} clôturé : ${data.written||0} écrit(s)`;
+          if (data.conflicts && data.conflicts.length) m += ` · ${data.conflicts.length} conflit(s) → rr@`;
+          if (data.notFound && data.notFound.length) m += ` · ${data.notFound.length} non trouvé(s)`;
+          showToast(m);
         } catch (e) { showToast('Erreur réseau : ' + e.message); }
-        finally { setWriting(false); }
+        finally { setWriting(false); setClosingInv(false); }
       };
 
       const sendManquant = async () => {
@@ -5973,7 +6029,11 @@
                       <span style={{color: isManual ? 'var(--ink-mute)' : 'inherit'}}>
                         {isManual ? '⚠️ ' : ''}{prodById[id]?.name || id}
                         {isManual && <span style={{fontSize:10,color:'var(--warn)'}}> (hors feuille)</span>}
-                        {countMeta[id] && countMeta[id].by && <span style={{fontSize:10,color:'var(--ink-mute)'}}> · par {countMeta[id].by}</span>}
+                        {countMeta[id] && countMeta[id].by && (
+                          countMeta[id].by !== session.name
+                            ? <span style={{fontSize:10,color:'var(--warn)',fontWeight:600}}> · ⚠️ déjà compté par {countMeta[id].by}{countMeta[id].at?` à ${new Date(countMeta[id].at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'})}`:''}</span>
+                            : <span style={{fontSize:10,color:'var(--ink-mute)'}}> · par {countMeta[id].by}{countMeta[id].at?` à ${new Date(countMeta[id].at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'})}`:''}</span>
+                        )}
                       </span>
                       <div style={{display:'flex',gap:6,alignItems:'center'}}>
                         <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)'}}
@@ -6002,33 +6062,44 @@
             </div>
           )}
 
-          {/* ── Porte horaire + écriture feuille de stock ── */}
-          <div className="card" style={{borderLeft:`3px solid ${completBlocked?'var(--danger)':'var(--info)'}`}}>
-            <h3 style={{marginBottom:6}}>💾 Écrire dans la feuille de stock</h3>
-            {beforeTen ? (
-              <div className="alert-info" style={{fontSize:12,marginBottom:8}}>🕗 Avant 10h → écriture sur <strong>Inventaire matin</strong> (colonne H) de la feuille « {invDate} ». Si H est déjà rempli pour un article, il bascule sur l'inventaire <strong>soir de la feuille précédente</strong>.</div>
+          {/* ── Mode d'inventaire + clôture ── */}
+          <div className="card" style={{borderLeft:'3px solid var(--info)'}}>
+            <h3 style={{marginBottom:6}}>💾 Clôturer l'inventaire</h3>
+            <div style={{display:'flex',gap:8,marginBottom:8}}>
+              <button onClick={()=>setMode('matin')} disabled={!canMatin}
+                className={mode==='matin'?'btn-primary':''}
+                style={{flex:1,padding:'10px 6px',fontSize:13,borderRadius:8,opacity:canMatin?1:0.45,border:mode==='matin'?'none':'1px solid var(--line,#ccc)',background:mode==='matin'?undefined:'transparent',cursor:canMatin?'pointer':'not-allowed'}}>
+                🌅 <strong>Matin</strong><br/><span style={{fontSize:10}}>mardi &lt;10h → veille (vendredi)</span>
+              </button>
+              <button onClick={()=>setMode('soir')}
+                className={mode==='soir'?'btn-primary':''}
+                style={{flex:1,padding:'10px 6px',fontSize:13,borderRadius:8,border:mode==='soir'?'none':'1px solid var(--line,#ccc)',background:mode==='soir'?undefined:'transparent'}}>
+                🌙 <strong>Soir</strong><br/><span style={{fontSize:10}}>tous les jours → aujourd'hui</span>
+              </button>
+            </div>
+            {mode==='matin' ? (
+              <div className="alert-info" style={{fontSize:12,marginBottom:8}}>🌅 Écrit sur <strong>« Inventaire soir » de la feuille de la veille</strong> (dernier jour de prépa). <strong>Écrase</strong> la valeur existante.{!canMatin && <span style={{color:'var(--warn)'}}> — disponible uniquement le mardi avant 10h.</span>}</div>
             ) : (
-              <div className="alert-warning" style={{fontSize:12,marginBottom:8}}>
-                ⛔ Après 10h, l'inventaire complet du matin est interdit (les ventes du site sont closes, le stock a bougé). On bascule sur <strong>l'inventaire du soir</strong> (colonne X), <strong>après le dispatch des commandes Kelbongoo</strong>.
+              <div className="alert-info" style={{fontSize:12,marginBottom:8}}>🌙 Écrit sur <strong>« Inventaire soir » de la feuille du jour</strong>. <strong>N'écrase pas</strong> une valeur déjà saisie : les écarts partent dans le récap à rr@ (modif manuelle).
                 <label style={{display:'flex',alignItems:'center',gap:6,marginTop:8,fontWeight:600}}>
                   <input type="checkbox" checked={dispatchDone} onChange={e=>setDispatchDone(e.target.checked)} style={{width:'auto'}} />
-                  Le dispatch des commandes Kelbongoo du jour est terminé
+                  La prépa du jour est terminée
                 </label>
               </div>
             )}
-            <button className="btn-primary btn-block" disabled={writing || completBlocked || counted.length===0}
+            <button className="btn-primary btn-block" disabled={writing || counted.length===0}
               onClick={validateStock}>
-              {writing ? 'Écriture…' : `Écrire ${counted.length} article(s) → ${writeSlot==='matin'?'Inventaire matin (H)':'Inventaire soir (X)'}`}
+              {closingInv ? 'Clôture…' : `✓ Clôturer l'inventaire ${mode} (${counted.length}) → mail rr@`}
             </button>
             {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)',marginTop:6}}>⚠️ STOCK_PROXY_URL vide — colle l'URL /exec du proxy stock pour activer.</div>}
             {writeResult && (
               <div style={{marginTop:8,fontSize:12}}>
-                <div style={{color:'var(--ok,#2e7d32)'}}>✓ Écrit : {writeResult.written} (matin){writeResult.writtenPrev?` · ${writeResult.writtenPrev} (soir feuille préc. ${writeResult.prevSheet||''})`:''}</div>
-                {writeResult.notFound && writeResult.notFound.length>0 && (
-                  <div style={{color:'var(--ink-mute)',marginTop:4}}>{writeResult.notFound.length} article(s) non trouvé(s) dans la feuille (id absent) : {writeResult.notFound.slice(0,6).map(x=>x.produit||x.id).join(', ')}{writeResult.notFound.length>6?'…':''}</div>
+                <div style={{color:'var(--ok,#2e7d32)'}}>✓ Écrit : {writeResult.written||0} dans « {writeResult.sheet||''} »</div>
+                {writeResult.conflicts && writeResult.conflicts.length>0 && (
+                  <div className="alert-warning" style={{marginTop:6,padding:'8px 10px'}}>⚠️ {writeResult.conflicts.length} valeur(s) déjà présente(s), <strong>non écrasée(s)</strong> — détaillées dans le mail à rr@ (à corriger à la main).</div>
                 )}
-                {writeResult.raimbaud && writeResult.raimbaud.length>0 && (
-                  <div className="alert-red" style={{marginTop:6,padding:'8px 10px'}}>📞 <strong>Appeler Raimbaud</strong> — {writeResult.raimbaud.length} article(s) : inventaire soir précédent déjà rempli, non écrasé.</div>
+                {writeResult.notFound && writeResult.notFound.length>0 && (
+                  <div style={{color:'var(--ink-mute)',marginTop:4}}>{writeResult.notFound.length} non trouvé(s) dans la feuille : {writeResult.notFound.slice(0,6).map(x=>x.produit||x.id).join(', ')}{writeResult.notFound.length>6?'…':''}</div>
                 )}
               </div>
             )}
