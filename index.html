@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.52</title>
+  <title>Kelbongoo — Distribution V9.53</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.52';
+    const APP_VERSION = 'V9.53';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -2478,11 +2478,22 @@
                 createdAt: editing?.createdAt || new Date().toISOString(),
                 updatedAt: new Date().toISOString(),
               });
+              // Source 3 de la console DLC : un retour PDP avec DLC alimente la surveillance DLC.
+              if (retourDlc) {
+                try {
+                  await storage.setDoc('dlc_watch', `pdpret_${id}`, {
+                    id: `pdpret_${id}`, produit: prodName, producteur: prodProducer,
+                    qty, dlc: retourDlc, status: 'watch', source: 'retour_pdp', site: currentSite,
+                    createdBy: session.name, createdAt: new Date().toISOString(),
+                  });
+                } catch (e) {}
+              }
             }
           } else if (editing && editing.anomalyTypes && editing.anomalyTypes.some(t => ['retour_pdp','dlc_courte','dlc','en_trop'].includes(t))) {
             // Édition : l'utilisateur a retiré tous les types DLC-décisionnels → on nettoie les deux côtés
             await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
             try { await storage.deleteDoc('losses', `lossret_${id}`); } catch (e) {}
+            try { await storage.deleteDoc('dlc_watch', `pdpret_${id}`); } catch (e) {}
           }
 
           showToast(editing ? '✓ Mise à jour' : '✓ Anomalie enregistrée');
@@ -5698,6 +5709,20 @@
         finally { setWriting(false); setClosingInv(false); }
       };
 
+      const undoLastInventory = async () => {
+        if (!STOCK_PROXY_URL) { showToast('⚠️ Proxy stock non configuré'); return; }
+        const ids = counted.filter(id => !manuallyAddedIds.has(id));
+        if (!ids.length) { showToast('Rien à annuler (aucun produit compté).'); return; }
+        if (!confirm(`Annuler le dernier inventaire ${mode.toUpperCase()} ?\n\nEfface ${ids.length} valeur(s) écrites par l'appli dans « Inventaire soir » (${mode==='matin'?'feuille de la veille':'feuille du jour'}).\nTes saisies MANUELLES ne sont pas touchées.`)) return;
+        setWriting(true);
+        try {
+          const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_inv_clear', target, column: 'soir', date: invDate, ids });
+          if (!data.ok) { showToast('Erreur : ' + (data.error || 'inconnue')); setWriting(false); return; }
+          showToast(`✓ ${data.cleared||0} valeur(s) effacée(s) dans « ${data.sheet||''} »`);
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        finally { setWriting(false); }
+      };
+
       const sendManquant = async () => {
         const prod = (mqProduit || '').trim();
         if (!prod) { showToast('Indique le produit'); return; }
@@ -6092,6 +6117,9 @@
               {closingInv ? 'Clôture…' : `✓ Clôturer l'inventaire ${mode} (${counted.length}) → mail rr@`}
             </button>
             {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)',marginTop:6}}>⚠️ STOCK_PROXY_URL vide — colle l'URL /exec du proxy stock pour activer.</div>}
+            <button className="btn-ghost" style={{fontSize:12,marginTop:6,color:'var(--ink-mute)'}} disabled={writing || counted.length===0} onClick={undoLastInventory}>
+              ↩️ Annuler le dernier inventaire (efface ce que l'appli a écrit, garde le manuel)
+            </button>
             {writeResult && (
               <div style={{marginTop:8,fontSize:12}}>
                 <div style={{color:'var(--ok,#2e7d32)'}}>✓ Écrit : {writeResult.written||0} dans « {writeResult.sheet||''} »</div>
@@ -11509,6 +11537,13 @@
 
       const reopen = async (i) => { await storage.setDoc('dlc_watch', i.id, { status: 'watch', resolvedAt: '', resolvedBy: '' }); };
       const remove = async (i) => { if (confirm('Supprimer cette ligne DLC ?')) await storage.deleteDoc('dlc_watch', i.id); };
+      // Croix ❌ : le produit a été vendu / parti à temps en boutique → il sort de la console,
+      // SANS perte ni envoi ROB. Évite que la console se sature de fausses « DLC dépassée ».
+      const markEcoule = async (i) => {
+        if (!confirm(`« ${i.produit} » a été vendu / parti à temps ?\n\nIl sort de la console DLC — aucune perte, aucun envoi ROB.`)) return;
+        await storage.setDoc('dlc_watch', i.id, { status: 'ecoule', resolvedAt: new Date().toISOString(), resolvedBy: session.name });
+        showToast(`✓ ${i.produit} écoulé — retiré de la console`);
+      };
 
       const navHint = (i) => i.lastNav ? `dernière navette utile : ${i.lastNav.label}` : 'plus de navette avant la DLC';
 
@@ -11577,7 +11612,10 @@
                           <div style={{fontWeight:600,fontSize:14}}>{i.produit}{i.qty>1?` ×${i.qty}`:''}</div>
                           <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''} · {navHint(i)}</div>
                         </div>
-                        <button className="btn-ghost" style={{fontSize:11,padding:'4px 8px',color:'var(--warn)'}} onClick={()=>sendOneToPartage(i)}>→ partage</button>
+                        <div style={{display:'flex',gap:4,alignItems:'center',flexShrink:0}}>
+                          <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:15,padding:'4px 8px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
+                          <button className="btn-ghost" style={{fontSize:11,padding:'4px 8px',color:'var(--warn)'}} onClick={()=>sendOneToPartage(i)}>→ partage</button>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -11609,7 +11647,10 @@
                         <div style={{fontWeight:600,fontSize:14}}>{i.produit}{i.qty>1?` ×${i.qty}`:''}</div>
                         <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''} · {i.days!=null && i.days<=0?'dépassée':navHint(i)}</div>
                       </div>
-                      <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px'}} onClick={()=>sendOneToPartage(i)}>Mis en cagette</button>
+                      <div style={{display:'flex',gap:4,alignItems:'center',flexShrink:0}}>
+                        <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:15,padding:'4px 8px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
+                        <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px'}} onClick={()=>sendOneToPartage(i)}>Mis en cagette</button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -11628,9 +11669,12 @@
                 ? <p style={{fontSize:13,color:'var(--ink-mute)',marginTop:8,marginBottom:0}}>Rien à surveiller.</p>
                 : <div className="stack" style={{gap:4,marginTop:8}}>
                     {watch.map(i => (
-                      <div key={i.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'4px 0',borderTop:'1px solid var(--line)'}}>
-                        <span style={{minWidth:0}}><strong>{i.produit}</strong>{i.qty>1?` ×${i.qty}`:''} <span style={{color:'var(--ink-mute)',fontSize:11}}>· {i.producteur}</span></span>
-                        <span style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap'}}>DLC {formatDateShort(i.dlc)}{i.lastNav?` · ROB ${dayLabelShort(i.lastNav.date).replace(/ \d.*/,'')}`:''}</span>
+                      <div key={i.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'4px 0',borderTop:'1px solid var(--line)',alignItems:'center'}}>
+                        <span style={{minWidth:0}}><strong>{i.produit}</strong>{i.qty>1?` ×${i.qty}`:''} <span style={{color:'var(--ink-mute)',fontSize:11}}>· {i.producteur}{i.source==='retour_pdp'?' · ↩️ retour PDP':''}</span></span>
+                        <span style={{display:'flex',gap:6,alignItems:'center',flexShrink:0}}>
+                          <span style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap'}}>DLC {formatDateShort(i.dlc)}{i.lastNav?` · ROB ${dayLabelShort(i.lastNav.date).replace(/ \d.*/,'')}`:''}</span>
+                          <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:13,padding:'0 4px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
+                        </span>
                       </div>
                     ))}
                   </div>
