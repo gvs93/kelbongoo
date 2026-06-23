@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.49</title>
+  <title>Kelbongoo — Distribution V9.51</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.49';
+    const APP_VERSION = 'V9.51';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -5071,6 +5071,142 @@
       );
     }
 
+    // ============================================================
+    // PURGE — report des pertes sèches du jour dans la colonne "purge" (U)
+    // de la feuille de stock. Règle : perte sèche (jeté/partage) ET pas un
+    // retour boutique rattaché à une commande client (déjà sortie du stock).
+    // Rien n'est écrit en aveugle : récap à cocher → Valider.
+    // ============================================================
+    function PurgeFromLossesBlock({ session, invDate, stockProducts }) {
+      const showToast = React.useContext(ToastContext);
+      const [losses, setLosses] = React.useState([]);
+      const [excluded, setExcluded] = React.useState({});
+      const [busy, setBusy] = React.useState(false);
+      const [result, setResult] = React.useState(null);
+
+      React.useEffect(() => {
+        const u = storage.subscribe('losses', (arr) => setLosses(arr || []));
+        return () => u && u();
+      }, []);
+
+      // Quitte le stock Kelbongoo → à déduire : jeté, partage, OU envoyé à ROB (pribon).
+      // Pas "rayon" (remis en rayon = reste en stock). Et pas un retour rattaché à une
+      // commande client (déjà sorti du stock car vendu) — sauf "en trop / surstock".
+      const isPurge = (l) => {
+        const dest = l.destination;
+        if (dest !== 'jete' && dest !== 'partage' && dest !== 'pribon') return false;
+        if (l.fromReturn && l.reason !== 'non_vendu') return false;
+        return true;
+      };
+
+      const agg = React.useMemo(() => {
+        const m = {};
+        for (const l of losses) {
+          if ((l.day || '') !== invDate) continue;
+          if (!isPurge(l)) continue;
+          const key = l.productKey || `${l.producteur || ''}|${l.produit || ''}`;
+          const qty = l.usingWeight ? (Number(l.weight) || 0) : (Number(l.quantity) || 0);
+          if (!m[key]) m[key] = { key, produit: l.produit || '', producteur: l.producteur || '', qty: 0, sources: [] };
+          m[key].qty += qty;
+          m[key].sources.push({ dest: l.destination, reason: l.reason, fromReturn: !!l.fromReturn, qty });
+        }
+        return Object.values(m).filter(a => a.qty > 0);
+      }, [losses, invDate]);
+
+      const stockMap = React.useMemo(() => {
+        const m = {};
+        (stockProducts || []).forEach(sp => {
+          if (!sp || !sp.id) return;
+          const pn = normalizeText(sp.name || sp.produit || '');
+          const full = normalizeText(sp.producteur || '') + '|' + pn;
+          if (!(full in m)) m[full] = sp.id;
+          if (!(('|' + pn) in m)) m['|' + pn] = sp.id;   // secours par produit seul
+        });
+        return m;
+      }, [stockProducts]);
+
+      const enriched = agg.map(a => {
+        const k = normalizeText(a.producteur) + '|' + normalizeText(a.produit);
+        const id = stockMap[k] || stockMap['|' + normalizeText(a.produit)] || '';
+        return { ...a, id, found: !!id, checked: !excluded[a.key] };
+      });
+
+      const toWrite  = enriched.filter(e => e.checked && e.found);
+      const notFound = enriched.filter(e => e.checked && !e.found);
+
+      const validate = async () => {
+        if (!stockProducts) { showToast('Liste stock non chargée — impossible de relier à la feuille.'); return; }
+        if (!toWrite.length && !notFound.length) return;
+        if (!confirm(`Reporter ${toWrite.length} produit(s) dans la colonne purge de la feuille ${invDate} ?`)) return;
+        setBusy(true);
+        try {
+          let written = 0;
+          if (toWrite.length) {
+            const data = await stockPost({ secret: FRESHDESK_SECRET, action: 'stock_purge_write',
+              date: invDate, items: toWrite.map(e => ({ id: e.id, produit: e.produit, qty: e.qty })) });
+            if (!data || !data.ok) throw new Error((data && data.error) || 'erreur proxy (action stock_purge_write déployée ?)');
+            written = data.written || 0;
+          }
+          if (notFound.length) {
+            const lines = notFound.map(e => `• ${e.produit}${e.producteur ? ' (' + e.producteur + ')' : ''} — ${e.qty}`).join('\n');
+            await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail',
+              to: 'rr@pribon.org', cc: 'hg@probon.fr',
+              subject: `[Purge] Produits introuvables dans la feuille de stock ${invDate}`,
+              body: `Ces pertes du jour n'ont pas pu être reportées automatiquement dans la colonne purge (produit introuvable dans la feuille ${invDate}). À reporter à la main :\n\n${lines}\n\n— App Distribution Kelbongoo` });
+          }
+          setResult({ written, notFound: notFound.length });
+          showToast(`✓ Purge : ${written} écrit(s)${notFound.length ? ` · ${notFound.length} introuvable(s) → mail envoyé` : ''}`);
+        } catch (e) {
+          showToast('Erreur purge : ' + e.message);
+        } finally { setBusy(false); }
+      };
+
+      const reasonLabel = (id) => {
+        const r = (typeof LOSS_REASONS !== 'undefined' ? LOSS_REASONS : []).find(x => x.id === id);
+        return r ? r.label : (id || '');
+      };
+
+      return (
+        <div className="card" style={{borderLeft:'4px solid var(--brand,#4A7C59)'}}>
+          <h3 style={{marginBottom:4}}>🗑️ Pertes du jour → purge (feuille de stock)</h3>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginBottom:8}}>
+            Reporte dans la colonne <strong>purge</strong> tout ce qui <strong>quitte le stock</strong> le {invDate} : jeté, partage équipe, et <strong>envoyé à ROB</strong>.
+            Exclut « remis en rayon » (reste en stock) et les retours boutique rattachés à une commande client (déjà vendus). Décoche au besoin, puis Valider.
+          </p>
+
+          {enriched.length === 0 ? (
+            <div style={{fontSize:13,color:'var(--ink-mute)'}}>Aucune perte sèche à reporter pour le {invDate}.</div>
+          ) : (
+            <div>
+              <div style={{maxHeight:260,overflowY:'auto',border:'1px solid var(--line)',borderRadius:6}}>
+                {enriched.map((e,i) => (
+                  <div key={e.key} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderTop:i?'1px solid var(--line)':'none',background: e.found ? 'transparent' : 'var(--warn-soft)'}}>
+                    <input type="checkbox" checked={e.checked} onChange={() => setExcluded(x => ({ ...x, [e.key]: e.checked }))} style={{width:18,height:18,flex:'0 0 auto'}} />
+                    <div style={{flex:'1 1 auto',minWidth:0}}>
+                      <div style={{fontWeight:600,fontSize:13,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{e.produit}{e.producteur ? <span style={{color:'var(--ink-mute)',fontWeight:400}}> — {e.producteur}</span> : ''}</div>
+                      <div style={{fontSize:11,color:'var(--ink-mute)'}}>
+                        {e.sources.map((s,j) => <span key={j}>{j?' · ':''}{s.fromReturn ? '↩️ retour' : '🏭 prépa'} {s.dest==='partage'?'partage':(s.dest==='pribon'?'ROB':'jeté')}{s.reason?` (${reasonLabel(s.reason)})`:''}</span>)}
+                        {!e.found && <span style={{color:'var(--warn,#b8860b)',fontWeight:600}}> · ⚠️ introuvable feuille stock</span>}
+                      </div>
+                    </div>
+                    <div style={{flex:'0 0 auto',fontWeight:800,fontSize:16,minWidth:34,textAlign:'right'}}>{e.qty}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:'flex',gap:10,flexWrap:'wrap',marginTop:8,fontSize:12,color:'var(--ink-mute)'}}>
+                <span>✓ <strong>{toWrite.length}</strong> à écrire</span>
+                {notFound.length > 0 && <span style={{color:'var(--warn,#b8860b)'}}>⚠️ {notFound.length} introuvable(s) → mail rr@ + hg@</span>}
+              </div>
+              <button className="btn-primary btn-block" disabled={busy || (!toWrite.length && !notFound.length)} onClick={validate} style={{marginTop:8}}>
+                {busy ? '⏳ Écriture…' : `⬇️ Valider → écrire dans purge (${invDate})`}
+              </button>
+              {result && <div className="alert-success" style={{marginTop:8}}>✓ {result.written} produit(s) écrit(s) en purge{result.notFound ? ` · ${result.notFound} introuvable(s) signalé(s) par mail` : ''}.</div>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // PAGE INVENTAIRE (expérimental — saisie manuelle + scan qui apprend les EAN)
     // ============================================================
     function InventoryPage({ session }) {
@@ -5154,6 +5290,8 @@
                   const name = pickStr(s, ['produit', 'name', 'nom', 'product', 'product_name', 'libelle', 'Produit']);
                   if (!name) return null;
                   return {
+                    id: pickStr(s, ['id', 'ID', 'Id', 'id_produit', 'product_id', 'idSite', 'id site kbg']),
+                    producteur: pickStr(s, ['producteur', 'producer', 'Producteur', 'fournisseur']),
                     name,
                     category: pickStr(s, ['categorie', 'category', 'catégorie', 'category_name', 'rayon', 'Catégorie', 'Categorie']),
                     family: pickStr(s, ['famille', 'family', 'family_name', 'sous_categorie', 'subcategory', 'Famille'])
@@ -5593,6 +5731,10 @@
             <span style={{fontSize:12,color:'var(--ink-mute)'}}>chaque date a son propre comptage</span>
           </div>
 
+          {session.isMaster && (
+            <PurgeFromLossesBlock session={session} invDate={invDate} stockProducts={stockProducts} />
+          )}
+
           <div className="card" style={{paddingBottom:10}}>
             <div className="filter-row" style={{marginBottom:scopeOk?8:0}}>
               <div className={`chip ${invType==='complet'?'selected':''}`}
@@ -5730,13 +5872,19 @@
                   </div>
                   <div className="stack" style={{gap:4,maxHeight:'40vh',overflowY:'auto'}}>
                     {scannedIds.map(id => (
-                      <div key={id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'6px 8px',border:'1px solid var(--border)',borderRadius:6}}>
-                        <div style={{fontSize:13,minWidth:0}}>
-                          <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{prodById[id]?.name || id}</div>
-                          <div style={{color:'var(--ink-mute)',fontSize:11}}>{prodById[id]?.producer}</div>
+                      <div key={id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,padding:'8px 10px',border:'1px solid var(--border)',borderRadius:10}}>
+                        <div style={{fontSize:14,minWidth:0,flex:1}}>
+                          <div style={{fontWeight:700,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{prodById[id]?.name || id}</div>
+                          <div style={{color:'var(--ink-mute)',fontSize:12}}>{prodById[id]?.producer}</div>
                         </div>
-                        <QtyInput value={counts[id] ?? 0} onCommit={(q)=>setCount(id, q)}
-                          style={{width:64,textAlign:'center',fontSize:15,padding:'6px'}} />
+                        <div style={{display:'flex',alignItems:'center',gap:5,flex:'0 0 auto'}}>
+                          <button onClick={()=>setCount(id, Math.max(0,(counts[id] ?? 0) - 1))} aria-label="moins"
+                            style={{width:44,height:44,fontSize:26,fontWeight:700,lineHeight:1,borderRadius:10,border:'1px solid var(--border)',background:'var(--bg-card,#fff)',cursor:'pointer'}}>−</button>
+                          <QtyInput value={counts[id] ?? 0} onCommit={(q)=>setCount(id, q)}
+                            style={{width:50,height:44,textAlign:'center',fontSize:20,fontWeight:800,padding:0,borderRadius:10}} />
+                          <button onClick={()=>setCount(id, (counts[id] ?? 0) + 1)} aria-label="plus"
+                            style={{width:44,height:44,fontSize:24,fontWeight:700,lineHeight:1,borderRadius:10,border:'1px solid var(--accent)',background:'var(--accent)',color:'#fff',cursor:'pointer'}}>+</button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -5748,7 +5896,7 @@
               <div style={{position:'relative',marginBottom:8}}>
                 <input value={search} onChange={e=>setSearch(e.target.value)}
                   placeholder={invType==='tournant' ? "Filtrer dans le périmètre…" : "Filtrer (nom, producteur)…"}
-                  style={{width:'100%',fontSize:15,padding:'8px',paddingRight:search?36:8}} />
+                  style={{width:'100%',fontSize:16,padding:'12px',paddingRight:search?40:12,borderRadius:10}} />
                 {search && (
                   <button onClick={()=>setSearch('')} aria-label="Effacer la recherche"
                     style={{position:'absolute',right:4,top:'50%',transform:'translateY(-50%)',border:'none',background:'var(--bg-muted)',borderRadius:'50%',width:26,height:26,fontSize:16,lineHeight:1,cursor:'pointer',color:'var(--ink-soft)'}}>×</button>
@@ -5760,7 +5908,7 @@
                 <div className={`chip ${invSort==='fournisseur'?'selected':''}`} onClick={()=>setInvSort('fournisseur')}>🧺 Fournisseur</div>
                 {hasFamilies && <div className={`chip ${invSort==='famille'?'selected':''}`} onClick={()=>setInvSort('famille')}>🗂️ Famille</div>}
               </div>
-              <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>{matches.length} produit(s) · tape la quantité, ou « 0 » si stock nul.</div>
+              <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>{matches.length} produit(s) · touche <strong>−</strong> / <strong>+</strong> ou tape le nombre. « Stock 0 » si vide.</div>
               <div className="stack" style={{gap:4,maxHeight:'55vh',overflowY:'auto'}}>
                 {matches.map(p => {
                   const isCounted = counts[p.id] !== undefined && counts[p.id] !== null;
@@ -5770,29 +5918,35 @@
                   const hasDlc = !!dlcInputs[p.id];
                   const dlcOpen = dlcExpandedId === p.id;
                   return (
-                  <div key={p.id} style={{padding:'6px 8px',border:`1px solid ${isCounted?'var(--accent)':'var(--border)'}`,background:isCounted?'var(--accent-soft)':'transparent',borderRadius:6}}>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
-                      <div style={{fontSize:13,minWidth:0,flex:1}}>
-                        <div style={{fontWeight:600,lineHeight:1.25,wordBreak:'break-word'}}>{isCounted?'✓ ':''}{p.name}</div>
-                        <div style={{color:'var(--ink-mute)',fontSize:11,lineHeight:1.2,wordBreak:'break-word'}}>{sub}</div>
+                  <div key={p.id} style={{padding:'10px',border:`2px solid ${isCounted?'var(--accent)':'var(--border)'}`,background:isCounted?'var(--accent-soft)':'transparent',borderRadius:10}}>
+                    <div style={{display:'flex',alignItems:'center',gap:10}}>
+                      <div style={{fontSize:15,minWidth:0,flex:1}}>
+                        <div style={{fontWeight:700,lineHeight:1.2,wordBreak:'break-word'}}>{isCounted?'✓ ':''}{p.name}</div>
+                        <div style={{color:'var(--ink-mute)',fontSize:12,lineHeight:1.2,wordBreak:'break-word'}}>{sub}</div>
                       </div>
-                      <div style={{display:'flex',alignItems:'center',gap:6}}>
-                        <button className="btn-ghost" title="Signaler une DLC courte"
-                          style={{fontSize:11,padding:'4px 8px',border:`1px solid ${hasDlc?'var(--accent)':'var(--border)'}`,borderRadius:6,color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)'}}
-                          onClick={()=>setDlcExpandedId(prev => prev===p.id ? null : p.id)}>{hasDlc ? '✓ DLC' : '📅'}</button>
-                        <button className="btn-ghost" style={{fontSize:13,padding:'4px 10px',border:'1px solid var(--border)',borderRadius:6}} onClick={()=>setCount(p.id, 0)}>0</button>
+                      <div style={{display:'flex',alignItems:'center',gap:5,flex:'0 0 auto'}}>
+                        <button onClick={()=>setCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
+                          style={{width:48,height:48,fontSize:28,fontWeight:700,lineHeight:1,borderRadius:10,border:'1px solid var(--border)',background:'var(--bg-card,#fff)',cursor:'pointer'}}>−</button>
                         <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
-                          style={{width:60,textAlign:'center',fontSize:15,padding:'6px'}} />
+                          style={{width:54,height:48,textAlign:'center',fontSize:22,fontWeight:800,padding:0,borderRadius:10}} />
+                        <button onClick={()=>setCount(p.id, (counts[p.id] ?? 0) + 1)} aria-label="plus"
+                          style={{width:48,height:48,fontSize:26,fontWeight:700,lineHeight:1,borderRadius:10,border:'1px solid var(--accent)',background:'var(--accent)',color:'#fff',cursor:'pointer'}}>+</button>
                       </div>
                     </div>
+                    <div style={{display:'flex',gap:8,marginTop:8}}>
+                      <button onClick={()=>setCount(p.id, 0)}
+                        style={{fontSize:13,padding:'7px 16px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',cursor:'pointer',fontWeight:600}}>Stock 0</button>
+                      <button onClick={()=>setDlcExpandedId(prev => prev===p.id ? null : p.id)}
+                        style={{fontSize:13,padding:'7px 14px',borderRadius:8,border:`1px solid ${hasDlc?'var(--accent)':'var(--border)'}`,background:'transparent',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)',cursor:'pointer',fontWeight:600}}>{hasDlc ? '✓ DLC courte' : '📅 DLC courte'}</button>
+                    </div>
                     {dlcOpen && (
-                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:6,paddingTop:6,borderTop:'1px dashed var(--border)'}}>
-                        <span style={{fontSize:11,color:'var(--ink-mute)'}}>DLC :</span>
+                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:8,paddingTop:8,borderTop:'1px dashed var(--border)'}}>
+                        <span style={{fontSize:12,color:'var(--ink-mute)'}}>DLC :</span>
                         <input type="date" value={dlcInputs[p.id] || ''} onChange={e => saveDlcFromInventory(p.id, e.target.value)}
-                          style={{fontSize:13,padding:'4px 6px',flex:1}} />
+                          style={{fontSize:15,padding:'8px',flex:1}} />
                         {dlcInputs[p.id] && (() => {
                           const d = Math.round((new Date(dlcInputs[p.id]) - new Date(todayKey())) / 86400000);
-                          return <span style={{fontSize:11,fontWeight:600,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
+                          return <span style={{fontSize:12,fontWeight:700,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
                         })()}
                       </div>
                     )}
