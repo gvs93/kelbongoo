@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.57';
+    const APP_VERSION = 'V9.59';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -6327,8 +6327,12 @@
           });
           if (data.ok) {
             showToast('✓ Réponse envoyée');
-            setSelId(null); setThread(null); setReply('');
-            loadList();
+            // Enchaîner sur le mail suivant plutôt que revenir à la liste générale.
+            const idx = tickets.findIndex(t => t.id === selId);
+            const next = (idx >= 0) ? tickets[idx + 1] : null;
+            loadList(); // rafraîchit la boîte en arrière-plan (le ticket résolu disparaît)
+            if (next) { openTicket(next.id); }
+            else { setSelId(null); setThread(null); setReply(''); showToast('✓ Boîte traitée 🎉'); }
           } else showToast('Échec : ' + (data.error || 'inconnu'));
         } catch (e) { showToast('Erreur réseau : ' + e.message); }
         setSending(false);
@@ -11822,9 +11826,29 @@
       const seuilVigilance = addDays(_saturdayOfWeek(today), 3);
       const seuilRetrait = addDays(today, 3);
 
+      // RESET COMPLET de la console DLC (master) — supprime toutes les lignes dlc_watch.
+      // Ne touche PAS aux pertes déjà enregistrées (collection 'losses').
+      const resetAll = async () => {
+        if (!session.isMaster) { showToast('Master uniquement'); return; }
+        if (!confirm(`Supprimer TOUTES les lignes DLC (${items.length}) ?\n\nLes pertes déjà enregistrées ne sont PAS touchées.\nAction irréversible.`)) return;
+        setBusy(true);
+        try {
+          for (const i of items) { await storage.deleteDoc('dlc_watch', i.id); }
+          showToast(`✓ Console DLC réinitialisée — ${items.length} ligne(s) supprimée(s)`);
+        } catch (e) { showToast('Erreur reset : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
       return (
         <div style={{marginTop:10}}>
-          <h1>🟠 DLC</h1>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+            <h1 style={{margin:0}}>🟠 DLC</h1>
+            {session.isMaster && items.length > 0 && (
+              <button className="btn-ghost" style={{fontSize:12,color:'var(--danger)',border:'1px solid var(--danger)',padding:'5px 10px',borderRadius:8}} disabled={busy} onClick={resetAll}>
+                🗑️ Réinitialiser la console DLC
+              </button>
+            )}
+          </div>
 
           {/* ====== GRAND BANDEAU INSTRUCTION DU JOUR ====== */}
           <div className="card" style={{borderLeft:'5px solid var(--master)',background:'var(--master-soft)',padding:'14px 16px'}}>
@@ -11981,18 +12005,20 @@
     }
 
     // ============================================================
-    // MAILS MANQUANTS 13h — l'appli DÉPOSE le lot du jour via le proxy Freshdesk
-    // (onglet Sheet MANQUANTS_OUTBOX). Un déclencheur Apps Script à 13h envoie ensuite
-    // chaque mail. Source : commandes du jour avec `removed[]` (client → manquants + email).
-    // Mode TEST (défaut) : les mails partent uniquement vers hg@pribon.org.
+    // MAILS MANQUANTS — ENVOI AUTOMATIQUE À 7H
+    // L'appli DÉPOSE automatiquement le lot du jour (clients ayant un manquant)
+    // dans la feuille MANQUANTS_OUTBOX via le proxy (action 'manquants_stage').
+    // Un déclencheur horaire 7h (Apps Script) lit cette feuille et envoie chaque mail.
+    // Plus aucun clic requis : le dépôt se fait dès que les manquants sont chargés.
+    // LIVE / TEST est piloté côté proxy (constante MANQUANTS_LIVE).
     // ============================================================
     function ManquantsMailPanel({ orders, session }) {
       const showToast = React.useContext(ToastContext);
       const [open, setOpen] = React.useState(false);
-      const [testMode, setTestMode] = React.useState(true);
-      const [busy, setBusy] = React.useState(false);
       const [status, setStatus] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
       const day = activeDay();
+      const lastSigRef = React.useRef(null);
 
       React.useEffect(() => {
         const unsub = storage.subscribe('manquants_outbox', (arr) => {
@@ -12014,30 +12040,41 @@
 
       const totalProducts = recipients.reduce((s, r) => s + r.items.reduce((a, i) => a + (i.qty || 1), 0), 0);
 
-      const stage = async () => {
-        if (recipients.length === 0) { showToast('Aucun manquant client aujourd\'hui'); return; }
-        setBusy(true);
-        try {
-          const data = await freshdeskPost({
-            secret: FRESHDESK_SECRET, action: 'manquants_stage',
-            date: day, testMode: !!testMode, recipients,
-          });
-          if (data && data.ok === false) throw new Error(data.error || 'refus proxy');
-          await storage.setDoc('manquants_outbox', day, {
-            staged: true, at: new Date().toISOString(), by: session.name,
-            count: recipients.length, products: totalProducts, testMode: !!testMode,
-          }, { replace: true });
-          showToast(testMode ? '✓ Programmé en TEST (13h → toi seul)' : '✓ Programmé — envoi auto à 13h');
-        } catch (e) { showToast('Erreur : ' + e.message); }
-        finally { setBusy(false); }
-      };
+      // Signature stable du lot (pour ne ré-déposer que si ça change)
+      const signature = React.useMemo(() => {
+        return JSON.stringify(
+          recipients.slice().sort((a, b) => a.email.localeCompare(b.email))
+            .map(r => [r.email, r.items.map(i => i.produit + ':' + i.qty).join('|')])
+        );
+      }, [recipients]);
+
+      // DÉPÔT AUTOMATIQUE dès que le lot change (et qu'il y a des destinataires).
+      React.useEffect(() => {
+        if (!session) return;
+        if (recipients.length === 0) return;
+        if (lastSigRef.current === signature) return;       // déjà déposé à l'identique
+        lastSigRef.current = signature;
+        (async () => {
+          try {
+            const data = await freshdeskPost({
+              secret: FRESHDESK_SECRET, action: 'manquants_stage', date: day, recipients,
+            });
+            if (data && data.ok === false) { lastSigRef.current = null; return; }
+            await storage.setDoc('manquants_outbox', day, {
+              staged: true, at: new Date().toISOString(), by: session.name,
+              count: recipients.length, products: totalProducts,
+            }, { replace: true });
+          } catch (e) { lastSigRef.current = null; }
+        })();
+      }, [signature, recipients.length, session, day]);
 
       const cancel = async () => {
         setBusy(true);
         try {
           await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'manquants_cancel', date: day });
           await storage.deleteDoc('manquants_outbox', day);
-          showToast('Envoi 13h annulé');
+          lastSigRef.current = null;
+          showToast('Envoi 7h annulé pour aujourd\'hui');
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
       };
@@ -12045,35 +12082,22 @@
       return (
         <div className="card" style={{padding:'12px 14px', marginBottom:12, borderLeft:'4px solid var(--prep)'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-            <strong style={{fontSize:14}}>📧 Mails manquants — envoi auto 13h</strong>
+            <strong style={{fontSize:14}}>📧 Mails manquants — envoi auto 7h</strong>
             <span className="badge" style={{background:'var(--prep-soft)',color:'var(--prep)',whiteSpace:'nowrap'}}>
               {recipients.length} client{recipients.length>1?'s':''} · {totalProducts} art.
             </span>
           </div>
 
-          {status && status.staged ? (
+          {recipients.length === 0 ? (
+            <p style={{fontSize:12,color:'var(--ink-mute)',margin:'10px 0 0'}}>Aucun manquant client pour la distribution du jour.</p>
+          ) : status && status.staged ? (
             <div className="alert-success" style={{marginTop:10,fontSize:13,display:'flex',flexDirection:'column',gap:8}}>
-              <div>
-                ✅ <strong>Programmé pour 13h</strong> — {status.count} client{status.count>1?'s':''}
-                {' '}<span className="badge" style={{background: status.testMode?'var(--warn-soft)':'var(--accent-soft)', color: status.testMode?'var(--warn)':'var(--accent-dark)'}}>{status.testMode?'TEST':'LIVE'}</span>
-                {status.by && <span style={{color:'var(--ink-mute)'}}> · par {status.by}</span>}
-              </div>
-              {status.testMode && <div style={{fontSize:12,color:'var(--warn)'}}>⚠️ Mode TEST : les mails partiront uniquement vers hg@pribon.org.</div>}
-              <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',alignSelf:'flex-start'}} disabled={busy} onClick={cancel}>Annuler l'envoi 13h</button>
+              <div>✅ <strong>Déposé — partira automatiquement à 7h</strong> — {status.count} client{status.count>1?'s':''}{status.by && <span style={{color:'var(--ink-mute)'}}> · par {status.by}</span>}</div>
+              <div style={{fontSize:11,color:'var(--ink-mute)'}}>Confirmation : une copie arrive sur contact@ après l'envoi. LIVE/TEST réglé dans le proxy.</div>
+              <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px',alignSelf:'flex-start'}} disabled={busy} onClick={cancel}>Annuler l'envoi de 7h</button>
             </div>
           ) : (
-            <>
-              <div style={{display:'flex',alignItems:'center',gap:8,margin:'10px 0'}}>
-                <label style={{fontSize:13,display:'flex',alignItems:'center',gap:6,cursor:'pointer'}}>
-                  <input type="checkbox" checked={testMode} onChange={e=>setTestMode(e.target.checked)} style={{width:'auto'}} />
-                  Mode TEST (envoi à moi seul)
-                </label>
-              </div>
-              <button className="btn-primary" style={{fontSize:13,padding:'8px 14px'}} disabled={busy || recipients.length===0} onClick={stage}>
-                {testMode ? 'Programmer l\'envoi 13h (TEST)' : 'Programmer l\'envoi 13h — VRAIS CLIENTS'}
-              </button>
-              {recipients.length===0 && <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>Aucun manquant client pour la distribution du jour.</p>}
-            </>
+            <p style={{fontSize:12,color:'var(--ink-mute)',margin:'10px 0 0'}}>Dépôt automatique en cours…</p>
           )}
 
           {recipients.length>0 && (
@@ -13003,8 +13027,9 @@
       React.useEffect(() => {
         if (!session) return;
         if (!(session.role === 'master' || session.isMaster)) return;
+        if (viewAs === 'distrib' || viewAs === 'prep') return; // en vue distrib/prépa : on laisse Clients/Clôture
         if (tab === 'clients' || tab === 'closure') setTab('mails');
-      }, [session, tab]);
+      }, [session, tab, viewAs]);
 
       // Si distrib (uniquement) sur admin/stats à l'ouverture, rediriger
       // Important : NE PAS affecter les prépas ni le master
