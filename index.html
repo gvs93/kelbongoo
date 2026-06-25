@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.56';
+    const APP_VERSION = 'V9.57';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -6241,6 +6241,211 @@
             {busy ? 'Envoi…' : sent ? '🎫 Mail envoyé ✓' : '🎫 Relancer par mail (Freshdesk)'}
           </button>
           <ClientMailHistory clientEmail={email} />
+        </div>
+      );
+    }
+
+    // ============================================================
+    // ONGLET MAILS (MASTER) — boîte Freshdesk dans l'appli
+    // Liste tickets ouverts/en attente → fil complet → réponse avec
+    // brouillon assisté par IA (Gemini, clé planquée côté proxy).
+    // Actions proxy : fd_list, fd_thread, fd_reply, ai_draft.
+    // ============================================================
+    const FD_STATUS = { 2: 'Ouvert', 3: 'En attente', 4: 'Résolu', 5: 'Fermé' };
+    const FD_STATUS_COLOR = { 2: 'var(--danger)', 3: 'var(--info)', 4: 'var(--accent)', 5: 'var(--ink-mute)' };
+
+    function MailsPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [tickets, setTickets] = React.useState([]);
+      const [loading, setLoading] = React.useState(false);
+      const [includeAll, setIncludeAll] = React.useState(false);
+      const [err, setErr] = React.useState('');
+
+      const [selId, setSelId] = React.useState(null);
+      const [thread, setThread] = React.useState(null);
+      const [threadLoading, setThreadLoading] = React.useState(false);
+
+      const [reply, setReply] = React.useState('');
+      const [instruction, setInstruction] = React.useState('');
+      const [aiBusy, setAiBusy] = React.useState(false);
+      const [sending, setSending] = React.useState(false);
+
+      const loadList = React.useCallback(async () => {
+        setLoading(true); setErr('');
+        try {
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fd_list', includeAll });
+          if (data.ok) setTickets(data.tickets || []);
+          else { setErr(data.error || 'Erreur'); setTickets([]); }
+        } catch (e) { setErr(e.message); setTickets([]); }
+        setLoading(false);
+      }, [includeAll]);
+
+      React.useEffect(() => { loadList(); }, [loadList]);
+
+      const openTicket = async (id) => {
+        setSelId(id); setThread(null); setReply(''); setInstruction(''); setThreadLoading(true);
+        try {
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fd_thread', id });
+          if (data.ok) setThread(data);
+          else { showToast(data.error || 'Erreur fil'); setSelId(null); }
+        } catch (e) { showToast(e.message); setSelId(null); }
+        setThreadLoading(false);
+      };
+
+      const threadAsText = () => {
+        if (!thread) return '';
+        return (thread.messages || []).map(m =>
+          `${m.incoming ? 'CLIENT' : 'KELBONGOO'} (${m.email || ''}) :\n${m.body || ''}`
+        ).join('\n\n---\n\n');
+      };
+
+      const genDraft = async () => {
+        if (!thread) return;
+        setAiBusy(true);
+        try {
+          const data = await freshdeskPost({
+            secret: FRESHDESK_SECRET,
+            action: 'ai_draft',
+            thread: threadAsText(),
+            instruction: instruction.trim(),
+            clientName: thread.requesterName || '',
+            subject: thread.subject || '',
+          });
+          if (data.ok && data.draft) setReply(data.draft);
+          else showToast(data.error || 'IA indisponible');
+        } catch (e) { showToast('Erreur IA : ' + e.message); }
+        setAiBusy(false);
+      };
+
+      const send = async () => {
+        if (!reply.trim()) { showToast('Réponse vide'); return; }
+        if (!confirm(`Envoyer cette réponse à ${thread.requesterName || thread.requesterEmail || 'ce client'} ?`)) return;
+        setSending(true);
+        try {
+          const data = await freshdeskPost({
+            secret: FRESHDESK_SECRET, action: 'fd_reply', id: selId, body: reply, resolve: true,
+          });
+          if (data.ok) {
+            showToast('✓ Réponse envoyée');
+            setSelId(null); setThread(null); setReply('');
+            loadList();
+          } else showToast('Échec : ' + (data.error || 'inconnu'));
+        } catch (e) { showToast('Erreur réseau : ' + e.message); }
+        setSending(false);
+      };
+
+      // ---- Vue FIL (ticket sélectionné) ----
+      if (selId) {
+        return (
+          <div className="page" style={{paddingBottom:24}}>
+            <button className="btn-ghost" style={{marginBottom:10,fontSize:13}} onClick={()=>{ setSelId(null); setThread(null); }}>← Boîte mail</button>
+
+            {threadLoading && <div className="card-flat" style={{padding:14,color:'var(--ink-mute)'}}>Chargement du fil…</div>}
+
+            {thread && (
+              <>
+                <div className="card" style={{padding:'12px 14px',marginBottom:12}}>
+                  <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{thread.subject || '(sans objet)'}</div>
+                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>
+                    {thread.requesterName ? thread.requesterName + ' · ' : ''}{thread.requesterEmail || ''}
+                    {thread.status != null && <span className="badge" style={{marginLeft:6,background:FD_STATUS_COLOR[thread.status],color:'#fff'}}>{FD_STATUS[thread.status] || thread.status}</span>}
+                  </div>
+                </div>
+
+                <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
+                  {(thread.messages || []).map((m, i) => (
+                    <div key={i} className="card-flat" style={{
+                      padding:'10px 12px',
+                      background: m.incoming ? 'var(--bg-soft, #f6f5f2)' : 'rgba(74,124,59,0.08)',
+                      borderLeft: '3px solid ' + (m.incoming ? 'var(--ink-mute)' : 'var(--accent)'),
+                    }}>
+                      <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:4,display:'flex',justifyContent:'space-between',gap:8}}>
+                        <strong>{m.incoming ? '👤 Client' : '🏬 Kelbongoo'}</strong>
+                        <span>{m.at ? formatDateShort(m.at) + ' ' + (formatTimeFR(m.at)) : ''}</span>
+                      </div>
+                      <div style={{fontSize:13,whiteSpace:'pre-wrap',lineHeight:1.4}}>{m.body || ''}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="card" style={{padding:'12px 14px'}}>
+                  <div style={{fontWeight:600,fontSize:13,marginBottom:8}}>✍️ Répondre</div>
+
+                  <input
+                    type="text"
+                    value={instruction}
+                    onChange={e=>setInstruction(e.target.value)}
+                    placeholder="Consigne pour l'IA (option) : ex. « propose un remboursement », « explique la DLC J+3 »…"
+                    style={{width:'100%',boxSizing:'border-box',padding:'8px 10px',fontSize:12,marginBottom:8,border:'1px solid var(--line,#ddd)',borderRadius:8}}
+                  />
+
+                  <button className="btn-secondary" style={{fontSize:13,marginBottom:8}} disabled={aiBusy} onClick={genDraft}>
+                    {aiBusy ? '✨ Rédaction…' : '✨ Brouillon IA'}
+                  </button>
+
+                  <textarea
+                    value={reply}
+                    onChange={e=>setReply(e.target.value)}
+                    placeholder="Ta réponse au client (relis toujours le brouillon IA avant d'envoyer)…"
+                    rows={9}
+                    style={{width:'100%',boxSizing:'border-box',padding:'10px',fontSize:14,border:'1px solid var(--line,#ddd)',borderRadius:8,lineHeight:1.45,resize:'vertical'}}
+                  />
+
+                  <div style={{display:'flex',gap:8,marginTop:10}}>
+                    <button className="btn-primary" style={{flex:1}} disabled={sending || !reply.trim()} onClick={send}>
+                      {sending ? 'Envoi…' : '📤 Envoyer la réponse'}
+                    </button>
+                    <button className="btn-ghost" onClick={()=>setReply('')} disabled={sending}>Effacer</button>
+                  </div>
+                  <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
+                    La réponse part au client via Freshdesk (copie interne à contact@). Le ticket passe en « Résolu ».
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        );
+      }
+
+      // ---- Vue LISTE (boîte) ----
+      return (
+        <div className="page" style={{paddingBottom:24}}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,marginBottom:12}}>
+            <h1 style={{margin:0,fontSize:20}}>📧 Mails clients <span className="ver-badge">{APP_VERSION}</span></h1>
+            <button className="btn-ghost" style={{fontSize:13}} disabled={loading} onClick={loadList}>↻ Actualiser</button>
+          </div>
+
+          <label style={{display:'flex',alignItems:'center',gap:6,fontSize:13,color:'var(--ink-mute)',marginBottom:12,cursor:'pointer'}}>
+            <input type="checkbox" checked={includeAll} onChange={e=>setIncludeAll(e.target.checked)} />
+            Inclure résolus / fermés
+          </label>
+
+          {err && <div className="card-flat" style={{padding:12,color:'var(--danger)',marginBottom:10,fontSize:13}}>⚠️ {err}</div>}
+
+          {loading && <div className="card-flat" style={{padding:14,color:'var(--ink-mute)'}}>Chargement de la boîte…</div>}
+
+          {!loading && tickets.length === 0 && !err && (
+            <div className="card-flat" style={{padding:18,textAlign:'center',color:'var(--ink-mute)'}}>
+              Aucun ticket {includeAll ? '' : 'ouvert ou en attente'} 🎉
+            </div>
+          )}
+
+          <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {tickets.map(t => (
+              <div key={t.id} className="card" style={{padding:'11px 13px',cursor:'pointer',display:'flex',alignItems:'flex-start',gap:10}} onClick={()=>openTicket(t.id)}>
+                <div style={{minWidth:0,flex:1}}>
+                  <div style={{fontWeight:600,fontSize:14,marginBottom:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{t.subject || '(sans objet)'}</div>
+                  <div style={{fontSize:12,color:'var(--ink-mute)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                    {t.requesterName || t.requesterEmail || 'Client'}{t.preview ? ' — ' + t.preview : ''}
+                  </div>
+                </div>
+                <div style={{textAlign:'right',flexShrink:0}}>
+                  <span className="badge" style={{background:FD_STATUS_COLOR[t.status]||'var(--ink-mute)',color:'#fff',fontSize:10}}>{FD_STATUS[t.status]||t.status}</span>
+                  <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>{t.updated_at ? formatDateShort(t.updated_at) : ''}</div>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       );
     }
@@ -12793,6 +12998,14 @@
         }
       }, [session, isClosed, tab]);
 
+      // Master : les onglets Clients et Clôture sont masqués pour lui → on le bascule
+      // automatiquement sur la boîte Mails s'il tombe dessus (état initial, etc.).
+      React.useEffect(() => {
+        if (!session) return;
+        if (!(session.role === 'master' || session.isMaster)) return;
+        if (tab === 'clients' || tab === 'closure') setTab('mails');
+      }, [session, tab]);
+
       // Si distrib (uniquement) sur admin/stats à l'ouverture, rediriger
       // Important : NE PAS affecter les prépas ni le master
       React.useEffect(() => {
@@ -12888,6 +13101,7 @@
         setCurrentSite(s.site);
         // Tab par défaut selon le rôle
         if (s.role === 'prep') setTab('prepdispatch');
+        else if (s.role === 'master' || s.isMaster) setTab('mails');
         else setTab('clients');
       };
       const handleLogout = () => {
@@ -13164,6 +13378,7 @@
           )}
 
           {tab === 'clients' && <ClientsPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} dispatch={dispatchData[currentSite] || null} lastminute={lastminute} />}
+          {tab === 'mails' && effSession.isMaster && <MailsPage session={effSession} />}
           {tab === "quality" && <QualityPage session={effSession} currentSite={currentSite} orders={orders} products={products} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'consignes' && <ConsignesPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'followup' && <FollowUpPage session={effSession} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
@@ -13178,9 +13393,16 @@
           {tab === 'admin' && effSession.isMaster && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
           <div className="tab-bar">
-            <button className={tab==='clients'?'active':''} onClick={()=>setTab('clients')}>
-              <span className="tab-icon">👥</span>Clients
-            </button>
+            {!effSession.isMaster && (
+              <button className={tab==='clients'?'active':''} onClick={()=>setTab('clients')}>
+                <span className="tab-icon">👥</span>Clients
+              </button>
+            )}
+            {effSession.isMaster && (
+              <button className={tab==='mails'?'active':''} onClick={()=>setTab('mails')}>
+                <span className="tab-icon">📧</span>Mails
+              </button>
+            )}
             {!effSession.isMaster && !isClosed && (
               <button className={tab==='quality'?'active':''} onClick={()=>setTab('quality')}>
                 <span className="tab-icon">⚠️</span>Qualité
@@ -13201,9 +13423,11 @@
                 <span className="tab-icon">📞</span>Suivi
               </button>
             )}
-            <button className={tab==='closure'?'active':''} onClick={()=>setTab('closure')}>
-              <span className="tab-icon">🔒</span>Clôt.
-            </button>
+            {!effSession.isMaster && (
+              <button className={tab==='closure'?'active':''} onClick={()=>setTab('closure')}>
+                <span className="tab-icon">🔒</span>Clôt.
+              </button>
+            )}
             {effSession.isMaster && (
               <button className={tab==='push'?'active':''} onClick={()=>setTab('push')}>
                 <span className="tab-icon">📣</span>Push
