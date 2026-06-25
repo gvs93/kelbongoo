@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.59';
+    const APP_VERSION = 'V9.61';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -11668,23 +11668,25 @@
       //  • dépassée OU plus aucune navette avant la DLC → cagette PARTAGE (perte sèche)
       //  • dernière navette utile = aujourd'hui → à ENVOYER À ROB aujourd'hui (dernière chance)
       //  • navette utile plus tard dans la semaine → à SURVEILLER (rien à faire today)
+      const isFriday = new Date().getDay() === 5;
       const enriched = React.useMemo(() => {
         return active.map(i => {
           const days = dlcDaysLeft(i.dlc, today);
           const lastNav = lastNavetteBeforeDLC(i.dlc, new Date());
-          const expired = days !== null && days <= 0;
           let bucket;
-          if (expired || !lastNav) bucket = 'partage';
-          else if (lastNav.date === today) bucket = 'rob';
+          if (days != null && days <= 0) bucket = 'partage';                 // périmé → partage (perte sèche)
+          else if (days != null && days <= 3) bucket = 'rob';                // Règle 1 : DLC ≤ aujourd'hui+3 → ROB
+          else if (isFriday && days != null && days <= 7) bucket = 'roll';   // Règle 2 (vendredi) : ≤ aujourd'hui+7 → roll
           else bucket = 'watch';
           return { ...i, days, lastNav, bucket };
         }).sort((a, b) => (a.days==null?999:a.days) - (b.days==null?999:b.days));
-      }, [items]);
+      }, [items, isFriday]);
 
-      const robToday = enriched.filter(i => i.bucket === 'rob');
-      const partage  = enriched.filter(i => i.bucket === 'partage');
-      const watch    = enriched.filter(i => i.bucket === 'watch');
-      const pdpItems = enriched.filter(i => i.source === 'retour_pdp');
+      const robToday  = enriched.filter(i => i.bucket === 'rob');
+      const rollItems = enriched.filter(i => i.bucket === 'roll');
+      const partage   = enriched.filter(i => i.bucket === 'partage');
+      const watch     = enriched.filter(i => i.bucket === 'watch');
+      const pdpItems  = enriched.filter(i => i.source === 'retour_pdp');
 
       const priceOf = (i) => {
         const prod = (catalogue || []).find(p => p.produit === i.produit && p.producteur === i.producteur);
@@ -11696,7 +11698,7 @@
       };
 
       // Écrit la perte (destination 'pribon' = ROB) + marque l'item parti ROB.
-      const markSentToRob = async (list) => {
+      const markSentToRob = async (list, initials) => {
         const dateKey = today;
         for (const i of list) {
           const unitPrice = priceOf(i); const qty = parseFloat(i.qty) || 1;
@@ -11708,7 +11710,8 @@
             usingWeight: false, quantity: qty, weight: 0,
             unitPrice, totalValue: unitPrice * qty,
             dlc: i.dlc || '', robSentDate: dateKey,
-            remark: `DLC courte → envoi ROB le ${formatDateShort(dateKey)}`,
+            remark: `DLC courte → envoi ROB le ${formatDateShort(dateKey)}${initials?` · contrôle ${initials}`:''}`,
+            controlInitials: initials || '',
             day: dateKey, fromDlc: true,
             createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
           });
@@ -11765,14 +11768,15 @@
       };
 
       // Envoie le BL à gestion@pribon.org (objet « Push kbg du jour ») + écrit les pertes + marque parti ROB.
-      const sendRob = async () => {
+      const sendRob = async (initials) => {
         if (!robToday.length) { showToast('Rien à envoyer à ROB aujourd\u2019hui'); return; }
+        if (!initials || !initials.trim()) { showToast('Initiales obligatoires pour valider'); return; }
         if (!confirm(`Envoyer ${robToday.length} produit(s) à ROB ?\n\n• BL « Push kbg du jour » envoyé à gestion@pribon.org\n• Comptés en perte (envoi Pribon/ROB) de la semaine\n• Sortis de la surveillance DLC`)) return;
         setBusy(true);
         try {
           const lines = robToday.map(i => `• ${i.produit}${i.qty>1?` ×${i.qty}`:''}${i.producteur?` — ${i.producteur}`:''}${i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''}`).join('\n');
           const subject = 'Push kbg du jour';
-          const body = `Bonjour,\n\nPush KBG du ${formatDateShort(today)} pour Robespierre — ${robToday.length} produit(s) à gérer selon les DLC :\n\n${lines}\n\nMerci,\n— App Distribution Kelbongoo`;
+          const body = `Bonjour,\n\nPush KBG du ${formatDateShort(today)} pour Robespierre — ${robToday.length} produit(s) à gérer selon les DLC :\n\n${lines}\n\nContrôle effectué par : ${initials}\n\nMerci,\n— App Distribution Kelbongoo`;
           let mailOk = false, mailErr = '';
           try {
             let payload = { secret: FRESHDESK_SECRET, action: 'send_mail', to: 'gestion@pribon.org', subject, body };
@@ -11784,7 +11788,7 @@
             mailOk = !!(r && r.ok); if (!mailOk) mailErr = (r && r.error) || 'inconnue';
           } catch (e) { mailErr = e.message; }
           // On enregistre la perte + sortie de surveillance même si le mail échoue (le BL reste générable manuellement).
-          await markSentToRob(robToday);
+          await markSentToRob(robToday, initials);
           if (mailOk) showToast(`✓ BL envoyé à gestion@pribon.org · ${robToday.length} produit(s) → perte ROB`);
           else showToast(`⚠️ Pertes enregistrées, mais mail KO (${mailErr}). Génère le BL en PDF et envoie-le à la main.`);
         } catch (e) { showToast('Erreur : ' + e.message); }
@@ -11823,8 +11827,10 @@
       // Seuils DLC datés (ce que l'équipe doit regarder concrètement) :
       //  • Vigilance = écouler en premier : DLC avant le mardi suivant (samedi + 3j de garantie client).
       //  • Retrait   = sortir de la vente : DLC à J+3 ou moins (ROB selon navette, sinon partage).
-      const seuilVigilance = addDays(_saturdayOfWeek(today), 3);
-      const seuilRetrait = addDays(today, 3);
+      const pivotRob  = addDays(today, 3);   // Règle 1 : retirer DLC ≤ aujourd'hui+3 → ROB
+      const pivotRoll = addDays(today, 7);   // Règle 2 (vendredi) : roll DLC ≤ aujourd'hui+7
+      const [initials, setInitials] = React.useState('');
+      const [showHelp, setShowHelp] = React.useState(false);
 
       // RESET COMPLET de la console DLC (master) — supprime toutes les lignes dlc_watch.
       // Ne touche PAS aux pertes déjà enregistrées (collection 'losses').
@@ -11850,46 +11856,49 @@
             )}
           </div>
 
-          {/* ====== GRAND BANDEAU INSTRUCTION DU JOUR ====== */}
+          {/* ====== BANDEAU INSTRUCTION DU JOUR (règles datées) ====== */}
           <div className="card" style={{borderLeft:'5px solid var(--master)',background:'var(--master-soft)',padding:'14px 16px'}}>
-            <div style={{fontSize:13,color:'var(--ink-soft)',textTransform:'capitalize'}}>Nous sommes le {dayLabelShort(today)}</div>
-            <div style={{marginTop:8,fontSize:13,lineHeight:1.55,background:'var(--bg-card,#fff)',borderRadius:8,padding:'8px 10px'}}>
-              <div style={{fontWeight:700,marginBottom:2}}>📅 Sur quelle date regarder aujourd'hui :</div>
-              <div>🔴 <strong>À retirer</strong> (ROB ou partage) : DLC <strong style={{textTransform:'capitalize'}}>avant {dayLabelShort(seuilRetrait)}</strong>.</div>
-              <div>🟡 <strong>Vigilance</strong> (écouler en premier) : DLC <strong style={{textTransform:'capitalize'}}>avant {dayLabelShort(seuilVigilance)}</strong>.</div>
-              <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:2}}>Garantie client : 3 jours de DLC au dernier retrait (samedi).</div>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <div style={{fontSize:13,color:'var(--ink-soft)',textTransform:'capitalize'}}>Nous sommes le {dayLabelShort(today)} — contrôle à faire avant 10h</div>
+              <button className="btn-ghost" style={{fontSize:12,border:'1px solid var(--master)',color:'var(--master)',padding:'4px 10px',borderRadius:8}} onClick={()=>setShowHelp(s=>!s)}>❓ Que faire ?</button>
             </div>
-            {hasNavToday ? (
-              <>
-                <div style={{fontSize:17,fontWeight:800,margin:'6px 0',lineHeight:1.3}}>
-                  🚚 Aujourd'hui, retire de la vente et envoie à ROB tous les produits qui ne tiendront pas jusqu'à la prochaine navette{nextNavDate?<> (<span style={{textTransform:'capitalize'}}>{dayLabelShort(nextNavDate)}</span>)</>:''}.
+
+            <div style={{marginTop:8,fontSize:14,lineHeight:1.5,background:'var(--bg-card,#fff)',borderRadius:8,padding:'10px 12px'}}>
+              <div style={{fontWeight:800,fontSize:15}}>🔴 Règle 1 — à retirer pour ROB</div>
+              <div>Sortir de la vente <strong>toute DLC ≤ <span style={{textTransform:'capitalize'}}>{dayLabelShort(pivotRob)}</span></strong> ({formatDateShort(pivotRob)}) → envoi ROB. <strong>{robToday.length}</strong> produit(s).</div>
+              {isFriday && (
+                <div style={{marginTop:8,paddingTop:8,borderTop:'1px solid var(--line)'}}>
+                  <div style={{fontWeight:800,fontSize:15}}>🟣 Règle 2 (vendredi) — à mettre sur roll</div>
+                  <div>Placer sur le roll <strong>toute DLC ≤ <span style={{textTransform:'capitalize'}}>{dayLabelShort(pivotRoll)}</span></strong> ({formatDateShort(pivotRoll)}) pour le contrôle de la semaine prochaine. <strong>{rollItems.length}</strong> produit(s).</div>
                 </div>
-                <div style={{fontSize:13,color:'var(--ink-soft)'}}>
-                  Navette ROB du jour : <strong>{todayNavs.map(n=>n.label).join(' / ')}</strong> · <strong>{robToday.length}</strong> produit(s) à envoyer (liste ci-dessous).
-                </div>
-              </>
-            ) : (
-              <div style={{fontSize:15,fontWeight:700,margin:'6px 0'}}>
-                Pas de navette ROB aujourd'hui. Prochaine navette : <strong style={{textTransform:'capitalize'}}>{nextNavDate?dayLabelShort(nextNavDate):'—'}</strong>.
+              )}
+            </div>
+
+            {showHelp && (
+              <div style={{marginTop:10,fontSize:13,lineHeight:1.55,background:'var(--bg-card,#fff)',borderRadius:8,padding:'10px 12px',border:'1px dashed var(--master)'}}>
+                <div style={{fontWeight:700,marginBottom:4}}>📋 Marche à suivre (avant 10h)</div>
+                <ol style={{margin:'0 0 0 18px',padding:0}}>
+                  <li>Contrôle d'abord {isFriday?'les produits sur le roll, puis ':''}le rayon.</li>
+                  <li>Retire tout ce qui a une <strong>DLC ≤ {formatDateShort(pivotRob)}</strong> → zone ROB.</li>
+                  {isFriday && <li>Mets sur le <strong>roll</strong> tout ce qui a une DLC ≤ {formatDateShort(pivotRoll)} (semaine suivante).</li>}
+                  <li>Les produits <strong>périmés</strong> → cagette partage équipe (perte sèche).</li>
+                  <li>Saisis tes <strong>initiales</strong> puis valide l'envoi ROB → BL généré + perte enregistrée automatiquement.</li>
+                </ol>
               </div>
             )}
             {pdpItems.length > 0 && (
               <div style={{marginTop:8,fontSize:13,fontWeight:600,color:'var(--accent-dark,#7a4a00)',background:'var(--accent-soft,#fff4e0)',padding:'6px 10px',borderRadius:8}}>
-                ↩️ {pdpItems.length} retour(s) PDP avec DLC à surveiller — listés dans la console ci-dessous.
+                ↩️ {pdpItems.length} retour(s) PDP avec DLC — inclus dans les listes ci-dessous.
               </div>
             )}
           </div>
 
-          <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-4}}>
-            Uniquement les produits à <strong>retirer</strong> : envoi ROB sur la prochaine navette, ou cagette partage. Le rayon vendable normal n'apparaît pas ici.
-          </p>
-
-          {/* ============ À ENVOYER À ROB AUJOURD'HUI ============ */}
+          {/* ============ À ENVOYER À ROB (Règle 1) ============ */}
           <div className="card" style={{borderLeft:'4px solid var(--master)',background: robToday.length?'var(--master-soft)':'transparent'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
               <div>
-                <div style={{fontWeight:800,fontSize:16}}>🚚 À envoyer à ROB aujourd'hui</div>
-                <div style={{fontSize:12,color:'var(--ink-mute)',textTransform:'capitalize'}}>{dayLabelShort(today)} · dernière navette utile avant la DLC</div>
+                <div style={{fontWeight:800,fontSize:16}}>🚚 À envoyer à ROB</div>
+                <div style={{fontSize:12,color:'var(--ink-mute)'}}>DLC ≤ {formatDateShort(pivotRob)}</div>
               </div>
               <span className="badge badge-master" style={{fontSize:13}}>{robToday.length}</span>
             </div>
@@ -11903,7 +11912,7 @@
                       <div style={{display:'flex',justifyContent:'space-between',gap:8,alignItems:'center'}}>
                         <div style={{minWidth:0}}>
                           <div style={{fontWeight:600,fontSize:14}}>{i.produit}{i.qty>1?` ×${i.qty}`:''}</div>
-                          <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''} · {navHint(i)}</div>
+                          <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''}</div>
                         </div>
                         <div style={{display:'flex',gap:4,alignItems:'center',flexShrink:0}}>
                           <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:15,padding:'4px 8px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
@@ -11913,16 +11922,43 @@
                     </div>
                   ))}
                 </div>
-                <div style={{display:'flex',gap:8,marginTop:12,flexWrap:'wrap'}}>
-                  <button className="btn-primary" style={{flex:1,minWidth:160,background:'var(--master)'}} disabled={busy} onClick={sendRob}>
-                    {busy ? 'Envoi…' : `📧 Envoyer le BL à ROB (gestion@pribon.org)`}
+                <div style={{display:'flex',gap:8,marginTop:12,alignItems:'center',flexWrap:'wrap'}}>
+                  <input value={initials} onChange={e=>setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Init." style={{width:80,boxSizing:'border-box',padding:'8px 10px',fontSize:14,border:'1px solid var(--line)',borderRadius:8,textTransform:'uppercase'}} />
+                  <button className="btn-primary" style={{flex:1,minWidth:150,background:'var(--master)'}} disabled={busy || !initials.trim()} onClick={()=>sendRob(initials.trim())}>
+                    {busy ? 'Envoi…' : `✅ Valider l'envoi ROB → BL + perte`}
                   </button>
                   <button className="btn-secondary" disabled={busy} onClick={genBlPdf}>📄 BL PDF</button>
                 </div>
-                <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Objet « Push kbg du jour ». Les produits envoyés sont comptés en perte (envoi ROB) et marqués sur le récap pertes du vendredi.</div>
+                {!initials.trim() && <div style={{fontSize:11,color:'var(--danger)',marginTop:6}}>Initiales obligatoires pour valider (contrôle avant 10h).</div>}
+                <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Le BL « Push kbg du jour » part à gestion@pribon.org. Les produits sont comptés en <strong>perte (ROB)</strong> et sortis de la console.</div>
               </>
             )}
           </div>
+
+          {/* ============ À METTRE SUR ROLL (Règle 2 — vendredi) ============ */}
+          {isFriday && (
+            <div className="card" style={{borderLeft:'4px solid #6e4a9c',background: rollItems.length?'rgba(110,74,156,0.06)':'transparent'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                <div>
+                  <div style={{fontWeight:800,fontSize:16}}>🟣 À mettre sur roll</div>
+                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>DLC ≤ {formatDateShort(pivotRoll)} · contrôle semaine prochaine</div>
+                </div>
+                <span className="badge" style={{background:'rgba(110,74,156,0.15)',color:'#6e4a9c',fontSize:13}}>{rollItems.length}</span>
+              </div>
+              {rollItems.length === 0 ? (
+                <p style={{fontSize:13,color:'var(--ink-mute)',marginTop:8,marginBottom:0}}>Rien à mettre sur roll.</p>
+              ) : (
+                <div className="stack" style={{gap:4,marginTop:10}}>
+                  {rollItems.map(i => (
+                    <div key={i.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'6px 8px',border:'1px solid var(--line)',borderRadius:8,alignItems:'center'}}>
+                      <span style={{minWidth:0}}><strong>{i.produit}</strong>{i.qty>1?` ×${i.qty}`:''} <span style={{color:'var(--ink-mute)',fontSize:11}}>· {i.producteur}</span></span>
+                      <span style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap'}}>DLC {formatDateShort(i.dlc)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* ============ CAGETTE PARTAGE ÉQUIPE ============ */}
           <div className="card" style={{borderLeft:'4px solid var(--warn)'}}>
@@ -12276,6 +12312,9 @@
       const [lastmin, setLastmin] = React.useState([]);
       const [manquants, setManquants] = React.useState([]);
       const [loading, setLoading] = React.useState(true);
+      const [openIds, setOpenIds] = React.useState(() => new Set());
+      const toggleDetail = (id) => setOpenIds(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+      const [orders, setOrders] = React.useState([]);
 
       React.useEffect(() => {
         setLoading(true);
@@ -12283,8 +12322,22 @@
         const done = () => { if (got1 && got2) setLoading(false); };
         const u1 = storage.subscribe(`day_${day}_lastminute`, (arr) => { setLastmin(arr || []); got1 = true; done(); });
         const u2 = storage.subscribe(`day_${day}_manquants`, (arr) => { setManquants(arr || []); got2 = true; done(); });
-        return () => { u1(); u2(); };
+        const u3 = storage.subscribe(`day_${day}_orders`, (arr) => { setOrders(arr || []); });
+        return () => { u1(); u2(); u3(); };
       }, [day]);
+
+      // Casier → nom du client (par boutique), pour afficher À QUI le ND a été attribué.
+      const casierName = React.useMemo(() => {
+        const map = {};
+        for (const o of (orders || [])) {
+          const site = (o.site || '').toUpperCase();
+          if (!site) continue;
+          if (!map[site]) map[site] = {};
+          const cs = [...(o.casiersFrais || []), ...(o.casiersSec || [])];
+          for (const c of cs) { if (c != null && c !== '') map[site][String(c)] = o.name || o.email || ''; }
+        }
+        return map;
+      }, [orders]);
 
       // Index des manquants par id, pour retrouver « ce qui était prévu »
       const manqById = React.useMemo(() => {
@@ -12317,6 +12370,7 @@
           return {
             id: l.id, produit: l.produit || '(sans nom)', producteur: l.producteur || '',
             prevu, recu, envoye, bySite,
+            allocDetail: l.allocBySite || {},   // { site: [{casier, qty}] } → à qui c'est attribué
             createdBy: l.createdBy || '', createdAt: l.createdAt || '',
           };
         }).sort((a, b) => (a.produit || '').localeCompare(b.produit || ''));
@@ -12384,13 +12438,39 @@
                        </span>
                      </div>
 
-                     <div style={{display:'flex',flexWrap:'wrap',gap:4,marginTop:8,borderTop:'1px solid var(--line)',paddingTop:8}}>
+                     <div style={{display:'flex',flexWrap:'wrap',gap:4,marginTop:8,borderTop:'1px solid var(--line)',paddingTop:8,alignItems:'center'}}>
                        {Object.keys(r.bySite).length === 0
                          ? <span style={{fontSize:12,color:'var(--ink-mute)'}}>Aucune boutique</span>
                          : Object.entries(r.bySite).sort((a,b)=>a[0].localeCompare(b[0])).map(([site, q]) => (
                              <span key={site} className="badge badge-site">{site} : {q}</span>
                            ))}
+                       {Object.keys(r.allocDetail || {}).length > 0 && (
+                         <button className="btn-ghost" style={{fontSize:11,padding:'2px 8px',marginLeft:'auto',color:'var(--master)'}} onClick={()=>toggleDetail(r.id)}>
+                           {openIds.has(r.id) ? '▾ Masquer le détail' : '🔍 Détail (à qui)'}
+                         </button>
+                       )}
                      </div>
+
+                     {openIds.has(r.id) && (
+                       <div style={{marginTop:8,background:'var(--bg-soft,#f6f5f2)',borderRadius:8,padding:'8px 10px'}}>
+                         <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>À qui le produit a été attribué (casier + client). « Bac ND » = non attribué, réparti à la main sur place.</div>
+                         {Object.entries(r.allocDetail).sort((a,b)=>a[0].localeCompare(b[0])).map(([site, arr]) => (
+                           <div key={site} style={{marginBottom:6}}>
+                             <div style={{fontWeight:700,fontSize:12,marginBottom:2}}>{site}</div>
+                             <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                               {(arr || []).filter(c => (c.qty||0) > 0).sort((a,b)=>String(a.casier).localeCompare(String(b.casier),undefined,{numeric:true})).map((c, ci) => {
+                                 const nm = (c.casier !== 'ND' && casierName[site]) ? (casierName[site][String(c.casier)] || '') : '';
+                                 return (
+                                   <span key={ci} className="badge" style={{background: c.casier==='ND'?'var(--warn-soft)':'var(--master-soft)', color: c.casier==='ND'?'var(--warn)':'var(--master)', fontSize:11}}>
+                                     {c.casier==='ND' ? 'Bac ND' : `Casier ${c.casier}`}{nm ? ` — ${nm}` : ''} : {c.qty}
+                                   </span>
+                                 );
+                               })}
+                             </div>
+                           </div>
+                         ))}
+                       </div>
+                     )}
                    </div>
                  );
                })}
