@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.62';
+    const APP_VERSION = 'V9.63';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -12665,6 +12665,137 @@
       );
     }
 
+    // ============================================================
+    // HISTORIQUE DES COMMANDES — vérification d'attribution
+    // Permet de voir, pour un produit, qui l'a REÇU et qui était en MANQUANT
+    // (boutique + casier + nom), afin de contrôler que le ND dernière minute
+    // est bien parti aux clients privés du produit, et pas à ceux déjà servis.
+    // ============================================================
+    function OrderHistoryView() {
+      const [day, setDay] = React.useState(activeDay());
+      const [orders, setOrders] = React.useState([]);
+      const [loading, setLoading] = React.useState(true);
+      const [query, setQuery] = React.useState('');
+
+      React.useEffect(() => {
+        setLoading(true);
+        const u = storage.subscribe(`day_${day}_orders`, (arr) => {
+          const doc = (arr || []).find(x => x.id === 'data') || (arr || [])[0];
+          setOrders(doc && doc.orders ? doc.orders : []);
+          setLoading(false);
+        });
+        return () => { u && u(); };
+      }, [day]);
+
+      const prevDistrib = (fromKey) => { let d = addDays(fromKey, -1); for (let i=0;i<31;i++){ if (isDistribDay(d)) return d; d = addDays(d,-1);} return null; };
+      const nextDistrib = (fromKey) => { let d = addDays(fromKey, 1);  for (let i=0;i<31;i++){ if (isDistribDay(d)) return d; d = addDays(d,1);}  return null; };
+      const prevDay = prevDistrib(day), nextDay = nextDistrib(day), isToday = day === todayKey();
+
+      const casierOf = (o) => (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
+
+      // Produits ayant eu ≥1 manquant ce jour-là (chips de raccourci).
+      const manqProducts = React.useMemo(() => {
+        const set = {};
+        for (const o of orders) for (const r of (o.removed || [])) { const k = r.produit || ''; if (k) set[k] = (set[k] || 0) + (r.qty || 1); }
+        return Object.entries(set).sort((a, b) => b[1] - a[1]).map(([produit, qty]) => ({ produit, qty }));
+      }, [orders]);
+
+      const q = normalizeText(query.trim());
+      const result = React.useMemo(() => {
+        if (!q) return null;
+        const recu = [], manquant = [];
+        for (const o of orders) {
+          const base = { name: o.name || o.email || '?', site: (o.site || '').toUpperCase(), casier: casierOf(o) };
+          const rm = (o.removed || []).find(r => normalizeText(r.produit || '').includes(q));
+          if (rm) { manquant.push({ ...base, qty: rm.qty || 1, produit: rm.produit }); continue; }
+          const it = (o.items || []).find(i => normalizeText(i.produit || '').includes(q));
+          if (it) recu.push({ ...base, qty: it.qty || 1, produit: it.produit });
+        }
+        const bySite = (a, b) => a.site.localeCompare(b.site) || a.name.localeCompare(b.name);
+        return { recu: recu.sort(bySite), manquant: manquant.sort(bySite) };
+      }, [orders, q]);
+
+      const Row = ({ r, kind }) => (
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,padding:'7px 10px',border:'1px solid var(--line)',borderRadius:8,background: kind==='manquant'?'var(--danger-soft,#fdeaea)':'var(--accent-soft,#eaf6ea)'}}>
+          <div style={{minWidth:0}}>
+            <div style={{fontWeight:600,fontSize:13}}>{r.name}</div>
+            <div style={{fontSize:11,color:'var(--ink-mute)'}}>{r.site} · {r.casier==='ND'?'Bac ND':`Casier ${r.casier}`}</div>
+          </div>
+          <span className="badge" style={{background: kind==='manquant'?'var(--danger)':'var(--accent)', color:'#fff', fontSize:11, whiteSpace:'nowrap'}}>
+            {kind==='manquant'?'❌ Manquant':'✅ Reçu'}{r.qty>1?` ×${r.qty}`:''}
+          </span>
+        </div>
+      );
+
+      return (
+        <div style={{marginTop:10}}>
+          <h2 style={{fontSize:18,margin:'0 0 4px'}}>🧾 Historique des commandes</h2>
+          <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0}}>
+            Cherche un produit : tu vois qui l'a <strong>reçu</strong> et qui était en <strong>manquant</strong> (boutique · casier · nom). À croiser avec le détail ND pour vérifier l'attribution.
+          </p>
+
+          {/* Navigation date */}
+          <div className="card" style={{padding:'10px 12px',marginBottom:12}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,justifyContent:'space-between'}}>
+              <button className="btn-secondary" style={{fontSize:13,padding:'6px 10px'}} disabled={!prevDay} onClick={()=> prevDay && setDay(prevDay)}>‹</button>
+              <div style={{textAlign:'center',flex:1,minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:14,textTransform:'capitalize'}}>{dayLabelShort(day)}</div>
+                <div style={{fontSize:11,color: isToday ? 'var(--accent)' : 'var(--warn)'}}>
+                  {isToday ? "aujourd'hui" : 'autre jour'}{!isDistribDay(day) && ' · pas de distrib ce jour'}
+                </div>
+              </div>
+              <button className="btn-secondary" style={{fontSize:13,padding:'6px 10px'}} disabled={!nextDay || nextDay > todayKey()} onClick={()=> { if (nextDay && nextDay <= todayKey()) setDay(nextDay); }}>›</button>
+            </div>
+            <div style={{display:'flex',gap:8,marginTop:8,alignItems:'center'}}>
+              <input type="date" value={day} max={todayKey()} onChange={(e)=> e.target.value && setDay(e.target.value)} style={{fontSize:13,flex:1}} />
+              {!isToday && <button className="btn-ghost" style={{fontSize:12,padding:'6px 10px',whiteSpace:'nowrap'}} onClick={()=>setDay(todayKey())}>↩ Aujourd'hui</button>}
+            </div>
+          </div>
+
+          {/* Recherche produit */}
+          <input
+            type="text" value={query} onChange={e=>setQuery(e.target.value)}
+            placeholder="🔍 Chercher un produit (ex. carottes)…"
+            style={{width:'100%',boxSizing:'border-box',padding:'10px 12px',fontSize:14,border:'1px solid var(--line)',borderRadius:8,marginBottom:10}}
+          />
+
+          {/* Chips produits avec manquants */}
+          {!q && manqProducts.length > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>Produits avec manquant ce jour-là :</div>
+              <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                {manqProducts.map((p,i) => (
+                  <button key={i} className="chip" onClick={()=>setQuery(p.produit)} style={{fontSize:12,cursor:'pointer'}}>{p.produit} <span style={{color:'var(--danger)'}}>×{p.qty}</span></button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {loading ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p>
+           : orders.length === 0 ? <div className="empty-state"><div className="icon">📭</div><p>Aucune commande enregistrée ce jour-là.</p></div>
+           : !q ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Tape un produit ou choisis une pastille ci-dessus.</p>
+           : (result.recu.length + result.manquant.length === 0)
+             ? <div className="empty-state"><div className="icon">🔍</div><p>Aucune commande avec « {query} » ce jour-là.</p></div>
+             : (
+               <div style={{display:'flex',flexDirection:'column',gap:14}}>
+                 <div>
+                   <div style={{fontWeight:700,fontSize:14,marginBottom:6,color:'var(--danger)'}}>❌ Manquant ({result.manquant.length}) — c'est à eux que le ND doit aller</div>
+                   {result.manquant.length === 0
+                     ? <p style={{fontSize:12,color:'var(--ink-mute)'}}>Personne en manquant.</p>
+                     : <div style={{display:'flex',flexDirection:'column',gap:6}}>{result.manquant.map((r,i)=><Row key={i} r={r} kind="manquant" />)}</div>}
+                 </div>
+                 <div>
+                   <div style={{fontWeight:700,fontSize:14,marginBottom:6,color:'var(--accent-dark,#2e7d32)'}}>✅ Reçu ({result.recu.length}) — NE doivent PAS recevoir de ND</div>
+                   {result.recu.length === 0
+                     ? <p style={{fontSize:12,color:'var(--ink-mute)'}}>Personne ne l'a reçu.</p>
+                     : <div style={{display:'flex',flexDirection:'column',gap:6}}>{result.recu.map((r,i)=><Row key={i} r={r} kind="recu" />)}</div>}
+                 </div>
+               </div>
+             )}
+        </div>
+      );
+    }
+
     function HistoryPage({ session }) {
       const [histTab, setHistTab] = React.useState('nd'); // 'nd' | 'dlc' | 'pdp'
       return (
@@ -12675,10 +12806,12 @@
           </p>
           <div className="filter-row">
             <div className={`chip ${histTab==='nd'?'selected':''}`} onClick={()=>setHistTab('nd')}>🚚 ND</div>
+            <div className={`chip ${histTab==='cmd'?'selected':''}`} onClick={()=>setHistTab('cmd')}>🧾 Commandes</div>
             <div className={`chip ${histTab==='dlc'?'selected':''}`} onClick={()=>setHistTab('dlc')}>🟠 DLC</div>
             <div className={`chip ${histTab==='pdp'?'selected':''}`} onClick={()=>setHistTab('pdp')}>↩️ Retours PDP</div>
           </div>
           {histTab === 'nd' && <NdHistoryPage session={session} />}
+          {histTab === 'cmd' && <OrderHistoryView />}
           {histTab === 'dlc' && <HistoryDlcView />}
           {histTab === 'pdp' && <HistoryPdpView />}
         </div>
