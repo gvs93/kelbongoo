@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.56</title>
+  <title>Kelbongoo — Distribution V9.66</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.63';
+    const APP_VERSION = 'V9.66';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -1131,7 +1131,7 @@
           frais: items.filter(i => i.cat === 'frais'),
           removed: (o.removed || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
-            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, reason: r.reason };
+            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, reason: r.reason, cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais' };
           }),
           reduced: (o.reduced || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
@@ -1617,17 +1617,27 @@
         // ses cerises en prépa recevait un 2e sachet en dernière minute (et était re-facturé).
         // Le repli `items` est donc supprimé : un produit reçu en extra SANS rupture client
         // ne s'attribue plus automatiquement aux casiers — il part au bac ND (réparti à la main).
-        let q = 0;
+        let q = 0, prodCat = '';
         for (const r of (o.removed || [])) {
-          if (matches(r)) q += (r.qty || 0);
+          if (matches(r)) { q += (r.qty || 0); if (!prodCat && r.cat) prodCat = r.cat; }
         }
         if (q <= 0) continue;
-        // casier du client : frais d'abord, sinon sec, sinon bac ND
-        const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
+        // V9.66 : casier selon la catégorie du produit. Frais et sec ont des numérotations
+        // SÉPARÉES (1,2,3… par type) — un pain va dans le casier SEC (🍞), sinon casier FRAIS (🧊).
+        const useSec = (prodCat === 'pain');
+        const primary  = useSec ? (o.casiersSec || []) : (o.casiersFrais || []);
+        const fallback = useSec ? (o.casiersFrais || []) : (o.casiersSec || []);
+        let casier = 'ND', ctype = '';
+        if (primary[0]) { casier = primary[0]; ctype = useSec ? 'S' : 'F'; }
+        else if (fallback[0]) { casier = fallback[0]; ctype = useSec ? 'F' : 'S'; }
         if (!out[site]) out[site] = { total: 0, casiers: [] };
         out[site].total += q;
-        const ex = out[site].casiers.find(c => c.casier === casier);
-        if (ex) ex.qty += q; else out[site].casiers.push({ casier, qty: q });
+        // V9.64 : on conserve l'identité du client attribué. Sans ça, l'historique devait
+        // re-deviner le nom par numéro de casier — faux dès qu'un numéro est partagé.
+        const who = { name: o.name || o.email || '', email: o.email || '', consumerId: o.consumerId || '', qty: q };
+        const ex = out[site].casiers.find(c => c.casier === casier && c.ctype === ctype);
+        if (ex) { ex.qty += q; (ex.clients || (ex.clients = [])).push(who); }
+        else out[site].casiers.push({ casier, ctype, qty: q, clients: [who] });
       }
       return out;
     }
@@ -1688,7 +1698,8 @@
       for (const c of sorted) {
         if (left <= 0) break;
         const give = Math.min(c.qty, left);
-        out.push({ casier: c.casier, qty: give });
+        // V9.64/66 : propage l'identité ET le type de casier (frais/sec) vers le dispatch.
+        out.push({ casier: c.casier, qty: give, ...(c.ctype ? { ctype: c.ctype } : {}), ...(c.clients ? { clients: c.clients } : {}) });
         left -= give;
       }
       // ré-ordonne le rendu par casier croissant pour rester lisible côté distributeur
@@ -2887,6 +2898,7 @@
       const [selectedClient, setSelectedClient] = React.useState(null);
 
       // Index dispatch dernière minute pour CE site : { [casier]: [{produit, qty}] }
+      // Conservé tel quel (par numéro nu) pour le modal legacy DispatchModal (chemin PDF).
       const lmByCasier = React.useMemo(() => {
         const idx = {};
         for (const l of (lastminute || [])) {
@@ -2898,6 +2910,40 @@
         }
         return idx;
       }, [lastminute, currentSite]);
+
+      // V9.65 — Attribution LM par IDENTITÉ client (immune à la collision de numéros frais/sec/pain).
+      // • lmByClientKey : dispatches récents qui portent l'identité (clients[]) → indexés par client.
+      // • lmByCasierNoId : anciens dispatches SANS identité → repli par numéro de casier.
+      // (On exclut les bacs ND, traités à part par lmBacND.)
+      const { lmByClientKey, lmByCasierNoId } = React.useMemo(() => {
+        const byClient = {}, byCasier = {};
+        for (const l of (lastminute || [])) {
+          const arr = (l.allocBySite && l.allocBySite[currentSite]) || [];
+          for (const c of arr) {
+            if (c.casier === 'ND') continue;
+            if (Array.isArray(c.clients) && c.clients.length) {
+              for (const cl of c.clients) {
+                const key = cl.consumerId || cl.email || cl.name;
+                if (!key) continue;
+                (byClient[key] = byClient[key] || []).push({ produit: l.produit, producteur: l.producteur, qty: (cl.qty != null ? cl.qty : c.qty) });
+              }
+            } else {
+              (byCasier[c.casier] = byCasier[c.casier] || []).push({ produit: l.produit, producteur: l.producteur, qty: c.qty });
+            }
+          }
+        }
+        return { lmByClientKey: byClient, lmByCasierNoId: byCasier };
+      }, [lastminute, currentSite]);
+
+      // LM d'un client = match par identité (fiable) + repli legacy par numéro de casier (vieux dispatches).
+      const lmForClient = React.useCallback((o, casFrais, casSec) => {
+        const key = o.consumerId || o.email || displayName(o);
+        const out = [...(lmByClientKey[key] || [])];
+        for (const cas of [...(casFrais || []), ...(casSec || [])]) {
+          for (const it of (lmByCasierNoId[cas] || [])) out.push(it);
+        }
+        return out;
+      }, [lmByClientKey, lmByCasierNoId]);
 
       // Dispatch dernière minute SANS casier (bac ND) pour CE site : à répartir sur place
       const lmBacND = React.useMemo(() => {
@@ -3085,10 +3131,8 @@
                     const pains      = isV4 ? (o.pains || []) : (cd ? cd.sec.flatMap(s => s.produits) : []);
                     const ndItems    = isV4 ? (o.nds || [])   : [];
                     const fraisItems = isV4 ? (o.frais || []) : (cd ? cd.frais.flatMap(f => f.produits) : []);
-                    // Dispatch dernière minute pour les casiers de ce client (inchangé)
-                    const lmItems = (casiersFrais.length || casiersSec.length)
-                      ? [...casiersFrais, ...casiersSec].flatMap(cas => (lmByCasier[cas] || []))
-                      : [];
+                    // V9.65 : LM par identité client + repli casier (au lieu du numéro nu).
+                    const lmItems = lmForClient(o, casiersFrais, casiersSec);
                     const allCasiers = [...casiersFrais.map(c=>({c,t:'F'})), ...casiersSec.map(c=>({c,t:'S'}))];
                     const clickable = isV4 || cd; // détail ouvrable si on a des données
                     return (
@@ -3164,7 +3208,7 @@
           )}
 
           {selectedClient && !dispatch && (Array.isArray(selectedClient.items)) && (
-            <ClientDetailV4 order={selectedClient} lmByCasier={lmByCasier} session={session} onClose={() => setSelectedClient(null)} />
+            <ClientDetailV4 order={selectedClient} lmForClient={lmForClient} session={session} onClose={() => setSelectedClient(null)} />
           )}
           {selectedClient && dispatch && (
             <DispatchModal
@@ -3317,7 +3361,7 @@
       );
     }
 
-    function ClientDetailV4({ order, lmByCasier, session, onClose }) {
+    function ClientDetailV4({ order, lmForClient, session, onClose }) {
       const o = order;
       const dayKey = activeDay();
       const [refunds, setRefunds] = React.useState([]);
@@ -3336,7 +3380,7 @@
       const amt = orderAmounts(o);
       const reelNet = amt.reel - totalRefund;
       const casiers = [...(o.casiersFrais || []).map(c => ({ c, t: '🧊' })), ...(o.casiersSec || []).map(c => ({ c, t: '🍞' }))];
-      const lm = [...(o.casiersFrais || []), ...(o.casiersSec || [])].flatMap(cas => (lmByCasier && lmByCasier[cas]) || []);
+      const lm = lmForClient ? lmForClient(o, o.casiersFrais || [], o.casiersSec || []) : [];
       const reducedByKey = {};
       for (const r of (o.reduced || [])) reducedByKey[r.id || r.produit] = r.percentage || 0;
       const lineEuro = (p) => fmtEuro((p.consumer_price || 0) * (p.qty || 1));
@@ -12329,15 +12373,23 @@
         return () => { u1(); u2(); u3(); };
       }, [day]);
 
-      // Casier → nom du client (par boutique), pour afficher À QUI le ND a été attribué.
-      const casierName = React.useMemo(() => {
+      // Casier → noms des clients (par boutique). Plusieurs clients peuvent partager un même
+      // numéro de casier (frais/sec, ou numérotation par client). On garde donc un Set de noms
+      // par casier au lieu d'écraser (avant : « dernier client gagne » → nom affiché faux).
+      const casierNames = React.useMemo(() => {
         const map = {};
         for (const o of (orders || [])) {
           const site = (o.site || '').toUpperCase();
           if (!site) continue;
+          const nm = o.name || o.email || '';
+          if (!nm) continue;
           if (!map[site]) map[site] = {};
           const cs = [...(o.casiersFrais || []), ...(o.casiersSec || [])];
-          for (const c of cs) { if (c != null && c !== '') map[site][String(c)] = o.name || o.email || ''; }
+          for (const c of cs) {
+            if (c == null || c === '') continue;
+            const k = String(c);
+            (map[site][k] || (map[site][k] = new Set())).add(nm);
+          }
         }
         return map;
       }, [orders]);
@@ -12462,10 +12514,23 @@
                              <div style={{fontWeight:700,fontSize:12,marginBottom:2}}>{site}</div>
                              <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                                {(arr || []).filter(c => (c.qty||0) > 0).sort((a,b)=>String(a.casier).localeCompare(String(b.casier),undefined,{numeric:true})).map((c, ci) => {
-                                 const nm = (c.casier !== 'ND' && casierName[site]) ? (casierName[site][String(c.casier)] || '') : '';
+                                 // V9.64 : identité fiable si enregistrée au dispatch (c.clients).
+                                 // Sinon repli honnête sur les commandes : 1 nom → sûr, plusieurs → ⚠ ambigu.
+                                 let nm = '', ambiguous = false;
+                                 if (c.casier !== 'ND') {
+                                   const carried = Array.isArray(c.clients)
+                                     ? [...new Set(c.clients.map(x => (x && x.name) || '').filter(Boolean))] : [];
+                                   if (carried.length) { nm = carried.join(', '); }
+                                   else {
+                                     const set = casierNames[site] && casierNames[site][String(c.casier)];
+                                     const names = set ? [...set] : [];
+                                     if (names.length === 1) nm = names[0];
+                                     else if (names.length > 1) { nm = names.join(' / '); ambiguous = true; }
+                                   }
+                                 }
                                  return (
-                                   <span key={ci} className="badge" style={{background: c.casier==='ND'?'var(--warn-soft)':'var(--master-soft)', color: c.casier==='ND'?'var(--warn)':'var(--master)', fontSize:11}}>
-                                     {c.casier==='ND' ? 'Bac ND' : `Casier ${c.casier}`}{nm ? ` — ${nm}` : ''} : {c.qty}
+                                   <span key={ci} className="badge" title={ambiguous ? 'Plusieurs clients partagent ce numéro de casier — identité non enregistrée au dispatch (donnée ancienne).' : undefined} style={{background: c.casier==='ND'?'var(--warn-soft)':(ambiguous?'var(--warn-soft)':'var(--master-soft)'), color: c.casier==='ND'?'var(--warn)':(ambiguous?'var(--warn)':'var(--master)'), fontSize:11}}>
+                                     {c.casier==='ND' ? 'Bac ND' : `${c.ctype==='S'?'🍞 ':c.ctype==='F'?'🧊 ':''}Casier ${c.casier}`}{nm ? ` — ${ambiguous ? '⚠ ' : ''}${nm}` : ''} : {c.qty}
                                    </span>
                                  );
                                })}
