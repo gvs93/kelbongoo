@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.66</title>
+  <title>Kelbongoo — Distribution V9.56</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.66';
+    const APP_VERSION = 'V9.67';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -1081,6 +1081,9 @@
       const salesByProduct = {}; // { pid: { id, produit, producteur, cat, qty, ca_cents } }
       const out = [];
       let dateKey = null;
+      // Index secondaire du fichier clients par e-mail (repli quand l'id ne matche pas).
+      const consByEmail = {};
+      for (const _k in consById) { const _e = consById[_k] && consById[_k].email; if (_e) consByEmail[_e] = consById[_k]; }
 
       for (const o of arr) {
         const status = o.status;
@@ -1089,7 +1092,9 @@
         else { if (status === 8 || status === 0) continue; }
 
         const cid = oid(o.consumer_id);
-        const cons = consById[cid];
+        // Repli : si l'id n'est pas dans le fichier clients, on tente par e-mail porté par la commande.
+        const _rawEmail = String(o.consumer_email || o.email || (o.consumer && o.consumer.email) || '').trim().toLowerCase();
+        const cons = consById[cid] || (_rawEmail ? consByEmail[_rawEmail] : null) || null;
         if (!cons) missingConsumers.add(cid);
 
         // Date de distribution → clé jour (YYYYMMDD)
@@ -1120,9 +1125,10 @@
           status,
           site: (o.locale || '').trim().toUpperCase(),
           consumerId: cid,
-          name: cons ? cons.nom : '(client inconnu)',
-          email: cons ? cons.email : '',
-          tel: cons ? cons.tel : '',
+          newClient: !cons,   // absent du fichier consumers chargé → « nouveau client »
+          name: cons ? cons.nom : (`${o.firstname||''} ${o.lastname||''}`.trim() || String(o.consumer_name||o.name||'').trim() || String(o.consumer_email||o.email||'').trim() || '(client inconnu)'),
+          email: cons ? cons.email : String(o.consumer_email||o.email||'').trim().toLowerCase(),
+          tel: cons ? cons.tel : String(o.tel||o.telephone||o.phone||'').replace(/\s+/g,''),
           casiersFrais: (o.bacs_frais || []).map(String),
           casiersSec: (o.bacs_sec || []).map(String),
           items,
@@ -1131,7 +1137,7 @@
           frais: items.filter(i => i.cat === 'frais'),
           removed: (o.removed || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
-            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, reason: r.reason, cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais' };
+            return { id: oid(r.producerproduct_id), produit: p ? p.name : '(inconnu)', producteur: p ? p.producer : '', qty: r.quantity || 1, consumer_price: r.consumer_price || 0, reason: r.reason };
           }),
           reduced: (o.reduced || []).map(r => {
             const p = prodById[oid(r.producerproduct_id)];
@@ -1617,27 +1623,17 @@
         // ses cerises en prépa recevait un 2e sachet en dernière minute (et était re-facturé).
         // Le repli `items` est donc supprimé : un produit reçu en extra SANS rupture client
         // ne s'attribue plus automatiquement aux casiers — il part au bac ND (réparti à la main).
-        let q = 0, prodCat = '';
+        let q = 0;
         for (const r of (o.removed || [])) {
-          if (matches(r)) { q += (r.qty || 0); if (!prodCat && r.cat) prodCat = r.cat; }
+          if (matches(r)) q += (r.qty || 0);
         }
         if (q <= 0) continue;
-        // V9.66 : casier selon la catégorie du produit. Frais et sec ont des numérotations
-        // SÉPARÉES (1,2,3… par type) — un pain va dans le casier SEC (🍞), sinon casier FRAIS (🧊).
-        const useSec = (prodCat === 'pain');
-        const primary  = useSec ? (o.casiersSec || []) : (o.casiersFrais || []);
-        const fallback = useSec ? (o.casiersFrais || []) : (o.casiersSec || []);
-        let casier = 'ND', ctype = '';
-        if (primary[0]) { casier = primary[0]; ctype = useSec ? 'S' : 'F'; }
-        else if (fallback[0]) { casier = fallback[0]; ctype = useSec ? 'F' : 'S'; }
+        // casier du client : frais d'abord, sinon sec, sinon bac ND
+        const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
         if (!out[site]) out[site] = { total: 0, casiers: [] };
         out[site].total += q;
-        // V9.64 : on conserve l'identité du client attribué. Sans ça, l'historique devait
-        // re-deviner le nom par numéro de casier — faux dès qu'un numéro est partagé.
-        const who = { name: o.name || o.email || '', email: o.email || '', consumerId: o.consumerId || '', qty: q };
-        const ex = out[site].casiers.find(c => c.casier === casier && c.ctype === ctype);
-        if (ex) { ex.qty += q; (ex.clients || (ex.clients = [])).push(who); }
-        else out[site].casiers.push({ casier, ctype, qty: q, clients: [who] });
+        const ex = out[site].casiers.find(c => c.casier === casier);
+        if (ex) ex.qty += q; else out[site].casiers.push({ casier, qty: q });
       }
       return out;
     }
@@ -1698,8 +1694,7 @@
       for (const c of sorted) {
         if (left <= 0) break;
         const give = Math.min(c.qty, left);
-        // V9.64/66 : propage l'identité ET le type de casier (frais/sec) vers le dispatch.
-        out.push({ casier: c.casier, qty: give, ...(c.ctype ? { ctype: c.ctype } : {}), ...(c.clients ? { clients: c.clients } : {}) });
+        out.push({ casier: c.casier, qty: give });
         left -= give;
       }
       // ré-ordonne le rendu par casier croissant pour rester lisible côté distributeur
@@ -2898,7 +2893,6 @@
       const [selectedClient, setSelectedClient] = React.useState(null);
 
       // Index dispatch dernière minute pour CE site : { [casier]: [{produit, qty}] }
-      // Conservé tel quel (par numéro nu) pour le modal legacy DispatchModal (chemin PDF).
       const lmByCasier = React.useMemo(() => {
         const idx = {};
         for (const l of (lastminute || [])) {
@@ -2910,40 +2904,6 @@
         }
         return idx;
       }, [lastminute, currentSite]);
-
-      // V9.65 — Attribution LM par IDENTITÉ client (immune à la collision de numéros frais/sec/pain).
-      // • lmByClientKey : dispatches récents qui portent l'identité (clients[]) → indexés par client.
-      // • lmByCasierNoId : anciens dispatches SANS identité → repli par numéro de casier.
-      // (On exclut les bacs ND, traités à part par lmBacND.)
-      const { lmByClientKey, lmByCasierNoId } = React.useMemo(() => {
-        const byClient = {}, byCasier = {};
-        for (const l of (lastminute || [])) {
-          const arr = (l.allocBySite && l.allocBySite[currentSite]) || [];
-          for (const c of arr) {
-            if (c.casier === 'ND') continue;
-            if (Array.isArray(c.clients) && c.clients.length) {
-              for (const cl of c.clients) {
-                const key = cl.consumerId || cl.email || cl.name;
-                if (!key) continue;
-                (byClient[key] = byClient[key] || []).push({ produit: l.produit, producteur: l.producteur, qty: (cl.qty != null ? cl.qty : c.qty) });
-              }
-            } else {
-              (byCasier[c.casier] = byCasier[c.casier] || []).push({ produit: l.produit, producteur: l.producteur, qty: c.qty });
-            }
-          }
-        }
-        return { lmByClientKey: byClient, lmByCasierNoId: byCasier };
-      }, [lastminute, currentSite]);
-
-      // LM d'un client = match par identité (fiable) + repli legacy par numéro de casier (vieux dispatches).
-      const lmForClient = React.useCallback((o, casFrais, casSec) => {
-        const key = o.consumerId || o.email || displayName(o);
-        const out = [...(lmByClientKey[key] || [])];
-        for (const cas of [...(casFrais || []), ...(casSec || [])]) {
-          for (const it of (lmByCasierNoId[cas] || [])) out.push(it);
-        }
-        return out;
-      }, [lmByClientKey, lmByCasierNoId]);
 
       // Dispatch dernière minute SANS casier (bac ND) pour CE site : à répartir sur place
       const lmBacND = React.useMemo(() => {
@@ -3131,8 +3091,10 @@
                     const pains      = isV4 ? (o.pains || []) : (cd ? cd.sec.flatMap(s => s.produits) : []);
                     const ndItems    = isV4 ? (o.nds || [])   : [];
                     const fraisItems = isV4 ? (o.frais || []) : (cd ? cd.frais.flatMap(f => f.produits) : []);
-                    // V9.65 : LM par identité client + repli casier (au lieu du numéro nu).
-                    const lmItems = lmForClient(o, casiersFrais, casiersSec);
+                    // Dispatch dernière minute pour les casiers de ce client (inchangé)
+                    const lmItems = (casiersFrais.length || casiersSec.length)
+                      ? [...casiersFrais, ...casiersSec].flatMap(cas => (lmByCasier[cas] || []))
+                      : [];
                     const allCasiers = [...casiersFrais.map(c=>({c,t:'F'})), ...casiersSec.map(c=>({c,t:'S'}))];
                     const clickable = isV4 || cd; // détail ouvrable si on a des données
                     return (
@@ -3141,6 +3103,9 @@
                           <div className="list-item-name">
                             <span className={`indicator-dot ${passed ? 'passed' : 'not-passed'}`}></span>
                             {displayName(o)}
+                            {o.newClient && (
+                              <span className="badge" style={{marginLeft:6,background:'#EAF1FC',color:'#2C5CC5',fontSize:10,fontWeight:700}} title="Client absent de la dernière liste consumers chargée">🆕 nouveau</span>
+                            )}
                             {o._mergedCount > 1 && (
                               <span className="badge" style={{marginLeft:6,background:'var(--info-soft)',color:'var(--info)',fontSize:10}}>🔗 fusionné ×{o._mergedCount}</span>
                             )}
@@ -3208,7 +3173,7 @@
           )}
 
           {selectedClient && !dispatch && (Array.isArray(selectedClient.items)) && (
-            <ClientDetailV4 order={selectedClient} lmForClient={lmForClient} session={session} onClose={() => setSelectedClient(null)} />
+            <ClientDetailV4 order={selectedClient} lmByCasier={lmByCasier} session={session} onClose={() => setSelectedClient(null)} />
           )}
           {selectedClient && dispatch && (
             <DispatchModal
@@ -3361,7 +3326,7 @@
       );
     }
 
-    function ClientDetailV4({ order, lmForClient, session, onClose }) {
+    function ClientDetailV4({ order, lmByCasier, session, onClose }) {
       const o = order;
       const dayKey = activeDay();
       const [refunds, setRefunds] = React.useState([]);
@@ -3380,7 +3345,7 @@
       const amt = orderAmounts(o);
       const reelNet = amt.reel - totalRefund;
       const casiers = [...(o.casiersFrais || []).map(c => ({ c, t: '🧊' })), ...(o.casiersSec || []).map(c => ({ c, t: '🍞' }))];
-      const lm = lmForClient ? lmForClient(o, o.casiersFrais || [], o.casiersSec || []) : [];
+      const lm = [...(o.casiersFrais || []), ...(o.casiersSec || [])].flatMap(cas => (lmByCasier && lmByCasier[cas]) || []);
       const reducedByKey = {};
       for (const r of (o.reduced || [])) reducedByKey[r.id || r.produit] = r.percentage || 0;
       const lineEuro = (p) => fmtEuro((p.consumer_price || 0) * (p.qty || 1));
@@ -6295,8 +6260,56 @@
     // brouillon assisté par IA (Gemini, clé planquée côté proxy).
     // Actions proxy : fd_list, fd_thread, fd_reply, ai_draft.
     // ============================================================
+    // ============================================================
+    // ONGLET MAILS (MASTER) — habillage « Freshdesk » (boîte helpdesk)
+    // Palette Freshdesk : fond gris-bleu, navy, bleu d'action, pastilles
+    // de statut, avatars ronds à initiales. Logique inchangée (fd_list /
+    // fd_thread / fd_reply / ai_draft).
+    // ============================================================
+    // ============================================================
+    // ONGLET MAILS (MASTER) — habillage fidèle à l'app mobile Freshdesk
+    // Cartes blanches sur fond gris, avatar pastel à initiale, objet navy,
+    // pastilles priorité + statut, barre de titre + recherche, tri/filtre.
+    // Logique inchangée (fd_list / fd_thread / fd_reply / ai_draft).
+    // Nécessite proxy ≥ v15 pour nom + priorité dans la liste.
+    // ============================================================
     const FD_STATUS = { 2: 'Ouvert', 3: 'En attente', 4: 'Résolu', 5: 'Fermé' };
-    const FD_STATUS_COLOR = { 2: 'var(--danger)', 3: 'var(--info)', 4: 'var(--accent)', 5: 'var(--ink-mute)' };
+    const FD_STATUS_COLOR = { 2: '#E8583B', 3: '#3B7DED', 4: '#25C16F', 5: '#8A98A8' };
+    const FD_PRIO = { 1: { label: 'Faible', color: '#25C16F' }, 2: { label: 'Moyenne', color: '#3B7DED' }, 3: { label: 'Haute', color: '#EFA130' }, 4: { label: 'Urgente', color: '#E8583B' } };
+    const FD_PAGE = '#ECEFF3', FD_LINE = '#E4E9EF', FD_NAVY = '#12344D', FD_INK = '#33475B', FD_MUTE = '#5B6B7B', FD_BLUE = '#2C5CC5';
+    const FD_AVATAR = [
+      { bg: '#FBE0E6', fg: '#C2557A' }, { bg: '#DDF3E6', fg: '#2E9E6B' }, { bg: '#E1E9FB', fg: '#3B62C4' },
+      { bg: '#FCEBD6', fg: '#C6821F' }, { bg: '#EEE2F7', fg: '#8E44AD' }, { bg: '#D9F1F1', fg: '#16938F' },
+    ];
+    function fdInitials(name, email) {
+      const s = String(name || email || '?').trim();
+      const p = s.split(/[\s._@-]+/).filter(Boolean);
+      return (((p[0] || '')[0] || '') + ((p[1] || '')[0] || '') || (p[0] || '?')[0] || '?').toUpperCase();
+    }
+    function fdPastel(key) {
+      const s = String(key || ''); let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+      return FD_AVATAR[h % FD_AVATAR.length];
+    }
+    function FdAvatar({ name, email, size = 42, agent = false }) {
+      const c = agent ? { bg: FD_NAVY, fg: '#fff' } : fdPastel(email || name);
+      return (
+        <div style={{width:size,height:size,borderRadius:'50%',background:c.bg,color:c.fg,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,fontSize:size*0.4,flexShrink:0}}>
+          {agent ? 'KB' : fdInitials(name, email)}
+        </div>
+      );
+    }
+    function fdAgo(iso) {
+      if (!iso) return '';
+      const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if (s < 3600) return 'il y a ' + Math.max(1, Math.floor(s / 60)) + ' min';
+      if (s < 86400) return 'il y a ' + Math.floor(s / 3600) + ' h';
+      const j = Math.floor(s / 86400);
+      if (j < 31) return 'il y a ' + j + ' j';
+      return 'il y a ' + Math.floor(j / 30) + ' mois';
+    }
+    const FdIconMail = () => (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={FD_MUTE} strokeWidth="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>);
+    const FdIconActivity = ({ c }) => (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>);
 
     function MailsPage({ session }) {
       const showToast = React.useContext(ToastContext);
@@ -6304,6 +6317,9 @@
       const [loading, setLoading] = React.useState(false);
       const [includeAll, setIncludeAll] = React.useState(false);
       const [err, setErr] = React.useState('');
+      const [search, setSearch] = React.useState('');
+      const [showSearch, setShowSearch] = React.useState(false);
+      const [sortAsc, setSortAsc] = React.useState(false);
 
       const [selId, setSelId] = React.useState(null);
       const [thread, setThread] = React.useState(null);
@@ -6348,12 +6364,9 @@
         setAiBusy(true);
         try {
           const data = await freshdeskPost({
-            secret: FRESHDESK_SECRET,
-            action: 'ai_draft',
-            thread: threadAsText(),
-            instruction: instruction.trim(),
-            clientName: thread.requesterName || '',
-            subject: thread.subject || '',
+            secret: FRESHDESK_SECRET, action: 'ai_draft',
+            thread: threadAsText(), instruction: instruction.trim(),
+            clientName: thread.requesterName || '', subject: thread.subject || '',
           });
           if (data.ok && data.draft) setReply(data.draft);
           else showToast(data.error || 'IA indisponible');
@@ -6366,15 +6379,12 @@
         if (!confirm(`Envoyer cette réponse à ${thread.requesterName || thread.requesterEmail || 'ce client'} ?`)) return;
         setSending(true);
         try {
-          const data = await freshdeskPost({
-            secret: FRESHDESK_SECRET, action: 'fd_reply', id: selId, body: reply, resolve: true,
-          });
+          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'fd_reply', id: selId, body: reply, resolve: true });
           if (data.ok) {
             showToast('✓ Réponse envoyée');
-            // Enchaîner sur le mail suivant plutôt que revenir à la liste générale.
             const idx = tickets.findIndex(t => t.id === selId);
             const next = (idx >= 0) ? tickets[idx + 1] : null;
-            loadList(); // rafraîchit la boîte en arrière-plan (le ticket résolu disparaît)
+            loadList();
             if (next) { openTicket(next.id); }
             else { setSelId(null); setThread(null); setReply(''); showToast('✓ Boîte traitée 🎉'); }
           } else showToast('Échec : ' + (data.error || 'inconnu'));
@@ -6382,117 +6392,165 @@
         setSending(false);
       };
 
-      // ---- Vue FIL (ticket sélectionné) ----
+      // ============ VUE FIL ============
       if (selId) {
         return (
-          <div className="page" style={{paddingBottom:24}}>
-            <button className="btn-ghost" style={{marginBottom:10,fontSize:13}} onClick={()=>{ setSelId(null); setThread(null); }}>← Boîte mail</button>
+          <div style={{background:FD_PAGE,borderRadius:14,overflow:'hidden',border:'1px solid '+FD_LINE}}>
+            <div style={{background:'#fff',borderBottom:'1px solid '+FD_LINE,padding:'12px 14px'}}>
+              <button onClick={()=>{ setSelId(null); setThread(null); }} style={{background:'none',border:'none',color:FD_BLUE,fontSize:13,fontWeight:600,padding:0,cursor:'pointer',marginBottom:10}}>‹ Tickets</button>
+              {thread && (
+                <>
+                  <div style={{display:'flex',alignItems:'center',gap:10}}>
+                    <FdAvatar name={thread.requesterName} email={thread.requesterEmail} size={40} />
+                    <div style={{minWidth:0,flex:1}}>
+                      <div style={{fontWeight:600,fontSize:15,color:FD_NAVY,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{thread.requesterName || thread.requesterEmail || 'Client'}</div>
+                      <div style={{fontSize:12,color:FD_MUTE,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{thread.requesterEmail || ''}</div>
+                    </div>
+                    {thread.status != null && (
+                      <span style={{display:'inline-flex',alignItems:'center',gap:5,fontSize:12,color:FD_MUTE,border:'1px solid '+FD_LINE,borderRadius:8,padding:'4px 9px',whiteSpace:'nowrap'}}>
+                        <FdIconActivity c={FD_STATUS_COLOR[thread.status]||FD_MUTE} />{FD_STATUS[thread.status] || 'En cours'}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{fontSize:16,fontWeight:700,color:FD_NAVY,marginTop:10}}>{thread.subject || '(sans objet)'}</div>
+                </>
+              )}
+            </div>
 
-            {threadLoading && <div className="card-flat" style={{padding:14,color:'var(--ink-mute)'}}>Chargement du fil…</div>}
+            {threadLoading && <div style={{padding:20,color:FD_MUTE,fontSize:13}}>Chargement de la conversation…</div>}
 
             {thread && (
-              <>
-                <div className="card" style={{padding:'12px 14px',marginBottom:12}}>
-                  <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{thread.subject || '(sans objet)'}</div>
-                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>
-                    {thread.requesterName ? thread.requesterName + ' · ' : ''}{thread.requesterEmail || ''}
-                    {thread.status != null && <span className="badge" style={{marginLeft:6,background:FD_STATUS_COLOR[thread.status],color:'#fff'}}>{FD_STATUS[thread.status] || thread.status}</span>}
-                  </div>
-                </div>
-
-                <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
+              <div style={{padding:'12px 12px 16px'}}>
+                <div style={{display:'flex',flexDirection:'column',gap:12,marginBottom:16}}>
                   {(thread.messages || []).map((m, i) => (
-                    <div key={i} className="card-flat" style={{
-                      padding:'10px 12px',
-                      background: m.incoming ? 'var(--bg-soft, #f6f5f2)' : 'rgba(74,124,59,0.08)',
-                      borderLeft: '3px solid ' + (m.incoming ? 'var(--ink-mute)' : 'var(--accent)'),
-                    }}>
-                      <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:4,display:'flex',justifyContent:'space-between',gap:8}}>
-                        <strong>{m.incoming ? '👤 Client' : '🏬 Kelbongoo'}</strong>
-                        <span>{m.at ? formatDateShort(m.at) + ' ' + (formatTimeFR(m.at)) : ''}</span>
+                    <div key={i} style={{display:'flex',gap:8,flexDirection: m.incoming?'row':'row-reverse'}}>
+                      {m.incoming ? <FdAvatar name={thread.requesterName} email={m.email || thread.requesterEmail} size={32} /> : <FdAvatar agent size={32} />}
+                      <div style={{minWidth:0,flex:1,background: m.incoming?'#fff':'#EAF1FC',border:'1px solid '+(m.incoming?FD_LINE:'#CFE0F7'),borderRadius:12,borderTopLeftRadius:m.incoming?2:12,borderTopRightRadius:m.incoming?12:2,padding:'9px 12px'}}>
+                        <div style={{display:'flex',justifyContent:'space-between',gap:8,marginBottom:4,alignItems:'baseline'}}>
+                          <span style={{fontSize:12,fontWeight:700,color:m.incoming?FD_INK:FD_NAVY}}>{m.incoming ? (thread.requesterName || 'Client') : 'Kelbongoo'}</span>
+                          <span style={{fontSize:11,color:FD_MUTE,whiteSpace:'nowrap'}}>{m.at ? formatDateShort(m.at)+' · '+formatTimeFR(m.at) : ''}</span>
+                        </div>
+                        <div style={{fontSize:13.5,color:FD_INK,whiteSpace:'pre-wrap',lineHeight:1.5}}>{m.body || ''}</div>
                       </div>
-                      <div style={{fontSize:13,whiteSpace:'pre-wrap',lineHeight:1.4}}>{m.body || ''}</div>
                     </div>
                   ))}
                 </div>
 
-                <div className="card" style={{padding:'12px 14px'}}>
-                  <div style={{fontWeight:600,fontSize:13,marginBottom:8}}>✍️ Répondre</div>
-
-                  <input
-                    type="text"
-                    value={instruction}
-                    onChange={e=>setInstruction(e.target.value)}
-                    placeholder="Consigne pour l'IA (option) : ex. « propose un remboursement », « explique la DLC J+3 »…"
-                    style={{width:'100%',boxSizing:'border-box',padding:'8px 10px',fontSize:12,marginBottom:8,border:'1px solid var(--line,#ddd)',borderRadius:8}}
-                  />
-
-                  <button className="btn-secondary" style={{fontSize:13,marginBottom:8}} disabled={aiBusy} onClick={genDraft}>
-                    {aiBusy ? '✨ Rédaction…' : '✨ Brouillon IA'}
-                  </button>
-
-                  <textarea
-                    value={reply}
-                    onChange={e=>setReply(e.target.value)}
-                    placeholder="Ta réponse au client (relis toujours le brouillon IA avant d'envoyer)…"
-                    rows={9}
-                    style={{width:'100%',boxSizing:'border-box',padding:'10px',fontSize:14,border:'1px solid var(--line,#ddd)',borderRadius:8,lineHeight:1.45,resize:'vertical'}}
-                  />
-
-                  <div style={{display:'flex',gap:8,marginTop:10}}>
-                    <button className="btn-primary" style={{flex:1}} disabled={sending || !reply.trim()} onClick={send}>
-                      {sending ? 'Envoi…' : '📤 Envoyer la réponse'}
-                    </button>
-                    <button className="btn-ghost" onClick={()=>setReply('')} disabled={sending}>Effacer</button>
-                  </div>
-                  <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:8}}>
-                    La réponse part au client via Freshdesk (copie interne à contact@). Le ticket passe en « Résolu ».
+                <div style={{background:'#fff',border:'1px solid '+FD_LINE,borderRadius:12,overflow:'hidden'}}>
+                  <div style={{padding:'8px 12px',borderBottom:'1px solid '+FD_LINE,fontSize:12,fontWeight:700,color:FD_NAVY,textTransform:'uppercase',letterSpacing:0.4}}>Répondre</div>
+                  <div style={{padding:12}}>
+                    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+                      <input type="text" value={instruction} onChange={e=>setInstruction(e.target.value)}
+                        placeholder="Consigne IA (option) : « propose un remboursement »…"
+                        style={{flex:1,minWidth:180,boxSizing:'border-box',padding:'9px 11px',fontSize:12.5,border:'1px solid '+FD_LINE,borderRadius:8,color:FD_INK}} />
+                      <button onClick={genDraft} disabled={aiBusy}
+                        style={{fontSize:12.5,fontWeight:600,color:FD_BLUE,background:'#fff',border:'1px solid '+FD_BLUE,borderRadius:8,padding:'0 14px',cursor:aiBusy?'default':'pointer',whiteSpace:'nowrap'}}>
+                        {aiBusy ? '✨ Rédaction…' : '✨ Brouillon IA'}
+                      </button>
+                    </div>
+                    <textarea value={reply} onChange={e=>setReply(e.target.value)} rows={8}
+                      placeholder="Écris ta réponse (relis le brouillon IA avant d'envoyer)…"
+                      style={{width:'100%',boxSizing:'border-box',padding:'11px',fontSize:14,border:'1px solid '+FD_LINE,borderRadius:8,lineHeight:1.5,resize:'vertical',color:FD_INK}} />
+                    <div style={{display:'flex',alignItems:'center',gap:8,marginTop:10,flexWrap:'wrap'}}>
+                      <div style={{fontSize:11,color:FD_MUTE,flex:1,minWidth:140}}>Envoi via Freshdesk · copie contact@ · ticket → « Résolu ».</div>
+                      <button onClick={()=>setReply('')} disabled={sending} style={{fontSize:13,color:FD_MUTE,background:'none',border:'none',cursor:'pointer',padding:'8px 6px'}}>Effacer</button>
+                      <button onClick={send} disabled={sending || !reply.trim()}
+                        style={{fontSize:14,fontWeight:700,color:'#fff',background:(sending||!reply.trim())?'#9db4dd':FD_BLUE,border:'none',borderRadius:8,padding:'9px 18px',cursor:(sending||!reply.trim())?'default':'pointer'}}>
+                        {sending ? 'Envoi…' : 'Envoyer ▸'}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </>
+              </div>
             )}
           </div>
         );
       }
 
-      // ---- Vue LISTE (boîte) ----
+      // ============ VUE LISTE ============
+      const q = search.trim().toLowerCase();
+      const filtered = tickets.filter(t => !q || (`${t.requesterName} ${t.requesterEmail} ${t.subject} ${t.preview}`).toLowerCase().includes(q));
+      const shown = sortAsc ? [...filtered].reverse() : filtered;
+
       return (
-        <div className="page" style={{paddingBottom:24}}>
-          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,marginBottom:12}}>
-            <h1 style={{margin:0,fontSize:20}}>📧 Mails clients <span className="ver-badge">{APP_VERSION}</span></h1>
-            <button className="btn-ghost" style={{fontSize:13}} disabled={loading} onClick={loadList}>↻ Actualiser</button>
+        <div style={{background:FD_PAGE,borderRadius:14,border:'1px solid '+FD_LINE,overflow:'hidden'}}>
+          {/* Barre de titre */}
+          <div style={{background:'#fff',borderBottom:'1px solid '+FD_LINE,padding:'12px 14px',display:'flex',alignItems:'center',gap:10}}>
+            <div style={{display:'flex',flexDirection:'column',gap:3,flexShrink:0}}>
+              <span style={{width:18,height:2,background:FD_NAVY,borderRadius:2}} /><span style={{width:18,height:2,background:FD_NAVY,borderRadius:2}} /><span style={{width:12,height:2,background:FD_NAVY,borderRadius:2}} />
+            </div>
+            <div style={{fontSize:16,fontWeight:700,color:FD_NAVY,flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+              {includeAll ? 'Tous les tickets' : 'Tickets non résolus'} ({shown.length})<span className="ver-badge" style={{marginLeft:6}}>{APP_VERSION}</span>
+            </div>
+            <button onClick={()=>setShowSearch(s=>!s)} title="Rechercher" style={{background:'none',border:'none',cursor:'pointer',color:FD_NAVY,fontSize:17,padding:4}}>🔍</button>
+            <button onClick={loadList} disabled={loading} title="Actualiser" style={{background:'none',border:'none',cursor:'pointer',color:FD_NAVY,fontSize:16,padding:4}}>↻</button>
           </div>
 
-          <label style={{display:'flex',alignItems:'center',gap:6,fontSize:13,color:'var(--ink-mute)',marginBottom:12,cursor:'pointer'}}>
-            <input type="checkbox" checked={includeAll} onChange={e=>setIncludeAll(e.target.checked)} />
-            Inclure résolus / fermés
-          </label>
+          {/* Ligne tri / filtre */}
+          <div style={{background:'#fff',borderBottom:'1px solid '+FD_LINE,padding:'9px 14px',display:'flex',alignItems:'center',gap:12,fontSize:13.5,color:FD_INK}}>
+            <button onClick={()=>setSortAsc(a=>!a)} style={{display:'flex',alignItems:'center',gap:6,background:'none',border:'none',color:FD_INK,cursor:'pointer',fontSize:13.5,padding:0}}>
+              <span style={{fontSize:15}}>⇅</span> Date de création {sortAsc ? '↑' : '↓'}
+            </button>
+            <span style={{width:1,height:16,background:FD_LINE}} />
+            <button onClick={()=>setIncludeAll(v=>!v)} style={{display:'flex',alignItems:'center',gap:6,background:'none',border:'none',color:includeAll?FD_BLUE:FD_INK,cursor:'pointer',fontSize:13.5,padding:0}}>
+              <span style={{fontSize:14}}>▽</span> {includeAll ? 'Tous' : 'Non résolus'}
+            </button>
+          </div>
 
-          {err && <div className="card-flat" style={{padding:12,color:'var(--danger)',marginBottom:10,fontSize:13}}>⚠️ {err}</div>}
-
-          {loading && <div className="card-flat" style={{padding:14,color:'var(--ink-mute)'}}>Chargement de la boîte…</div>}
-
-          {!loading && tickets.length === 0 && !err && (
-            <div className="card-flat" style={{padding:18,textAlign:'center',color:'var(--ink-mute)'}}>
-              Aucun ticket {includeAll ? '' : 'ouvert ou en attente'} 🎉
+          {showSearch && (
+            <div style={{background:'#fff',borderBottom:'1px solid '+FD_LINE,padding:'8px 14px'}}>
+              <input autoFocus value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher un nom, un objet…"
+                style={{width:'100%',boxSizing:'border-box',padding:'9px 11px',fontSize:13.5,border:'1px solid '+FD_LINE,borderRadius:8,color:FD_INK}} />
             </div>
           )}
 
-          <div style={{display:'flex',flexDirection:'column',gap:8}}>
-            {tickets.map(t => (
-              <div key={t.id} className="card" style={{padding:'11px 13px',cursor:'pointer',display:'flex',alignItems:'flex-start',gap:10}} onClick={()=>openTicket(t.id)}>
-                <div style={{minWidth:0,flex:1}}>
-                  <div style={{fontWeight:600,fontSize:14,marginBottom:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{t.subject || '(sans objet)'}</div>
-                  <div style={{fontSize:12,color:'var(--ink-mute)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-                    {t.requesterName || t.requesterEmail || 'Client'}{t.preview ? ' — ' + t.preview : ''}
+          <div style={{padding:'10px'}}>
+            {err && <div style={{padding:'10px 12px',background:'#FDECEA',border:'1px solid #F5C2BC',borderRadius:8,color:'#B23B2E',fontSize:13,marginBottom:10}}>⚠️ {err}</div>}
+            {loading && <div style={{padding:14,color:FD_MUTE,fontSize:13}}>Chargement de la boîte…</div>}
+
+            {!loading && shown.length === 0 && !err && (
+              <div style={{padding:'40px 18px',textAlign:'center',color:FD_MUTE}}>
+                <div style={{fontSize:34,marginBottom:8}}>📭</div>
+                <div style={{fontSize:14,fontWeight:600,color:FD_INK}}>{q ? 'Aucun résultat' : 'Rien à traiter'}</div>
+                <div style={{fontSize:12}}>{q ? 'Essaie un autre terme.' : 'Aucun ticket ' + (includeAll ? '' : 'non résolu') + '. Bien joué !'}</div>
+              </div>
+            )}
+
+            {shown.map(t => {
+              const prio = FD_PRIO[t.priority] || FD_PRIO[1];
+              const sc = FD_STATUS_COLOR[t.status] || FD_MUTE;
+              return (
+                <div key={t.id} onClick={()=>openTicket(t.id)}
+                  style={{background:'#fff',border:'1px solid '+FD_LINE,borderRadius:12,padding:'14px',marginBottom:10,cursor:'pointer',boxShadow:'0 1px 2px rgba(18,52,77,0.05)'}}>
+                  {/* Ligne client */}
+                  <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
+                    <FdAvatar name={t.requesterName} email={t.requesterEmail} size={40} />
+                    <div style={{fontSize:15,fontWeight:500,color:FD_MUTE,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{t.requesterName || t.requesterEmail || 'Client'}</div>
+                  </div>
+                  {/* Méta */}
+                  <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
+                    <span style={{fontSize:12,color:FD_MUTE,background:'#F1F3F5',borderRadius:6,padding:'3px 8px',fontWeight:600}}>N°{t.id}</span>
+                    <span style={{fontSize:12,color:FD_MUTE,background:'#F1F3F5',borderRadius:6,padding:'3px 8px'}}>{fdAgo(t.created_at)}</span>
+                  </div>
+                  {/* Objet */}
+                  <div style={{fontSize:16.5,fontWeight:700,color:FD_NAVY,lineHeight:1.3,display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden'}}>{t.subject || '(sans objet)'}</div>
+                  {/* Aperçu */}
+                  <div style={{display:'flex',alignItems:'center',gap:7,marginTop:7}}>
+                    <FdIconMail />
+                    <span style={{fontSize:13.5,color:FD_MUTE,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',minWidth:0}}>{t.preview || '—'}</span>
+                  </div>
+                  {/* Pastilles bas */}
+                  <div style={{display:'flex',gap:8,marginTop:12,flexWrap:'wrap'}}>
+                    <span style={{display:'inline-flex',alignItems:'center',gap:6,fontSize:12.5,color:FD_INK,border:'1px solid '+FD_LINE,borderRadius:8,padding:'5px 10px'}}>
+                      <span style={{width:8,height:8,borderRadius:'50%',background:prio.color}} />{prio.label}
+                    </span>
+                    <span style={{display:'inline-flex',alignItems:'center',gap:6,fontSize:12.5,color:FD_INK,border:'1px solid '+FD_LINE,borderRadius:8,padding:'5px 10px'}}>
+                      <FdIconActivity c={sc} />{FD_STATUS[t.status] || 'En cours'}
+                    </span>
                   </div>
                 </div>
-                <div style={{textAlign:'right',flexShrink:0}}>
-                  <span className="badge" style={{background:FD_STATUS_COLOR[t.status]||'var(--ink-mute)',color:'#fff',fontSize:10}}>{FD_STATUS[t.status]||t.status}</span>
-                  <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>{t.updated_at ? formatDateShort(t.updated_at) : ''}</div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       );
@@ -8451,10 +8509,15 @@
       const day = activeDay();
       const [manquants, setManquants] = React.useState([]);
       const [prepInfos, setPrepInfos] = React.useState([]);
+      const [orders, setOrders] = React.useState([]);
       React.useEffect(() => {
         const u1 = storage.subscribe(`day_${day}_manquants`, setManquants);
         const u2 = storage.subscribe(`day_${day}_prep`, setPrepInfos);
-        return () => { u1(); u2(); };
+        const u3 = storage.subscribe(`day_${day}_orders`, (arr) => {
+          const doc = (arr || []).find(x => x.id === 'data') || (arr || [])[0];
+          setOrders(doc && doc.orders ? doc.orders : []);
+        });
+        return () => { u1(); u2(); u3(); };
       }, [day]);
 
       const reasonLabel = (id) => (PREP_REASONS.find(r => r.id === id) || {}).label || (id || '');
@@ -8512,6 +8575,8 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Produits manquants et leur raison — pour informer les clients.
           </p>
+
+          {isDistrib && <ManquantsMailPanel orders={orders} session={session} />}
 
           {!isDistrib ? (
             <div className="empty-state"><div className="icon">📅</div><p>Pas de distribution aujourd'hui.</p></div>
@@ -12139,12 +12204,12 @@
             const data = await freshdeskPost({
               secret: FRESHDESK_SECRET, action: 'manquants_stage', date: day, recipients,
             });
-            if (data && data.ok === false) { lastSigRef.current = null; return; }
+            if (data && data.ok === false) { lastSigRef.current = null; showToast('⚠️ Dépôt manquants refusé : ' + (data.error || 'proxy pas à jour ?')); return; }
             await storage.setDoc('manquants_outbox', day, {
               staged: true, at: new Date().toISOString(), by: session.name,
               count: recipients.length, products: totalProducts,
             }, { replace: true });
-          } catch (e) { lastSigRef.current = null; }
+          } catch (e) { lastSigRef.current = null; showToast('⚠️ Dépôt manquants — erreur réseau'); }
         })();
       }, [signature, recipients.length, session, day]);
 
@@ -12373,23 +12438,15 @@
         return () => { u1(); u2(); u3(); };
       }, [day]);
 
-      // Casier → noms des clients (par boutique). Plusieurs clients peuvent partager un même
-      // numéro de casier (frais/sec, ou numérotation par client). On garde donc un Set de noms
-      // par casier au lieu d'écraser (avant : « dernier client gagne » → nom affiché faux).
-      const casierNames = React.useMemo(() => {
+      // Casier → nom du client (par boutique), pour afficher À QUI le ND a été attribué.
+      const casierName = React.useMemo(() => {
         const map = {};
         for (const o of (orders || [])) {
           const site = (o.site || '').toUpperCase();
           if (!site) continue;
-          const nm = o.name || o.email || '';
-          if (!nm) continue;
           if (!map[site]) map[site] = {};
           const cs = [...(o.casiersFrais || []), ...(o.casiersSec || [])];
-          for (const c of cs) {
-            if (c == null || c === '') continue;
-            const k = String(c);
-            (map[site][k] || (map[site][k] = new Set())).add(nm);
-          }
+          for (const c of cs) { if (c != null && c !== '') map[site][String(c)] = o.name || o.email || ''; }
         }
         return map;
       }, [orders]);
@@ -12514,23 +12571,10 @@
                              <div style={{fontWeight:700,fontSize:12,marginBottom:2}}>{site}</div>
                              <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                                {(arr || []).filter(c => (c.qty||0) > 0).sort((a,b)=>String(a.casier).localeCompare(String(b.casier),undefined,{numeric:true})).map((c, ci) => {
-                                 // V9.64 : identité fiable si enregistrée au dispatch (c.clients).
-                                 // Sinon repli honnête sur les commandes : 1 nom → sûr, plusieurs → ⚠ ambigu.
-                                 let nm = '', ambiguous = false;
-                                 if (c.casier !== 'ND') {
-                                   const carried = Array.isArray(c.clients)
-                                     ? [...new Set(c.clients.map(x => (x && x.name) || '').filter(Boolean))] : [];
-                                   if (carried.length) { nm = carried.join(', '); }
-                                   else {
-                                     const set = casierNames[site] && casierNames[site][String(c.casier)];
-                                     const names = set ? [...set] : [];
-                                     if (names.length === 1) nm = names[0];
-                                     else if (names.length > 1) { nm = names.join(' / '); ambiguous = true; }
-                                   }
-                                 }
+                                 const nm = (c.casier !== 'ND' && casierName[site]) ? (casierName[site][String(c.casier)] || '') : '';
                                  return (
-                                   <span key={ci} className="badge" title={ambiguous ? 'Plusieurs clients partagent ce numéro de casier — identité non enregistrée au dispatch (donnée ancienne).' : undefined} style={{background: c.casier==='ND'?'var(--warn-soft)':(ambiguous?'var(--warn-soft)':'var(--master-soft)'), color: c.casier==='ND'?'var(--warn)':(ambiguous?'var(--warn)':'var(--master)'), fontSize:11}}>
-                                     {c.casier==='ND' ? 'Bac ND' : `${c.ctype==='S'?'🍞 ':c.ctype==='F'?'🧊 ':''}Casier ${c.casier}`}{nm ? ` — ${ambiguous ? '⚠ ' : ''}${nm}` : ''} : {c.qty}
+                                   <span key={ci} className="badge" style={{background: c.casier==='ND'?'var(--warn-soft)':'var(--master-soft)', color: c.casier==='ND'?'var(--warn)':'var(--master)', fontSize:11}}>
+                                     {c.casier==='ND' ? 'Bac ND' : `Casier ${c.casier}`}{nm ? ` — ${nm}` : ''} : {c.qty}
                                    </span>
                                  );
                                })}
