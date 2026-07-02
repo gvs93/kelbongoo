@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.67';
+    const APP_VERSION = 'V9.68';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -8504,6 +8504,190 @@
     // ============================================================
     // PAGE INFOS DU JOUR (visible par tous : distrib voit, prépa voit, master voit)
     // ============================================================
+    // ============================================================
+    // ONGLET TEMPÉRATURE (distrib, boutiques fixes) — données Koovea
+    // Température actuelle du capteur de la boutique connectée + courbe,
+    // et alerte bloquante (popup à initiales) si > seuil depuis ≥ 5 min.
+    // Source : proxy action 'koovea_temp' (login + getTags + getTagTemperatures).
+    // ============================================================
+    function TemperaturePage({ session, currentSite }) {
+      const showToast = React.useContext(ToastContext);
+      const [data, setData] = React.useState(null);
+      const [loading, setLoading] = React.useState(true);
+      const [err, setErr] = React.useState('');
+      const [ackKeys, setAckKeys] = React.useState(() => new Set());
+      const [alertEp, setAlertEp] = React.useState(null);
+      const [initials, setInitials] = React.useState('');
+      const [ackBusy, setAckBusy] = React.useState(false);
+
+      const load = React.useCallback(async () => {
+        setErr('');
+        try {
+          const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site: currentSite, hours: 12 });
+          if (r && r.ok) { setData(r); }
+          else { setErr((r && r.error) || 'Erreur Koovea'); }
+        } catch (e) { setErr(e.message); }
+        setLoading(false);
+      }, [currentSite]);
+
+      React.useEffect(() => {
+        setLoading(true); load();
+        const id = setInterval(load, 180000); // 3 min
+        return () => clearInterval(id);
+      }, [load]);
+
+      // Alertes déjà prises en charge (traçabilité)
+      React.useEffect(() => {
+        const u = storage.subscribe('temp_alerts', (arr) => setAckKeys(new Set((arr || []).map(a => a.id))));
+        return () => { if (u) u(); };
+      }, []);
+
+      const threshold = (data && data.threshold != null) ? data.threshold : 8;
+      const unit = (data && data.unit) || '°C';
+
+      const series = React.useMemo(() => {
+        if (!data || !Array.isArray(data.series)) return [];
+        return data.series
+          .filter(p => p && p.at != null && p.temp != null && !isNaN(Number(p.temp)))
+          .map(p => ({ at: p.at, t: Number(p.temp), ms: new Date(p.at).getTime() }))
+          .filter(p => !isNaN(p.ms))
+          .sort((a, b) => a.ms - b.ms);
+      }, [data]);
+
+      const current = React.useMemo(() => {
+        if (data && data.current && data.current.temp != null) return { t: Number(data.current.temp), at: data.current.at };
+        return series.length ? { t: series[series.length - 1].t, at: series[series.length - 1].at } : null;
+      }, [data, series]);
+
+      // Épisode « chaud » en cours : dernier run de mesures au-dessus du seuil finissant à la dernière mesure.
+      const episode = React.useMemo(() => {
+        if (!series.length) return null;
+        const last = series[series.length - 1];
+        if (last.t <= threshold) return null;
+        let start = series.length - 1;
+        while (start - 1 >= 0 && series[start - 1].t > threshold) start--;
+        const minutes = (last.ms - series[start].ms) / 60000;
+        return { key: `${currentSite}_${series[start].at}`, temp: last.t, sinceMs: series[start].ms, minutes, lastAt: last.at };
+      }, [series, threshold, currentSite]);
+
+      React.useEffect(() => {
+        if (episode && episode.minutes >= 5 && !ackKeys.has(episode.key)) setAlertEp(episode);
+        else if (!episode) setAlertEp(null);
+      }, [episode, ackKeys]);
+
+      const acknowledge = async () => {
+        if (!initials.trim()) { showToast('Initiales obligatoires'); return; }
+        setAckBusy(true);
+        try {
+          await storage.setDoc('temp_alerts', alertEp.key, {
+            site: currentSite, temp: alertEp.temp, sinceMs: alertEp.sinceMs,
+            minutes: Math.round(alertEp.minutes), threshold,
+            by: initials.trim().toUpperCase(), operator: session.name,
+            at: new Date().toISOString(),
+          });
+          showToast('✓ Alerte prise en charge');
+          setAlertEp(null); setInitials('');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        setAckBusy(false);
+      };
+
+      const isHigh = current && current.t > threshold;
+      const tColor = isHigh ? '#E8583B' : '#25A55F';
+
+      // ---- Graphe SVG ----
+      const chart = React.useMemo(() => {
+        if (series.length < 2) return null;
+        const W = 320, H = 150, PL = 30, PR = 8, PT = 10, PB = 22;
+        const temps = series.map(p => p.t).concat([threshold]);
+        let lo = Math.min(...temps), hi = Math.max(...temps);
+        if (hi - lo < 2) { hi += 1; lo -= 1; }
+        const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
+        const t0 = series[0].ms, t1 = series[series.length - 1].ms || t0 + 1;
+        const x = (ms) => PL + (t1 === t0 ? 0 : (ms - t0) / (t1 - t0)) * (W - PL - PR);
+        const y = (t) => PT + (1 - (t - lo) / (hi - lo)) * (H - PT - PB);
+        const pts = series.map(p => `${x(p.ms).toFixed(1)},${y(p.t).toFixed(1)}`).join(' ');
+        const yThr = y(threshold);
+        const fmtH = (ms) => { const d = new Date(ms); return String(d.getHours()).padStart(2, '0') + 'h'; };
+        return (
+          <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }}>
+            <line x1={PL} y1={PT} x2={PL} y2={H - PB} stroke="#E1E6EC" strokeWidth="1" />
+            <line x1={PL} y1={H - PB} x2={W - PR} y2={H - PB} stroke="#E1E6EC" strokeWidth="1" />
+            <text x={PL - 4} y={y(hi) + 3} textAnchor="end" fontSize="9" fill="#7A8B9A">{hi.toFixed(1)}</text>
+            <text x={PL - 4} y={y(lo) + 3} textAnchor="end" fontSize="9" fill="#7A8B9A">{lo.toFixed(1)}</text>
+            <line x1={PL} y1={yThr} x2={W - PR} y2={yThr} stroke="#E8583B" strokeWidth="1" strokeDasharray="4 3" />
+            <text x={W - PR} y={yThr - 3} textAnchor="end" fontSize="9" fill="#E8583B">seuil {threshold}{unit}</text>
+            <polyline points={pts} fill="none" stroke="#2C5CC5" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+            {series.map((p, i) => (i % Math.ceil(series.length / 40) === 0 || i === series.length - 1) && (
+              <circle key={i} cx={x(p.ms)} cy={y(p.t)} r="2" fill={p.t > threshold ? '#E8583B' : '#2C5CC5'} />
+            ))}
+            <text x={PL} y={H - 6} textAnchor="start" fontSize="9" fill="#7A8B9A">{fmtH(t0)}</text>
+            <text x={W - PR} y={H - 6} textAnchor="end" fontSize="9" fill="#7A8B9A">{fmtH(t1)}</text>
+          </svg>
+        );
+      }, [series, threshold, unit]);
+
+      return (
+        <div className="stack">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <h1 style={{ margin: 0 }}>🌡️ Température · {currentSite}</h1>
+            <button className="btn-ghost" style={{ fontSize: 13 }} disabled={loading} onClick={() => { setLoading(true); load(); }}>↻</button>
+          </div>
+
+          {loading && !data && <div className="card-flat" style={{ padding: 16, color: 'var(--ink-mute)' }}>Chargement Koovea…</div>}
+
+          {err && (
+            <div className="card" style={{ padding: 14, borderLeft: '4px solid var(--danger)' }}>
+              <div style={{ fontWeight: 700, color: 'var(--danger)', marginBottom: 4 }}>⚠️ Koovea indisponible</div>
+              <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{err}</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Vérifie la config Koovea dans le proxy (URL, identifiants, capteur du site).</div>
+            </div>
+          )}
+
+          {data && current && (
+            <div className="card" style={{ padding: '18px 16px', textAlign: 'center' }}>
+              <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{data.tagName || 'Capteur ' + currentSite}</div>
+              <div style={{ fontSize: 52, fontWeight: 800, color: tColor, lineHeight: 1.1 }}>{current.t.toFixed(1)}{unit}</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
+                {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
+                {current.at ? ' · ' + formatTimeFR(current.at) : ''}
+              </div>
+            </div>
+          )}
+
+          {chart && (
+            <div className="card" style={{ padding: '12px 10px' }}>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 6, paddingLeft: 4 }}>12 dernières heures</div>
+              {chart}
+            </div>
+          )}
+
+          {data && !current && !err && (
+            <div className="empty-state"><div className="icon">🌡️</div><p>Pas de mesure disponible pour ce capteur.</p></div>
+          )}
+
+          {/* ---- POPUP ALERTE (bloquante, initiales) ---- */}
+          {alertEp && (
+            <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+              <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: '20px', borderTop: '6px solid #E8583B' }}>
+                <div style={{ fontSize: 22, fontWeight: 800, color: '#E8583B', marginBottom: 6 }}>🚨 Alerte température</div>
+                <div style={{ fontSize: 15, color: 'var(--ink)', lineHeight: 1.5 }}>
+                  <strong>{currentSite}</strong> : température à <strong>{alertEp.temp.toFixed(1)}{unit}</strong> (seuil {threshold}{unit}),
+                  au-dessus depuis <strong>{Math.round(alertEp.minutes)} min</strong>.
+                </div>
+                <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '10px 0' }}>Vérifie l'enceinte (porte, groupe froid) puis valide la prise en charge avec tes initiales.</div>
+                <input value={initials} onChange={e => setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Initiales"
+                  style={{ width: '100%', boxSizing: 'border-box', padding: '11px', fontSize: 16, border: '1px solid var(--line)', borderRadius: 10, textTransform: 'uppercase', marginBottom: 10 }} />
+                <button className="btn-primary" style={{ width: '100%', background: '#E8583B', fontSize: 15, padding: '12px' }} disabled={ackBusy || !initials.trim()} onClick={acknowledge}>
+                  {ackBusy ? 'Enregistrement…' : '✅ J\'ai pris en charge'}
+                </button>
+                <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8, textAlign: 'center' }}>Enregistré pour la traçabilité (qui, quand, température).</div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function InfosPage({ session }) {
       // Suit la distribution active (date du fichier chargé, sinon aujourd'hui)
       const day = activeDay();
@@ -13733,6 +13917,7 @@
           {tab === 'consignes' && <ConsignesPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'followup' && <FollowUpPage session={effSession} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
           {tab === 'infos' && <InfosPage session={effSession} />}
+          {tab === 'temp' && !effSession.isMaster && BOUTIQUES.includes(currentSite) && <TemperaturePage session={effSession} currentSite={currentSite} />}
           {tab === 'closure' && <ClosurePage session={effSession} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} />}
           {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
@@ -13766,6 +13951,11 @@
             {!effSession.isMaster && !isClosed && (
               <button className={tab==='infos'?'active':''} onClick={()=>setTab('infos')}>
                 <span className="tab-icon">📋</span>Infos
+              </button>
+            )}
+            {!effSession.isMaster && BOUTIQUES.includes(currentSite) && (
+              <button className={tab==='temp'?'active':''} onClick={()=>setTab('temp')}>
+                <span className="tab-icon">🌡️</span>Temp.
               </button>
             )}
             {!effSession.isMaster && (
