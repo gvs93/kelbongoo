@@ -8646,6 +8646,13 @@
         );
       }, [series, threshold, unit]);
 
+      const ageMinutes = current && current.at ? (Date.now() - new Date(current.at).getTime()) / 60000 : null;
+      const isStale = ageMinutes != null && ageMinutes > 15;
+      const fmtFullDateTime = (iso) => {
+        try { return new Date(iso).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }); }
+        catch (e) { return iso; }
+      };
+
       return (
         <div className="card" style={{ padding: '16px', textAlign: 'center', borderLeft: `4px solid ${isHigh ? '#E8583B' : 'var(--line)'}` }}>
           <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{s.label || s.tagName || 'Capteur'}</div>
@@ -8654,10 +8661,16 @@
               <div style={{ fontSize: 44, fontWeight: 800, color: tColor, lineHeight: 1.1 }}>{current.t.toFixed(1)}{unit}</div>
               <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
                 {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
-                {current.at ? ' · ' + formatTimeFR(current.at) : ''}
+                {current.at ? ' · ' + fmtFullDateTime(current.at) : ''}
                 {config && <span style={{ color: 'var(--info)' }}> · réglé par le master</span>}
               </div>
+              {isStale && (
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--danger)', background: 'var(--danger-soft)', borderRadius: 8, padding: '6px 10px', textAlign: 'left' }}>
+                  ⚠️ Donnée ancienne ({ageMinutes < 60 ? `${Math.round(ageMinutes)} min` : `${Math.floor(ageMinutes / 60)}h${String(Math.round(ageMinutes % 60)).padStart(2, '0')}`}) — le capteur ne remonte peut-être plus de mesure fraîche. Compare avec l'app Koovea et signale au master si l'écart persiste.
+                </div>
+              )}
             </>
+
           ) : (
             <div className="empty-state" style={{ padding: '16px 0' }}><div className="icon">🌡️</div><p>Pas de mesure disponible pour ce capteur.</p></div>
           )}
@@ -8881,6 +8894,8 @@
                   const effThreshold = (cfg && cfg.threshold != null) ? cfg.threshold : s.threshold;
                   const cur = s.current && s.current.temp != null ? Number(s.current.temp) : null;
                   const isHigh = cur != null && effThreshold != null && cur > effThreshold;
+                  const ageMin = s.current && s.current.at ? (Date.now() - new Date(s.current.at).getTime()) / 60000 : null;
+                  const isStale = ageMin != null && ageMin > 15;
                   return (
                     <div key={s.mac} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderTop: '1px solid var(--line)', flexWrap: 'wrap' }}>
                       <div style={{ flex: '1 1 140px', minWidth: 0 }}>
@@ -8890,6 +8905,7 @@
                           {' '}· MAC {s.mac}
                           {cfg && <span style={{ color: 'var(--info)' }}> · seuil personnalisé</span>}
                           {!s.ok && <span style={{ color: 'var(--danger)' }}> · ⚠️ indisponible</span>}
+                          {isStale && <span style={{ color: 'var(--warn)' }}> · ⏱️ donnée vieille de {ageMin < 60 ? `${Math.round(ageMin)} min` : `${Math.floor(ageMin / 60)}h${String(Math.round(ageMin % 60)).padStart(2, '0')}`}</span>}
                         </div>
                       </div>
                       <input
@@ -14314,6 +14330,55 @@
     }
 
     // ============================================================
+    // ERROR BOUNDARY GLOBAL
+    // Sans ça, toute exception survenant pendant un rendu (ex : un clic sur un
+    // onglet qui plante) démonte silencieusement tout React → écran blanc, sans
+    // aucun message. Ce garde-fou affiche l'erreur (message + composant) et
+    // permet de revenir en arrière ou de recharger, au lieu de bloquer l'appli.
+    // ============================================================
+    class ErrorBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { error: null, info: null };
+      }
+      static getDerivedStateFromError(error) {
+        return { error };
+      }
+      componentDidCatch(error, info) {
+        this.setState({ info });
+        console.error('Erreur React attrapée par ErrorBoundary :', error, info);
+      }
+      render() {
+        if (this.state.error) {
+          const msg = (this.state.error && this.state.error.message) || String(this.state.error);
+          const comp = this.state.info && this.state.info.componentStack ? this.state.info.componentStack.trim().split('\n')[0] : '';
+          return (
+            <div style={{ maxWidth: 480, margin: '40px auto', padding: 24, fontFamily: 'system-ui,-apple-system,sans-serif', textAlign: 'center', color: '#1f1d1a' }}>
+              <div style={{ fontSize: 40 }}>⚠️</div>
+              <h2 style={{ margin: '12px 0 6px', fontSize: 18 }}>Une erreur est survenue</h2>
+              <p style={{ color: '#57534d', fontSize: 14, lineHeight: 1.5 }}>{msg}</p>
+              {comp && <p style={{ color: '#94908a', fontSize: 11, marginTop: 8, fontFamily: 'monospace' }}>{comp}</p>}
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'center', marginTop: 16 }}>
+                <button onClick={() => this.setState({ error: null, info: null })}
+                  style={{ background: '#fff', color: '#1f1d1a', border: '1px solid #d6d0c4', borderRadius: 8, padding: '11px 18px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                  ↩ Revenir
+                </button>
+                <button onClick={() => location.reload()}
+                  style={{ background: '#4a7c3b', color: '#fff', border: 0, borderRadius: 8, padding: '11px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                  ↻ Recharger
+                </button>
+              </div>
+              <p style={{ color: '#94908a', fontSize: 12, marginTop: 16, lineHeight: 1.4 }}>
+                Transmets ce message au master pour corriger le bug (avec l'onglet où tu étais).
+              </p>
+            </div>
+          );
+        }
+        return this.props.children;
+      }
+    }
+
+    // ============================================================
     // BOOT
     // ============================================================
     let __booted = false;
@@ -14328,7 +14393,7 @@
       }
       try {
         const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<ToastProvider><App /></ToastProvider>);
+        root.render(<ErrorBoundary><ToastProvider><App /></ToastProvider></ErrorBoundary>);
       } catch (e) {
         console.error('Rendu impossible', e);
         if (window.showBootError) window.showBootError("Erreur au démarrage de l'application.");
