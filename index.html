@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.56</title>
+  <title>Kelbongoo — Distribution V9.69</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,7 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.68';
+    const APP_VERSION = 'V9.69';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -8505,20 +8505,94 @@
     // PAGE INFOS DU JOUR (visible par tous : distrib voit, prépa voit, master voit)
     // ============================================================
     // ============================================================
-    // ONGLET TEMPÉRATURE (distrib, boutiques fixes) — données Koovea
-    // Température actuelle du capteur de la boutique connectée + courbe,
-    // et alerte bloquante (popup à initiales) si > seuil depuis ≥ 5 min.
+    // ONGLET TEMPÉRATURE (LECTURE SEULE — distrib & prépa) — données Koovea
+    // Température actuelle du capteur du local + courbe 12h, et alerte bloquante
+    // (popup à initiales, son + vibration en boucle) si > seuil depuis ≥ 5 min.
+    // Le SEUIL est réglable UNIQUEMENT par le master (page TempMasterPage, écrit
+    // dans `temp_config`) — aucun contrôle de réglage n'est rendu ici, jamais.
     // Source : proxy action 'koovea_temp' (login + getTags + getTagTemperatures).
     // ============================================================
-    function TemperaturePage({ session, currentSite }) {
+    function TemperatureAlertOverlay({ episode, threshold, unit, session, currentSite, onDone }) {
       const showToast = React.useContext(ToastContext);
+      const [initials, setInitials] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+
+      // Son fort en boucle + vibration tant que la popup reste ouverte.
+      // (iOS Safari ignore navigator.vibrate — limitation OS, pas contournable en web.)
+      React.useEffect(() => {
+        let stopped = false;
+        const C = window.AudioContext || window.webkitAudioContext;
+        const ctx = C ? new C() : null;
+        const beep = () => {
+          if (stopped || !ctx) return;
+          try {
+            if (ctx.state === 'suspended') ctx.resume();
+            const o = ctx.createOscillator(), g = ctx.createGain();
+            o.type = 'square'; o.frequency.value = 1046;
+            o.connect(g); g.connect(ctx.destination);
+            g.gain.setValueAtTime(0.22, ctx.currentTime);
+            g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+            o.start(); o.stop(ctx.currentTime + 0.36);
+          } catch (e) {}
+        };
+        beep();
+        const soundTimer = setInterval(beep, 1100);
+        try { navigator.vibrate && navigator.vibrate([300, 150, 300, 150, 300]); } catch (e) {}
+        const vibeTimer = setInterval(() => {
+          try { navigator.vibrate && navigator.vibrate([300, 150, 300]); } catch (e) {}
+        }, 1600);
+        return () => {
+          stopped = true;
+          clearInterval(soundTimer);
+          clearInterval(vibeTimer);
+          try { navigator.vibrate && navigator.vibrate(0); } catch (e) {}
+          try { ctx && ctx.close(); } catch (e) {}
+        };
+      }, []);
+
+      const acknowledge = async () => {
+        if (!initials.trim()) { showToast('Initiales obligatoires'); return; }
+        setBusy(true);
+        try {
+          await storage.setDoc('temp_alerts', episode.key, {
+            site: currentSite, temp: episode.temp, sinceMs: episode.sinceMs,
+            minutes: Math.round(episode.minutes), threshold, unit,
+            by: initials.trim().toUpperCase(), operator: session.name,
+            at: new Date().toISOString(),
+          });
+          showToast('✓ Alerte prise en charge');
+          onDone();
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        setBusy(false);
+      };
+
+      return (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+          <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: '20px', borderTop: '6px solid #E8583B' }}>
+            <div style={{ fontSize: 22, fontWeight: 800, color: '#E8583B', marginBottom: 6 }}>🚨 Alerte température</div>
+            <div style={{ fontSize: 15, color: 'var(--ink)', lineHeight: 1.5 }}>
+              <strong>{currentSite}</strong> : température à <strong>{episode.temp.toFixed(1)}{unit}</strong> (seuil {threshold}{unit}),
+              au-dessus depuis <strong>{Math.round(episode.minutes)} min</strong>.
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '10px 0' }}>Vérifie l'enceinte (porte, groupe froid) puis valide la prise en charge avec tes initiales.</div>
+            <input value={initials} onChange={e => setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Initiales"
+              style={{ width: '100%', boxSizing: 'border-box', padding: '11px', fontSize: 16, border: '1px solid var(--line)', borderRadius: 10, textTransform: 'uppercase', marginBottom: 10 }} />
+            <button className="btn-primary" style={{ width: '100%', background: '#E8583B', fontSize: 15, padding: '12px' }} disabled={busy || !initials.trim()} onClick={acknowledge}>
+              {busy ? 'Enregistrement…' : '✅ J\'ai pris en charge'}
+            </button>
+            <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8, textAlign: 'center' }}>Enregistré pour la traçabilité (qui, quand, température).</div>
+          </div>
+        </div>
+      );
+    }
+
+    function TemperaturePage({ session, currentSite }) {
       const [data, setData] = React.useState(null);
       const [loading, setLoading] = React.useState(true);
       const [err, setErr] = React.useState('');
       const [ackKeys, setAckKeys] = React.useState(() => new Set());
       const [alertEp, setAlertEp] = React.useState(null);
-      const [initials, setInitials] = React.useState('');
-      const [ackBusy, setAckBusy] = React.useState(false);
+      const [config, setConfig] = React.useState(null); // seuil réglé par le master (temp_config), lecture seule ici
 
       const load = React.useCallback(async () => {
         setErr('');
@@ -8542,8 +8616,16 @@
         return () => { if (u) u(); };
       }, []);
 
-      const threshold = (data && data.threshold != null) ? data.threshold : 8;
-      const unit = (data && data.unit) || '°C';
+      // Seuil réglé par le master pour ce local — LECTURE SEULE ici, jamais éditable.
+      React.useEffect(() => {
+        const u = storage.subscribe('temp_config', (arr) => {
+          setConfig((arr || []).find(c => c.site === currentSite) || null);
+        });
+        return () => { if (u) u(); };
+      }, [currentSite]);
+
+      const threshold = (config && config.threshold != null) ? config.threshold : ((data && data.threshold != null) ? data.threshold : 8);
+      const unit = (data && data.unit) || (config && config.unit) || '°C';
 
       const series = React.useMemo(() => {
         if (!data || !Array.isArray(data.series)) return [];
@@ -8574,22 +8656,6 @@
         if (episode && episode.minutes >= 5 && !ackKeys.has(episode.key)) setAlertEp(episode);
         else if (!episode) setAlertEp(null);
       }, [episode, ackKeys]);
-
-      const acknowledge = async () => {
-        if (!initials.trim()) { showToast('Initiales obligatoires'); return; }
-        setAckBusy(true);
-        try {
-          await storage.setDoc('temp_alerts', alertEp.key, {
-            site: currentSite, temp: alertEp.temp, sinceMs: alertEp.sinceMs,
-            minutes: Math.round(alertEp.minutes), threshold,
-            by: initials.trim().toUpperCase(), operator: session.name,
-            at: new Date().toISOString(),
-          });
-          showToast('✓ Alerte prise en charge');
-          setAlertEp(null); setInitials('');
-        } catch (e) { showToast('Erreur : ' + e.message); }
-        setAckBusy(false);
-      };
 
       const isHigh = current && current.t > threshold;
       const tColor = isHigh ? '#E8583B' : '#25A55F';
@@ -8639,7 +8705,7 @@
             <div className="card" style={{ padding: 14, borderLeft: '4px solid var(--danger)' }}>
               <div style={{ fontWeight: 700, color: 'var(--danger)', marginBottom: 4 }}>⚠️ Koovea indisponible</div>
               <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{err}</div>
-              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Vérifie la config Koovea dans le proxy (URL, identifiants, capteur du site).</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Vérifie la config Koovea dans le proxy (URL, identifiants, capteur du site). Signale-le au master.</div>
             </div>
           )}
 
@@ -8650,6 +8716,7 @@
               <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
                 {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
                 {current.at ? ' · ' + formatTimeFR(current.at) : ''}
+                {config && <span style={{ color: 'var(--info)' }}> · réglé par le master</span>}
               </div>
             </div>
           )}
@@ -8665,28 +8732,144 @@
             <div className="empty-state"><div className="icon">🌡️</div><p>Pas de mesure disponible pour ce capteur.</p></div>
           )}
 
-          {/* ---- POPUP ALERTE (bloquante, initiales) ---- */}
+          <p style={{ fontSize: 11, color: 'var(--ink-mute)', textAlign: 'center' }}>
+            Le seuil d'alerte est réglé par le master. Signale toute anomalie de capteur au master.
+          </p>
+
           {alertEp && (
-            <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-              <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: '20px', borderTop: '6px solid #E8583B' }}>
-                <div style={{ fontSize: 22, fontWeight: 800, color: '#E8583B', marginBottom: 6 }}>🚨 Alerte température</div>
-                <div style={{ fontSize: 15, color: 'var(--ink)', lineHeight: 1.5 }}>
-                  <strong>{currentSite}</strong> : température à <strong>{alertEp.temp.toFixed(1)}{unit}</strong> (seuil {threshold}{unit}),
-                  au-dessus depuis <strong>{Math.round(alertEp.minutes)} min</strong>.
-                </div>
-                <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '10px 0' }}>Vérifie l'enceinte (porte, groupe froid) puis valide la prise en charge avec tes initiales.</div>
-                <input value={initials} onChange={e => setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Initiales"
-                  style={{ width: '100%', boxSizing: 'border-box', padding: '11px', fontSize: 16, border: '1px solid var(--line)', borderRadius: 10, textTransform: 'uppercase', marginBottom: 10 }} />
-                <button className="btn-primary" style={{ width: '100%', background: '#E8583B', fontSize: 15, padding: '12px' }} disabled={ackBusy || !initials.trim()} onClick={acknowledge}>
-                  {ackBusy ? 'Enregistrement…' : '✅ J\'ai pris en charge'}
-                </button>
-                <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8, textAlign: 'center' }}>Enregistré pour la traçabilité (qui, quand, température).</div>
-              </div>
-            </div>
+            <TemperatureAlertOverlay
+              episode={alertEp} threshold={threshold} unit={unit}
+              session={session} currentSite={currentSite}
+              onDone={() => setAlertEp(null)}
+            />
           )}
         </div>
       );
     }
+
+    // ============================================================
+    // TEMPÉRATURES — PAGE MASTER (réglages seuils + vue globale tous les locaux)
+    // Seul le master peut écrire dans `temp_config`. La page TemperaturePage des
+    // distributeurs/prépa est 100% lecture seule — aucune écriture possible ailleurs.
+    // ============================================================
+    function TempMasterPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [bySite, setBySite] = React.useState({}); // { site: {loading, err, data} }
+      const [configs, setConfigs] = React.useState({}); // { site: config }
+      const [edit, setEdit] = React.useState({}); // { site: valeur en cours de saisie }
+      const [busySite, setBusySite] = React.useState(null);
+
+      const sites = BOUTIQUES; // locaux équipés de capteurs
+
+      const loadSite = React.useCallback(async (site) => {
+        setBySite(prev => ({ ...prev, [site]: { ...(prev[site] || {}), loading: true, err: '' } }));
+        try {
+          const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site, hours: 1 });
+          if (r && r.ok) {
+            setBySite(prev => ({ ...prev, [site]: { loading: false, err: '', data: r } }));
+          } else {
+            setBySite(prev => ({ ...prev, [site]: { loading: false, err: (r && r.error) || 'Erreur', data: null } }));
+          }
+        } catch (e) {
+          setBySite(prev => ({ ...prev, [site]: { loading: false, err: e.message, data: null } }));
+        }
+      }, []);
+
+      React.useEffect(() => { sites.forEach(loadSite); }, [loadSite]);
+
+      React.useEffect(() => {
+        const u = storage.subscribe('temp_config', (arr) => {
+          const m = {}; for (const c of (arr || [])) m[c.site] = c;
+          setConfigs(m);
+        });
+        return () => { if (u) u(); };
+      }, []);
+
+      const saveThreshold = async (site, unit) => {
+        const raw = edit[site];
+        const val = parseFloat(String(raw).replace(',', '.'));
+        if (isNaN(val)) { showToast('Valeur invalide'); return; }
+        setBusySite(site);
+        try {
+          await storage.setDoc('temp_config', site, {
+            site, threshold: val, unit: unit || '°C',
+            updatedBy: session.name, updatedAt: new Date().toISOString(),
+          }, { replace: true });
+          showToast(`✓ Seuil ${site} : ${val}${unit || '°C'}`);
+          setEdit(e => { const n = { ...e }; delete n[site]; return n; });
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        setBusySite(null);
+      };
+
+      const resetThreshold = async (site) => {
+        if (!confirm(`Revenir au seuil par défaut (Koovea) pour ${site} ?`)) return;
+        setBusySite(site);
+        try {
+          await storage.deleteDoc('temp_config', site);
+          showToast('✓ Seuil par défaut restauré');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        setBusySite(null);
+      };
+
+      return (
+        <div className="stack">
+          <h1>🌡️⚙️ Températures — réglages</h1>
+          <p style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: -8 }}>
+            Vue de toutes les chambres froides équipées. <strong>Seul le master peut modifier un seuil d'alerte</strong> —
+            les distributeurs et préparateurs n'ont qu'un affichage en lecture seule (aucun réglage possible de leur côté).
+          </p>
+
+          {sites.map(site => {
+            const st = bySite[site] || { loading: true };
+            const cfg = configs[site];
+            const data = st.data;
+            const defaultThreshold = data && data.threshold != null ? data.threshold : 8;
+            const unit = (data && data.unit) || (cfg && cfg.unit) || '°C';
+            const effThreshold = (cfg && cfg.threshold != null) ? cfg.threshold : defaultThreshold;
+            const cur = data && data.current && data.current.temp != null ? Number(data.current.temp) : null;
+            const isHigh = cur != null && cur > effThreshold;
+            return (
+              <div key={site} className="card">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <h3 style={{ margin: 0 }}>{siteLabel(site)} <span style={{ color: 'var(--ink-mute)', fontWeight: 400 }}>({site})</span></h3>
+                  <button className="btn-ghost" style={{ fontSize: 12 }} disabled={st.loading} onClick={() => loadSite(site)}>↻</button>
+                </div>
+                {st.loading && <p style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Chargement…</p>}
+                {st.err && <div className="alert-warning" style={{ fontSize: 12 }}>⚠️ {st.err}</div>}
+                {!st.loading && !st.err && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 140px', minWidth: 0 }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: isHigh ? 'var(--danger)' : 'var(--accent-dark)' }}>
+                        {cur != null ? `${cur.toFixed(1)}${unit}` : '—'}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>
+                        seuil actuel : {effThreshold}{unit}{cfg && <span style={{ color: 'var(--info)' }}> · personnalisé</span>}
+                      </div>
+                    </div>
+                    <input
+                      type="text" inputMode="decimal"
+                      placeholder={`seuil (${defaultThreshold})`}
+                      value={edit[site] ?? (cfg ? String(cfg.threshold) : '')}
+                      onChange={e => setEdit(prev => ({ ...prev, [site]: e.target.value }))}
+                      style={{ width: 90, fontSize: 13, padding: '6px 8px' }}
+                    />
+                    <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={busySite === site} onClick={() => saveThreshold(site, unit)}>
+                      Enregistrer
+                    </button>
+                    {cfg && (
+                      <button className="btn-ghost" style={{ fontSize: 12, padding: '6px 8px', color: 'var(--ink-mute)' }} disabled={busySite === site} onClick={() => resetThreshold(site)}>
+                        ↩ défaut
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
 
     function InfosPage({ session }) {
       // Suit la distribution active (date du fichier chargé, sinon aujourd'hui)
@@ -13089,24 +13272,92 @@
       );
     }
 
+    // ============================================================
+    // HISTORIQUE (master) — sous-onglet Températures
+    // Liste les alertes hautes prises en charge (collection `temp_alerts`),
+    // groupées par jour, avec le local, la température, le seuil, la durée
+    // de dépassement et les INITIALES de la personne qui a validé.
+    // ============================================================
+    function HistoryTempView() {
+      const [alerts, setAlerts] = React.useState([]);
+      const [loaded, setLoaded] = React.useState(false);
+
+      React.useEffect(() => {
+        let alive = true;
+        storage.getAll('temp_alerts').then(arr => { if (alive) { setAlerts(arr || []); setLoaded(true); } });
+        return () => { alive = false; };
+      }, []);
+
+      const fmtTime = (iso) => { try { return new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } };
+
+      const byDay = React.useMemo(() => {
+        const m = {};
+        for (const a of alerts) {
+          if (!a.at) continue;
+          const dk = a.at.slice(0, 10);
+          (m[dk] = m[dk] || []).push(a);
+        }
+        for (const k of Object.keys(m)) m[k].sort((a, b) => (b.at || '').localeCompare(a.at || ''));
+        return m;
+      }, [alerts]);
+      const days = Object.keys(byDay).sort((a, b) => b.localeCompare(a));
+
+      if (!loaded) return <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement…</p>;
+      if (alerts.length === 0) return <div className="empty-state"><div className="icon">🌡️</div><p>Aucune alerte température prise en charge pour l'instant.</p></div>;
+
+      return (
+        <div>
+          <div className="stat-grid" style={{ marginBottom: 12 }}>
+            <div className="stat"><div className="stat-value">{alerts.length}</div><div className="stat-label">Alertes validées</div></div>
+            <div className="stat"><div className="stat-value">{new Set(alerts.map(a => a.site)).size}</div><div className="stat-label">Locaux concernés</div></div>
+          </div>
+          {days.map(dk => (
+            <div key={dk} className="card" style={{ marginBottom: 10 }}>
+              <h3 style={{ marginBottom: 8, textTransform: 'capitalize' }}>{dayLabelShort(dk)}</h3>
+              <div className="stack" style={{ gap: 6 }}>
+                {byDay[dk].map(a => (
+                  <div key={a.id} style={{ padding: '8px 10px', border: '1px solid var(--line)', borderRadius: 8, borderLeft: '3px solid var(--danger)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 14 }}>{a.site}</div>
+                        <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>
+                          {a.temp != null ? `${Number(a.temp).toFixed(1)}${a.unit || '°C'}` : '—'} (seuil {a.threshold}{a.unit || '°C'}) · dépassé {a.minutes} min
+                        </div>
+                      </div>
+                      <span className="badge badge-danger" style={{ whiteSpace: 'nowrap' }}>✅ {a.by || '—'}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 4 }}>
+                      Validé par {a.by}{a.operator ? ` (session ${a.operator})` : ''} · {fmtTime(a.at)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
     function HistoryPage({ session }) {
-      const [histTab, setHistTab] = React.useState('nd'); // 'nd' | 'dlc' | 'pdp'
+      const [histTab, setHistTab] = React.useState('nd'); // 'nd' | 'dlc' | 'pdp' | 'temp'
       return (
         <div className="stack">
           <h1>📜 Historique</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Trace des décisions : dispatch dernière minute (ND), produits DLC résolus, et retours PDP traités. 🚩 = choix qui s'écarte du conseil navette.
+            Trace des décisions : dispatch dernière minute (ND), produits DLC résolus, retours PDP traités, et alertes température validées. 🚩 = choix qui s'écarte du conseil navette.
           </p>
           <div className="filter-row">
             <div className={`chip ${histTab==='nd'?'selected':''}`} onClick={()=>setHistTab('nd')}>🚚 ND</div>
             <div className={`chip ${histTab==='cmd'?'selected':''}`} onClick={()=>setHistTab('cmd')}>🧾 Commandes</div>
             <div className={`chip ${histTab==='dlc'?'selected':''}`} onClick={()=>setHistTab('dlc')}>🟠 DLC</div>
             <div className={`chip ${histTab==='pdp'?'selected':''}`} onClick={()=>setHistTab('pdp')}>↩️ Retours PDP</div>
+            <div className={`chip ${histTab==='temp'?'selected':''}`} onClick={()=>setHistTab('temp')}>🌡️ Température</div>
           </div>
           {histTab === 'nd' && <NdHistoryPage session={session} />}
           {histTab === 'cmd' && <OrderHistoryView />}
           {histTab === 'dlc' && <HistoryDlcView />}
           {histTab === 'pdp' && <HistoryPdpView />}
+          {histTab === 'temp' && <HistoryTempView />}
         </div>
       );
     }
@@ -13924,6 +14175,7 @@
           {tab === 'casuivi' && effSession.isMaster && <CaSuiviPage session={effSession} />}
           {tab === 'manqhist' && effSession.isMaster && <ManquantsHistoryPage session={effSession} />}
           {tab === 'histo' && effSession.isMaster && <HistoryPage session={effSession} />}
+          {tab === 'tempmaster' && effSession.isMaster && <TempMasterPage session={effSession} />}
           {tab === 'stats' && effSession.isMaster && <StatsPage session={effSession} />}
           {tab === 'admin' && effSession.isMaster && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
@@ -13996,6 +14248,11 @@
             {effSession.isMaster && (
               <button className={tab==='histo'?'active':''} onClick={()=>setTab('histo')}>
                 <span className="tab-icon">📜</span>Histo.
+              </button>
+            )}
+            {effSession.isMaster && (
+              <button className={tab==='tempmaster'?'active':''} onClick={()=>setTab('tempmaster')}>
+                <span className="tab-icon">🌡️</span>Temp.
               </button>
             )}
             {effSession.isMaster && (
