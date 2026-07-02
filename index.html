@@ -8512,7 +8512,15 @@
     // dans `temp_config`) — aucun contrôle de réglage n'est rendu ici, jamais.
     // Source : proxy action 'koovea_temp' (login + getTags + getTagTemperatures).
     // ============================================================
-    function TemperatureAlertOverlay({ episode, threshold, unit, session, currentSite, onDone }) {
+    // ============================================================
+    // ONGLET TEMPÉRATURE (LECTURE SEULE — distrib & prépa) — données Koovea
+    // Proxy v24+ : renvoie { ok, site, sensors:[{ ok, label, mac, tagName, unit,
+    // threshold, alert, current:{temp,at}, series:[{at,temp},...] }] } — UN local
+    // peut avoir PLUSIEURS capteurs (frais / surgelé / légumerie…), chacun affiché
+    // en carte séparée. Le SEUIL est réglable UNIQUEMENT par le master (page
+    // TempMasterPage, écrit dans `temp_config` par MAC) — rien n'est éditable ici.
+    // ============================================================
+    function TemperatureAlertOverlay({ episode, session, currentSite, onDone }) {
       const showToast = React.useContext(ToastContext);
       const [initials, setInitials] = React.useState('');
       const [busy, setBusy] = React.useState(false);
@@ -8554,9 +8562,11 @@
         if (!initials.trim()) { showToast('Initiales obligatoires'); return; }
         setBusy(true);
         try {
-          await storage.setDoc('temp_alerts', episode.key, {
-            site: currentSite, temp: episode.temp, sinceMs: episode.sinceMs,
-            minutes: Math.round(episode.minutes), threshold, unit,
+          const id = `${currentSite}_${episode.mac || 'default'}_${episode.sinceMs}`;
+          await storage.setDoc('temp_alerts', id, {
+            site: currentSite, mac: episode.mac || '', label: episode.label || '',
+            temp: episode.temp, threshold: episode.threshold, unit: episode.unit || '°C',
+            sinceMs: episode.sinceMs, minutes: Math.round(episode.minutes),
             by: initials.trim().toUpperCase(), operator: session.name,
             at: new Date().toISOString(),
           });
@@ -8571,7 +8581,7 @@
           <div style={{ background: '#fff', borderRadius: 16, maxWidth: 380, width: '100%', padding: '20px', borderTop: '6px solid #E8583B' }}>
             <div style={{ fontSize: 22, fontWeight: 800, color: '#E8583B', marginBottom: 6 }}>🚨 Alerte température</div>
             <div style={{ fontSize: 15, color: 'var(--ink)', lineHeight: 1.5 }}>
-              <strong>{currentSite}</strong> : température à <strong>{episode.temp.toFixed(1)}{unit}</strong> (seuil {threshold}{unit}),
+              <strong>{currentSite}</strong>{episode.label ? <> — <strong>{episode.label}</strong></> : ''} : température à <strong>{episode.temp.toFixed(1)}{episode.unit || '°C'}</strong> (seuil {episode.threshold}{episode.unit || '°C'}),
               au-dessus depuis <strong>{Math.round(episode.minutes)} min</strong>.
             </div>
             <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '10px 0' }}>Vérifie l'enceinte (porte, groupe froid) puis valide la prise en charge avec tes initiales.</div>
@@ -8580,90 +8590,34 @@
             <button className="btn-primary" style={{ width: '100%', background: '#E8583B', fontSize: 15, padding: '12px' }} disabled={busy || !initials.trim()} onClick={acknowledge}>
               {busy ? 'Enregistrement…' : '✅ J\'ai pris en charge'}
             </button>
-            <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8, textAlign: 'center' }}>Enregistré pour la traçabilité (qui, quand, température).</div>
+            <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8, textAlign: 'center' }}>Enregistré pour la traçabilité (qui, quand, capteur, température).</div>
           </div>
         </div>
       );
     }
 
-    function TemperaturePage({ session, currentSite }) {
-      const [data, setData] = React.useState(null);
-      const [loading, setLoading] = React.useState(true);
-      const [err, setErr] = React.useState('');
-      const [ackKeys, setAckKeys] = React.useState(() => new Set());
-      const [alertEp, setAlertEp] = React.useState(null);
-      const [config, setConfig] = React.useState(null); // seuil réglé par le master (temp_config), lecture seule ici
-
-      const load = React.useCallback(async () => {
-        setErr('');
-        try {
-          const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site: currentSite, hours: 12 });
-          if (r && r.ok) { setData(r); }
-          else { setErr((r && r.error) || 'Erreur Koovea'); }
-        } catch (e) { setErr(e.message); }
-        setLoading(false);
-      }, [currentSite]);
-
-      React.useEffect(() => {
-        setLoading(true); load();
-        const id = setInterval(load, 180000); // 3 min
-        return () => clearInterval(id);
-      }, [load]);
-
-      // Alertes déjà prises en charge (traçabilité)
-      React.useEffect(() => {
-        const u = storage.subscribe('temp_alerts', (arr) => setAckKeys(new Set((arr || []).map(a => a.id))));
-        return () => { if (u) u(); };
-      }, []);
-
-      // Seuil réglé par le master pour ce local — LECTURE SEULE ici, jamais éditable.
-      React.useEffect(() => {
-        const u = storage.subscribe('temp_config', (arr) => {
-          setConfig((arr || []).find(c => c.site === currentSite) || null);
-        });
-        return () => { if (u) u(); };
-      }, [currentSite]);
-
-      const threshold = (config && config.threshold != null) ? config.threshold : ((data && data.threshold != null) ? data.threshold : 8);
-      const unit = (data && data.unit) || (config && config.unit) || '°C';
-
+    // Une carte par capteur — courbe 12h + seuil (surchargé par temp_config si le
+    // master l'a réglé pour ce MAC). Purement affichage, aucune saisie.
+    function TemperatureSensorCard({ s, config }) {
+      const threshold = (config && config.threshold != null) ? config.threshold : (s.threshold != null ? s.threshold : 8);
+      const unit = s.unit || '°C';
       const series = React.useMemo(() => {
-        if (!data || !Array.isArray(data.series)) return [];
-        return data.series
+        if (!Array.isArray(s.series)) return [];
+        return s.series
           .filter(p => p && p.at != null && p.temp != null && !isNaN(Number(p.temp)))
           .map(p => ({ at: p.at, t: Number(p.temp), ms: new Date(p.at).getTime() }))
           .filter(p => !isNaN(p.ms))
           .sort((a, b) => a.ms - b.ms);
-      }, [data]);
-
-      const current = React.useMemo(() => {
-        if (data && data.current && data.current.temp != null) return { t: Number(data.current.temp), at: data.current.at };
-        return series.length ? { t: series[series.length - 1].t, at: series[series.length - 1].at } : null;
-      }, [data, series]);
-
-      // Épisode « chaud » en cours : dernier run de mesures au-dessus du seuil finissant à la dernière mesure.
-      const episode = React.useMemo(() => {
-        if (!series.length) return null;
-        const last = series[series.length - 1];
-        if (last.t <= threshold) return null;
-        let start = series.length - 1;
-        while (start - 1 >= 0 && series[start - 1].t > threshold) start--;
-        const minutes = (last.ms - series[start].ms) / 60000;
-        return { key: `${currentSite}_${series[start].at}`, temp: last.t, sinceMs: series[start].ms, minutes, lastAt: last.at };
-      }, [series, threshold, currentSite]);
-
-      React.useEffect(() => {
-        if (episode && episode.minutes >= 5 && !ackKeys.has(episode.key)) setAlertEp(episode);
-        else if (!episode) setAlertEp(null);
-      }, [episode, ackKeys]);
-
+      }, [s.series]);
+      const current = (s.current && s.current.temp != null)
+        ? { t: Number(s.current.temp), at: s.current.at }
+        : (series.length ? { t: series[series.length - 1].t, at: series[series.length - 1].at } : null);
       const isHigh = current && current.t > threshold;
       const tColor = isHigh ? '#E8583B' : '#25A55F';
 
-      // ---- Graphe SVG ----
       const chart = React.useMemo(() => {
         if (series.length < 2) return null;
-        const W = 320, H = 150, PL = 30, PR = 8, PT = 10, PB = 22;
+        const W = 320, H = 140, PL = 30, PR = 8, PT = 10, PB = 20;
         const temps = series.map(p => p.t).concat([threshold]);
         let lo = Math.min(...temps), hi = Math.max(...temps);
         if (hi - lo < 2) { hi += 1; lo -= 1; }
@@ -8693,6 +8647,98 @@
       }, [series, threshold, unit]);
 
       return (
+        <div className="card" style={{ padding: '16px', textAlign: 'center', borderLeft: `4px solid ${isHigh ? '#E8583B' : 'var(--line)'}` }}>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{s.label || s.tagName || 'Capteur'}</div>
+          {current ? (
+            <>
+              <div style={{ fontSize: 44, fontWeight: 800, color: tColor, lineHeight: 1.1 }}>{current.t.toFixed(1)}{unit}</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
+                {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
+                {current.at ? ' · ' + formatTimeFR(current.at) : ''}
+                {config && <span style={{ color: 'var(--info)' }}> · réglé par le master</span>}
+              </div>
+            </>
+          ) : (
+            <div className="empty-state" style={{ padding: '16px 0' }}><div className="icon">🌡️</div><p>Pas de mesure disponible pour ce capteur.</p></div>
+          )}
+          {!s.ok && <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 6 }}>⚠️ Capteur signalé indisponible côté Koovea.</div>}
+          {chart && (
+            <div style={{ marginTop: 10, textAlign: 'left' }}>
+              <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginBottom: 4 }}>12 dernières heures</div>
+              {chart}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function TemperaturePage({ session, currentSite }) {
+      const [data, setData] = React.useState(null);
+      const [loading, setLoading] = React.useState(true);
+      const [err, setErr] = React.useState('');
+      const [configs, setConfigs] = React.useState({}); // { mac: config } — réglé par le master, lecture seule ici
+      const [ackKeys, setAckKeys] = React.useState(() => new Set());
+      const [alertQueue, setAlertQueue] = React.useState([]);
+
+      const load = React.useCallback(async () => {
+        setErr('');
+        try {
+          const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site: currentSite, hours: 12 });
+          if (r && r.ok) { setData(r); }
+          else { setErr((r && r.error) || 'Erreur Koovea'); }
+        } catch (e) { setErr(e.message); }
+        setLoading(false);
+      }, [currentSite]);
+
+      React.useEffect(() => {
+        setLoading(true); load();
+        const id = setInterval(load, 180000); // 3 min
+        return () => clearInterval(id);
+      }, [load]);
+
+      // Alertes déjà prises en charge (traçabilité)
+      React.useEffect(() => {
+        const u = storage.subscribe('temp_alerts', (arr) => setAckKeys(new Set((arr || []).map(a => a.id))));
+        return () => { if (u) u(); };
+      }, []);
+
+      // Seuils réglés par le master pour ce local (par MAC) — LECTURE SEULE ici.
+      React.useEffect(() => {
+        const u = storage.subscribe('temp_config', (arr) => {
+          const m = {};
+          for (const c of (arr || [])) if (c.site === currentSite) m[c.mac] = c;
+          setConfigs(m);
+        });
+        return () => { if (u) u(); };
+      }, [currentSite]);
+
+      const sensors = (data && Array.isArray(data.sensors)) ? data.sensors : [];
+
+      // Épisodes en cours (au-dessus du seuil depuis ≥ 5 min), un par capteur, non acquittés.
+      React.useEffect(() => {
+        const queue = [];
+        for (const s of sensors) {
+          const series = Array.isArray(s.series) ? s.series
+            .filter(p => p && p.at != null && p.temp != null && !isNaN(Number(p.temp)))
+            .map(p => ({ t: Number(p.temp), ms: new Date(p.at).getTime() }))
+            .filter(p => !isNaN(p.ms)).sort((a, b) => a.ms - b.ms) : [];
+          if (!series.length) continue;
+          const cfg = configs[s.mac];
+          const threshold = (cfg && cfg.threshold != null) ? cfg.threshold : (s.threshold != null ? s.threshold : 8);
+          const last = series[series.length - 1];
+          if (last.t <= threshold) continue;
+          let start = series.length - 1;
+          while (start - 1 >= 0 && series[start - 1].t > threshold) start--;
+          const minutes = (last.ms - series[start].ms) / 60000;
+          if (minutes < 5) continue;
+          const key = `${currentSite}_${s.mac || 'default'}_${series[start].ms}`;
+          if (ackKeys.has(key)) continue;
+          queue.push({ mac: s.mac, label: s.label || s.tagName, temp: last.t, threshold, unit: s.unit, sinceMs: series[start].ms, minutes });
+        }
+        setAlertQueue(queue);
+      }, [sensors, configs, ackKeys, currentSite]);
+
+      return (
         <div className="stack">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
             <h1 style={{ margin: 0 }}>🌡️ Température · {currentSite}</h1>
@@ -8705,42 +8751,27 @@
             <div className="card" style={{ padding: 14, borderLeft: '4px solid var(--danger)' }}>
               <div style={{ fontWeight: 700, color: 'var(--danger)', marginBottom: 4 }}>⚠️ Koovea indisponible</div>
               <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{err}</div>
-              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Vérifie la config Koovea dans le proxy (URL, identifiants, capteur du site). Signale-le au master.</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Signale-le au master.</div>
             </div>
           )}
 
-          {data && current && (
-            <div className="card" style={{ padding: '18px 16px', textAlign: 'center' }}>
-              <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{data.tagName || 'Capteur ' + currentSite}</div>
-              <div style={{ fontSize: 52, fontWeight: 800, color: tColor, lineHeight: 1.1 }}>{current.t.toFixed(1)}{unit}</div>
-              <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
-                {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
-                {current.at ? ' · ' + formatTimeFR(current.at) : ''}
-                {config && <span style={{ color: 'var(--info)' }}> · réglé par le master</span>}
-              </div>
-            </div>
+          {!loading && !err && sensors.length === 0 && (
+            <div className="empty-state"><div className="icon">🌡️</div><p>Aucun capteur configuré pour ce local.</p></div>
           )}
 
-          {chart && (
-            <div className="card" style={{ padding: '12px 10px' }}>
-              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 6, paddingLeft: 4 }}>12 dernières heures</div>
-              {chart}
-            </div>
-          )}
-
-          {data && !current && !err && (
-            <div className="empty-state"><div className="icon">🌡️</div><p>Pas de mesure disponible pour ce capteur.</p></div>
-          )}
+          {sensors.map(s => (
+            <TemperatureSensorCard key={s.mac || s.label} s={s} config={configs[s.mac]} />
+          ))}
 
           <p style={{ fontSize: 11, color: 'var(--ink-mute)', textAlign: 'center' }}>
             Le seuil d'alerte est réglé par le master. Signale toute anomalie de capteur au master.
           </p>
 
-          {alertEp && (
+          {alertQueue.length > 0 && (
             <TemperatureAlertOverlay
-              episode={alertEp} threshold={threshold} unit={unit}
+              episode={alertQueue[0]}
               session={session} currentSite={currentSite}
-              onDone={() => setAlertEp(null)}
+              onDone={() => {}}
             />
           )}
         </div>
@@ -8748,16 +8779,16 @@
     }
 
     // ============================================================
-    // TEMPÉRATURES — PAGE MASTER (réglages seuils + vue globale tous les locaux)
-    // Seul le master peut écrire dans `temp_config`. La page TemperaturePage des
-    // distributeurs/prépa est 100% lecture seule — aucune écriture possible ailleurs.
+    // TEMPÉRATURES — PAGE MASTER (réglages seuils par capteur + vue globale)
+    // Seul le master peut écrire dans `temp_config` (clé = MAC du capteur). La page
+    // TemperaturePage des distributeurs/prépa est 100% lecture seule.
     // ============================================================
     function TempMasterPage({ session }) {
       const showToast = React.useContext(ToastContext);
-      const [bySite, setBySite] = React.useState({}); // { site: {loading, err, data} }
-      const [configs, setConfigs] = React.useState({}); // { site: config }
-      const [edit, setEdit] = React.useState({}); // { site: valeur en cours de saisie }
-      const [busySite, setBusySite] = React.useState(null);
+      const [bySite, setBySite] = React.useState({}); // { site: {loading, err, sensors} }
+      const [configs, setConfigs] = React.useState({}); // { mac: config }
+      const [edit, setEdit] = React.useState({}); // { mac: valeur en cours de saisie }
+      const [busyMac, setBusyMac] = React.useState(null);
 
       const sites = BOUTIQUES; // locaux équipés de capteurs
 
@@ -8766,12 +8797,12 @@
         try {
           const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site, hours: 1 });
           if (r && r.ok) {
-            setBySite(prev => ({ ...prev, [site]: { loading: false, err: '', data: r } }));
+            setBySite(prev => ({ ...prev, [site]: { loading: false, err: '', sensors: r.sensors || [] } }));
           } else {
-            setBySite(prev => ({ ...prev, [site]: { loading: false, err: (r && r.error) || 'Erreur', data: null } }));
+            setBySite(prev => ({ ...prev, [site]: { loading: false, err: (r && r.error) || 'Erreur', sensors: [] } }));
           }
         } catch (e) {
-          setBySite(prev => ({ ...prev, [site]: { loading: false, err: e.message, data: null } }));
+          setBySite(prev => ({ ...prev, [site]: { loading: false, err: e.message, sensors: [] } }));
         }
       }, []);
 
@@ -8779,96 +8810,101 @@
 
       React.useEffect(() => {
         const u = storage.subscribe('temp_config', (arr) => {
-          const m = {}; for (const c of (arr || [])) m[c.site] = c;
+          const m = {}; for (const c of (arr || [])) m[c.mac] = c;
           setConfigs(m);
         });
         return () => { if (u) u(); };
       }, []);
 
-      const saveThreshold = async (site, unit) => {
-        const raw = edit[site];
+      const saveThreshold = async (site, s) => {
+        const raw = edit[s.mac];
         const val = parseFloat(String(raw).replace(',', '.'));
         if (isNaN(val)) { showToast('Valeur invalide'); return; }
-        setBusySite(site);
+        setBusyMac(s.mac);
         try {
-          await storage.setDoc('temp_config', site, {
-            site, threshold: val, unit: unit || '°C',
+          await storage.setDoc('temp_config', s.mac, {
+            site, mac: s.mac, label: s.label || s.tagName || '',
+            threshold: val, unit: s.unit || '°C',
             updatedBy: session.name, updatedAt: new Date().toISOString(),
           }, { replace: true });
-          showToast(`✓ Seuil ${site} : ${val}${unit || '°C'}`);
-          setEdit(e => { const n = { ...e }; delete n[site]; return n; });
+          showToast(`✓ Seuil ${site} — ${s.label || s.mac} : ${val}${s.unit || '°C'}`);
+          setEdit(e => { const n = { ...e }; delete n[s.mac]; return n; });
         } catch (e) { showToast('Erreur : ' + e.message); }
-        setBusySite(null);
+        setBusyMac(null);
       };
 
-      const resetThreshold = async (site) => {
-        if (!confirm(`Revenir au seuil par défaut (Koovea) pour ${site} ?`)) return;
-        setBusySite(site);
+      const resetThreshold = async (s) => {
+        if (!confirm('Revenir au seuil par défaut (Koovea) pour ce capteur ?')) return;
+        setBusyMac(s.mac);
         try {
-          await storage.deleteDoc('temp_config', site);
+          await storage.deleteDoc('temp_config', s.mac);
           showToast('✓ Seuil par défaut restauré');
         } catch (e) { showToast('Erreur : ' + e.message); }
-        setBusySite(null);
+        setBusyMac(null);
       };
 
       return (
         <div className="stack">
           <h1>🌡️⚙️ Températures — réglages</h1>
           <p style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: -8 }}>
-            Vue de toutes les chambres froides équipées. <strong>Seul le master peut modifier un seuil d'alerte</strong> —
-            les distributeurs et préparateurs n'ont qu'un affichage en lecture seule (aucun réglage possible de leur côté).
+            Vue de tous les capteurs des chambres froides. <strong>Seul le master peut modifier un seuil d'alerte</strong> —
+            les distributeurs et préparateurs n'ont qu'un affichage en lecture seule.
           </p>
 
           {sites.map(site => {
-            const st = bySite[site] || { loading: true };
-            const cfg = configs[site];
-            const data = st.data;
-            const defaultThreshold = data && data.threshold != null ? data.threshold : 8;
-            const unit = (data && data.unit) || (cfg && cfg.unit) || '°C';
-            const effThreshold = (cfg && cfg.threshold != null) ? cfg.threshold : defaultThreshold;
-            const cur = data && data.current && data.current.temp != null ? Number(data.current.temp) : null;
-            const isHigh = cur != null && cur > effThreshold;
+            const st = bySite[site] || { loading: true, sensors: [] };
             return (
               <div key={site} className="card">
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                   <h3 style={{ margin: 0 }}>{siteLabel(site)} <span style={{ color: 'var(--ink-mute)', fontWeight: 400 }}>({site})</span></h3>
                   <button className="btn-ghost" style={{ fontSize: 12 }} disabled={st.loading} onClick={() => loadSite(site)}>↻</button>
                 </div>
                 {st.loading && <p style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Chargement…</p>}
                 {st.err && <div className="alert-warning" style={{ fontSize: 12 }}>⚠️ {st.err}</div>}
-                {!st.loading && !st.err && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <div style={{ flex: '1 1 140px', minWidth: 0 }}>
-                      <div style={{ fontSize: 22, fontWeight: 800, color: isHigh ? 'var(--danger)' : 'var(--accent-dark)' }}>
-                        {cur != null ? `${cur.toFixed(1)}${unit}` : '—'}
-                      </div>
-                      <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>
-                        seuil actuel : {effThreshold}{unit}{cfg && <span style={{ color: 'var(--info)' }}> · personnalisé</span>}
-                      </div>
-                    </div>
-                    <input
-                      type="text" inputMode="decimal"
-                      placeholder={`seuil (${defaultThreshold})`}
-                      value={edit[site] ?? (cfg ? String(cfg.threshold) : '')}
-                      onChange={e => setEdit(prev => ({ ...prev, [site]: e.target.value }))}
-                      style={{ width: 90, fontSize: 13, padding: '6px 8px' }}
-                    />
-                    <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={busySite === site} onClick={() => saveThreshold(site, unit)}>
-                      Enregistrer
-                    </button>
-                    {cfg && (
-                      <button className="btn-ghost" style={{ fontSize: 12, padding: '6px 8px', color: 'var(--ink-mute)' }} disabled={busySite === site} onClick={() => resetThreshold(site)}>
-                        ↩ défaut
-                      </button>
-                    )}
-                  </div>
+                {!st.loading && !st.err && st.sensors.length === 0 && (
+                  <p style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Aucun capteur trouvé pour ce local.</p>
                 )}
+                {st.sensors.map(s => {
+                  const cfg = configs[s.mac];
+                  const effThreshold = (cfg && cfg.threshold != null) ? cfg.threshold : s.threshold;
+                  const cur = s.current && s.current.temp != null ? Number(s.current.temp) : null;
+                  const isHigh = cur != null && effThreshold != null && cur > effThreshold;
+                  return (
+                    <div key={s.mac} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderTop: '1px solid var(--line)', flexWrap: 'wrap' }}>
+                      <div style={{ flex: '1 1 140px', minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 13 }}>{s.label || s.tagName || 'Capteur'}</div>
+                        <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>
+                          {cur != null ? <span style={{ color: isHigh ? 'var(--danger)' : 'var(--accent-dark)', fontWeight: 700 }}>{cur.toFixed(1)}{s.unit || '°C'}</span> : '—'}
+                          {' '}· MAC {s.mac}
+                          {cfg && <span style={{ color: 'var(--info)' }}> · seuil personnalisé</span>}
+                          {!s.ok && <span style={{ color: 'var(--danger)' }}> · ⚠️ indisponible</span>}
+                        </div>
+                      </div>
+                      <input
+                        type="text" inputMode="decimal"
+                        placeholder={`seuil (${s.threshold != null ? s.threshold : '—'})`}
+                        value={edit[s.mac] ?? (cfg ? String(cfg.threshold) : '')}
+                        onChange={e => setEdit(prev => ({ ...prev, [s.mac]: e.target.value }))}
+                        style={{ width: 90, fontSize: 13, padding: '6px 8px' }}
+                      />
+                      <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={busyMac === s.mac} onClick={() => saveThreshold(site, s)}>
+                        Enregistrer
+                      </button>
+                      {cfg && (
+                        <button className="btn-ghost" style={{ fontSize: 12, padding: '6px 8px', color: 'var(--ink-mute)' }} disabled={busyMac === s.mac} onClick={() => resetThreshold(s)}>
+                          ↩ défaut
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             );
           })}
         </div>
       );
     }
+
 
 
     function InfosPage({ session }) {
