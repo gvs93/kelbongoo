@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.70</title>
+  <title>Kelbongoo — Distribution V9.71</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -531,7 +531,11 @@
     // n'ont pas de casier : tout part EN CAGETTE. (Liste à confirmer si besoin.)
     const BOUTIQUES = ['BIC','BOR','STB','PDP','TOL','ROB','PDC'];
     function isCagetteSite(code) { return !BOUTIQUES.includes(String(code || '').toUpperCase()); }
-    const APP_VERSION = 'V9.70';
+    // Au-delà de ce délai sans mesure fraîche, un capteur Koovea est considéré HORS-LIGNE :
+    // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
+    // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
+    const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
+    const APP_VERSION = 'V9.71';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -8612,8 +8616,10 @@
       const current = (s.current && s.current.temp != null)
         ? { t: Number(s.current.temp), at: s.current.at }
         : (series.length ? { t: series[series.length - 1].t, at: series[series.length - 1].at } : null);
-      const isHigh = current && current.t > threshold;
-      const tColor = isHigh ? '#E8583B' : '#25A55F';
+      const ageMin = current && current.at ? (Date.now() - new Date(current.at).getTime()) / 60000 : null;
+      const isOffline = ageMin != null && ageMin > KOOVEA_OFFLINE_MIN; // mesure trop vieille : capteur hors-ligne
+      const isHigh = !isOffline && current && current.t > threshold;    // pas d'alerte "live" sur une mesure périmée
+      const tColor = isOffline ? '#9AA7B2' : (isHigh ? '#E8583B' : '#25A55F');
 
       const chart = React.useMemo(() => {
         if (series.length < 2) return null;
@@ -8646,8 +8652,11 @@
         );
       }, [series, threshold, unit]);
 
-      const ageMinutes = current && current.at ? (Date.now() - new Date(current.at).getTime()) / 60000 : null;
-      const isStale = ageMinutes != null && ageMinutes > 15;
+      const ageMinutes = ageMin;
+      const isStale = ageMinutes != null && ageMinutes > 15 && !isOffline;
+      const fmtAge = (min) => min < 60 ? `${Math.round(min)} min`
+        : min < 60 * 48 ? `${Math.floor(min / 60)}h${String(Math.round(min % 60)).padStart(2, '0')}`
+        : `${Math.floor(min / 1440)} j`;
       const fmtFullDateTime = (iso) => {
         try { return new Date(iso).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }); }
         catch (e) { return iso; }
@@ -8660,13 +8669,18 @@
             <>
               <div style={{ fontSize: 44, fontWeight: 800, color: tColor, lineHeight: 1.1 }}>{current.t.toFixed(1)}{unit}</div>
               <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
-                {isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme'} · seuil {threshold}{unit}
+                {isOffline ? '⛔ capteur hors-ligne' : (isHigh ? '⚠️ au-dessus du seuil' : '✓ dans la norme')} · seuil {threshold}{unit}
                 {current.at ? ' · ' + fmtFullDateTime(current.at) : ''}
                 {config && <span style={{ color: 'var(--info)' }}> · réglé par le master</span>}
               </div>
+              {isOffline && (
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--danger)', background: 'var(--danger-soft)', borderRadius: 8, padding: '8px 10px', textAlign: 'left' }}>
+                  ⛔ <strong>Capteur hors-ligne</strong> — aucune mesure fraîche depuis {fmtAge(ageMinutes)}. La valeur ci-dessus est la <strong>dernière mesure connue</strong> ({fmtFullDateTime(current.at)}), <strong>pas</strong> la température actuelle. Vérifie dans l'app Koovea et signale au master.
+                </div>
+              )}
               {isStale && (
                 <div style={{ marginTop: 8, fontSize: 12, color: 'var(--danger)', background: 'var(--danger-soft)', borderRadius: 8, padding: '6px 10px', textAlign: 'left' }}>
-                  ⚠️ Donnée ancienne ({ageMinutes < 60 ? `${Math.round(ageMinutes)} min` : `${Math.floor(ageMinutes / 60)}h${String(Math.round(ageMinutes % 60)).padStart(2, '0')}`}) — le capteur ne remonte peut-être plus de mesure fraîche. Compare avec l'app Koovea et signale au master si l'écart persiste.
+                  ⚠️ Donnée ancienne ({fmtAge(ageMinutes)}) — le capteur ne remonte peut-être plus de mesure fraîche. Compare avec l'app Koovea et signale au master si l'écart persiste.
                 </div>
               )}
             </>
@@ -8782,6 +8796,7 @@
           const cfg = configs[s.mac];
           const threshold = (cfg && cfg.threshold != null) ? cfg.threshold : (s.threshold != null ? s.threshold : 8);
           const last = series[series.length - 1];
+          if ((Date.now() - last.ms) > KOOVEA_OFFLINE_MIN * 60000) continue; // capteur hors-ligne : aucune alerte bloquante sur données périmées
           if (last.t <= threshold) continue;
           let start = series.length - 1;
           while (start - 1 >= 0 && series[start - 1].t > threshold) start--;
@@ -8928,19 +8943,22 @@
                   const cfg = configs[s.mac];
                   const effThreshold = (cfg && cfg.threshold != null) ? cfg.threshold : s.threshold;
                   const cur = s.current && s.current.temp != null ? Number(s.current.temp) : null;
-                  const isHigh = cur != null && effThreshold != null && cur > effThreshold;
                   const ageMin = s.current && s.current.at ? (Date.now() - new Date(s.current.at).getTime()) / 60000 : null;
-                  const isStale = ageMin != null && ageMin > 15;
+                  const isOffline = ageMin != null && ageMin > KOOVEA_OFFLINE_MIN;
+                  const isHigh = !isOffline && cur != null && effThreshold != null && cur > effThreshold;
+                  const isStale = ageMin != null && ageMin > 15 && !isOffline;
+                  const fmtAgeM = (min) => min < 60 ? `${Math.round(min)} min` : min < 60 * 48 ? `${Math.floor(min / 60)}h${String(Math.round(min % 60)).padStart(2, '0')}` : `${Math.floor(min / 1440)} j`;
                   return (
                     <div key={s.mac} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderTop: '1px solid var(--line)', flexWrap: 'wrap' }}>
                       <div style={{ flex: '1 1 140px', minWidth: 0 }}>
                         <div style={{ fontWeight: 600, fontSize: 13 }}>{s.label || s.tagName || 'Capteur'}</div>
                         <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>
-                          {cur != null ? <span style={{ color: isHigh ? 'var(--danger)' : 'var(--accent-dark)', fontWeight: 700 }}>{cur.toFixed(1)}{s.unit || '°C'}</span> : '—'}
+                          {cur != null ? <span style={{ color: isOffline ? 'var(--ink-mute)' : (isHigh ? 'var(--danger)' : 'var(--accent-dark)'), fontWeight: 700 }}>{cur.toFixed(1)}{s.unit || '°C'}</span> : '—'}
                           {' '}· MAC {s.mac}
                           {cfg && <span style={{ color: 'var(--info)' }}> · seuil personnalisé</span>}
                           {!s.ok && <span style={{ color: 'var(--danger)' }}> · ⚠️ indisponible</span>}
-                          {isStale && <span style={{ color: 'var(--warn)' }}> · ⏱️ donnée vieille de {ageMin < 60 ? `${Math.round(ageMin)} min` : `${Math.floor(ageMin / 60)}h${String(Math.round(ageMin % 60)).padStart(2, '0')}`}</span>}
+                          {isOffline && <span style={{ color: 'var(--danger)' }}> · ⛔ hors-ligne ({fmtAgeM(ageMin)})</span>}
+                          {isStale && <span style={{ color: 'var(--warn)' }}> · ⏱️ donnée vieille de {fmtAgeM(ageMin)}</span>}
                         </div>
                       </div>
                       <input
