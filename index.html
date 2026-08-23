@@ -536,7 +536,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.19';
+    const APP_VERSION = 'V9.21';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -2096,6 +2096,39 @@
         return merged.length > 0 ? merged : SITES;
       }, [sitesOfDay, sitesWithPending]);
 
+      // ---- Connexion Google pour le rôle MASTER ----
+      const gRef = React.useRef(null);
+      const [gDown, setGDown] = React.useState(false);
+      const [gErr, setGErr] = React.useState('');
+      const loginRef = React.useRef({});
+      loginRef.current = { site, name, availableSites };
+      React.useEffect(() => {
+        if (role !== 'master') return;
+        setGErr(''); setGDown(false);
+        let n = 0;
+        const t = setInterval(() => {
+          n++;
+          if (window.google && google.accounts && google.accounts.id) {
+            clearInterval(t);
+            try {
+              google.accounts.id.initialize({
+                client_id: OAUTH_CLIENT_ID,
+                callback: (resp) => {
+                  const info = decodeJwt(resp.credential);
+                  if (!info) { setGErr('Jeton Google illisible.'); return; }
+                  if (String(info.email_verified) !== 'true') { setGErr('Email Google non vérifié.'); return; }
+                  if (!isAdminEmail(info.email)) { setGErr('Accès refusé : ' + info.email + " n'est pas autorisé."); return; }
+                  const L = loginRef.current;
+                  onLogin({ role: 'master', isMaster: true, site: L.site || (L.availableSites && L.availableSites[0]) || 'BOR', name: (L.name && L.name.trim()) || info.given_name || info.name || info.email, adminEmail: String(info.email).toLowerCase(), loggedAt: new Date().toISOString() });
+                }
+              });
+              if (gRef.current) { gRef.current.innerHTML = ''; google.accounts.id.renderButton(gRef.current, { theme: 'filled_blue', size: 'large', text: 'signin_with', width: 280 }); }
+            } catch (e) { setGDown(true); }
+          } else if (n > 18) { clearInterval(t); setGDown(true); }
+        }, 400);
+        return () => clearInterval(t);
+      }, [role]);
+
       const handleSubmit = () => {
         setError('');
         if (!name.trim()) { setError('Entre ton prénom.'); return; }
@@ -2219,16 +2252,35 @@
               )}
             </div>
 
-            <div className="field">
-              <label>
-                {role === 'master' ? 'Mot de passe master' : role === 'prep' ? 'Mot de passe préparateur' : 'Mot de passe distributeur'}
-              </label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
-            </div>
+            {role === 'master' ? (
+              <div className="field">
+                <label>Connexion administrateur (Google)</label>
+                <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>
+                  Seuls les comptes Google autorisés peuvent ouvrir l'espace master.
+                </div>
+                <div ref={gRef} style={{display:'flex',justifyContent:'center',minHeight:44}}></div>
+                {gErr && <div style={{color:'var(--danger)',fontSize:12,marginTop:8,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{gErr}</div>}
+                {gDown && (
+                  <div style={{marginTop:12}}>
+                    <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>
+                      Google indisponible — connexion de secours par mot de passe :
+                    </div>
+                    <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="field">
+                <label>{role === 'prep' ? 'Mot de passe préparateur' : 'Mot de passe distributeur'}</label>
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
+              </div>
+            )}
 
             {error && <div style={{color:'var(--danger)',fontSize:12,marginBottom:12,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{error}</div>}
 
-            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit}>Se connecter</button>
+            {(role !== 'master' || gDown) && (
+              <button className="btn-primary btn-block btn-lg" onClick={handleSubmit}>Se connecter</button>
+            )}
 
             <div style={{marginTop:14,textAlign:'center',fontSize:11,color:'var(--ink-mute)'}}>
               {firebaseConfigured
@@ -12613,7 +12665,7 @@
         <div className="stack">
           <h1>🔐 Administration</h1>
           <div className="card" style={{ maxWidth: 460 }}>
-            <p style={{ fontSize: 13, color: 'var(--ink-mute)', marginTop: 0 }}>Connexion administrateur requise (Google). Réservé à : achat@probon.fr, rr@probon.fr, hg@probon.fr.</p>
+            <p style={{ fontSize: 13, color: 'var(--ink-mute)', marginTop: 0 }}>Connexion administrateur requise (compte Google autorisé).</p>
             <div ref={ref} style={{ display: 'flex', justifyContent: 'center', margin: '10px 0' }}></div>
             {!ready && !down && !err && <div style={{ fontSize: 12, color: 'var(--ink-mute)', textAlign: 'center' }}>Chargement de la connexion Google…</div>}
             {err && <div style={{ color: 'var(--danger,#c62828)', fontSize: 13, marginTop: 8 }}>{err}</div>}
@@ -13034,7 +13086,7 @@
       return (
         <div className="stack">
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-            <h1 style={{margin:0}}>Administration</h1>
+            <h1 style={{margin:0}}>📥 Chargement</h1>
             {adminEmail && onLogoutAdmin && <button className="btn-ghost" style={{fontSize:12}} onClick={onLogoutAdmin} title={adminEmail}>🔓 {adminEmail === 'master-fallback' ? 'secours' : adminEmail} · déconnexion</button>}
           </div>
 
@@ -15694,7 +15746,7 @@
           {tab === 'histo' && effSession.isMaster && <HistoryPage session={effSession} />}
           {tab === 'tempmaster' && effSession.isMaster && <TempMasterPage session={effSession} />}
           {tab === 'stats' && effSession.isMaster && <StatsPage session={effSession} />}
-          {tab === 'admin' && effSession.isMaster && <AdminGated session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
+          {tab === 'admin' && effSession.isMaster && <AdminPage session={effSession} adminEmail={effSession.adminEmail || ''} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
           <div className="tab-bar">
             {!effSession.isMaster && (
@@ -15769,7 +15821,7 @@
             )}
             {effSession.isMaster && (
               <button className={tab==='admin'?'active':''} onClick={()=>setTab('admin')}>
-                <span className="tab-icon">⚙️</span>Admin
+                <span className="tab-icon">📥</span>Chargement
               </button>
             )}
           </div>
