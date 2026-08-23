@@ -22,6 +22,7 @@
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async></script>
   <script>
     if (window.pdfjsLib) {
       window.pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -535,7 +536,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.16';
+    const APP_VERSION = 'V9.19';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -738,6 +739,11 @@
     // L'URL du proxy Apps Script déployé (Application Web /exec)
     const FRESHDESK_PROXY_URL = "https://script.google.com/macros/s/AKfycbzCe9N3pn0fBcW-FiTBp-e_TYIIRr0xL29AaVloScbu7S6Exim-ErtQvpgtJmwapLU_6w/exec";
     const FRESHDESK_SECRET = "Lesmailspartent!"; // doit correspondre au SHARED_SECRET du script
+    // Connexion Google pour l'Admin (même client OAuth que les autres apps).
+    const OAUTH_CLIENT_ID = "757658680772-ogalpu5olqd2fiovnbnj55j1g0lbq7rr.apps.googleusercontent.com";
+    const ADMIN_EMAILS = ["achat@probon.fr", "rr@probon.fr", "hg@probon.fr", "ga@pribon.org", "achat@pribon.org"];
+    function isAdminEmail(email) { return ADMIN_EMAILS.map(e => e.toLowerCase()).includes(String(email || '').toLowerCase().trim()); }
+    function decodeJwt(t) { try { const b = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); const j = decodeURIComponent(atob(b).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')); return JSON.parse(j); } catch (e) { return null; } }
 
     // PROXY FL / PROBON (inventaire FL, stock, import Probon, mails) — script dédié
     const FL_PROXY_URL = "https://script.google.com/macros/s/AKfycbyVvvafumNfLZ7RzseUvoHaghPK7c-_7KqthgtV_VY9ulXe7sJIYEclWnratDbBJeDd/exec";
@@ -4893,6 +4899,35 @@
       }
       return { colis: Math.ceil(mq / col), besoin: mq, unit: t || 'pièce', ok: true };
     }
+    // Libellé d'unité lisible pour le mail Rungis (sachets / pièces / bottes).
+    function frUnitLabel(t) { t = _flNorm(t); if (t === 'sachet') return 'sachets'; if (t === 'botte') return 'bottes'; if (t === 'piece' || t === 'pièce') return 'pièces'; return t || 'unités'; }
+    // Construit le mail de rajout FL. `rows` = produits avec colisage (colis calculés) ;
+    // `warn` = produits SANS colisage → on donne la quantité à Rungis qui calcule à la main.
+    function buildFlRuptureMail(rows, warn, day, by) {
+      const totalColis = rows.reduce((a, x) => a + (x.colis || 0), 0);
+      let body = `Bonjour,\n\nMerci d'ajouter à la commande FL du ${day} les rajouts suivants (suite à ruptures) :\n\n`;
+      if (rows.length) {
+        body += `— À AJOUTER (colis calculés) —\n`;
+        rows.forEach(x => { body += `• ${x.producer ? x.producer + ' — ' : ''}${x.produit} : ${x.colis} colis (colisage ${x.colisage}${_flNorm(x.type) === 'sachet' && x.muKilo ? `, ${x.muKilo} kg/sachet` : ''}) — manque ${x.manque} ${frUnitLabel(x.type)}\n`; });
+        body += `\nTOTAL : ${totalColis} colis.\n`;
+      }
+      if (warn.length) {
+        body += `\n— SANS COLISAGE (à calculer par vos soins) —\n`;
+        warn.forEach(x => { body += `• Pas de colisage pour ${x.produit} → besoin de ${x.manque} ${frUnitLabel(x.type)} de ${x.produit}\n`; });
+        body += `\n⚠️ Merci de remplir le colisage dans le Google Sheet pour ces produits.\n`;
+      }
+      body += `\nDemande émise par ${by} via l'app distribution.\n`;
+      const subject = `Rajout FL ${day} — ${rows.length} produit(s) / ${totalColis} colis${warn.length ? ` (+${warn.length} sans colisage)` : ''}`;
+      return { subject, body };
+    }
+    // Envoi via le proxy FL (action mail_fl_rupture) : le proxy envoie le mail à gestion@probon.fr
+    // ET journalise dans l'onglet « DEMANDES RAJOUT FL ». On passe aussi les produits sans colisage
+    // (warnItems) pour qu'ils apparaissent dans le mail + le journal (voir fl_rupture.gs mis à jour).
+    async function sendFlRuptureMail(rows, warn, day, by) {
+      const items = rows.map(x => ({ producer: x.producer, produit: x.produit, manque: x.manque, colisage: x.colisage, colis: x.colis, type: x.type, muKilo: x.muKilo || '' }));
+      const warnItems = warn.map(x => ({ producer: x.producer || '', produit: x.produit, manque: x.manque, type: x.type, unit: frUnitLabel(x.type), reason: x.reason || 'colisage manquant' }));
+      return await flPost({ secret: FRESHDESK_SECRET, action: 'mail_fl_rupture', date: day, by, items, warnItems });
+    }
 
     // Affiche une quantité de cagettes avec fraction lisible : 2.33 → « 2⅓ », 0.5 → « ½ ».
     const CAGETTE_FRACTIONS = [
@@ -4908,6 +4943,20 @@
       if (whole === 0) return sym || '0';
       return sym ? `${whole}${sym}` : `${whole}`;
     }
+    // Dessin d'une cagette remplie à `frac` (0..1) — visuel pour remplacer « 1/4, 2/4 ».
+    function CagetteIcon({ frac, size }) {
+      const w = size || 40, h = (size || 40) * 0.82, pad = (size || 40) * 0.13;
+      const innerW = w - 2 * pad, innerH = h - 2 * pad;
+      const f = Math.max(0, Math.min(1, Number(frac) || 0));
+      const fillH = innerH * f;
+      return (
+        <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{ display: 'block' }}>
+          <rect x={pad} y={pad} width={innerW} height={innerH} rx="2" fill="#f5efe4" stroke="#b07d4d" strokeWidth="1.6" />
+          {f > 0 && <rect x={pad + 1} y={pad + innerH - fillH} width={innerW - 2} height={fillH} rx="1.5" fill={f >= 1 ? '#5a9c2f' : '#8bc34a'} />}
+          {[0.33, 0.66].map((p, i) => <line key={i} x1={pad + innerW * p} y1={pad} x2={pad + innerW * p} y2={pad + innerH} stroke="#b07d4d" strokeWidth="1" opacity="0.45" />)}
+        </svg>
+      );
+    }
     // Pavé de saisie « cagettes » pensé entrepôt : gros − / + pour les cagettes entières,
     // rangée de fractions pour la cagette entamée. Utilisable au pouce, à une main.
     function FractionPad({ value, onChange, onClose, label }) {
@@ -4922,8 +4971,8 @@
         <div style={{ padding: '12px 8px', background: 'var(--accent-soft)', borderTop: '1px dashed var(--accent)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginBottom: 12 }}>
             <button onClick={() => setWhole(whole - 1)} style={bigBtn}>−</button>
-            <div style={{ minWidth: 96, textAlign: 'center' }}>
-              <div style={{ fontSize: 30, fontWeight: 800, lineHeight: 1 }}>🥬 {fmtCagette(v)}</div>
+            <div style={{ minWidth: 96, textAlign: 'center', display:'flex', flexDirection:'column', alignItems:'center' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:6 }}><CagetteIcon frac={frac} size={36} /><span style={{ fontSize: 30, fontWeight: 800, lineHeight: 1 }}>{fmtCagette(v)}</span></div>
               <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 2 }}>{label || 'cagettes'} · {v.toFixed(2)}</div>
             </div>
             <button onClick={() => setWhole(whole + 1)} style={bigBtn}>+</button>
@@ -4933,10 +4982,11 @@
               const sel = Math.abs(closest.val - f.val) < 0.001;
               return (
                 <button key={f.label} onClick={() => setFrac(f.val)}
-                  style={{ minWidth: 48, height: 48, fontSize: 20, fontWeight: 700, borderRadius: 10, cursor: 'pointer',
+                  style={{ minWidth: 54, height: 64, borderRadius: 10, cursor: 'pointer', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:2, padding:0,
                     border: sel ? '2px solid var(--accent)' : '1px solid var(--border)',
-                    background: sel ? 'var(--accent)' : 'var(--bg-card,#fff)', color: sel ? '#fff' : 'var(--ink)' }}>
-                  {f.label}
+                    background: sel ? 'var(--accent-soft)' : 'var(--bg-card,#fff)', color: 'var(--ink)' }}>
+                  <CagetteIcon frac={f.val} size={30} />
+                  <span style={{ fontSize: 13, fontWeight: 800, color: sel ? 'var(--accent)' : 'var(--ink)' }}>{f.label === '0' ? 'vide' : f.label}</span>
                 </button>
               );
             })}
@@ -8303,14 +8353,13 @@
       }, [flIdx, manquants]);
 
       const sendFlRupture = async () => {
-        if (!flRuptures.rows.length) return;
+        if (!flRuptures.rows.length && !flRuptures.warn.length) return;
         const totalColis = flRuptures.rows.reduce((a, x) => a + (x.colis || 0), 0);
-        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${flRuptures.rows.length} produit(s) · ${totalColis} colis au total.`)) return;
+        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${flRuptures.rows.length} produit(s) · ${totalColis} colis${flRuptures.warn.length ? `\n+ ${flRuptures.warn.length} sans colisage (Rungis calcule à la main)` : ''}.`)) return;
         setFlSending(true);
         try {
-          const items = flRuptures.rows.map(x => ({ producer: x.producer, produit: x.produit, manque: x.manque, colisage: x.colisage, colis: x.colis }));
-          const res = await flPost({ secret: FRESHDESK_SECRET, action: 'mail_fl_rupture', date: day, by: session.name, items: items });
-          if (res && res.ok) showToast(`📧 Demande envoyée : ${res.sent} produit(s), ${res.totalColis} colis`);
+          const res = await sendFlRuptureMail(flRuptures.rows, flRuptures.warn, day, session.name);
+          if (res && res.ok !== false) showToast(`📧 Demande envoyée à gestion@probon.fr (${flRuptures.rows.length + flRuptures.warn.length} produit(s))`);
           else showToast('Erreur envoi : ' + ((res && res.error) || 'inconnue'));
         } catch (e) { showToast('Erreur réseau : ' + e.message); }
         finally { setFlSending(false); }
@@ -8644,14 +8693,14 @@
 
               {flRuptures.warn.length > 0 && (
                 <div style={{marginTop:8,padding:'8px 10px',background:'var(--warn-soft,#fff7e6)',border:'1px solid #f0c36d',borderRadius:6,fontSize:12}}>
-                  ⚠️ Non inclus dans la commande (à compléter dans le Sheet FL) :
+                  ⚠️ Sans colisage — inclus dans le mail, Rungis calcule à la main (pense à remplir le colisage dans le Sheet) :
                   <ul style={{margin:'4px 0 0',paddingLeft:18}}>
-                    {flRuptures.warn.map(x => <li key={x.id}>{x.produit} — {x.reason}</li>)}
+                    {flRuptures.warn.map(x => <li key={x.id}>{x.produit} — besoin {x.manque} {frUnitLabel(x.type)}</li>)}
                   </ul>
                 </div>
               )}
 
-              {flRuptures.rows.length > 0 && (
+              {(flRuptures.rows.length > 0 || flRuptures.warn.length > 0) && (
                 <button className="btn-primary" style={{marginTop:12,fontSize:14}} disabled={flSending} onClick={sendFlRupture}>
                   {flSending ? 'Envoi…' : '📧 Envoyer la demande à gestion@probon.fr'}
                 </button>
@@ -10127,7 +10176,47 @@
 
 
 
-    function InfosPage({ session }) {
+    // Message libre du distributeur → mail au bureau (rr@pribon.org). Sujet = « BOUTIQUE — OBJET ».
+    function DistribMessageCard({ session, currentSite }) {
+      const showToast = React.useContext(ToastContext);
+      const OBJETS = ['Besoins fournitures', 'Problème boutique', 'Autre (à préciser)'];
+      const [objet, setObjet] = React.useState(OBJETS[0]);
+      const [custom, setCustom] = React.useState('');
+      const [txt, setTxt] = React.useState('');
+      const [sending, setSending] = React.useState(false);
+      const site = currentSite || session.site || '';
+      const objetLabel = objet === 'Autre (à préciser)' ? (custom.trim() || 'Message') : objet;
+      const send = async () => {
+        if (!txt.trim()) { showToast('Écris ton message.'); return; }
+        if (objet === 'Autre (à préciser)' && !custom.trim()) { showToast("Précise l'objet."); return; }
+        setSending(true);
+        try {
+          const subject = `${site || 'Boutique'} — ${objetLabel}`;
+          const body = `${txt.trim()}\n\n— ${session.name} (${site || '?'}) via l'app distribution`;
+          const res = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'rr@pribon.org', subject, body });
+          if (res && res.ok !== false) { showToast('📧 Message envoyé au bureau'); setTxt(''); setCustom(''); }
+          else showToast('Erreur : ' + ((res && res.error) || 'inconnue'));
+        } catch (e) { showToast('Erreur réseau : ' + e.message); } finally { setSending(false); }
+      };
+      return (
+        <div className="card" style={{ borderLeft: '4px solid var(--info,#2f6fc0)' }}>
+          <h3 style={{ marginBottom: 6 }}>✉️ Message au bureau (rr@pribon.org)</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}>Objet
+              <select value={objet} onChange={e => setObjet(e.target.value)} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1.5px solid var(--border)', marginTop: 4 }}>
+                {OBJETS.map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </label>
+            {objet === 'Autre (à préciser)' && <input value={custom} onChange={e => setCustom(e.target.value)} placeholder="Objet personnalisé…" style={{ padding: 10, borderRadius: 8, border: '1.5px solid var(--border)' }} />}
+            <textarea value={txt} onChange={e => setTxt(e.target.value)} rows={4} placeholder="Ton message…" style={{ padding: 10, borderRadius: 8, border: '1.5px solid var(--border)', resize: 'vertical' }} />
+            <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>Sujet du mail : <b>{(site || 'Boutique')} — {objetLabel}</b></div>
+            <button className="btn-primary" disabled={sending} onClick={send}>{sending ? 'Envoi…' : '📧 Envoyer au bureau'}</button>
+          </div>
+        </div>
+      );
+    }
+
+    function InfosPage({ session, currentSite }) {
       // Suit la distribution active (date du fichier chargé, sinon aujourd'hui)
       const day = activeDay();
       const [manquants, setManquants] = React.useState([]);
@@ -10198,6 +10287,8 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Produits manquants et leur raison — pour informer les clients.
           </p>
+
+          <DistribMessageCard session={session} currentSite={currentSite} />
 
           {isDistrib && <ManquantsMailPanel orders={orders} session={session} />}
 
@@ -12488,7 +12579,119 @@
       );
     }
 
-    function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta }) {
+    // Écran de connexion Google pour accéder à l'Admin.
+    function AdminGate({ onOk }) {
+      const ref = React.useRef(null);
+      const [err, setErr] = React.useState('');
+      const [ready, setReady] = React.useState(false);
+      const [down, setDown] = React.useState(false);
+      React.useEffect(() => {
+        let n = 0;
+        const t = setInterval(() => {
+          n++;
+          if (window.google && google.accounts && google.accounts.id) {
+            clearInterval(t);
+            try {
+              google.accounts.id.initialize({
+                client_id: OAUTH_CLIENT_ID,
+                callback: (resp) => {
+                  const info = decodeJwt(resp.credential);
+                  if (!info) { setErr('Jeton Google illisible.'); return; }
+                  if (String(info.email_verified) !== 'true') { setErr('Email Google non vérifié.'); return; }
+                  if (!isAdminEmail(info.email)) { setErr('Accès refusé : ' + info.email + " n'est pas admin."); return; }
+                  onOk(String(info.email).toLowerCase());
+                }
+              });
+              if (ref.current) google.accounts.id.renderButton(ref.current, { theme: 'filled_blue', size: 'large', text: 'signin_with' });
+              setReady(true);
+            } catch (e) { setErr('Erreur Google : ' + e.message); setDown(true); }
+          } else if (n > 20) { clearInterval(t); setDown(true); }
+        }, 400);
+        return () => clearInterval(t);
+      }, []);
+      return (
+        <div className="stack">
+          <h1>🔐 Administration</h1>
+          <div className="card" style={{ maxWidth: 460 }}>
+            <p style={{ fontSize: 13, color: 'var(--ink-mute)', marginTop: 0 }}>Connexion administrateur requise (Google). Réservé à : achat@probon.fr, rr@probon.fr, hg@probon.fr.</p>
+            <div ref={ref} style={{ display: 'flex', justifyContent: 'center', margin: '10px 0' }}></div>
+            {!ready && !down && !err && <div style={{ fontSize: 12, color: 'var(--ink-mute)', textAlign: 'center' }}>Chargement de la connexion Google…</div>}
+            {err && <div style={{ color: 'var(--danger,#c62828)', fontSize: 13, marginTop: 8 }}>{err}</div>}
+            {down && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--line)' }}>
+                <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 6 }}>Connexion Google indisponible (bloqueur / origine non autorisée).</div>
+                <button className="btn-secondary" onClick={() => onOk('master-fallback')}>Continuer en master (accès de secours)</button>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    // Enrobe l'Admin d'une connexion Google (l'onglet reste réservé au master).
+    function AdminGated(props) {
+      const [email, setEmail] = React.useState(() => { try { return localStorage.getItem('kb_admin_email') || ''; } catch (e) { return ''; } });
+      const ok = isAdminEmail(email) || email === 'master-fallback';
+      if (!ok) return <AdminGate onOk={(em) => { try { localStorage.setItem('kb_admin_email', em); } catch (e) {} setEmail(em); }} />;
+      return <AdminPage {...props} adminEmail={email} onLogoutAdmin={() => { try { localStorage.removeItem('kb_admin_email'); } catch (e) {} setEmail(''); }} />;
+    }
+
+    // Carte « Rajout F&L à Rungis » — réutilisable (Manquants & ND + Admin).
+    function FlRuptureCard({ session }) {
+      const day = activeDay();
+      const showToast = React.useContext(ToastContext);
+      const [manquants, setManquants] = React.useState([]);
+      const [flIdx, setFlIdx] = React.useState(null);
+      const [sending, setSending] = React.useState(false);
+      React.useEffect(() => { if (!day) return; const u = storage.subscribe(`day_${day}_manquants`, setManquants); return u; }, [day]);
+      React.useEffect(() => { let alive = true; (async () => { try { const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }); if (alive && res && res.ok && res.rows) setFlIdx(parseFLSheetIndex(res.rows)); } catch (e) {} })(); return () => { alive = false; }; }, []);
+      const fl = React.useMemo(() => {
+        if (!flIdx) return { ready: false, rows: [], warn: [] };
+        const rows = [], warn = [];
+        (manquants || []).forEach(m => {
+          const rec = _flMatchFL(flIdx, m.produit); if (!rec) return;
+          const manque = Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0; if (manque <= 0) return;
+          const calc = flColisNeeded(rec.type, manque, rec.muKilo, rec.colisage);
+          const item = { id: m.id, producer: rec.producer || m.producteur || '', produit: rec.produit || m.produit, type: rec.type, manque, muKilo: rec.muKilo, colisage: rec.colisage, colis: calc.colis, ok: calc.ok, reason: calc.reason };
+          if (calc.ok && calc.colis > 0) rows.push(item); else warn.push(item);
+        });
+        rows.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.produit || '').localeCompare(b.produit || '', 'fr'));
+        return { ready: true, rows, warn };
+      }, [flIdx, manquants]);
+      const totalColis = fl.rows.reduce((a, x) => a + (x.colis || 0), 0);
+      const send = async () => {
+        if (!fl.rows.length && !fl.warn.length) return;
+        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${fl.rows.length} produit(s) · ${totalColis} colis${fl.warn.length ? `\n+ ${fl.warn.length} sans colisage (Rungis calcule à la main)` : ''}.`)) return;
+        setSending(true);
+        try { const res = await sendFlRuptureMail(fl.rows, fl.warn, day, session.name); if (res && res.ok !== false) showToast('📧 Demande envoyée à gestion@probon.fr'); else showToast('Erreur : ' + ((res && res.error) || 'inconnue')); }
+        catch (e) { showToast('Erreur réseau : ' + e.message); } finally { setSending(false); }
+      };
+      return (
+        <div className="card" style={{ border: '2px solid #6a9a3f' }}>
+          <h3 style={{ marginBottom: 4 }}>🥬 Rajout F&L à Rungis (ruptures du jour)</h3>
+          <p style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 0 }}>Rapproche les manquants F&L du jour ({day || '—'}) au Sheet FL et calcule les colis à rajouter à la commande. Envoi 100% serveur à gestion@probon.fr.</p>
+          {!fl.ready && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement de la feuille FL…</p>}
+          {fl.ready && fl.rows.length === 0 && fl.warn.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun manquant F&L à rajouter aujourd'hui.</p>}
+          {fl.rows.length > 0 && (
+            <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+              <thead><tr><th style={{ textAlign: 'left', padding: '4px 6px' }}>Produit</th><th style={{ padding: '4px 6px', textAlign: 'right' }}>Manque</th><th style={{ padding: '4px 6px' }}>Colisage</th><th style={{ padding: '4px 6px', textAlign: 'right' }}>Colis</th></tr></thead>
+              <tbody>
+                {fl.rows.map(x => (<tr key={x.id} style={{ borderTop: '1px solid var(--line)' }}><td style={{ padding: '6px' }}>{x.producer ? x.producer + ' — ' : ''}{x.produit}</td><td style={{ padding: '6px', textAlign: 'right' }}>{x.manque}</td><td style={{ padding: '6px', textAlign: 'center' }}>{x.colisage}</td><td style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>{x.colis}</td></tr>))}
+                <tr style={{ borderTop: '2px solid var(--line)' }}><td colSpan="3" style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>Total</td><td style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>{totalColis} colis</td></tr>
+              </tbody>
+            </table></div>
+          )}
+          {fl.warn.length > 0 && (
+            <div style={{ marginTop: 8, padding: '8px 10px', background: 'var(--warn-soft,#fff7e6)', border: '1px solid #f0c36d', borderRadius: 6, fontSize: 12 }}>
+              ⚠️ Sans colisage — inclus dans le mail, Rungis calcule à la main (pense à remplir le colisage dans le Sheet) :
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>{fl.warn.map(x => <li key={x.id}>{x.produit} — besoin {x.manque} {frUnitLabel(x.type)}</li>)}</ul>
+            </div>
+          )}
+          {(fl.rows.length > 0 || fl.warn.length > 0) && <button className="btn-primary" style={{ marginTop: 12, fontSize: 14 }} disabled={sending} onClick={send}>{sending ? 'Envoi…' : '📧 Envoyer la demande à gestion@probon.fr'}</button>}
+        </div>
+      );
+    }
+
+    function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta, adminEmail, onLogoutAdmin }) {
       const showToast = React.useContext(ToastContext);
       const [flSync, setFlSync] = React.useState(null); // résultat synchro FL au dernier chargement catalogue
       const [csvFile, setCsvFile] = React.useState(null);
@@ -12830,10 +13033,14 @@
 
       return (
         <div className="stack">
-          <h1>Administration</h1>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+            <h1 style={{margin:0}}>Administration</h1>
+            {adminEmail && onLogoutAdmin && <button className="btn-ghost" style={{fontSize:12}} onClick={onLogoutAdmin} title={adminEmail}>🔓 {adminEmail === 'master-fallback' ? 'secours' : adminEmail} · déconnexion</button>}
+          </div>
 
           <LoadStatusCard />
 
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'6px 2px -2px'}}>▸ Chargement du jour</div>
           {/* ====== V4 : CHARGEMENT UNIFIÉ (3 fichiers JSON) ====== */}
           <div className="card" style={{border:'2px solid var(--accent)'}}>
             <h3 style={{marginBottom:4}}>🚀 Chargement du jour (nouveau)</h3>
@@ -12900,21 +13107,14 @@
             )}
           </div>
 
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'10px 2px -2px'}}>▸ Rajout F&amp;L à Rungis (ruptures du jour)</div>
+          <FlRuptureCard session={session} />
+
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'10px 2px -2px'}}>▸ Bases &amp; imports (Master)</div>
           {session.isMaster && <FlSyncResultPanel info={flSync} onClear={()=>setFlSync(null)} />}
           {session.isMaster && <ProbonImportCard session={session} />}
 
-          <LossesHistory />
-
-          <div className="card card-flat">
-            <h3 style={{marginBottom:8}}>Infos</h3>
-            <div style={{fontSize:12,color:'var(--ink-soft)',lineHeight:1.6}}>
-              <strong>Mode :</strong> {session.role}<br/>
-              <strong>Firebase :</strong> {firebaseConfigured ? 'connecté' : 'local'}<br/>
-              <strong>Sites :</strong> {SITES.join(', ')}<br/>
-              <strong>Alerte non-récup :</strong> +{ALERT_DAYS_NON_RECUP}j
-            </div>
-          </div>
-
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'10px 2px -2px'}}>▸ Chargement de secours</div>
           {/* ====== Ancien chargement (secours / repli) ====== */}
           <div className="card">
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer'}}
@@ -13060,8 +13260,21 @@
               {busy ? 'Chargement…' : 'Charger catalogue'}
             </button>
           </div>
+
           </>
           )}
+
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'10px 2px -2px'}}>▸ Suivi &amp; système</div>
+          <LossesHistory />
+          <div className="card card-flat">
+            <h3 style={{marginBottom:8}}>Infos</h3>
+            <div style={{fontSize:12,color:'var(--ink-soft)',lineHeight:1.6}}>
+              <strong>Mode :</strong> {session.role}<br/>
+              <strong>Firebase :</strong> {firebaseConfigured ? 'connecté' : 'local'}<br/>
+              <strong>Sites :</strong> {SITES.join(', ')}<br/>
+              <strong>Alerte non-récup :</strong> +{ALERT_DAYS_NON_RECUP}j
+            </div>
+          </div>
 
         </div>
       );
@@ -15471,7 +15684,7 @@
           {tab === "quality" && <QualityPage session={effSession} currentSite={currentSite} orders={orders} products={products} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'consignes' && <ConsignesPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'followup' && <FollowUpPage session={effSession} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
-          {tab === 'infos' && <InfosPage session={effSession} />}
+          {tab === 'infos' && <InfosPage session={effSession} currentSite={currentSite} />}
           {tab === 'temp' && !effSession.isMaster && BOUTIQUES.includes(currentSite) && <TemperaturePage session={effSession} currentSite={currentSite} />}
           {tab === 'closure' && <ClosurePage session={effSession} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} />}
@@ -15481,7 +15694,7 @@
           {tab === 'histo' && effSession.isMaster && <HistoryPage session={effSession} />}
           {tab === 'tempmaster' && effSession.isMaster && <TempMasterPage session={effSession} />}
           {tab === 'stats' && effSession.isMaster && <StatsPage session={effSession} />}
-          {tab === 'admin' && effSession.isMaster && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
+          {tab === 'admin' && effSession.isMaster && <AdminGated session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
 
           <div className="tab-bar">
             {!effSession.isMaster && (
