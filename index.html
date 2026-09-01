@@ -37,12 +37,14 @@
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
     import {
-      getAuth, signInAnonymously, onAuthStateChanged
+      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+    import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
     window.__firebase = {
       initializeApp, getFirestore, collection, doc, setDoc, getDoc, getDocs,
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp,
-      getAuth, signInAnonymously, onAuthStateChanged
+      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
+      getFunctions, httpsCallable
     };
     window.dispatchEvent(new Event('firebase-ready'));
   </script>
@@ -847,6 +849,8 @@
         const db = getFirestore(app);
         const auth = getAuth(app);
         fb = { db, auth, ...window.__firebase };
+        window.__app = app;
+        try { window.__fns = window.__firebase.getFunctions(app, 'europe-west1'); } catch(_) {}
 
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error('Auth timeout')), 10000);
@@ -7021,7 +7025,7 @@
           if (amt.remise>0) reasons.push('remise '+fmtEuro(amt.remise));
           if (refund>0) reasons.push('remboursement distrib '+fmtEuro(refund));
           const cons = consumersByEmail && m.email ? consumersByEmail[String(m.email).toLowerCase()] : null;
-          rows.push({ id:m.consumerId||'', nom:displayName(m), email:m.email||'', tel:(cons&&(cons.telephone||cons.tel))||m.tel||'', site:m.site, initial, reel, ecart, reasons:reasons.join(' · ') });
+          rows.push({ id:m.consumerId||'', nom:displayName(m), email:m.email||'', tel:(cons&&(cons.telephone||cons.tel))||m.tel||'', site:m.site, initial, reel, ecart, reasons:reasons.join(' · '), payzenUuid: (m.payzen_uuid || m.payzenUuid || '') });
         }
         return rows.sort((a,b)=>b.ecart-a.ecart);
       }, [empreOrders, empreRefundByOrder, consumersByEmail, emprePrep, empreFix]);
@@ -7037,6 +7041,39 @@
         showToast(`✓ ${empreRows.length} client(s) exporté(s)`);
       };
 
+      // ── PayZen : MAJ automatique des empreintes (Transaction/Update + Validate) ──
+      const [payAdmin, setPayAdmin]   = React.useState(null);
+      const [payBusy, setPayBusy]     = React.useState({});
+      const [payDone, setPayDone]     = React.useState({});
+      const [uuidManual, setUuidManual] = React.useState({});
+      const payRowKey = (r) => r.id || r.email || r.nom;
+      const payUuidOf = (r) => (r.payzenUuid || uuidManual[payRowKey(r)] || '').trim();
+      const loginAdmin = async () => {
+        const email = prompt('Email admin :'); if (!email) return;
+        const pass  = prompt('Mot de passe :'); if (!pass) return;
+        try {
+          const { getAuth, signInWithEmailAndPassword } = window.__firebase;
+          const cred = await signInWithEmailAndPassword(getAuth(window.__app), email, pass);
+          const tok = await cred.user.getIdTokenResult();
+          if (!tok.claims.admin) { showToast('Compte sans droit admin'); return; }
+          setPayAdmin(cred.user); showToast('✓ Admin connecté');
+        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message)); }
+      };
+      const majPayzenRow = async (r) => {
+        const key = payRowKey(r), uuid = payUuidOf(r);
+        if (!payAdmin) { showToast("Connecte-toi en admin d'abord"); return; }
+        if (!uuid)     { showToast('⚠️ UUID PayZen manquant'); return; }
+        if (!window.__fns) { showToast('Functions non initialisé (Firebase)'); return; }
+        setPayBusy(b => ({ ...b, [key]: true }));
+        try {
+          const fn = window.__firebase.httpsCallable(window.__fns, 'updatePayzenTransaction');
+          await fn({ orderRef: r.id, transactionUuid: uuid, amountEuros: r.reel / 100, validate: true });
+          setPayDone(d => ({ ...d, [key]: 'ok' })); showToast(`✓ ${r.nom} → ${fmtEuro(r.reel)}`);
+        } catch (e) {
+          setPayDone(d => ({ ...d, [key]: 'err' })); showToast('❌ ' + ((e && e.message) || e));
+        } finally { setPayBusy(b => ({ ...b, [key]: false })); }
+      };
+
       return (
         <div className="stack">
           <h1>📋 Récap master — tous locaux</h1>
@@ -7046,7 +7083,7 @@
           <div className="card" style={{border:'2px solid var(--accent)'}}>
             <h2 style={{marginTop:0}}>💶 Empreintes à régulariser</h2>
             <p style={{fontSize:13,color:'var(--ink-soft)',marginTop:-4}}>
-              Clients dont le montant <b>réel</b> est inférieur à l'empreinte bancaire <b>initiale</b> (manques, remises, remboursements distrib). En attendant l'automatisation du web service, tu ajustes ces montants un par un.
+              Clients dont le montant <b>réel</b> est inférieur à l'empreinte bancaire <b>initiale</b> (manques, remises, remboursements distrib). Connecte-toi en admin puis <b>MAJ PayZen</b> par client (ou « Tout régulariser ») pour ajuster l'empreinte automatiquement via le web service. Les lignes <b>sans UUID</b> sont signalées ⚠️ — tu peux saisir l'UUID à la main.
             </p>
             <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',margin:'8px 0'}}>
               <label style={{fontSize:13,fontWeight:600}}>Jour de distribution :</label>
@@ -7058,27 +7095,54 @@
               <span style={{background:'var(--info-soft,#e6eff3)',color:'var(--info,#2f6f8f)',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>{empreRows.length} client(s) à modifier</span>
               <span style={{background:'#fbf3df',color:'#8a6400',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>Total à régulariser : {fmtEuro(empreTotal)}</span>
             </div>
-            {empreRows.length===0 ? (
-              <div style={{color:'var(--ink-mute)',fontSize:13}}>Aucun écart pour ce jour (ou commandes non chargées pour cette date).</div>
-            ) : (
-              <div style={{overflowX:'auto'}}>
-                <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-                  <thead><tr style={{textAlign:'left',color:'var(--ink-soft)',fontSize:12}}>
-                    <th style={{padding:'4px 6px'}}>Client</th><th style={{padding:'4px 6px'}}>Contact</th><th style={{padding:'4px 6px'}}>Initial</th><th style={{padding:'4px 6px'}}>Réel</th><th style={{padding:'4px 6px'}}>Écart</th><th style={{padding:'4px 6px'}}>Raisons</th>
-                  </tr></thead>
-                  <tbody>{empreRows.map((r,i)=>(
-                    <tr key={i} style={{borderTop:'1px solid var(--line)'}}>
-                      <td style={{padding:'5px 6px'}}><b>{r.nom}</b><div style={{fontSize:11,color:'var(--ink-mute)'}}>{r.site}{r.id?' · '+r.id:''}</div></td>
-                      <td style={{padding:'5px 6px',fontSize:12}}>{r.tel||'—'}<div style={{color:'var(--ink-mute)'}}>{r.email}</div></td>
-                      <td style={{padding:'5px 6px'}}>{fmtEuro(r.initial)}</td>
-                      <td style={{padding:'5px 6px',fontWeight:700,color:'var(--accent-dark)'}}>{fmtEuro(r.reel)}</td>
-                      <td style={{padding:'5px 6px',fontWeight:700,color:'var(--warn)'}}>-{fmtEuro(r.ecart)}</td>
-                      <td style={{padding:'5px 6px',fontSize:12,color:'var(--ink-soft)'}}>{r.reasons}</td>
-                    </tr>
-                  ))}</tbody>
-                </table>
-              </div>
-            )}
+            {(() => {
+              const missing = empreRows.filter(r => !payUuidOf(r)).length;
+              return (
+              <>
+                <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',margin:'0 0 10px'}}>
+                  {payAdmin
+                    ? <span style={{background:'#e7f5ec',color:'var(--accent-dark)',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>🔓 admin : {payAdmin.email}</span>
+                    : <button className="btn-secondary" style={{padding:'5px 10px',fontSize:12}} onClick={loginAdmin}>🔐 Se connecter (admin)</button>}
+                  {missing>0 && <span style={{background:'#fbe9d6',color:'#c86a00',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>⚠️ {missing} sans UUID</span>}
+                  <span style={{flex:1}} />
+                  <button className="btn-primary" disabled={!payAdmin || !empreRows.some(r=>payUuidOf(r))}
+                    onClick={async()=>{ for (const r of empreRows) if (payUuidOf(r) && !payBusy[payRowKey(r)] && payDone[payRowKey(r)]!=='ok') await majPayzenRow(r); }}>
+                    ⚡ Tout régulariser via PayZen
+                  </button>
+                </div>
+                {empreRows.length===0 ? (
+                  <div style={{color:'var(--ink-mute)',fontSize:13}}>Aucun écart pour ce jour (ou commandes non chargées pour cette date).</div>
+                ) : (
+                  <div style={{overflowX:'auto'}}>
+                    <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+                      <thead><tr style={{textAlign:'left',color:'var(--ink-soft)',fontSize:12}}>
+                        <th style={{padding:'4px 6px'}}>Client</th><th style={{padding:'4px 6px'}}>Initial</th><th style={{padding:'4px 6px'}}>Réel</th><th style={{padding:'4px 6px'}}>Écart</th><th style={{padding:'4px 6px'}}>UUID PayZen</th><th style={{padding:'4px 6px'}}>Action</th>
+                      </tr></thead>
+                      <tbody>{empreRows.map((r,i)=>{ const key=payRowKey(r), uuid=payUuidOf(r), done=payDone[key];
+                        return (
+                        <tr key={i} style={{borderTop:'1px solid var(--line)', background: uuid ? undefined : '#fff8f0'}}>
+                          <td style={{padding:'5px 6px'}}><b>{r.nom}</b><div style={{fontSize:11,color:'var(--ink-mute)'}}>{r.site}{r.id?' · '+r.id:''}</div></td>
+                          <td style={{padding:'5px 6px'}}>{fmtEuro(r.initial)}</td>
+                          <td style={{padding:'5px 6px',fontWeight:700,color:'var(--accent-dark)'}}>{fmtEuro(r.reel)}</td>
+                          <td style={{padding:'5px 6px',fontWeight:700,color:'var(--warn)'}}>-{fmtEuro(r.ecart)}</td>
+                          <td style={{padding:'5px 6px'}}>
+                            {uuid
+                              ? <span style={{fontFamily:'ui-monospace,monospace',fontSize:11,color:'var(--ink-mute)'}}>{uuid.slice(0,8)}…{uuid.slice(-4)}</span>
+                              : <span><span style={{color:'#c86a00',fontWeight:600,fontSize:12}}>⚠️ manquant </span><input type="text" placeholder="coller l'UUID…" style={{padding:'4px 6px',fontSize:12,width:200,border:'1px solid var(--line)',borderRadius:6}} onChange={e=>setUuidManual(m=>({ ...m, [key]: e.target.value }))} /></span>}
+                          </td>
+                          <td style={{padding:'5px 6px'}}>
+                            {done==='ok'
+                              ? <span style={{background:'#e7f5ec',color:'var(--accent-dark)',padding:'2px 8px',borderRadius:8,fontSize:12,fontWeight:700}}>✓ validé</span>
+                              : <button className="btn-primary" style={{padding:'5px 10px',fontSize:12}} disabled={!payAdmin || !uuid || payBusy[key]} onClick={()=>majPayzenRow(r)}>{payBusy[key]?'…':'MAJ PayZen'}</button>}
+                          </td>
+                        </tr>);
+                      })}</tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+              );
+            })()}
           </div>
 
           {overduePdp.length > 0 && (
