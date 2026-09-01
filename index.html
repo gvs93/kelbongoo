@@ -37,13 +37,15 @@
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
     import {
-      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword
+      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
+      GoogleAuthProvider, signInWithPopup
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
     import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
     window.__firebase = {
       initializeApp, getFirestore, collection, doc, setDoc, getDoc, getDocs,
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp,
       getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
+      GoogleAuthProvider, signInWithPopup,
       getFunctions, httpsCallable
     };
     window.dispatchEvent(new Event('firebase-ready'));
@@ -7046,18 +7048,42 @@
       const [payBusy, setPayBusy]     = React.useState({});
       const [payDone, setPayDone]     = React.useState({});
       const [uuidManual, setUuidManual] = React.useState({});
+      // Mode manuel libre (paiement hors-liste par UUID)
+      const [freeUuid, setFreeUuid] = React.useState('');
+      const [freeAmount, setFreeAmount] = React.useState('');
+      const [freeValidate, setFreeValidate] = React.useState(true);
+      const [freeBusy, setFreeBusy] = React.useState(false);
       const payRowKey = (r) => r.id || r.email || r.nom;
       const payUuidOf = (r) => (r.payzenUuid || uuidManual[payRowKey(r)] || '').trim();
+      // Connexion admin via Google (compte de l'organisation, droit `admin`)
       const loginAdmin = async () => {
-        const email = prompt('Email admin :'); if (!email) return;
-        const pass  = prompt('Mot de passe :'); if (!pass) return;
         try {
-          const { getAuth, signInWithEmailAndPassword } = window.__firebase;
-          const cred = await signInWithEmailAndPassword(getAuth(window.__app), email, pass);
-          const tok = await cred.user.getIdTokenResult();
-          if (!tok.claims.admin) { showToast('Compte sans droit admin'); return; }
-          setPayAdmin(cred.user); showToast('✓ Admin connecté');
-        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message)); }
+          const { getAuth, GoogleAuthProvider, signInWithPopup } = window.__firebase;
+          const provider = new GoogleAuthProvider();
+          provider.setCustomParameters({ prompt: 'select_account' });
+          const cred = await signInWithPopup(getAuth(window.__app), provider);
+          const tok = await cred.user.getIdTokenResult(true); // force refresh du claim
+          if (!tok.claims.admin) { showToast('Compte Google sans droit admin'); return; }
+          setPayAdmin(cred.user); showToast('✓ Admin connecté : ' + (cred.user.email || ''));
+        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message || e)); }
+      };
+      const callPayzenFn = (payload) => {
+        if (!window.__fns) throw new Error('Functions non initialisé (Firebase)');
+        return window.__firebase.httpsCallable(window.__fns, 'updatePayzenTransaction')(payload).then(r => r.data);
+      };
+      // MAJ manuelle libre : n'importe quel UUID + montant, sans ligne de la liste
+      const majFreePayzen = async () => {
+        const uuid = freeUuid.trim(), amt = parseFloat(freeAmount);
+        if (!payAdmin) { showToast("Connecte-toi en admin d'abord"); return; }
+        if (!uuid) { showToast('UUID requis'); return; }
+        if (!(amt > 0)) { showToast('Montant invalide'); return; }
+        setFreeBusy(true);
+        try {
+          await callPayzenFn({ transactionUuid: uuid, amountEuros: amt, validate: freeValidate });
+          showToast('✓ Paiement mis à jour : ' + amt.toFixed(2) + ' €');
+          setFreeUuid(''); setFreeAmount('');
+        } catch (e) { showToast('❌ ' + ((e && e.message) || e)); }
+        finally { setFreeBusy(false); }
       };
       const majPayzenRow = async (r) => {
         const key = payRowKey(r), uuid = payUuidOf(r);
@@ -7143,6 +7169,18 @@
               </>
               );
             })()}
+
+            <div style={{marginTop:14,paddingTop:12,borderTop:'1px dashed var(--line)'}}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>🛠️ Mettre à jour un paiement manuellement (par UUID)</div>
+              <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:8}}>Hors-liste : régularise n'importe quelle transaction PayZen (colle son UUID) sans passer par la liste ci-dessus.</div>
+              <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+                <input type="text" placeholder="UUID PayZen" value={freeUuid} onChange={e=>setFreeUuid(e.target.value)} style={{padding:'6px 8px',fontSize:13,minWidth:280,flex:'1 1 280px',border:'1px solid var(--line)',borderRadius:6}} />
+                <input type="number" step="0.01" placeholder="Montant réel €" value={freeAmount} onChange={e=>setFreeAmount(e.target.value)} style={{padding:'6px 8px',fontSize:13,width:140,border:'1px solid var(--line)',borderRadius:6}} />
+                <label style={{fontSize:12,display:'flex',alignItems:'center',gap:4}}><input type="checkbox" checked={freeValidate} onChange={e=>setFreeValidate(e.target.checked)} /> Valider</label>
+                <button className="btn-primary" style={{padding:'6px 12px',fontSize:13}} disabled={!payAdmin || !freeUuid.trim() || !(parseFloat(freeAmount)>0) || freeBusy} onClick={majFreePayzen}>{freeBusy?'…':'Mettre à jour'}</button>
+              </div>
+              {!payAdmin && <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Connecte-toi en admin (bouton plus haut) pour activer.</div>}
+            </div>
           </div>
 
           {overduePdp.length > 0 && (
