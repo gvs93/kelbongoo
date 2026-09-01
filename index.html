@@ -7067,12 +7067,26 @@
           setPayAdmin(cred.user); showToast('✓ Admin connecté : ' + (cred.user.email || ''));
         } catch (e) { showToast('Échec connexion : ' + (e.code || e.message || e)); }
       };
-      // Appel via Firebase Hosting (contourne le blocage allUsers de l'org)
-      const PAYZEN_FN_URL = 'https://distribkbg.web.app/updatePayzenTransaction';
-      const callPayzenFn = (payload) => {
-        if (!window.__fns) throw new Error('Functions non initialisé (Firebase)');
-        return window.__firebase.httpsCallableFromURL(window.__fns, PAYZEN_FN_URL)(payload).then(r => r.data);
-      };
+      // Contournement org (allUsers bloqué) : on écrit une demande dans Firestore,
+      // une function déclenchée par Firestore fait l'appel PayZen et réécrit le résultat.
+      const callPayzenFn = (payload) => new Promise((resolve, reject) => {
+        if (!fb || !fb.db) { reject(new Error('Firestore non initialisé')); return; }
+        const user = fb.auth && fb.auth.currentUser;
+        if (!user) { reject(new Error('Connexion admin requise')); return; }
+        const ref = fb.doc(fb.collection(fb.db, 'payzen_requests'));
+        let done = false, unsub = null, timer = null;
+        const finish = (fn) => { if (done) return; done = true; try { if (unsub) unsub(); } catch (_) {} if (timer) clearTimeout(timer); fn(); };
+        timer = setTimeout(() => finish(() => reject(new Error('Délai dépassé (aucune réponse de la function)'))), 45000);
+        fb.setDoc(ref, { ...payload, byUid: user.uid, byEmail: user.email || '', status: 'pending', createdAt: fb.serverTimestamp() })
+          .then(() => {
+            unsub = fb.onSnapshot(ref, (s) => {
+              const d = s.data(); if (!d) return;
+              if (d.status === 'done') finish(() => resolve(d));
+              else if (d.status === 'error') finish(() => reject(new Error(d.message || 'Erreur PayZen')));
+            }, (err) => finish(() => reject(err)));
+          })
+          .catch((e) => finish(() => reject(e)));
+      });
       // MAJ manuelle libre : n'importe quel UUID + montant, sans ligne de la liste
       const majFreePayzen = async () => {
         const uuid = freeUuid.trim(), amt = parseFloat(freeAmount);
