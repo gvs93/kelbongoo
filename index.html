@@ -37,16 +37,14 @@
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
     import {
-      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
-      GoogleAuthProvider, signInWithPopup
+      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-    import { getFunctions, httpsCallable, httpsCallableFromURL } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
+    import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
     window.__firebase = {
       initializeApp, getFirestore, collection, doc, setDoc, getDoc, getDocs,
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp,
       getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
-      GoogleAuthProvider, signInWithPopup,
-      getFunctions, httpsCallable, httpsCallableFromURL
+      getFunctions, httpsCallable
     };
     window.dispatchEvent(new Event('firebase-ready'));
   </script>
@@ -5233,13 +5231,20 @@
             await flPost({ secret: FRESHDESK_SECRET, action: 'fl_log_inventory', by: session.name, count: nbCounted, date: invDate });
             refreshLastInv();
           } catch (e) {}
-          // Photo complète horodatée → classeur historique du mois (Drive).
+          // Sauvegarde structurée Drive UNIFIÉE : Sauvegarde app / Kelbongoo / Inventaire (type = fl)
+          // Deux quantités par produit → deux lignes (cagette + sachet µ), seulement si > 0.
           try {
-            const snapItems = entryItems.map(it => {
+            const backupItems = [];
+            entryItems.forEach(it => {
               const c = counts[it.key] || {};
-              return { producer: it.producer, produit: it.produit, uv: it.uv, colis: c.colis || 0, mu: c.mu || 0 };
-            }).filter(x => x.colis > 0 || x.mu > 0);
-            await flPost({ secret: FRESHDESK_SECRET, action: 'fl_snapshot', date: invDate, by: session.name, items: snapItems });
+              const colis = c.colis || 0, mu = c.mu || 0;
+              if (colis > 0) backupItems.push({ id: it.key, producteur: it.producer, produit: it.produit, unite: 'cagette', qty: colis });
+              if (mu > 0)    backupItems.push({ id: it.key, producteur: it.producer, produit: it.produit, unite: 'sachet µ', qty: mu });
+            });
+            if (backupItems.length) {
+              await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_backup',
+                app: 'Kelbongoo', theme: 'Inventaire', type: 'fl', date: invDate, by: session.name, items: backupItems });
+            }
           } catch (e) {}
           let msg = `✓ Inventaire validé : ${data.written} ligne(s) écrites dans le Sheet`;
           if (data.notFound && data.notFound.length) msg += ` · ${data.notFound.length} non trouvée(s)`;
@@ -6031,6 +6036,16 @@
               to: 'rr@pribon.org', cc: 'hg@probon.fr',
               subject: `Inventaire ${mode} du ${invDate} — ${items.length} produit(s) (${initials})`,
               htmlBody: buildRecapHtml(data, initials) });
+          } catch(e){}
+          // Sauvegarde structurée Drive (append-only) : Sauvegarde app / Kelbongoo / Inventaire
+          try {
+            const backupItems = counted.map(id => {
+              const p = prodById[id] || {};
+              return { id, producteur: p.producteur || p.producer || '', produit: p.name || p.produit || '', unite: p.unite || p.unit || '', qty: counts[id] };
+            });
+            await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_backup',
+              app: 'Kelbongoo', theme: 'Inventaire', type: `${invType} (${mode})`,
+              date: invDate, by: session.name, items: backupItems });
           } catch(e){}
           let m = `✓ Inventaire ${mode} clôturé : ${data.written||0} écrit(s)`;
           if (data.conflicts && data.conflicts.length) m += ` · ${data.conflicts.length} conflit(s) → rr@`;
@@ -7048,58 +7063,18 @@
       const [payBusy, setPayBusy]     = React.useState({});
       const [payDone, setPayDone]     = React.useState({});
       const [uuidManual, setUuidManual] = React.useState({});
-      // Mode manuel libre (paiement hors-liste par UUID)
-      const [freeUuid, setFreeUuid] = React.useState('');
-      const [freeAmount, setFreeAmount] = React.useState('');
-      const [freeValidate, setFreeValidate] = React.useState(true);
-      const [freeBusy, setFreeBusy] = React.useState(false);
       const payRowKey = (r) => r.id || r.email || r.nom;
       const payUuidOf = (r) => (r.payzenUuid || uuidManual[payRowKey(r)] || '').trim();
-      // Connexion admin via Google (compte de l'organisation, droit `admin`)
       const loginAdmin = async () => {
+        const email = prompt('Email admin :'); if (!email) return;
+        const pass  = prompt('Mot de passe :'); if (!pass) return;
         try {
-          const { getAuth, GoogleAuthProvider, signInWithPopup } = window.__firebase;
-          const provider = new GoogleAuthProvider();
-          provider.setCustomParameters({ prompt: 'select_account' });
-          const cred = await signInWithPopup(getAuth(window.__app), provider);
-          const tok = await cred.user.getIdTokenResult(true); // force refresh du claim
-          if (!tok.claims.admin) { showToast('Compte Google sans droit admin'); return; }
-          setPayAdmin(cred.user); showToast('✓ Admin connecté : ' + (cred.user.email || ''));
-        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message || e)); }
-      };
-      // Contournement org (allUsers bloqué) : on écrit une demande dans Firestore,
-      // une function déclenchée par Firestore fait l'appel PayZen et réécrit le résultat.
-      const callPayzenFn = (payload) => new Promise((resolve, reject) => {
-        if (!fb || !fb.db) { reject(new Error('Firestore non initialisé')); return; }
-        const user = fb.auth && fb.auth.currentUser;
-        if (!user) { reject(new Error('Connexion admin requise')); return; }
-        const ref = fb.doc(fb.collection(fb.db, 'payzen_requests'));
-        let done = false, unsub = null, timer = null;
-        const finish = (fn) => { if (done) return; done = true; try { if (unsub) unsub(); } catch (_) {} if (timer) clearTimeout(timer); fn(); };
-        timer = setTimeout(() => finish(() => reject(new Error('Délai dépassé (aucune réponse de la function)'))), 45000);
-        fb.setDoc(ref, { ...payload, byUid: user.uid, byEmail: user.email || '', status: 'pending', createdAt: fb.serverTimestamp() })
-          .then(() => {
-            unsub = fb.onSnapshot(ref, (s) => {
-              const d = s.data(); if (!d) return;
-              if (d.status === 'done') finish(() => resolve(d));
-              else if (d.status === 'error') finish(() => reject(new Error(d.message || 'Erreur PayZen')));
-            }, (err) => finish(() => reject(err)));
-          })
-          .catch((e) => finish(() => reject(e)));
-      });
-      // MAJ manuelle libre : n'importe quel UUID + montant, sans ligne de la liste
-      const majFreePayzen = async () => {
-        const uuid = freeUuid.trim(), amt = parseFloat(freeAmount);
-        if (!payAdmin) { showToast("Connecte-toi en admin d'abord"); return; }
-        if (!uuid) { showToast('UUID requis'); return; }
-        if (!(amt > 0)) { showToast('Montant invalide'); return; }
-        setFreeBusy(true);
-        try {
-          await callPayzenFn({ transactionUuid: uuid, amountEuros: amt, validate: freeValidate });
-          showToast('✓ Paiement mis à jour : ' + amt.toFixed(2) + ' €');
-          setFreeUuid(''); setFreeAmount('');
-        } catch (e) { showToast('❌ ' + ((e && e.message) || e)); }
-        finally { setFreeBusy(false); }
+          const { getAuth, signInWithEmailAndPassword } = window.__firebase;
+          const cred = await signInWithEmailAndPassword(getAuth(window.__app), email, pass);
+          const tok = await cred.user.getIdTokenResult();
+          if (!tok.claims.admin) { showToast('Compte sans droit admin'); return; }
+          setPayAdmin(cred.user); showToast('✓ Admin connecté');
+        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message)); }
       };
       const majPayzenRow = async (r) => {
         const key = payRowKey(r), uuid = payUuidOf(r);
@@ -7108,7 +7083,8 @@
         if (!window.__fns) { showToast('Functions non initialisé (Firebase)'); return; }
         setPayBusy(b => ({ ...b, [key]: true }));
         try {
-          await callPayzenFn({ orderRef: r.id, transactionUuid: uuid, amountEuros: r.reel / 100, validate: true });
+          const fn = window.__firebase.httpsCallable(window.__fns, 'updatePayzenTransaction');
+          await fn({ orderRef: r.id, transactionUuid: uuid, amountEuros: r.reel / 100, validate: true });
           setPayDone(d => ({ ...d, [key]: 'ok' })); showToast(`✓ ${r.nom} → ${fmtEuro(r.reel)}`);
         } catch (e) {
           setPayDone(d => ({ ...d, [key]: 'err' })); showToast('❌ ' + ((e && e.message) || e));
@@ -7184,18 +7160,6 @@
               </>
               );
             })()}
-
-            <div style={{marginTop:14,paddingTop:12,borderTop:'1px dashed var(--line)'}}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>🛠️ Mettre à jour un paiement manuellement (par UUID)</div>
-              <div style={{fontSize:12,color:'var(--ink-soft)',marginBottom:8}}>Hors-liste : régularise n'importe quelle transaction PayZen (colle son UUID) sans passer par la liste ci-dessus.</div>
-              <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
-                <input type="text" placeholder="UUID PayZen" value={freeUuid} onChange={e=>setFreeUuid(e.target.value)} style={{padding:'6px 8px',fontSize:13,minWidth:280,flex:'1 1 280px',border:'1px solid var(--line)',borderRadius:6}} />
-                <input type="number" step="0.01" placeholder="Montant réel €" value={freeAmount} onChange={e=>setFreeAmount(e.target.value)} style={{padding:'6px 8px',fontSize:13,width:140,border:'1px solid var(--line)',borderRadius:6}} />
-                <label style={{fontSize:12,display:'flex',alignItems:'center',gap:4}}><input type="checkbox" checked={freeValidate} onChange={e=>setFreeValidate(e.target.checked)} /> Valider</label>
-                <button className="btn-primary" style={{padding:'6px 12px',fontSize:13}} disabled={!payAdmin || !freeUuid.trim() || !(parseFloat(freeAmount)>0) || freeBusy} onClick={majFreePayzen}>{freeBusy?'…':'Mettre à jour'}</button>
-              </div>
-              {!payAdmin && <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Connecte-toi en admin (bouton plus haut) pour activer.</div>}
-            </div>
           </div>
 
           {overduePdp.length > 0 && (
