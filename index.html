@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Kelbongoo — Distribution V9.23</title>
+  <title>Kelbongoo — Distribution V9.25</title>
 
   <script>
     // Repli CDN : si jsDelivr est bloqué/inaccessible pour un script critique,
@@ -538,7 +538,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.23';
+    const APP_VERSION = 'V9.25';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -4897,6 +4897,24 @@
     }
     function _flTok(s) { return _flNorm(s).split(' ').filter(w => w.length >= 3); }
 
+    // Mots génériques qui NE distinguent PAS un produit F&L (label, conditionnement…).
+    // On les retire avant tout rapprochement flou, sinon deux produits différents « matchent »
+    // juste parce qu'ils partagent « bio » ou « sachet ».
+    const FL_STOPWORDS = new Set(['bio','ab','demeter','msc','aop','igp','label','sachet','sachets','botte','bottes','barquette','barquettes','pot','pots','piece','pieces','pce','paquet','paquets','boite','boites','bouteille','bouteilles','filet','filets','cagette','cagettes','colis','vrac','env','environ','les','des','aux','sous','vide','cru','crue','frais','fraiche','extra','fine','plein','pleine','terre','local','locale','ultra','production']);
+    // Racine simple (retire le pluriel s/x) pour rapprocher singulier ↔ pluriel.
+    function _flStem(w) { return w.replace(/[sx]$/, ''); }
+    // Mots SIGNIFICATIFS d'une désignation : ≥3 lettres, hors nombres/poids et hors mots génériques.
+    function _flSig(s) {
+      const out = [];
+      for (const w of _flNorm(s).split(' ')) {
+        if (w.length < 3) continue;
+        if (/^\d/.test(w)) continue;         // 650g, 250, 1kg…
+        if (FL_STOPWORDS.has(w)) continue;
+        out.push(_flStem(w));
+      }
+      return out;
+    }
+
     // Indexe les lignes du Sheet FL (rows = tableau de tableaux via fl_read)
     function parseFLSheetIndex(rows) {
       if (!rows || !rows.length) return { byName: {}, list: [] };
@@ -4922,24 +4940,38 @@
         };
         const k = _flNorm(produit);
         if (k && !byName[k]) byName[k] = rec;
-        list.push({ rec: rec, tok: _flTok(produit) });
+        list.push({ rec: rec, sig: new Set(_flSig(produit)) });
       }
       return { byName: byName, list: list };
     }
 
-    // Rapproche un manquant (désignation) d'une ligne FL : exact puis recouvrement de mots
-    function _flMatchFL(index, produit) {
-      if (!index) return null;
-      const k = _flNorm(produit);
-      if (index.byName[k]) return index.byName[k];
-      const tk = _flTok(produit); if (!tk.length) return null;
+    // Rapproche un manquant d'une ligne du Sheet FL.
+    // Retourne { rec, source } avec source ∈ exact | alias | fuzzy | fuzzy_weak | alias_missing | ignore | none.
+    // Règle clé : en flou, le NOM du produit (1er mot significatif) DOIT correspondre — on ne rapproche
+    // plus deux produits juste parce qu'ils partagent « bio » ou une couleur. En cas de doute → pas de
+    // rapprochement automatique (l'utilisateur choisira), jamais une supposition silencieuse.
+    function _flResolve(index, produit, aliasMap) {
+      const norm = _flNorm(produit);
+      if (aliasMap) {
+        const a = aliasMap[norm];
+        if (a !== undefined) {
+          if (!a || a === '__ignore__') return { rec: null, source: 'ignore' };
+          if (index && index.byName[a]) return { rec: index.byName[a], source: 'alias' };
+          return { rec: null, source: 'alias_missing' };
+        }
+      }
+      if (!index) return { rec: null, source: 'none' };
+      if (index.byName[norm]) return { rec: index.byName[norm], source: 'exact' };
+      const A = _flSig(produit); if (!A.length) return { rec: null, source: 'none' };
+      const head = A[0];
       let best = null, bestScore = 0;
       for (const it of index.list) {
-        const set = {}; it.tok.forEach(t => set[t] = 1);
-        let sc = 0; tk.forEach(t => { if (set[t]) sc++; });
-        if (sc >= 2 && sc > bestScore) { bestScore = sc; best = it.rec; }
+        if (!it.sig.has(head)) continue;      // le vrai produit doit correspondre
+        let sc = 0; for (const t of A) { if (it.sig.has(t)) sc++; }
+        if (sc > bestScore) { bestScore = sc; best = it.rec; }
       }
-      return best;
+      if (best) return { rec: best, source: bestScore >= 2 ? 'fuzzy' : 'fuzzy_weak' };
+      return { rec: null, source: 'none' };
     }
 
     // Nombre de colis à commander pour un manquant FL.
@@ -8577,53 +8609,6 @@
         return () => { u0(); u1(); u2(); u3(); u4(); };
       }, [day]);
 
-      // ── Rajout FL en rupture → commande Probon en colis ──
-      const [flIdx, setFlIdx] = React.useState(null);
-      const [flSending, setFlSending] = React.useState(false);
-      React.useEffect(() => {
-        let alive = true;
-        (async () => {
-          try {
-            const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
-            if (alive && res && res.ok && res.rows) setFlIdx(parseFLSheetIndex(res.rows));
-          } catch (e) {}
-        })();
-        return () => { alive = false; };
-      }, []);
-
-      const flRuptures = React.useMemo(() => {
-        if (!flIdx) return { ready: false, rows: [], warn: [] };
-        const rows = [], warn = [];
-        (manquants || []).forEach(m => {
-          const rec = _flMatchFL(flIdx, m.produit);
-          if (!rec) return; // pas un produit FL
-          const manque = Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0;
-          if (manque <= 0) return;
-          const calc = flColisNeeded(rec.type, manque, rec.muKilo, rec.colisage);
-          const item = {
-            id: m.id, producer: rec.producer || m.producteur || '', produit: rec.produit || m.produit,
-            type: rec.type, manque: manque, muKilo: rec.muKilo, colisage: rec.colisage,
-            colis: calc.colis, ok: calc.ok, reason: calc.reason, unit: calc.unit, besoin: calc.besoin,
-          };
-          if (calc.ok && calc.colis > 0) rows.push(item); else warn.push(item);
-        });
-        rows.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.produit || '').localeCompare(b.produit || '', 'fr'));
-        return { ready: true, rows: rows, warn: warn };
-      }, [flIdx, manquants]);
-
-      const sendFlRupture = async () => {
-        if (!flRuptures.rows.length && !flRuptures.warn.length) return;
-        const totalColis = flRuptures.rows.reduce((a, x) => a + (x.colis || 0), 0);
-        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${flRuptures.rows.length} produit(s) · ${totalColis} colis${flRuptures.warn.length ? `\n+ ${flRuptures.warn.length} sans colisage (Rungis calcule à la main)` : ''}.`)) return;
-        setFlSending(true);
-        try {
-          const res = await sendFlRuptureMail(flRuptures.rows, flRuptures.warn, day, session.name);
-          if (res && res.ok !== false) showToast(`📧 Demande envoyée à gestion@probon.fr (${flRuptures.rows.length + flRuptures.warn.length} produit(s))`);
-          else showToast('Erreur envoi : ' + ((res && res.error) || 'inconnue'));
-        } catch (e) { showToast('Erreur réseau : ' + e.message); }
-        finally { setFlSending(false); }
-      };
-
       const setRemiseReason = async (r, reason) => {
         await storage.setDoc(`day_${day}_remises`, r.id, { ...r, reason });
       };
@@ -8908,64 +8893,8 @@
           </div>
 
           {/* ============ FL EN RUPTURE — RAJOUT RUNGIS ============ */}
-          {flRuptures.ready && (flRuptures.rows.length > 0 || flRuptures.warn.length > 0) && (
-            <div className="card" style={{borderLeft:'3px solid #2e7d32'}}>
-              <h3 style={{margin:0,marginBottom:4}}>🥬 FL en rupture — rajout Rungis</h3>
-              <p style={{fontSize:12,color:'var(--ink-soft)',marginBottom:10}}>
-                Fruits &amp; Légumes manquants pour cette distribution, à faire ajouter à la commande livrée le matin. Commande calculée en <strong>colis entiers</strong>.
-              </p>
-              {flRuptures.rows.length > 0 ? (
-                <table style={{width:'100%',fontSize:13,borderCollapse:'collapse'}}>
-                  <thead>
-                    <tr style={{textAlign:'left',color:'var(--ink-mute)',fontSize:11}}>
-                      <th style={{padding:'4px 6px'}}>Produit</th>
-                      <th style={{padding:'4px 6px'}}>Manque</th>
-                      <th style={{padding:'4px 6px'}}>Colisage</th>
-                      <th style={{padding:'4px 6px',textAlign:'right'}}>Colis</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {flRuptures.rows.map(x => (
-                      <tr key={x.id} style={{borderTop:'1px solid var(--line)'}}>
-                        <td style={{padding:'6px'}}>
-                          <div style={{fontWeight:600}}>{x.produit}</div>
-                          <div style={{fontSize:11,color:'var(--ink-mute)'}}>{x.producer}{x.type?` · ${x.type}`:''}</div>
-                        </td>
-                        <td style={{padding:'6px'}}>
-                          {x.manque}{_flNorm(x.type)==='sachet' ? ` sach. → ${x.besoin} kg` : ''}
-                        </td>
-                        <td style={{padding:'6px'}}>{x.colisage || '—'}{_flNorm(x.type)==='sachet' ? ' kg' : ''}</td>
-                        <td style={{padding:'6px',textAlign:'right',fontWeight:700}}>{x.colis}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                  <tfoot>
-                    <tr style={{borderTop:'2px solid var(--line)'}}>
-                      <td colSpan="3" style={{padding:'6px',textAlign:'right',fontWeight:600}}>Total</td>
-                      <td style={{padding:'6px',textAlign:'right',fontWeight:700}}>{flRuptures.rows.reduce((a,x)=>a+(x.colis||0),0)} colis</td>
-                    </tr>
-                  </tfoot>
-                </table>
-              ) : (
-                <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun FL en rupture calculable pour l'instant.</p>
-              )}
+          <FlRuptureBlock day={day} session={session} manquants={manquants} />
 
-              {flRuptures.warn.length > 0 && (
-                <div style={{marginTop:8,padding:'8px 10px',background:'var(--warn-soft,#fff7e6)',border:'1px solid #f0c36d',borderRadius:6,fontSize:12}}>
-                  ⚠️ Sans colisage — inclus dans le mail, Rungis calcule à la main (pense à remplir le colisage dans le Sheet) :
-                  <ul style={{margin:'4px 0 0',paddingLeft:18}}>
-                    {flRuptures.warn.map(x => <li key={x.id}>{x.produit} — besoin {x.manque} {frUnitLabel(x.type)}</li>)}
-                  </ul>
-                </div>
-              )}
-
-              {(flRuptures.rows.length > 0 || flRuptures.warn.length > 0) && (
-                <button className="btn-primary" style={{marginTop:12,fontSize:14}} disabled={flSending} onClick={sendFlRupture}>
-                  {flSending ? 'Envoi…' : '📧 Envoyer la demande à gestion@probon.fr'}
-                </button>
-              )}
-            </div>
-          )}
 
           {/* ============ PRODUITS REMISÉS ============ */}
           {remises.length > 0 && (
@@ -12894,60 +12823,157 @@
       return <AdminPage {...props} adminEmail={email} onLogoutAdmin={() => { try { localStorage.removeItem('kb_admin_email'); } catch (e) {} setEmail(''); }} />;
     }
 
-    // Carte « Rajout F&L à Rungis » — réutilisable (Manquants & ND + Admin).
-    function FlRuptureCard({ session }) {
-      const day = activeDay();
-      const showToast = React.useContext(ToastContext);
-      const [manquants, setManquants] = React.useState([]);
-      const [flIdx, setFlIdx] = React.useState(null);
-      const [sending, setSending] = React.useState(false);
-      React.useEffect(() => { if (!day) return; const u = storage.subscribe(`day_${day}_manquants`, setManquants); return u; }, [day]);
-      React.useEffect(() => { let alive = true; (async () => { try { const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }); if (alive && res && res.ok && res.rows) setFlIdx(parseFLSheetIndex(res.rows)); } catch (e) {} })(); return () => { alive = false; }; }, []);
-      const fl = React.useMemo(() => {
-        if (!flIdx) return { ready: false, rows: [], warn: [] };
-        const rows = [], warn = [];
-        (manquants || []).forEach(m => {
-          const rec = _flMatchFL(flIdx, m.produit); if (!rec) return;
-          const manque = Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0; if (manque <= 0) return;
+    // ============================================================
+    // RAJOUT F&L À RUNGIS — rapprochement manquants ↔ Sheet FL
+    // • Auto UNIQUEMENT si match sûr (nom exact, ou rapprochement mémorisé).
+    // • Rapprochement incertain → listé « à rapprocher » : on choisit dans la liste,
+    //   et le choix est mémorisé (Firebase, partagé en live) pour les prochaines fois.
+    // ============================================================
+    function computeFlBuckets(flIdx, manquants, aliasMap) {
+      if (!flIdx) return { ready: false, rows: [], warn: [], todo: [] };
+      const rows = [], warn = [], todo = [];
+      (manquants || []).forEach(m => {
+        const manque = Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0;
+        if (manque <= 0) return;
+        const res = _flResolve(flIdx, m.produit, aliasMap);
+        if (res.source === 'ignore') return;                         // marqué « pas un FL »
+        if (res.source === 'exact' || res.source === 'alias') {
+          const rec = res.rec;
           const calc = flColisNeeded(rec.type, manque, rec.muKilo, rec.colisage);
-          const item = { id: m.id, producer: rec.producer || m.producteur || '', produit: rec.produit || m.produit, type: rec.type, manque, muKilo: rec.muKilo, colisage: rec.colisage, colis: calc.colis, ok: calc.ok, reason: calc.reason };
+          const item = { id: m.id, manquant: m.produit, producer: rec.producer || m.producteur || '', produit: rec.produit, type: rec.type, manque, muKilo: rec.muKilo, colisage: rec.colisage, colis: calc.colis, ok: calc.ok, reason: calc.reason, unit: calc.unit, besoin: calc.besoin, source: res.source };
           if (calc.ok && calc.colis > 0) rows.push(item); else warn.push(item);
-        });
-        rows.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.produit || '').localeCompare(b.produit || '', 'fr'));
-        return { ready: true, rows, warn };
-      }, [flIdx, manquants]);
-      const totalColis = fl.rows.reduce((a, x) => a + (x.colis || 0), 0);
+          return;
+        }
+        if (res.source === 'fuzzy' || res.source === 'fuzzy_weak' || res.source === 'alias_missing') {
+          todo.push({ id: m.id, manquant: m.produit, producteur: m.producteur || '', manque, guess: res.rec ? _flNorm(res.rec.produit) : '', guessLabel: res.rec ? res.rec.produit : '' });
+        }
+        // source 'none' → considéré non-FL, ignoré silencieusement
+      });
+      rows.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.produit || '').localeCompare(b.produit || '', 'fr'));
+      return { ready: true, rows, warn, todo };
+    }
+
+    const flAliasDocId = (norm) => 'a_' + String(norm || '').replace(/[^a-z0-9]+/g, '_').slice(0, 180);
+
+    // Options <select> des produits du Sheet FL (dédupliquées, triées).
+    function FlSheetOptions({ flIdx }) {
+      const opts = React.useMemo(() => {
+        if (!flIdx) return [];
+        const seen = {}, out = [];
+        for (const it of flIdx.list) {
+          const v = _flNorm(it.rec.produit); if (!v || seen[v]) continue; seen[v] = 1;
+          out.push({ value: v, label: (it.rec.producer ? it.rec.producer + ' — ' : '') + it.rec.produit });
+        }
+        out.sort((a, b) => a.label.localeCompare(b.label, 'fr'));
+        return out;
+      }, [flIdx]);
+      return opts.map(o => <option key={o.value} value={o.value}>{o.label}</option>);
+    }
+
+    // Bloc réutilisable (Admin + Manquants & ND).
+    function FlRuptureBlock({ day, session, manquants }) {
+      const showToast = React.useContext(ToastContext);
+      const [flIdx, setFlIdx] = React.useState(null);
+      const [aliases, setAliases] = React.useState([]);
+      const [sel, setSel] = React.useState({});
+      const [sending, setSending] = React.useState(false);
+      React.useEffect(() => {
+        let alive = true;
+        (async () => { try { const res = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }); if (alive && res && res.ok && res.rows) setFlIdx(parseFLSheetIndex(res.rows)); } catch (e) {} })();
+        return () => { alive = false; };
+      }, []);
+      React.useEffect(() => storage.subscribe('fl_aliases', setAliases), []);
+      const aliasMap = React.useMemo(() => {
+        const m = {};
+        for (const a of (aliases || [])) { if (a && a.key) m[a.key] = a.ignore ? '__ignore__' : (a.fl || undefined); }
+        return m;
+      }, [aliases]);
+      const buckets = React.useMemo(() => computeFlBuckets(flIdx, manquants, aliasMap), [flIdx, manquants, aliasMap]);
+      const totalColis = buckets.rows.reduce((a, x) => a + (x.colis || 0), 0);
+
+      const saveAlias = async (t, value) => {
+        const norm = _flNorm(t.manquant);
+        const id = flAliasDocId(norm);
+        try {
+          if (value === '__ignore__') await storage.setDoc('fl_aliases', id, { key: norm, ignore: true, produitLabel: t.manquant, by: session.name, at: new Date().toISOString() });
+          else if (value) await storage.setDoc('fl_aliases', id, { key: norm, fl: value, ignore: false, produitLabel: t.manquant, by: session.name, at: new Date().toISOString() });
+          else { await storage.deleteDoc('fl_aliases', id); return; }
+          showToast('✓ Rapprochement enregistré');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+
       const send = async () => {
-        if (!fl.rows.length && !fl.warn.length) return;
-        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${fl.rows.length} produit(s) · ${totalColis} colis${fl.warn.length ? `\n+ ${fl.warn.length} sans colisage (Rungis calcule à la main)` : ''}.`)) return;
+        if (!buckets.rows.length && !buckets.warn.length) return;
+        if (!confirm(`Envoyer la demande de rajout FL à gestion@probon.fr ?\n\n${buckets.rows.length} produit(s) · ${totalColis} colis${buckets.warn.length ? `\n+ ${buckets.warn.length} sans colisage (Rungis calcule à la main)` : ''}${buckets.todo.length ? `\n\n⚠️ ${buckets.todo.length} manquant(s) NON rapproché(s) ne sont PAS inclus.` : ''}`)) return;
         setSending(true);
-        try { const res = await sendFlRuptureMail(fl.rows, fl.warn, day, session.name); if (res && res.ok !== false) showToast('📧 Demande envoyée à gestion@probon.fr'); else showToast('Erreur : ' + ((res && res.error) || 'inconnue')); }
+        try { const res = await sendFlRuptureMail(buckets.rows, buckets.warn, day, session.name); if (res && res.ok !== false) showToast('📧 Demande envoyée à gestion@probon.fr'); else showToast('Erreur : ' + ((res && res.error) || 'inconnue')); }
         catch (e) { showToast('Erreur réseau : ' + e.message); } finally { setSending(false); }
       };
+
       return (
         <div className="card" style={{ border: '2px solid #6a9a3f' }}>
           <h3 style={{ marginBottom: 4 }}>🥬 Rajout F&L à Rungis (ruptures du jour)</h3>
-          <p style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 0 }}>Rapproche les manquants F&L du jour ({day || '—'}) au Sheet FL et calcule les colis à rajouter à la commande. Envoi 100% serveur à gestion@probon.fr.</p>
-          {!fl.ready && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement de la feuille FL…</p>}
-          {fl.ready && fl.rows.length === 0 && fl.warn.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun manquant F&L à rajouter aujourd'hui.</p>}
-          {fl.rows.length > 0 && (
-            <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <p style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 0 }}>Rapproche les manquants F&L du jour ({day || '—'}) au Sheet FL et calcule les colis. Seuls les produits <strong>sûrs</strong> partent automatiquement ; les rapprochements incertains sont à valider ci-dessous.</p>
+          {!buckets.ready && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement de la feuille FL…</p>}
+
+          {buckets.todo.length > 0 && (
+            <div style={{ marginTop: 8, padding: '10px 12px', background: 'var(--warn-soft,#fff7e6)', border: '1px solid #f0c36d', borderRadius: 8 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>⚠️ {buckets.todo.length} manquant(s) F&L à rapprocher — choisis la correspondance (mémorisée pour tous)</div>
+              {buckets.todo.map(t => {
+                const cur = sel[t.id] !== undefined ? sel[t.id] : (t.guess || '');
+                return (
+                  <div key={t.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', padding: '6px 0', borderTop: '1px solid #f0d9a8' }}>
+                    <div style={{ flex: '1 1 220px', minWidth: 170 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{t.manquant}</div>
+                      <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{t.producteur ? t.producteur + ' · ' : ''}manque {t.manque}{t.guessLabel ? ` · suggestion : ${t.guessLabel}` : ''}</div>
+                    </div>
+                    <select value={cur} onChange={e => setSel(s => ({ ...s, [t.id]: e.target.value }))} style={{ fontSize: 12, flex: '1 1 220px', minWidth: 170, padding: '4px 6px' }}>
+                      <option value="">— choisir un produit FL —</option>
+                      <option value="__ignore__">🚫 Pas un F&L (ignorer)</option>
+                      <FlSheetOptions flIdx={flIdx} />
+                    </select>
+                    <button className="btn-primary" style={{ fontSize: 12, padding: '5px 10px' }} disabled={cur === ''} onClick={() => saveAlias(t, cur)}>Valider</button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {buckets.ready && buckets.rows.length === 0 && buckets.warn.length === 0 && buckets.todo.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun manquant F&L à rajouter aujourd'hui.</p>}
+
+          {buckets.rows.length > 0 && (
+            <div style={{ overflowX: 'auto', marginTop: 10 }}><table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
               <thead><tr><th style={{ textAlign: 'left', padding: '4px 6px' }}>Produit</th><th style={{ padding: '4px 6px', textAlign: 'right' }}>Manque</th><th style={{ padding: '4px 6px' }}>Colisage</th><th style={{ padding: '4px 6px', textAlign: 'right' }}>Colis</th></tr></thead>
               <tbody>
-                {fl.rows.map(x => (<tr key={x.id} style={{ borderTop: '1px solid var(--line)' }}><td style={{ padding: '6px' }}>{x.producer ? x.producer + ' — ' : ''}{x.produit}</td><td style={{ padding: '6px', textAlign: 'right' }}>{x.manque}</td><td style={{ padding: '6px', textAlign: 'center' }}>{x.colisage}</td><td style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>{x.colis}</td></tr>))}
+                {buckets.rows.map(x => (<tr key={x.id} style={{ borderTop: '1px solid var(--line)' }}>
+                  <td style={{ padding: '6px' }}><div style={{ fontWeight: 600 }}>{x.producer ? x.producer + ' — ' : ''}{x.produit}</div>{_flNorm(x.manquant) !== _flNorm(x.produit) && <div style={{ fontSize: 10, color: 'var(--ink-mute)' }}>manquant : {x.manquant}</div>}</td>
+                  <td style={{ padding: '6px', textAlign: 'right' }}>{x.manque}</td>
+                  <td style={{ padding: '6px', textAlign: 'center' }}>{x.colisage}</td>
+                  <td style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>{x.colis}</td>
+                </tr>))}
                 <tr style={{ borderTop: '2px solid var(--line)' }}><td colSpan="3" style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>Total</td><td style={{ padding: '6px', textAlign: 'right', fontWeight: 700 }}>{totalColis} colis</td></tr>
               </tbody>
             </table></div>
           )}
-          {fl.warn.length > 0 && (
+
+          {buckets.warn.length > 0 && (
             <div style={{ marginTop: 8, padding: '8px 10px', background: 'var(--warn-soft,#fff7e6)', border: '1px solid #f0c36d', borderRadius: 6, fontSize: 12 }}>
               ⚠️ Sans colisage — inclus dans le mail, Rungis calcule à la main (pense à remplir le colisage dans le Sheet) :
-              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>{fl.warn.map(x => <li key={x.id}>{x.produit} — besoin {x.manque} {frUnitLabel(x.type)}</li>)}</ul>
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>{buckets.warn.map(x => <li key={x.id}>{x.produit} — besoin {x.manque} {frUnitLabel(x.type)}</li>)}</ul>
             </div>
           )}
-          {(fl.rows.length > 0 || fl.warn.length > 0) && <button className="btn-primary" style={{ marginTop: 12, fontSize: 14 }} disabled={sending} onClick={send}>{sending ? 'Envoi…' : '📧 Envoyer la demande à gestion@probon.fr'}</button>}
+
+          {(buckets.rows.length > 0 || buckets.warn.length > 0) && <button className="btn-primary" style={{ marginTop: 12, fontSize: 14 }} disabled={sending} onClick={send}>{sending ? 'Envoi…' : '📧 Envoyer la demande à gestion@probon.fr'}</button>}
         </div>
       );
+    }
+
+    // Carte « Rajout F&L à Rungis » — Admin (jour actif).
+    function FlRuptureCard({ session }) {
+      const day = activeDay();
+      const [manquants, setManquants] = React.useState([]);
+      React.useEffect(() => { if (!day) return; return storage.subscribe(`day_${day}_manquants`, setManquants); }, [day]);
+      return <FlRuptureBlock day={day} session={session} manquants={manquants} />;
     }
 
     function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta, adminEmail, onLogoutAdmin }) {
