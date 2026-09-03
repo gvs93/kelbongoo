@@ -538,7 +538,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.25';
+    const APP_VERSION = 'V9.27';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -12039,12 +12039,45 @@
       const [result, setResult] = React.useState(null);
       const [sendingMail, setSendingMail] = React.useState(false);
       const [lastImport, setLastImport] = React.useState(null);
+      const [showManual, setShowManual] = React.useState(false);        // chargement manuel = secours, replié par défaut
+      const [pending, setPending] = React.useState(null);               // null = pas encore chargé / proxy sans l'action ; [] = rien à vérifier
+      const [pendBusy, setPendBusy] = React.useState('');               // code en cours de traitement
 
       React.useEffect(() => {
         (async () => {
           try { const m = await storage.getDoc('probon_import_meta','last'); if (m) setLastImport(m); } catch(e) {}
         })();
       }, []);
+
+      // Charge la liste « à vérifier » écrite par le script automatique Rungis (onglet FL_A_VERIFIER via le proxy).
+      const loadPending = React.useCallback(async () => {
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_pending' });
+          if (data && data.ok && Array.isArray(data.items)) setPending(data.items);
+        } catch(e) { /* proxy pas encore déployé avec fl_pending → on n'affiche simplement pas le panneau */ }
+      }, []);
+      React.useEffect(() => { loadPending(); }, [loadPending]);
+
+      const confirmNew = async (it) => {
+        setPendBusy(it.code);
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_confirm_new', item: it });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          showToast(`✓ « ${it.designation} » ajouté à COMMANDE FL`);
+          setPending(p => (p||[]).filter(x => x.code !== it.code));
+        } catch(e) { showToast('Erreur : ' + e.message); }
+        finally { setPendBusy(''); }
+      };
+      const ignorePending = async (it) => {
+        setPendBusy(it.code);
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_ignore', code: it.code });
+          if (!data.ok) throw new Error(data.error || 'erreur proxy');
+          showToast(`« ${it.designation} » ignoré`);
+          setPending(p => (p||[]).filter(x => x.code !== it.code));
+        } catch(e) { showToast('Erreur : ' + e.message); }
+        finally { setPendBusy(''); }
+      };
 
       const parseXlsx = (file) => new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -12141,15 +12174,57 @@
 
       return (
         <div className="card" style={{borderLeft:'4px solid var(--brand,#4A7C59)'}}>
-          <h3 style={{marginBottom:4}}>🥬 Chargement fichier Probon FL</h3>
-          <p style={{fontSize:12,color:'var(--ink-mute)',marginBottom:10}}>
-            À charger après réception du fichier Probon. Lie chaque FL <strong>par sa désignation</strong> (le FL n'a pas de code côté site),
-            met à jour <strong>colisage / UV / prix</strong>, et liste les FL <strong>qu'on vend mais absents du fichier Probon</strong>
-            (risque de rupture → désactiver ou mettre le stock à 0). <strong>Ne désactive rien</strong> tout seul.
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+            <h3 style={{margin:0}}>🥬 Fruits &amp; Légumes (Probon / Rungis)</h3>
+            <span style={{fontSize:10,fontWeight:800,letterSpacing:'.04em',textTransform:'uppercase',color:'#2e7d32',background:'#e6f4ea',border:'1px solid #b7e0c2',borderRadius:99,padding:'2px 8px'}}>⚙️ Automatique</span>
+          </div>
+          <p style={{fontSize:12,color:'var(--ink-soft)',margin:'6px 0 10px'}}>
+            La MAJ FL (prix, colisage, actif/inactif) se fait <strong>automatiquement</strong> chaque jour depuis le fichier Rungis — rien à charger.
+            Les seuls cas qui demandent une décision s'affichent ci-dessous.
+          </p>
+
+          {/* ====== À VÉRIFIER (auto) — validation dans l'écran ====== */}
+          <div style={{background:'#f0f4f8',border:'1px solid #b8cce4',borderRadius:8,padding:10,marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div style={{fontWeight:700,fontSize:13}}>❓ À vérifier — nouveau produit ou doublon ?</div>
+              <button className="btn-ghost" style={{fontSize:12}} onClick={loadPending}>↻</button>
+            </div>
+            {pending === null && (
+              <div style={{fontSize:11.5,color:'var(--ink-mute)',marginTop:6}}>En attente du script (ou proxy à déployer avec l'action <code>fl_pending</code>). Rien à valider pour l'instant.</div>
+            )}
+            {pending !== null && pending.length === 0 && (
+              <div style={{fontSize:12,color:'#2e7d32',marginTop:6}}>✓ Rien à vérifier. Tout est à jour.</div>
+            )}
+            {pending !== null && pending.length > 0 && (
+              <div style={{marginTop:6}}>
+                <div style={{fontSize:11.5,color:'var(--ink-mute)',marginBottom:8}}>Le script a trouvé chez Rungis un produit proche d'un existant. Confirme si c'est un <strong>nouveau produit</strong> (→ ajouté à COMMANDE FL) ou un <strong>doublon</strong> (→ ignoré).</div>
+                {pending.map((it,i) => (
+                  <div key={it.code||i} style={{padding:'8px 0',borderBottom:'1px solid #cdd8e3'}}>
+                    <div style={{fontSize:13,fontWeight:600}}>Rungis : « {it.designation} » <span style={{color:'var(--ink-mute)',fontWeight:400}}>(code {it.code})</span></div>
+                    {it.proche && <div style={{fontSize:11.5,color:'#8a6d00'}}>≈ proche de FL « {it.proche} »{it.sim!=null?` (${it.sim}%)`:''}</div>}
+                    {it.commentaire && <div style={{fontSize:11,color:'var(--ink-mute)'}}>{it.commentaire}</div>}
+                    <div style={{display:'flex',gap:6,marginTop:6}}>
+                      <button className="btn-primary" style={{fontSize:12,padding:'6px 10px'}} disabled={pendBusy===it.code} onClick={()=>confirmNew(it)}>{pendBusy===it.code?'…':'✔ Nouveau — ajouter'}</button>
+                      <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px'}} disabled={pendBusy===it.code} onClick={()=>ignorePending(it)}>✖ Doublon — ignorer</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ====== Chargement manuel = SECOURS, replié ====== */}
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer',padding:'6px 0'}} onClick={()=>setShowManual(s=>!s)}>
+            <span style={{fontSize:12,fontWeight:600,color:'var(--ink-soft)'}}>🛟 Charger le fichier Probon à la main (secours, en cas de bug)</span>
+            <span style={{fontSize:16}}>{showManual ? '▾' : '▸'}</span>
+          </div>
+          {showManual && (<>
+          <p style={{fontSize:11.5,color:'var(--ink-mute)',margin:'0 0 8px'}}>
+            À utiliser seulement si l'automatique est en panne. Lie chaque FL par sa désignation, met à jour colisage / UV / prix. <strong>Ne désactive rien</strong> tout seul.
           </p>
           {lastImport && (
             <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:10,padding:'6px 8px',background:'var(--surface-alt,#f5f5f5)',borderRadius:6}}>
-              Dernier chargement : <strong>{new Date(lastImport.at).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})}</strong>
+              Dernier chargement manuel : <strong>{new Date(lastImport.at).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})}</strong>
               {' '}par {lastImport.by} · {lastImport.file} · {lastImport.updated} MAJ
               {lastImport.unmatchedSite?.length > 0 && <span style={{color:'var(--info,#1565c0)'}}> · {lastImport.unmatchedSite.length} à coder</span>}
               {lastImport.missingCodes?.length > 0 && <span style={{color:'var(--warn,#F2823F)'}}> · {lastImport.missingCodes.length} à remonter</span>}
@@ -12217,6 +12292,7 @@
               </div>
             </div>
           )}
+          </>)}
         </div>
       );
     }
@@ -13190,6 +13266,30 @@
         finally { setBusy(false); }
       };
 
+      // --- Mise à jour INDÉPENDANTE : produits seuls (sans commandes) ---
+      const handleProdsOnly = async () => {
+        if (!v4Prods) { showToast('Sélectionne le fichier produits'); return; }
+        setBusy(true);
+        try {
+          const prodById = parseProductsFile(v4Prods);
+          await writeCache("products", prodById);
+          autoSyncFLAfterImport(prodById, showToast, setFlSync);
+          showToast(`✓ Produits mis à jour : ${Object.keys(prodById).length}`);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+      // --- Mise à jour INDÉPENDANTE : consommateurs seuls (sans commandes) ---
+      const handleConsOnly = async () => {
+        if (!v4Cons) { showToast('Sélectionne le fichier consommateurs'); return; }
+        setBusy(true);
+        try {
+          const consById = parseConsumersById(v4Cons);
+          await writeCache('consumers', consById);
+          showToast(`✓ Consommateurs mis à jour : ${Object.keys(consById).length}`);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
       // Helpers pour les boutons de date rapide
       const dateLabel = (d) => {
         if (d === todayKey()) return 'Aujourd\'hui';
@@ -13343,11 +13443,21 @@
                 onChange={e => e.target.files[0] && readText(e.target.files[0], setV4Prods)} />
               <span>🏷️ Produits (JSON, CSV ou TXT) {v4Prods ? '✓' : '(optionnel)'}</span>
             </label>
-            <label className="upload-zone" style={{display:'block',marginBottom:10}}>
+            {v4Prods && (
+              <button className="btn-secondary btn-block" disabled={busy} onClick={handleProdsOnly} style={{marginBottom:8,fontSize:13}}>
+                🏷️ Mettre à jour les produits seuls (sans commandes)
+              </button>
+            )}
+            <label className="upload-zone" style={{display:'block',marginBottom:6}}>
               <input type="file" accept=".json,application/json,*/*" style={{display:'none'}}
                 onChange={e => e.target.files[0] && readJSON(e.target.files[0], setV4Cons)} />
               <span>👤 Consommateurs {v4Cons ? '✓' : '(optionnel)'}</span>
             </label>
+            {v4Cons && (
+              <button className="btn-secondary btn-block" disabled={busy} onClick={handleConsOnly} style={{marginBottom:10,fontSize:13}}>
+                👤 Mettre à jour les consommateurs seuls (sans commandes)
+              </button>
+            )}
 
             <label className="upload-zone" style={{display:'block',marginBottom:6}}>
               <input type="file" accept=".txt,text/plain,*/*" style={{display:'none'}}
