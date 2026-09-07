@@ -284,6 +284,8 @@
     }
     .role-tab.active { background: white; color: var(--ink); border-color: var(--line); box-shadow: var(--shadow-sm); }
     .role-tab .role-icon { display: block; font-size: 20px; margin-bottom: 2px; }
+    /* V9.43 : champ code perso (chiffres centrés espacés) */
+    .code-input { text-align: center; letter-spacing: 8px; font-size: 24px !important; font-weight: 800; }
 
     /* === MODAL === */
     .modal-backdrop {
@@ -552,6 +554,19 @@
          • « Rajout F&L à Rungis » retiré de la page Prépa « Manquants & ND » ;
            conservé uniquement dans l'espace Master (carte FlRuptureCard).
          • <title> → « Kelbongoo » (n'affichait plus la bonne version) + favicon.
+
+       JOURNAL — V9.43 (authentification par code perso)
+         • Connexion Prépa + Distrib par CODE PERSONNEL unique (1 seul code, pas de
+           code magasin), validé CÔTÉ SERVEUR sur le registre « Salariés » (le même
+           que l'appli réception) via RECEPTION_PROXY_URL, action "verify-kbg-code".
+           Le serveur répond juste { valid } : les codes ne sont jamais dans le HTML.
+           Périmètre : salariés dont Magasin = « KELBONGOO » et Actif = Oui.
+         • Master inchangé (Auth Google liste blanche + repli mot de passe).
+         • Mots de passe partagés Prepa2026 / Distrib2026 : neutralisés (legacy).
+         • Déconnexion auto après 60 min sans interaction (INACTIVITY_MS), comme
+           réception. Réarmée sur l'état « connecté », pas sur chaque ping lastSeen.
+         • CÔTÉ SERVEUR À DÉPLOYER : ajouter l'action "verify-kbg-code" au script
+           central réception (apps_script_reception.gs) — cf. snippet livré.
        ===================================================================== */
 
     // ============================================================
@@ -568,8 +583,10 @@
     };
 
     const MASTER_PASSWORD = "Adminkelbongoo93!";
-    const PREP_PASSWORD = "Prepa2026";   // mot de passe préparateurs
-    const DISTRIB_PASSWORD = "Distrib2026";  // mot de passe distributeurs (partagé)
+    const PREP_PASSWORD = "Prepa2026";   // (legacy V9.42) — remplacé par le code perso en V9.43
+    const DISTRIB_PASSWORD = "Distrib2026";  // (legacy V9.42) — remplacé par le code perso en V9.43
+    // V9.43 : déconnexion auto après 60 min sans interaction (comme l'appli réception).
+    const INACTIVITY_MS = 60 * 60 * 1000; // 60 min
     const PREPARATEURS = ['Robin', 'Diana', 'Mamadou', 'Hamidou', 'Tom', 'Norman', 'Marjorie'];
     const SITES = ["BAR","BIC","BOR","CES","CHA","DOM","FOR","LIL","NCA","NCC","PAD","PDC","PDP","ROB","ROM","STB","TOL"];
     // Nom long de chaque local — pour les mails CLIENTS (le code court "PDP" est incompréhensible
@@ -604,7 +621,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.41';
+    const APP_VERSION = 'V9.43';
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -812,6 +829,21 @@
 
     // PROXY FL / PROBON (inventaire FL, stock, import Probon, mails) — script dédié
     const FL_PROXY_URL = "https://script.google.com/macros/s/AKfycbyVvvafumNfLZ7RzseUvoHaghPK7c-_7KqthgtV_VY9ulXe7sJIYEclWnratDbBJeDd/exec";
+
+    // V9.43 — WEBHOOK CENTRAL RÉCEPTION (registre « Salariés »), MÊME script que l'appli réception.
+    // Sert UNIQUEMENT à valider un code perso côté serveur (action "verify-kbg-code").
+    // Les codes ne transitent jamais en clair dans le HTML : le serveur répond juste { valid }.
+    const RECEPTION_PROXY_URL = "https://script.google.com/macros/s/AKfycbzSMWziEuPvxY6UvM6FimJlFCTE1v9u1mWh3gJXbOtMVlHcb478_gASeIwZ1PMEw7-2Sw/exec";
+    // Valide un code perso Kelbongoo (1 seul code, pas de code magasin). Renvoie { valid, reason }.
+    async function verifyKbgCode(code) {
+      const res = await fetch(RECEPTION_PROXY_URL, { method: 'POST', body: JSON.stringify({ action: 'verify-kbg-code', code: String(code || '').trim() }) });
+      const text = await res.text();
+      try { return JSON.parse(text); }
+      catch (e) {
+        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
+        throw new Error(`réponse non-JSON (déploiement réception en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
+      }
+    }
 
     // Envoie au proxy Freshdesk et renvoie la réponse JSON. Si la réponse n'est pas du JSON
     // (typiquement une page de login HTML → déploiement pas en accès « Tout le monde »),
@@ -2117,7 +2149,8 @@
       const [masterOpen, setMasterOpen] = React.useState(false); // overlay accès master
       const [site, setSite] = React.useState('');
       const [name, setName] = React.useState('');
-      const [password, setPassword] = React.useState('');
+      const [password, setPassword] = React.useState(''); // V9.43 : contient le CODE perso
+      const [busy, setBusy] = React.useState(false);       // V9.43 : vérification serveur en cours
       const [error, setError] = React.useState('');
       const [now, setNow] = React.useState(new Date());
       const [sitesOfDay, setSitesOfDay] = React.useState([]); // calculé depuis les commandes du jour
@@ -2199,19 +2232,25 @@
         return () => clearInterval(t);
       }, [masterOpen]);
 
-      const handleSubmit = () => {
+      // V9.43 : connexion par CODE PERSO unique (Prépa + Distrib), validé côté serveur
+      // sur le même registre « Salariés » que l'appli réception. Master reste inchangé.
+      const handleSubmit = async () => {
         setError('');
         if (!name.trim()) { setError('Entre ton prénom.'); return; }
-
+        if (role === 'distrib' && !site) { setError('Choisis un lieu.'); return; }
+        const code = String(password || '').trim();
+        if (!code) { setError('Entre ton code personnel.'); return; }
+        setBusy(true);
+        let r;
+        try { r = await verifyKbgCode(code); }
+        catch (e) { setBusy(false); setError('Serveur injoignable. Réessaie dans un instant.'); return; }
+        setBusy(false);
+        if (!r || !r.valid) { setError((r && r.reason) || 'Code personnel incorrect.'); return; }
         if (role === 'prep') {
-          if (password !== PREP_PASSWORD) { setError('Mot de passe préparateur incorrect.'); return; }
-          onLogin({ role: 'prep', isPrep: true, site: 'ENTREPOT', name: name.trim(), loggedAt: new Date().toISOString() });
-          return;
+          onLogin({ role: 'prep', isPrep: true, site: 'ENTREPOT', name: name.trim(), code, loggedAt: new Date().toISOString() });
+        } else {
+          onLogin({ role: 'distrib', site, name: name.trim(), code, loggedAt: new Date().toISOString() });
         }
-        // Distrib
-        if (!site) { setError('Choisis un lieu.'); return; }
-        if (password !== DISTRIB_PASSWORD) { setError('Mot de passe distributeur incorrect.'); return; }
-        onLogin({ role: 'distrib', site, name: name.trim(), loggedAt: new Date().toISOString() });
       };
 
       // Connexion de secours master par mot de passe (si Google indisponible).
@@ -2306,13 +2345,18 @@
             </div>
 
             <div className="field">
-              <label>{role === 'prep' ? 'Mot de passe préparateur' : 'Mot de passe distributeur'}</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" />
+              <label>Code personnel</label>
+              <input type="password" inputMode="numeric" className="code-input" value={password}
+                onChange={e => setPassword(e.target.value)} placeholder="••••••"
+                autoComplete="off" onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }} />
+              <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6,textAlign:'center'}}>
+                Ton code perso (le même partout). Pas de code ? Demande-le au bureau.
+              </div>
             </div>
 
             {error && <div style={{color:'var(--danger)',fontSize:12,marginBottom:12,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{error}</div>}
 
-            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit}>Se connecter</button>
+            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit} disabled={busy}>{busy ? 'Vérification…' : 'Se connecter'}</button>
 
             <div style={{marginTop:14,textAlign:'center',fontSize:11,color:'var(--ink-mute)'}}>
               {firebaseConfigured
@@ -5680,6 +5724,12 @@
       const [mode, setMode] = React.useState(() => (new Date().getDay() === 2 && new Date().getHours() < 10) ? 'matin' : 'soir');
       const [closingInv, setClosingInv] = React.useState(false); // état d'envoi à la clôture
       const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
+      // Clôture d'inventaire (complet/tournant) : verrou + réutilisation du MÊME
+      // classeur pour une même demi-journée. Créneau = matin (<12h) / après-midi.
+      const [closedInfo, setClosedInfo] = React.useState(null); // doc partagé inventory_closed
+      const invSlot = (new Date().getHours() < 12) ? 'AM' : 'PM';
+      const invClosedId = `${invDate}_${invType}_${invSlot}`;
+      const invLocked = !!(closedInfo && !closedInfo.reopened && (invType === 'complet' || invType === 'tournant'));
       const [scopeKind, setScopeKind] = React.useState('producer'); // 'producer' | 'type' | 'family'
       const [scopeValue, setScopeValue] = React.useState(''); // producteur / type / famille sélectionné
       const [showLearn, setShowLearn] = React.useState(false); // section apprentissage des codes (temps du test)
@@ -5774,6 +5824,16 @@
         });
         return () => { u && u(); };
       }, [invDate, mode]);
+
+      // État de clôture partagé (verrou + classeur réutilisable pour la demi-journée)
+      React.useEffect(() => {
+        setClosedInfo(null);
+        const u = storage.subscribe('inventory_closed', (arr) => {
+          const d = (arr || []).find(x => x.id === invClosedId);
+          setClosedInfo(d || null);
+        });
+        return () => { u && u(); };
+      }, [invClosedId]);
 
       // Charge le type / périmètre mémorisés pour cette date (partagé entre opérateurs)
       React.useEffect(() => {
@@ -5891,6 +5951,7 @@
       }, [products, universe]);
 
       const setCount = async (productId, qty) => {
+        if (invLocked) { showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier'); return; }
         const q = Math.max(0, parseInt(qty,10) || 0);
         await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
           id: productId, qty: q,
@@ -6047,7 +6108,15 @@
 
       const counted = Object.keys(counts).filter(id => counts[id] !== undefined && counts[id] !== null);
       const clearCount = async (id) => {
+        if (invLocked) { showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier'); return; }
         try { await storage.deleteDoc(`inventory_${invDate}_${mode}`, id); } catch(e){}
+      };
+      const reopenInventory = async () => {
+        if (!closedInfo) return;
+        try {
+          await storage.setDoc('inventory_closed', invClosedId, { ...closedInfo, reopened: true, reopenedBy: session.name, reopenedAt: new Date().toISOString() });
+          showToast('🔓 Inventaire rouvert — tu peux modifier puis re-clôturer');
+        } catch (e) { showToast('Erreur : ' + e.message); }
       };
       const isTuesday = new Date().getDay() === 2;
       const beforeTen = new Date().getHours() < 10;
@@ -6086,18 +6155,45 @@
         if (!items.length) { showToast('Rien à écrire (tous les articles comptés sont en saisie manuelle)'); return; }
         const initials = (prompt('Tes initiales pour clôturer l\'inventaire :') || '').trim();
         if (initials.length < 2) { showToast('Initiales requises (2 caractères min).'); return; }
-        if (!confirm(`Clôturer l'inventaire ${invType} ?\n\n${items.length} produit(s) → un NOUVEAU classeur d'inventaire (à recopier ensuite sur la feuille de stock).\nLa feuille de stock n'est pas modifiée. Un mail part à rr@pribon.org.`)) return;
+        // Même jour + même demi-journée (matin/après-midi) + même type → on RÉUTILISE
+        // le classeur déjà créé (mise à jour) au lieu d'en créer un nouveau.
+        const reuse = closedInfo && closedInfo.sheetId ? closedInfo : null;
+        const slotLbl = invSlot === 'AM' ? 'ce matin' : 'cet après-midi';
+        const msg = reuse
+          ? `Mettre à jour le classeur d'inventaire de ${slotLbl} ?\n\n${items.length} produit(s) → MÊME classeur (chiffres remis à jour). Un mail part à rr@pribon.org.`
+          : `Clôturer l'inventaire ${invType} ?\n\n${items.length} produit(s) → un NOUVEAU classeur d'inventaire (à recopier ensuite sur la feuille de stock).\nLa feuille de stock n'est pas modifiée. Un mail part à rr@pribon.org.`;
+        if (!confirm(msg)) return;
         setClosingInv(true); setWriting(true); setWriteResult(null);
         try {
           const who = initials + ' · ' + session.name;
-          const nw = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_new', date: invDate, by: who, type: invType });
-          if (!nw.ok) { showToast('Erreur création : ' + (nw.error || 'inconnue')); setWriting(false); setClosingInv(false); return; }
-          const wr = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_write', sheetId: nw.sheetId, items });
-          const cl = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_close', sheetId: nw.sheetId, by: who, stockDate: nw.stockDate });
-          setWriteResult({ written: (wr && wr.written) || 0, sheet: nw.name, url: (cl && cl.url) || nw.url, newSheet: true });
-          try { await storage.setDoc('inventory_log', `${invDate}_${invType}_${Date.now()}`, { date: invDate, mode: invType, by: session.name, initials, at: new Date().toISOString(), nbProducts: items.length, written: (wr && wr.written) || 0, sheet: nw.name, url: (cl && cl.url) || nw.url }); } catch (e) {}
+          let sheetId, name, url, stockDate, writtenN = 0;
+          if (reuse) {
+            sheetId = reuse.sheetId; name = reuse.name; stockDate = reuse.stockDate || '';
+            const wr = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_write', sheetId, items, clearFirst: true });
+            const cl = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_close', sheetId, by: who, stockDate });
+            url = (cl && cl.url) || reuse.url; writtenN = (wr && wr.written) || 0;
+            setWriteResult({ written: writtenN, sheet: name, url, newSheet: true, updated: true });
+          } else {
+            const nw = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_new', date: invDate, by: who, type: invType });
+            if (!nw.ok) { showToast('Erreur création : ' + (nw.error || 'inconnue')); setWriting(false); setClosingInv(false); return; }
+            sheetId = nw.sheetId; name = nw.name; stockDate = nw.stockDate;
+            const wr = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_write', sheetId, items });
+            const cl = await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_close', sheetId, by: who, stockDate });
+            url = (cl && cl.url) || nw.url; writtenN = (wr && wr.written) || 0;
+            setWriteResult({ written: writtenN, sheet: name, url, newSheet: true });
+          }
+          // Marque clôturé (partagé) → verrouille le comptage + réutilise ce classeur
+          // pour toute re-clôture de la même demi-journée.
+          try {
+            await storage.setDoc('inventory_closed', invClosedId, {
+              id: invClosedId, sheetId, name: name || '', url: url || '', stockDate: stockDate || '',
+              slot: invSlot, invDate, invType,
+              closedBy: who, closedAt: new Date().toISOString(), reopened: false,
+            }, { replace: true });
+          } catch (e) {}
+          try { await storage.setDoc('inventory_log', `${invDate}_${invType}_${Date.now()}`, { date: invDate, mode: invType, by: session.name, initials, at: new Date().toISOString(), nbProducts: items.length, written: writtenN, sheet: name, url, updated: !!reuse }); } catch (e) {}
           try { const backupItems = counted.map(id => { const p = prodById[id] || {}; return { id, producteur: p.producteur || p.producer || '', produit: p.name || p.produit || '', unite: p.unite || p.unit || '', qty: counts[id] }; }); await stockPost({ secret: FRESHDESK_SECRET, action: 'inv_backup', app: 'Kelbongoo', theme: 'Inventaire', type: invType, date: invDate, by: session.name, items: backupItems }); } catch (e) {}
-          showToast(`✓ Inventaire clôturé : ${(wr && wr.written) || 0} produit(s) dans le nouveau classeur → mail rr@`);
+          showToast(reuse ? '✓ Classeur mis à jour → mail rr@' : `✓ Inventaire clôturé → nouveau classeur, mail rr@`);
         } catch (e) { showToast('Erreur réseau : ' + e.message); }
         finally { setWriting(false); setClosingInv(false); }
       };
@@ -6521,10 +6617,24 @@
               )}
               </>
             )}
-            <button className="btn-primary btn-block" disabled={writing || counted.length===0}
-              onClick={validateStock}>
-              {closingInv ? 'Clôture…' : ((invType==='complet'||invType==='tournant') ? `✓ Clôturer → nouveau classeur (${counted.length}) + mail rr@` : `✓ Clôturer l'inventaire ${mode} (${counted.length}) → mail rr@`)}
-            </button>
+            {/* Verrou : inventaire complet/tournant clôturé pour cette demi-journée */}
+            {invLocked ? (
+              <div className="alert-warning" style={{fontSize:13,marginBottom:0}}>
+                🔒 <strong>Inventaire clôturé</strong>{closedInfo && closedInfo.closedAt ? ' le ' + new Date(closedInfo.closedAt).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : ''}{closedInfo && closedInfo.closedBy ? ' · ' + closedInfo.closedBy : ''}. Le comptage est verrouillé.
+                {closedInfo && closedInfo.url && <span> · <a href={closedInfo.url} target="_blank" rel="noopener">ouvrir le classeur</a></span>}
+                <button className="btn-secondary btn-block" style={{marginTop:8}} onClick={reopenInventory}>🔓 Rouvrir pour modifier</button>
+              </div>
+            ) : (
+              <button className="btn-primary btn-block" disabled={writing || counted.length===0}
+                onClick={validateStock}>
+                {closingInv ? 'Clôture…'
+                  : (invType==='complet'||invType==='tournant')
+                    ? ((closedInfo && closedInfo.sheetId)
+                        ? `✓ Mettre à jour le classeur (${counted.length}) + mail rr@`
+                        : `✓ Clôturer → nouveau classeur (${counted.length}) + mail rr@`)
+                    : `✓ Clôturer l'inventaire ${mode} (${counted.length}) → mail rr@`}
+              </button>
+            )}
             {!STOCK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)',marginTop:6}}>⚠️ STOCK_PROXY_URL vide — colle l'URL /exec du proxy stock pour activer.</div>}
             {!(invType==='complet'||invType==='tournant') && (
               <button className="btn-ghost" style={{fontSize:12,marginTop:6,color:'var(--ink-mute)'}} disabled={writing || counted.length===0} onClick={undoLastInventory}>
@@ -15461,6 +15571,23 @@
         setConfirmName(false);
         setViewAs(null);
       };
+
+      // V9.43 : déconnexion auto après INACTIVITY_MS (60 min) sans interaction, comme réception.
+      // On dépend de l'état « connecté » (booléen) et non de l'objet session : sinon le
+      // rafraîchissement de lastSeen (toutes les 5 min) réarmerait le minuteur en boucle
+      // et la déconnexion ne se déclencherait jamais.
+      const logoutRef = React.useRef(() => {});
+      logoutRef.current = handleLogout;
+      const loggedIn = !!session;
+      React.useEffect(() => {
+        if (!loggedIn) return;
+        let timer = null;
+        const reset = () => { if (timer) clearTimeout(timer); timer = setTimeout(() => logoutRef.current(), INACTIVITY_MS); };
+        const evs = ['mousedown', 'keydown', 'touchstart', 'click', 'scroll'];
+        evs.forEach(e => window.addEventListener(e, reset, { passive: true }));
+        reset();
+        return () => { if (timer) clearTimeout(timer); evs.forEach(e => window.removeEventListener(e, reset)); };
+      }, [loggedIn]);
 
       // Rafraîchit lastSeen et décide quand redemander « tu es bien X ? ».
       // On redemande au plus une fois toutes les ~18h d'usage, et seulement
