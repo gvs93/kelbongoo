@@ -626,7 +626,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.44';
+    const APP_VERSION = 'V9.45';
+    // V9.45 — MU du jour : nouvelle section « Autres produits commandés — à préparer
+    //         (non ensachés) ». Lecture de la feuille FL (action fl_read, onglet MU_TAB) :
+    //         produits actifs, non-sachets, absents de la liste MU, avec quantité
+    //         commandée du jour (colonne VENTES DU JOUR). 100 % client, aucun changement proxy.
 
     // Calendrier des distributions Kelbongoo (jour JS : 0=dim … 6=sam).
     // Stable toute l'année. NB : PDP ne distribue PAS le samedi.
@@ -7729,6 +7733,19 @@
       const [showExtra,setShowExtra]=React.useState(false);
       const [showRecap,setShowRecap]=React.useState(false);
       const [mailing,setMailing]=React.useState(false);
+      // Autres produits commandés du jour (pièce / barquette / botte…), non ensachés
+      const [flRows,setFlRows]=React.useState(null);
+      const [flErr,setFlErr]=React.useState('');
+      const [showAprep,setShowAprep]=React.useState(true);
+      const loadFl = React.useCallback(async ()=>{
+        setFlErr('');
+        try{
+          const data = await flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:MU_TAB, ts:Date.now() });
+          if(!data || data.ok===false) throw new Error((data&&data.error)||'lecture impossible');
+          setFlRows(data.rows||[]);
+        }catch(e){ setFlRows([]); setFlErr('Produits commandés indisponibles : '+e.message); }
+      },[]);
+      React.useEffect(()=>{ loadFl(); },[loadFl]);
 
       const loadList = React.useCallback(async ()=>{
         setError(''); setItems(null);
@@ -7771,6 +7788,44 @@
         const pool = extraPool.filter(it=>!(muName(it) in extraAdded));
         return q ? pool.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : pool;
       },[extraPool,extraAdded,q]);
+
+      // --- « À préparer » : produits actifs commandés, non-sachets, absents de la liste MU ---
+      const flCols = React.useMemo(()=>{
+        if(!flRows||!flRows.length) return null;
+        const H = flRows[0].map(h=>normalizeText(String(h||'')).trim());
+        const find=(preds)=>{ for(const p of preds){ const i=H.findIndex(h=>p(h)); if(i>=0) return i; } return -1; };
+        return {
+          prod:     find([h=>h==='designation', h=>h.includes('designation'), h=>h.includes('produit')]),
+          producer: find([h=>h==='producteur', h=>h.includes('producteur')]),
+          type:     find([h=>h==='type']),
+          unite:    find([h=>h.includes('unite de vente'), h=>h.includes('unite')]),
+          ventes:   find([h=>h.includes('ventes du jour'), h=>h.includes('ventes')]),
+          actif:    find([h=>h.includes('actif')]),
+        };
+      },[flRows]);
+      const muNamesSet = React.useMemo(()=>{
+        const s=new Set(); (items||[]).forEach(it=> s.add(normalizeText(muName(it)).trim())); return s;
+      },[items]);
+      const aPreparer = React.useMemo(()=>{
+        if(!flRows||!flCols||flCols.prod<0) return [];
+        const out=[];
+        for(let r=1;r<flRows.length;r++){
+          const row=flRows[r]; if(!row) continue;
+          const name=String(row[flCols.prod]==null?'':row[flCols.prod]).trim();
+          if(!name) continue;
+          if(flCols.actif>=0){ const a=normalizeText(String(row[flCols.actif]||'')).trim(); if(!(a==='actif'||a==='oui'||a==='x'||a==='1'||a==='vrai')) continue; }
+          const typ=normalizeText(String(flCols.type>=0?row[flCols.type]:'')).trim();
+          if(typ==='sachet'||typ==='mu') continue;                       // les sachets = domaine MU, déjà couverts
+          if(muNamesSet.has(normalizeText(name).trim())) continue;        // déjà dans la liste MU
+          const qte=parseFloat(String(flCols.ventes>=0?row[flCols.ventes]:'').replace(',','.'))||0;
+          if(qte<=0) continue;                                            // rien de commandé aujourd'hui
+          out.push({ name, producer:flCols.producer>=0?String(row[flCols.producer]||'').trim():'', unite:flCols.unite>=0?String(row[flCols.unite]||'').trim():'', type:typ, qte:Math.round(qte) });
+        }
+        out.sort((a,b)=> (a.producer||'').localeCompare(b.producer||'') || a.name.localeCompare(b.name));
+        return out;
+      },[flRows,flCols,muNamesSet]);
+      const aPreparerFiltered = React.useMemo(()=> q ? aPreparer.filter(x=> muStrip(x.name.toLowerCase()).includes(q)) : aPreparer, [aPreparer,q]);
+      const totalAPrep = aPreparer.reduce((s,x)=>s+x.qte,0);
 
       const renderCard=(it,idx)=>{ const key=muName(it); const info=byProduct[key]||{doneCount:0,busy:[],mine:null}; return (
         <MuCard key={key+'_'+idx} item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} />
@@ -7818,7 +7873,7 @@
 
           <div style={{display:'flex',gap:8,alignItems:'center'}}>
             <input type="text" placeholder="🔍 Chercher un fruit / légume…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,padding:10,borderRadius:8,border:'1.5px solid #ddd'}}/>
-            <button className="btn-secondary" onClick={loadList}>↻</button>
+            <button className="btn-secondary" onClick={()=>{loadList();loadFl();}}>↻</button>
           </div>
 
           {items!==null && plannedItems.length>0 && (
@@ -7864,6 +7919,33 @@
                     </div>
                   ); })}
                   {filteredExtra.length===0 && Object.keys(extraAdded).length===extraPool.length && <div style={{fontSize:12,color:'var(--ink-mute)',textAlign:'center',padding:8}}>Tous les produits disponibles ont été ajoutés.</div>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {flRows!==null && (
+            <div style={{marginTop:4}}>
+              <button className="btn-secondary" style={{width:'100%',borderStyle:'dashed',borderColor:'#2c4a8c',color:'#2c4a8c',fontWeight:700}} onClick={()=>setShowAprep(s=>!s)}>
+                📦 Autres produits commandés — à préparer (non ensachés){aPreparer.length>0?` · ${aPreparer.length} produits · ${totalAPrep} u`:''} {showAprep?'▲':'▼'}
+              </button>
+              {showAprep && (
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:8}}>Pièces, barquettes, bottes… commandés aujourd'hui (hors sachets MU). Quantité = ventes du jour.</div>
+                  {flErr && <div className="card" style={{background:'#fff3e0',border:'1px solid #ffcc80'}}><p style={{fontSize:12,color:'#bf6000',margin:0}}>{flErr}</p></div>}
+                  {!flErr && aPreparerFiltered.length===0 && <div style={{fontSize:12,color:'var(--ink-mute)',textAlign:'center',padding:8}}>Aucun autre produit commandé{q?' pour cette recherche':''}.</div>}
+                  {aPreparerFiltered.map((x,i)=>(
+                    <div key={x.name+'_'+i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 12px',marginBottom:6,borderRadius:8,border:'1px solid #e1e8f5',background:'#f7f9ff'}}>
+                      <div style={{minWidth:0}}>
+                        <div style={{fontWeight:600,fontSize:13}}>{x.name}</div>
+                        <div style={{fontSize:11,color:'var(--ink-mute)'}}>{[x.producer,x.unite].filter(Boolean).join(' · ')}</div>
+                      </div>
+                      <div style={{textAlign:'right',whiteSpace:'nowrap',marginLeft:10}}>
+                        <div style={{fontSize:20,fontWeight:900,color:'#2c4a8c',lineHeight:1}}>{x.qte}</div>
+                        <div style={{fontSize:10,color:'var(--ink-mute)'}}>commandé{x.qte>1?'s':''}</div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
