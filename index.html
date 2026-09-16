@@ -626,7 +626,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.45';
+    const APP_VERSION = 'V9.46';
     // V9.45 — MU du jour : nouvelle section « Autres produits commandés — à préparer
     //         (non ensachés) ». Lecture de la feuille FL (action fl_read, onglet MU_TAB) :
     //         produits actifs, non-sachets, absents de la liste MU, avec quantité
@@ -870,13 +870,21 @@
 
     // Même logique que freshdeskPost mais vers le proxy FL/Probon dédié.
     async function flPost(payload) {
-      const res = await fetch(FL_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
-      const text = await res.text();
-      try { return JSON.parse(text); }
-      catch (e) {
-        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-        throw new Error(`réponse non-JSON (proxy FL en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
+      // V9.46 — auto-retry : un flash réseau au boot renvoie parfois une page
+      // de login HTML au lieu du JSON ; on réessaie 3× avant d'échouer.
+      let lastSnippet = '';
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt) await new Promise(r => setTimeout(r, 400 * attempt));
+        let text = '';
+        try {
+          const res = await fetch(FL_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
+          text = await res.text();
+          return JSON.parse(text);
+        } catch (e) {
+          lastSnippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
+        }
       }
+      throw new Error(`réponse non-JSON (proxy FL en accès « Tout le monde » ?) — ${lastSnippet || 'vide'}`);
     }
 
     // PROXY STOCK (écriture inventaire matin/soir dans les feuilles de stock du jour,
@@ -956,14 +964,27 @@
         window.__app = app;
         try { window.__fns = window.__firebase.getFunctions(app, 'europe-west1'); } catch(_) {}
 
-        await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('Auth timeout')), 10000);
-          onAuthStateChanged(auth, (user) => {
-            if (user) { clearTimeout(timer); resolve(); }
-          });
-          signInAnonymously(auth).catch(reject);
-        });
-        return true;
+        // Déjà authentifié (reconnexion) ? on ne réattend pas.
+        if (auth.currentUser) return true;
+
+        // V9.46 — jusqu'à 3 tentatives (12s) : le réseau mobile est capricieux au
+        // démarrage. Avant, un seul essai de 10s faisait basculer en Mode local.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error('Auth timeout')), 12000);
+              const unsub = onAuthStateChanged(auth, (user) => {
+                if (user) { clearTimeout(timer); if (unsub) unsub(); resolve(); }
+              });
+              signInAnonymously(auth).catch(reject);
+            });
+            return true;
+          } catch (e) {
+            console.warn('Auth tentative ' + (attempt + 1) + ' échouée', e);
+            if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
+          }
+        }
+        return false;
       } catch (e) { console.error("Firebase init failed", e); return false; }
     }
 
@@ -7643,13 +7664,67 @@
     function muName(it){ return it.produit || it.product || ''; }
     function muEst(it){ const v = it.estimation!=null ? it.estimation : it.target; const n = parseFloat(String(v).replace(',','.')); return isNaN(n)?0:n; }
 
+    // V9.46 — icône MU : balance + sachet (mise en unité = pesée en sachets).
+    function MuGlyph({ size = 20 }) {
+      return (
+        <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M12 3.5v15" />
+          <path d="M8 20h8" />
+          <path d="M4.5 7.5h15" />
+          <path d="M4.5 7.5 2 12.5a2.5 2.5 0 0 0 5 0z" />
+          <path d="M15 8.2c0-.9.9-1.6 2-1.6s2 .7 2 1.6c0 .5-.3 1-.8 1.6l1.3 3.4a1.6 1.6 0 0 1-1.5 2.3h-2a1.6 1.6 0 0 1-1.5-2.3l1.3-3.4c-.5-.6-.8-1.1-.8-1.6z" />
+        </svg>
+      );
+    }
+
+    // V9.46 — petite récompense à la validation d'une MU (kif, pas flicage).
+    if (!document.getElementById('mu-cheer-css')) {
+      const st = document.createElement('style'); st.id = 'mu-cheer-css';
+      st.textContent = '.mu-cheer{position:fixed;inset:0;z-index:99998;pointer-events:none;display:flex;align-items:center;justify-content:center;}'
+        + '.mu-cheer-badge{background:#2e7d32;color:#fff;font:900 26px/1.1 system-ui,sans-serif;padding:16px 22px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);text-align:center;animation:muPop .5s cubic-bezier(.2,1.4,.4,1) both;}'
+        + '.mu-cheer-badge span{font-size:15px;font-weight:700;}'
+        + '@keyframes muPop{0%{transform:scale(.4);opacity:0;}60%{transform:scale(1.08);opacity:1;}100%{transform:scale(1);opacity:1;}}'
+        + '.mu-confetti{position:fixed;top:38%;width:9px;height:14px;border-radius:2px;opacity:.95;animation:muFall 1.3s ease-in forwards;}'
+        + '@keyframes muFall{0%{transform:translateY(0) rotate(0);opacity:1;}100%{transform:translateY(60vh) rotate(360deg);opacity:0;}}'
+        + '.mu-live{background:linear-gradient(90deg,#fff7ed,#fef3c7);border:1px solid #fcd9a5;border-radius:12px;padding:8px 12px;}'
+        + '.mu-live-head{font-size:11px;font-weight:800;color:#b45309;letter-spacing:.02em;margin-bottom:6px;}'
+        + '.mu-live-row{display:flex;flex-wrap:wrap;gap:6px;}'
+        + '.mu-live-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;background:#fff;border:1px solid #ffd8a8;border-radius:99px;padding:4px 10px;}'
+        + '.mu-live-chip::before{content:"";width:7px;height:7px;border-radius:50%;background:#2e7d32;animation:muDot 1.4s infinite;}'
+        + '.mu-live-chip.paused{opacity:.7;}'
+        + '.mu-live-chip.paused::before{background:#f0b429;animation:none;}'
+        + '.mu-live-chip b{color:#ef6c00;}'
+        + '.mu-live-chip em{color:#7a5b34;font-style:normal;font-weight:700;}'
+        + '@keyframes muDot{0%{box-shadow:0 0 0 0 rgba(46,125,50,.5);}70%{box-shadow:0 0 0 6px rgba(46,125,50,0);}100%{box-shadow:0 0 0 0 rgba(46,125,50,0);}}';
+      document.head.appendChild(st);
+    }
+    const MU_CHEERS = ['Bien jou\u00E9 \uD83D\uDC4F','En feu \uD83D\uDD25','Machine \uD83D\uDCAA','Clean \u2728','Au top \uD83D\uDE4C','Nickel \uD83D\uDC4C','GG \uD83C\uDF89'];
+    function muCelebrate(n) {
+      try { if (navigator.vibrate) navigator.vibrate([18, 40, 18]); } catch (_) {}
+      const wrap = document.createElement('div');
+      wrap.className = 'mu-cheer';
+      const cheer = MU_CHEERS[Math.floor(Math.random() * MU_CHEERS.length)];
+      wrap.innerHTML = '<div class="mu-cheer-badge">+' + (n || 0) + ' sachet' + ((n || 0) > 1 ? 's' : '') + '<br><span>' + cheer + '</span></div>';
+      const COLORS = ['#ef6c00', '#2e7d32', '#f0b429', '#2c4a8c', '#e53935', '#8e24aa'];
+      for (let i = 0; i < 18; i++) {
+        const c = document.createElement('i');
+        c.className = 'mu-confetti';
+        c.style.left = (50 + (Math.random() * 60 - 30)) + '%';
+        c.style.background = COLORS[i % COLORS.length];
+        c.style.animationDelay = (Math.random() * 0.12) + 's';
+        c.style.transform = 'rotate(' + (Math.random() * 360) + 'deg)';
+        wrap.appendChild(c);
+      }
+      document.body.appendChild(wrap);
+      setTimeout(function(){ wrap.remove(); }, 1600);
+    }
+
     function MuCard({ item, operator, dateKey, myActive, doneCount, busyBy }) {
       const coll = 'mu_'+dateKey;
       const [phase,setPhase]=React.useState(myActive?(myActive.status==='paused'?'paused':'running'):'idle');
       const [inProgress,setInProgress]=React.useState('');
       const [finalQty,setFinalQty]=React.useState('');
       const [, force]=React.useState(0);
-      React.useEffect(()=>{ const t=setInterval(()=>force(x=>x+1),1000); return ()=>clearInterval(t); },[]);
       React.useEffect(()=>{
         if(!myActive){ setPhase('idle'); setInProgress(''); return; }
         setPhase(myActive.status==='paused'?'paused':'running');
@@ -7663,7 +7738,7 @@
       const cancel=()=>{ if(!myActive)return; if(!confirm('Annuler cette mise en unité ?'))return; storage.deleteDoc(coll,myActive.id); setPhase('idle'); setInProgress(''); setFinalQty(''); };
       const saveIp=()=>{ if(!myActive)return; const v=parseInt(inProgress,10); if(!isNaN(v)&&v>=0) storage.setDoc(coll,myActive.id,{ inProgress:v }); };
       const openFinish=()=>{ const ip=parseInt(inProgress,10)||(myActive&&myActive.inProgress)||0; setFinalQty(String(Math.max(ip, est||0))); setPhase('finishing'); };
-      const validate=()=>{ if(!myActive)return; const done=Math.max(0,parseInt(finalQty,10)||0); const finishedAt=Date.now(); const elapsed=(myActive.elapsedMs||0)+(phase!=='paused'?finishedAt-(myActive.startedAt||finishedAt):0); storage.setDoc(coll,myActive.id,{ status:'done', done, finishedAt, durationMs:elapsed, inProgress:done }); setPhase('idle'); setInProgress(''); setFinalQty(''); };
+      const validate=()=>{ if(!myActive)return; const done=Math.max(0,parseInt(finalQty,10)||0); const finishedAt=Date.now(); const elapsed=(myActive.elapsedMs||0)+(phase!=='paused'?finishedAt-(myActive.startedAt||finishedAt):0); storage.setDoc(coll,myActive.id,{ status:'done', done, finishedAt, durationMs:elapsed, inProgress:done }); muCelebrate(done); setPhase('idle'); setInProgress(''); setFinalQty(''); };
       const ip = (myActive&&myActive.inProgress)||0;
       const pct = est>0 ? Math.min(100, Math.round(((doneCount+ip)/est)*100)) : 0;
       const active = phase!=='idle';
@@ -7682,7 +7757,7 @@
           {phase==='idle' && <button className="btn-primary" style={{width:'100%',padding:14,fontSize:16,fontWeight:800}} onClick={start}>▶ Je commence !</button>}
           {phase==='running' && (
             <div style={{background:'#fff3e0',borderRadius:10,padding:10}}>
-              <div style={{fontSize:13,color:'#ef6c00',fontWeight:700,marginBottom:8,textAlign:'center'}}>🏃 En cours · {muClock((myActive.elapsedMs||0)+(Date.now()-(myActive.startedAt||Date.now())))}</div>
+              <div style={{fontSize:14,color:'#ef6c00',fontWeight:800,marginBottom:8,textAlign:'center'}}>🔥 C'est parti — en sachets !</div>
               <div style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center',marginBottom:10}}>
                 <span style={{fontSize:13}}>Sachets prêts :</span>
                 <input type="number" inputMode="numeric" value={inProgress} onChange={e=>setInProgress(e.target.value)} onBlur={saveIp} placeholder="0" style={{width:66,textAlign:'center',fontSize:18,fontWeight:700,padding:5,borderRadius:8,border:'2px solid #ef6c00'}}/>
@@ -7751,7 +7826,13 @@
         setError(''); setItems(null);
         try{
           const url = `${FL_PROXY_URL}?action=get-mu-list&sheetId=${MU_SHEET_ID}&tab=${encodeURIComponent(MU_TAB)}&typeCol=TYPE&activeCol=ACTIF+%3F&typeVal=MU`;
-          const resp = await fetch(url); const data = await resp.json();
+          let data=null, lastErr='';                       // V9.46 — auto-retry 3×
+          for(let attempt=0; attempt<3 && !data; attempt++){
+            if(attempt) await new Promise(r=>setTimeout(r,400*attempt));
+            try{ const resp=await fetch(url); data=await resp.json(); }
+            catch(err){ lastErr=err.message; data=null; }
+          }
+          if(!data) throw new Error(lastErr||'réponse illisible');
           if(data.success===false) throw new Error(data.error||'Lecture de la feuille impossible');
           const list = data.items||[];
           setItems(list);
@@ -7773,6 +7854,17 @@
       },[entries,operator]);
 
       const totals = React.useMemo(()=>{ let all=0,mine=0; Object.values(entries).forEach(e=>{ if(e.status==='done'){ all+=(e.done||0); if(e.operator===operator) mine+=(e.done||0); } }); return {all,mine}; },[entries,operator]);
+      // V9.46 — présence live : qui fait quoi en ce moment (MAJ temps réel via Firestore).
+      const activeNow = React.useMemo(()=>{
+        const list=[];
+        Object.values(entries).forEach(e=>{
+          if(e && (e.status==='active'||e.status==='paused')){
+            const target=e.target||0, ip=e.inProgress||0;
+            list.push({ id:e.id, operator:e.operator||'—', product:e.product||'', paused:e.status==='paused', remaining: target>0?Math.max(0,target-ip):null });
+          }
+        });
+        return list.sort((a,b)=> String(a.operator).localeCompare(String(b.operator)));
+      },[entries]);
 
       const plannedItems = React.useMemo(()=> (items||[]).filter(it=>muEst(it)>0), [items]);
       const extraPool    = React.useMemo(()=> (items||[]).filter(it=>muEst(it)<=0), [items]);
@@ -7859,7 +7951,7 @@
       return (
         <div className="stack">
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-            <h1 style={{margin:0}}>🧺 MU <span style={{fontSize:12,fontWeight:400,color:'var(--ink-mute)'}}>en cours · mise en unité F&L</span></h1>
+            <h1 style={{margin:0,display:'flex',alignItems:'center',gap:8}}><MuGlyph size={24} /> MU <span style={{fontSize:12,fontWeight:400,color:'var(--ink-mute)'}}>en cours · mise en unité F&L</span></h1>
             {setTab && (
               <button className="btn-secondary" style={{fontSize:13,padding:'6px 12px',whiteSpace:'nowrap'}} onClick={()=>setTab('mufaite')}>
                 ✅ MU réalisée →
@@ -7870,6 +7962,20 @@
             <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Préparateur</div><div style={{fontSize:20,fontWeight:900,color:'#ef6c00'}}>{operator}</div></div>
             <div style={{textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>Tes sachets : <b style={{color:'#ef6c00'}}>{totals.mine}</b><br/>Total du jour : <b>{totals.all}</b></div>
           </div>
+
+          {activeNow.length>0 && (
+            <div className="mu-live">
+              <div className="mu-live-head">👥 En ce moment · {activeNow.length} sur la MU</div>
+              <div className="mu-live-row">
+                {activeNow.map(a=>(
+                  <span key={a.id} className={"mu-live-chip"+(a.paused?" paused":"")}>
+                    <b>{a.operator}</b> {a.paused?'en pause sur':'fait'} {a.product}
+                    {a.remaining!=null && <em> · reste {a.remaining}</em>}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div style={{display:'flex',gap:8,alignItems:'center'}}>
             <input type="text" placeholder="🔍 Chercher un fruit / légume…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,padding:10,borderRadius:8,border:'1.5px solid #ddd'}}/>
@@ -8043,7 +8149,7 @@
                 <div>
                   <div style={{fontSize:17,fontWeight:800,lineHeight:1.15}}>{e.product||'(produit)'}</div>
                   <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:3}}>
-                    👤 {e.operator||'—'}{e.finishedAt?(' · ✅ '+muTime(e.finishedAt)):''}{e.durationMs?(' · ⏱ '+muDur(e.durationMs)):''}{e.uv?(' · 📏 '+e.uv):''}
+                    👤 {e.operator||'—'}{e.finishedAt?(' · ✅ '+muTime(e.finishedAt)):''}{e.uv?(' · 📏 '+e.uv):''}
                     {e.correctedAt && <span style={{color:'#b45309'}}> · ✏️ corrigé</span>}
                   </div>
                 </div>
@@ -15862,7 +15968,7 @@
                 <span className="tab-icon">🥬</span>Prépa du jour
               </button>
               <button className={(tab==='mudujour'||tab==='mufaite')?'active':''} onClick={()=>setTab('mudujour')}>
-                <span className="tab-icon">🧺</span>MU
+                <span className="tab-icon"><MuGlyph size={20} /></span>MU
               </button>
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
                 <span className="tab-icon">🚚</span>Manquants & ND
@@ -16068,6 +16174,90 @@
     // ============================================================
     // BOOT
     // ============================================================
+    // ============================================================
+    // FIABILITÉ LOCAL ↔ FIRESTORE (V9.46) — aucune MU ne doit être perdue.
+    //  • Au boot connecté : on remonte vers Firestore tout ce qui a été écrit
+    //    en local lors d'une session précédente (récupération).
+    //  • Hors-ligne : bandeau clair + reconnexion auto en tâche de fond. Les MU
+    //    restent en localStorage (persistant) et remontent dès la reconnexion.
+    // ============================================================
+    async function syncLocalToFirestore() {
+      if (!fb || !fb.db) return 0;
+      let n = 0;
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key || key.indexOf('kb_distrib_') !== 0 || !/_list$/.test(key)) continue;
+          const coll = key.slice('kb_distrib_'.length, -('_list'.length));
+          let obj = {};
+          try { obj = JSON.parse(localStorage.getItem(key) || '{}'); } catch (_) { continue; }
+          for (const id of Object.keys(obj)) {
+            try {
+              const d = obj[id] || {}; const data = {}; for (const k in d) { if (k !== '_ts') data[k] = d[k]; }
+              await fb.setDoc(fb.doc(fb.db, coll, id), Object.assign({}, data, { _ts: fb.serverTimestamp(), _recovered: true }), { merge: true });
+              n++;
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      return n;
+    }
+    function kbPendingLocalCount() {
+      let n = 0;
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key || key.indexOf('kb_distrib_') !== 0 || !/_list$/.test(key)) continue;
+          try { n += Object.keys(JSON.parse(localStorage.getItem(key) || '{}')).length; } catch (_) {}
+        }
+      } catch (_) {}
+      return n;
+    }
+    let __connState = 'live';           // 'live' | 'local' | 'recovered'
+    let __reconnectTimer = null;
+    function renderConnBanner() {
+      let el = document.getElementById('kb-conn-banner');
+      if (__connState === 'live') { if (el) el.remove(); return; }
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'kb-conn-banner';
+        el.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:99999;padding:10px 14px;font:600 13px/1.35 system-ui,sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.15);';
+        document.body.appendChild(el);
+      }
+      if (__connState === 'local') {
+        el.style.background = '#7a1f1f'; el.style.color = '#fff';
+        el.innerHTML = "\u26A0\uFE0F Hors-ligne \u2014 tes MU sont gard\u00E9es sur cet appareil et seront sauvegard\u00E9es d\u00E8s la reconnexion. Continue \u00E0 bosser, ne ferme pas l'appli. " +
+          '<button id="kb-reco-btn" style="margin-left:8px;padding:4px 10px;border:0;border-radius:6px;background:#fff;color:#7a1f1f;font-weight:800;cursor:pointer;">Reconnecter</button>';
+        const b = document.getElementById('kb-reco-btn'); if (b) b.onclick = function(){ attemptReconnect(true); };
+      } else {
+        el.style.background = '#1b5e20'; el.style.color = '#fff';
+        el.innerHTML = "\u2705 Reconnect\u00E9 \u2014 tes MU sont sauvegard\u00E9es. " +
+          '<button id="kb-rel-btn" style="margin-left:8px;padding:4px 10px;border:0;border-radius:6px;background:#fff;color:#1b5e20;font-weight:800;cursor:pointer;">Recharger</button> pour repasser en direct.';
+        const b = document.getElementById('kb-rel-btn'); if (b) b.onclick = function(){ location.reload(); };
+      }
+    }
+    async function attemptReconnect(manual) {
+      if (__connState === 'recovered') { renderConnBanner(); return; }
+      const ok = await initFirebase();
+      if (ok) {
+        await syncLocalToFirestore();
+        __connState = 'recovered';
+        if (__reconnectTimer) { clearInterval(__reconnectTimer); }
+        __reconnectTimer = setInterval(syncLocalToFirestore, 20000); // remonte les MU faites après coup
+        renderConnBanner();
+      } else if (manual) {
+        renderConnBanner();
+      }
+    }
+    function startLocalMode() {
+      __connState = 'local';
+      renderConnBanner();
+      if (!__reconnectTimer) __reconnectTimer = setInterval(function(){ attemptReconnect(false); }, 15000);
+      window.addEventListener('beforeunload', function (e) {
+        if (__connState === 'local' && kbPendingLocalCount() > 0) { e.preventDefault(); e.returnValue = ''; }
+      });
+    }
+
     let __booted = false;
     async function boot() {
       if (__booted) return;            // garde anti double-démarrage
@@ -16077,6 +16267,12 @@
       } catch (e) {
         console.error('initFirebase a échoué', e);
         firebaseConfigured = false;    // on continue en mode local
+      }
+      if (firebaseConfigured) {
+        __connState = 'live';
+        try { const rec = await syncLocalToFirestore(); if (rec) console.info('MU locales récupérées → Firestore : ' + rec); } catch (_) {}
+      } else {
+        try { startLocalMode(); } catch (_) {}
       }
       try {
         const root = ReactDOM.createRoot(document.getElementById('root'));
