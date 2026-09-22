@@ -626,7 +626,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.46';
+    const APP_VERSION = 'V9.47';
+    // V9.47 — Pilotage : nouvel onglet « 🏷️ Codes-barres » (master). Consultation
+    //         complète des associations code-barre ↔ produit apprises au scan
+    //         (collection ean_mapping), filtre, correction (réattribution à un autre
+    //         produit), suppression, et export Excel (code-barre + désignation +
+    //         producteur + catégorie + famille + …). 100 % client, aucun changement proxy.
     // V9.45 — MU du jour : nouvelle section « Autres produits commandés — à préparer
     //         (non ensachés) ». Lecture de la feuille FL (action fl_read, onglet MU_TAB) :
     //         produits actifs, non-sachets, absents de la liste MU, avec quantité
@@ -11119,12 +11124,223 @@
     }
 
     // === PILOTAGE (master) — regroupe CA, Stats, Manquants/Remises, Température, Historique ===
+    // === CODES-BARRES (master) ===
+    // Gestion des associations code-barre ↔ produit apprises au scan (collection
+    // « ean_mapping »). Permet de : consulter/filtrer la liste complète, corriger
+    // une association erronée (réattribuer à un autre produit), supprimer, et
+    // exporter le tout en Excel (code-barre + désignation + producteur + …).
+    function BarcodesManagerPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [rows, setRows] = React.useState(null);       // docs ean_mapping (live)
+      const [prodById, setProdById] = React.useState({}); // cache produits {id:{name,producer,category,family,uv}}
+      const [q, setQ] = React.useState('');
+      const [editing, setEditing] = React.useState(null); // doc en cours de réattribution
+      const [pickQuery, setPickQuery] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+
+      React.useEffect(() => {
+        (async () => { try { const d = await readCache('products'); if (d) setProdById(d); } catch (e) {} })();
+        const u = storage.subscribe('ean_mapping', (arr) => {
+          const a = [...(arr || [])].sort((x, y) => (y.learnedAt || '').localeCompare(x.learnedAt || ''));
+          setRows(a);
+        });
+        return () => { u && u(); };
+      }, []);
+
+      const prodArr = React.useMemo(
+        () => Object.entries(prodById).map(([id, p]) => ({ id, ...p })),
+        [prodById]
+      );
+
+      const fmt = (iso) => { if (!iso) return '—'; const d = new Date(iso); return isNaN(d) ? '—' : d.toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }); };
+
+      const enrich = (e) => {
+        const p = prodById[e.productId] || {};
+        return {
+          id: e.id, ean: e.ean || e.id, productId: e.productId || '',
+          name: p.name || '', producer: p.producer || '', category: p.category || '',
+          family: p.family || '', uv: p.uv || '',
+          learnedBy: e.learnedBy || '', learnedAt: e.learnedAt || '',
+          orphan: !p.name,
+        };
+      };
+
+      const enriched = React.useMemo(() => (rows ? rows.map(enrich) : null), [rows, prodById]);
+
+      const filtered = React.useMemo(() => {
+        if (!enriched) return null;
+        const needle = normalizeText(q).trim();
+        if (!needle) return enriched;
+        return enriched.filter(r => normalizeText([r.ean, r.name, r.producer, r.category, r.family, r.learnedBy].join(' ')).includes(needle));
+      }, [enriched, q]);
+
+      const orphanCount = React.useMemo(() => (enriched ? enriched.filter(r => r.orphan).length : 0), [enriched]);
+
+      // Produits proposés dans le sélecteur de réattribution
+      const pickMatches = React.useMemo(() => {
+        const needle = normalizeText(pickQuery).trim();
+        if (!needle) return [];
+        const out = [];
+        for (const p of prodArr) {
+          if (normalizeText([p.name, p.producer].join(' ')).includes(needle)) {
+            out.push(p);
+            if (out.length >= 40) break;
+          }
+        }
+        return out;
+      }, [prodArr, pickQuery]);
+
+      const reassign = async (doc, newId) => {
+        if (!doc || !newId) return;
+        setBusy(true);
+        try {
+          await storage.setDoc('ean_mapping', doc.id, {
+            ean: doc.ean, productId: newId,
+            learnedBy: session.name, learnedAt: new Date().toISOString(),
+          }, { replace: true });
+          showToast('✓ Code réattribué à ' + (prodById[newId]?.name || newId));
+          setEditing(null); setPickQuery('');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      const remove = async (doc) => {
+        if (!confirm(`Supprimer l'association du code ${doc.ean}${doc.name ? ' → ' + doc.name : ''} ?`)) return;
+        setBusy(true);
+        try { await storage.deleteDoc('ean_mapping', doc.id); showToast('✓ Association supprimée'); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      const exportXlsx = () => {
+        const data = (filtered || []).map(r => ({
+          'Code-barres': r.ean,
+          'Désignation': r.name || '(produit inconnu)',
+          'Producteur': r.producer,
+          'Catégorie': r.category,
+          'Famille': r.family,
+          'Unité de vente': r.uv,
+          'ID produit': r.productId,
+          'Appris par': r.learnedBy,
+          'Appris le': r.learnedAt ? new Date(r.learnedAt).toLocaleString('fr-FR') : '',
+        }));
+        if (!data.length) { showToast('Aucun code à exporter'); return; }
+        if (typeof XLSX === 'undefined') { showToast('⚠️ Librairie Excel non chargée'); return; }
+        try {
+          const ws = XLSX.utils.json_to_sheet(data);
+          ws['!cols'] = [{ wch: 16 }, { wch: 42 }, { wch: 26 }, { wch: 20 }, { wch: 20 }, { wch: 14 }, { wch: 26 }, { wch: 14 }, { wch: 18 }];
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, 'Codes-barres');
+          XLSX.writeFile(wb, `codes_barres_kelbongoo_${todayKey()}.xlsx`);
+          showToast(`✓ ${data.length} code(s) exporté(s)`);
+        } catch (e) { showToast('Erreur export : ' + e.message); }
+      };
+
+      return (
+        <div className="stack">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <h1 style={{ margin: 0 }}>🏷️ Codes-barres <span className="ver-badge">{APP_VERSION}</span></h1>
+            <button className="btn-primary" style={{ fontSize: 13 }} disabled={!filtered || !filtered.length} onClick={exportXlsx}>
+              ⬇️ Export Excel{filtered ? ` (${filtered.length})` : ''}
+            </button>
+          </div>
+          <p style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: -8 }}>
+            Toutes les associations code-barre ↔ produit apprises au scan. Corrige une erreur en réattribuant à un autre produit, ou supprime l'association.
+          </p>
+
+          {enriched && (
+            <div className="filter-row" style={{ gap: 8 }}>
+              <div className="stat"><div className="stat-value">{enriched.length}</div><div className="stat-label">Codes appris</div></div>
+              {orphanCount > 0 && (
+                <div className="stat"><div className="stat-value" style={{ color: 'var(--danger,#c0392b)' }}>{orphanCount}</div><div className="stat-label">Produit inconnu</div></div>
+              )}
+            </div>
+          )}
+
+          {prodArr.length === 0 && (
+            <div className="card" style={{ borderLeft: '3px solid var(--danger,#c0392b)', fontSize: 13 }}>
+              ⚠️ Cache produits vide sur cet appareil : les désignations ne s'affichent pas et la réattribution est impossible. Recharge les produits dans <strong>Chargement</strong>, puis reviens ici.
+            </div>
+          )}
+
+          <div className="card">
+            <div style={{ position: 'relative', marginBottom: 8 }}>
+              <input value={q} onChange={e => setQ(e.target.value)}
+                placeholder="Filtrer (code-barre, produit, producteur…)"
+                style={{ width: '100%', fontSize: 16, padding: '12px', paddingRight: q ? 40 : 12, borderRadius: 10 }} />
+              {q && (
+                <button onClick={() => setQ('')} aria-label="Effacer"
+                  style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', border: 'none', background: 'var(--bg-muted)', borderRadius: '50%', width: 26, height: 26, fontSize: 16, lineHeight: 1, cursor: 'pointer', color: 'var(--ink-soft)' }}>×</button>
+              )}
+            </div>
+
+            {filtered === null ? (
+              <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement…</p>
+            ) : filtered.length === 0 ? (
+              <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{q ? 'Aucun code ne correspond.' : 'Aucun code appris pour l\'instant.'}</p>
+            ) : (
+              <div className="stack" style={{ gap: 4, maxHeight: '62vh', overflowY: 'auto' }}>
+                {filtered.map(r => (
+                  <div key={r.id} style={{ padding: '9px 10px', border: `1px solid ${r.orphan ? 'var(--danger,#c0392b)' : 'var(--border)'}`, borderRadius: 10 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start' }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ fontWeight: 700, fontSize: 14, wordBreak: 'break-word' }}>
+                          {r.orphan ? '⚠️ (produit inconnu)' : r.name}
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--ink-mute)', wordBreak: 'break-word' }}>
+                          {[r.producer, r.category && r.family ? `${r.category} › ${r.family}` : (r.category || r.family)].filter(Boolean).join(' · ')}
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>
+                          <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--ink)' }}>{r.ean}</span> · {r.learnedBy || '—'} · {fmt(r.learnedAt)}
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: '0 0 auto' }}>
+                        <button className="btn-secondary" style={{ fontSize: 12, padding: '5px 10px' }} disabled={busy}
+                          onClick={() => { setEditing(editing === r.id ? null : r.id); setPickQuery(''); }}>
+                          {editing === r.id ? 'Annuler' : '✏️ Corriger'}
+                        </button>
+                        <button className="btn-ghost" style={{ fontSize: 12, padding: '5px 10px', color: 'var(--danger,#c0392b)' }} disabled={busy}
+                          onClick={() => remove(r)}>🗑️ Suppr.</button>
+                      </div>
+                    </div>
+
+                    {editing === r.id && (
+                      <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 4 }}>Réattribuer <strong style={{ fontFamily: 'monospace' }}>{r.ean}</strong> au produit :</div>
+                        <input value={pickQuery} onChange={e => setPickQuery(e.target.value)} autoFocus
+                          placeholder="Chercher un produit (nom, producteur)…"
+                          style={{ width: '100%', fontSize: 15, padding: '10px', borderRadius: 8 }} />
+                        {pickQuery && (
+                          <div className="stack" style={{ gap: 2, marginTop: 6, maxHeight: '32vh', overflowY: 'auto' }}>
+                            {pickMatches.length === 0 ? (
+                              <div style={{ fontSize: 12, color: 'var(--ink-mute)', padding: '4px 0' }}>Aucun produit trouvé.</div>
+                            ) : pickMatches.map(p => (
+                              <button key={p.id} disabled={busy} onClick={() => reassign(r, p.id)}
+                                style={{ textAlign: 'left', padding: '8px 10px', border: `1px solid ${p.id === r.productId ? 'var(--accent)' : 'var(--border)'}`, background: p.id === r.productId ? 'var(--accent-soft)' : 'transparent', borderRadius: 8, cursor: 'pointer', fontSize: 13 }}>
+                                <div style={{ fontWeight: 600 }}>{p.id === r.productId ? '✓ ' : ''}{p.name}</div>
+                                <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{[p.producer, p.category].filter(Boolean).join(' · ')}</div>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     function SuiviGeneralPage({ session }) {
       const SUB = [
         { k: 'ca',    label: 'Suivi CA',      icon: '💶' },
         { k: 'stats', label: 'Stats',         icon: '📊' },
         { k: 'manq',  label: 'Manq. & Rem.',  icon: '💸' },
         { k: 'temp',  label: 'Température',    icon: '🌡️' },
+        { k: 'codes', label: 'Codes-barres',  icon: '🏷️' },
         { k: 'histo', label: 'Historique',    icon: '📜' },
       ];
       const [sub, setSub] = React.useState(() => { try { return localStorage.getItem('kbg_suivi_sub') || 'ca'; } catch (e) { return 'ca'; } });
@@ -11144,6 +11360,7 @@
           {sub === 'stats' && <StatsPage session={session} />}
           {sub === 'manq'  && <ManquantsHistoryPage session={session} />}
           {sub === 'temp'  && <TempMasterPage session={session} />}
+          {sub === 'codes' && <BarcodesManagerPage session={session} />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
       );
