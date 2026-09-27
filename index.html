@@ -626,7 +626,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.47';
+    const APP_VERSION = 'V9.49';
+    // V9.49 — F&L › MAJ FL › « Sur Rungis, pas dans COMMANDE FL » : la liste propose aussi
+    //   les produits F&L du FICHIER PRODUITS Kelbongoo pas encore dans COMMANDE FL.
+    //   Valider = fonctions EXISTANTES : fl_sync apply (ajout ligne : producteur, désignation,
+    //   UV, TYPE, MU EN KILO, ID SITE KBG) puis fl_resolve_missing (code Probon + prix +
+    //   colisage + Actif/Inactif). Aucun changement côté Apps Script.
+    //   Suggestions cliquables (Sheet FL et fichier produits).
     // V9.47 — Pilotage : nouvel onglet « 🏷️ Codes-barres » (master). Consultation
     //         complète des associations code-barre ↔ produit apprises au scan
     //         (collection ean_mapping), filtre, correction (réattribution à un autre
@@ -13159,6 +13165,35 @@
       const [loading, setLoading] = React.useState(true);
       const [busy, setBusy] = React.useState('');      // clé en cours
       const [sel, setSel] = React.useState({});        // code Rungis -> {flRow, actif}
+      const [catalog, setCatalog] = React.useState([]); // FL du fichier produits (buildCatalogFLFrom)
+
+      React.useEffect(() => {
+        let alive = true;
+        (async () => { try { const p = await readCache('products'); if (alive && p) setCatalog(buildCatalogFLFrom(p)); } catch (e) {} })();
+        return () => { alive = false; };
+      }, []);
+      // Produits du fichier produits PAS encore dans COMMANDE FL (ni par ID site, ni par nom).
+      const catalogFree = React.useMemo(() => {
+        if (!data) return [];
+        const names = new Set((data.flList || []).map(f => _flNorm(f.des)));
+        const ids = new Set((data.flList || []).map(f => String(f.idSite || f.id || '').trim()).filter(Boolean));
+        return catalog.filter(c => !names.has(_flNorm(c.produit)) && !(c.id && ids.has(c.id)))
+          .sort((a, b) => a.produit.localeCompare(b.produit, 'fr'));
+      }, [catalog, data]);
+      // Meilleure proposition du fichier produits pour une désignation Rungis (mots communs).
+      const catSuggest = React.useCallback((des) => {
+        const stop = new Set(['bio', 'kg', 'pce', 'piece', 'botte', 'sachet', 'de', 'du', 'la', 'le', 'les', 'g', 'x']);
+        const tok = t => _flNorm(t).split(' ').filter(w => w.length > 1 && !stop.has(w) && !/^\d+$/.test(w));
+        const a = tok(des); if (!a.length) return null;
+        let best = null, bs = 0;
+        for (const c of catalogFree) {
+          const b = tok(c.produit); if (!b.length) continue;
+          const inter = a.filter(w => b.some(v => v === w || (w.length > 3 && v.length > 3 && (v.startsWith(w) || w.startsWith(v))))).length;
+          const sc = inter / Math.max(a.length, b.length);
+          if (sc > bs) { bs = sc; best = c; }
+        }
+        return bs >= 0.3 ? { c: best, sim: Math.round(bs * 100) } : null;
+      }, [catalogFree]);
 
       const load = React.useCallback(async () => {
         setLoading(true);
@@ -13174,12 +13209,30 @@
 
       const validConcord = async (m) => {
         const pick = sel[m.code] || {};
-        if (!pick.flRow) { showToast('Choisis le produit correspondant'); return; }
+        if (!pick.flRow) { showToast('Choisis le produit dans la liste (COMMANDE FL ou fichier produits)'); return; }
         if (pick.actif === undefined) { showToast('Coche Actif ou Inactif (obligatoire)'); return; }
         setBusy(m.code);
+        let flRow = pick.flRow;
+        // Produit du FICHIER PRODUITS pas encore dans COMMANDE FL → ajout de la ligne via fl_sync
+        // (fonction existante : producteur, désignation, UV, TYPE, MU EN KILO, ID SITE KBG),
+        // puis concordance classique sur la ligne créée.
+        if (String(flRow).startsWith('cat:')) {
+          const c = catalogFree.find(x => 'cat:' + (x.id || x.produit) === flRow);
+          if (!c) { showToast('Produit introuvable dans le fichier produits'); setBusy(''); return; }
+          try {
+            const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false,
+              catalog: [{ id: c.id, produit: c.produit, producer: c.producer, uv: c.uv }] });
+            if (!r || !r.ok) throw new Error((r && r.error) || 'ajout impossible');
+            const d2 = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_compare' });
+            const f = d2 && d2.ok ? (d2.flList || []).find(x => (c.id && String(x.idSite || x.id || '') === c.id) || _flNorm(x.des) === _flNorm(c.produit)) : null;
+            if (!f) throw new Error('ligne ajoutée mais introuvable — Actualise puis fais la concordance');
+            flRow = String(f.row);
+            if (d2 && d2.ok) setData(dd => ({ ...dd, flList: d2.flList || dd.flList }));
+          } catch (e) { showToast('Erreur : ' + e.message); setBusy(''); return; }
+        }
         try {
           const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_resolve_missing',
-            rungisCode: m.code, flRow: pick.flRow, prix: m.prix, pv: m.pv, colis: m.colis, actif: !!pick.actif, action_: 'concord' });
+            rungisCode: m.code, flRow: flRow, prix: m.prix, pv: m.pv, colis: m.colis, actif: !!pick.actif, action_: 'concord' });
           if (!d.ok) throw new Error(d.error || 'erreur');
           showToast('✓ Concordance appliquée');
           setData(dd => ({ ...dd, missing: dd.missing.filter(x => x.code !== m.code) }));
@@ -13238,7 +13291,7 @@
           {/* ---- Sur Rungis, pas dans la liste : concordance ---- */}
           <div style={{ background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 8, padding: 10, marginBottom: 10 }}>
             <div style={{ fontWeight: 800, fontSize: 13 }}>🆕 Sur Rungis, pas dans COMMANDE FL ({missing.length})</div>
-            <div style={{ fontSize: 11.5, color: 'var(--ink-mute)', margin: '4px 0 6px' }}>Choisis le produit correspondant (concordance) ou ignore. La validation écrit le code Probon + prix + colisage. La case Actif/Inactif est obligatoire.</div>
+            <div style={{ fontSize: 11.5, color: 'var(--ink-mute)', margin: '4px 0 6px' }}>Choisis le produit : déjà dans COMMANDE FL (concordance) ou du fichier produits Kelbongoo (ligne ajoutée avec producteur, UV, type, MU, ID site). La validation écrit le code Probon + prix + colisage. La case Actif/Inactif est obligatoire.</div>
             {missing.length === 0 && <div style={{ fontSize: 12, color: '#2e7d32' }}>✓ Tout est dans la liste.</div>}
             {missing.map((m, i) => {
               const pick = sel[m.code] || {};
@@ -13248,8 +13301,15 @@
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginTop: 6 }}>
                     <select value={pick.flRow || (m.proche ? '' : '')} onChange={e => setPick(m.code, { flRow: e.target.value })}
                       style={{ fontSize: 12, flex: '1 1 240px', minWidth: 180, padding: '5px 6px' }}>
-                      <option value="">— produit correspondant dans COMMANDE FL —</option>
-                      {(data.flList || []).map(f => <option key={f.row} value={f.row}>{f.des}{f.code ? ` (${f.code})` : ''}</option>)}
+                      <option value="">— choisir le produit —</option>
+                      <optgroup label="Dans COMMANDE FL">
+                        {(data.flList || []).map(f => <option key={f.row} value={f.row}>{f.des}{f.code ? ` (${f.code})` : ''}</option>)}
+                      </optgroup>
+                      {catalogFree.length > 0 && (
+                        <optgroup label="🆕 Fichier produits — à ajouter">
+                          {catalogFree.map(c => <option key={'cat:' + (c.id || c.produit)} value={'cat:' + (c.id || c.produit)}>🆕 {c.produit}{c.producer ? ` — ${c.producer}` : ''}</option>)}
+                        </optgroup>
+                      )}
                     </select>
                     <label style={{ fontSize: 12, display: 'inline-flex', gap: 4, alignItems: 'center' }}>
                       <input type="radio" name={'act_' + m.code} checked={pick.actif === true} onChange={() => setPick(m.code, { actif: true })} /> Actif
@@ -13260,7 +13320,29 @@
                     <button className="btn-primary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={busy === m.code} onClick={() => validConcord(m)}>Valider</button>
                     <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={busy === m.code} onClick={() => ignoreMissing(m)}>Ignorer</button>
                   </div>
-                  {m.proche && <div style={{ fontSize: 11, color: '#8a6d00', marginTop: 4 }}>💡 suggestion : « {m.proche} » ({m.sim}%)</div>}
+                  {String(pick.flRow || '').startsWith('cat:') && (() => {
+                    const c = catalogFree.find(x => 'cat:' + (x.id || x.produit) === pick.flRow);
+                    return c ? <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 4 }}>🆕 Ajout dans COMMANDE FL : {c.produit}{c.producer ? ` · ${c.producer}` : ''}{c.uv ? ` · ${c.uv}` : ''} → code {m.code} · achat {m.prix}€ · vente {m.pv}€</div> : null;
+                  })()}
+                  {m.proche && (() => {
+                    const hit = (data.flList || []).find(f => _flNorm(f.des) === _flNorm(m.proche));
+                    return (
+                      <div onClick={hit ? () => setPick(m.code, { flRow: String(hit.row) }) : undefined}
+                        style={{ fontSize: 11, color: '#8a6d00', marginTop: 4, cursor: hit ? 'pointer' : 'default', textDecoration: hit ? 'underline dotted' : 'none' }}>
+                        💡 suggestion : « {m.proche} » ({m.sim}%){hit ? ' — toucher pour sélectionner' : ''}
+                      </div>
+                    );
+                  })()}
+                  {(() => {
+                    const cs = catSuggest(m.des); if (!cs) return null;
+                    const v = 'cat:' + (cs.c.id || cs.c.produit);
+                    return (
+                      <div onClick={() => setPick(m.code, { flRow: v })}
+                        style={{ fontSize: 11, color: '#2e7d32', marginTop: 4, cursor: 'pointer', textDecoration: 'underline dotted' }}>
+                        🆕 fichier produits : « {cs.c.produit} »{cs.c.producer ? ` — ${cs.c.producer}` : ''} — toucher pour sélectionner
+                      </div>
+                    );
+                  })()}
                 </div>
               );
             })}
