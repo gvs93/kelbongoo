@@ -627,7 +627,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.54';
+    const APP_VERSION = 'V9.55';
+    // V9.55 — SÉCURITÉ phase 2 : proxies Apps Script (Freshdesk, FL, Stock) via Cloud Function kbgProxy,
+    //   plus d'URL /exec ni de secret dans le HTML ; UUID PayZen hors des commandes (coffre master
+    //   payzen_private), effacés après régularisation, purge J+7, bouton « Détruire les UUID du jour ».
     // V9.54 — SÉCURITÉ : fin de l'accès anonyme. Code perso → Cloud Function kbgLogin (anti force brute)
     //   → jeton Firebase signé portant le rôle ; Master → Google + liste blanche serveur (kbgClaimAdmin).
     //   Mots de passe retirés du HTML ; session localStorage validée contre le jeton ; PayZen via
@@ -863,78 +866,42 @@
 
     // FRESHDESK (relance clients non récupérés)
     // L'URL du proxy Apps Script déployé (Application Web /exec)
-    const FRESHDESK_PROXY_URL = "https://script.google.com/macros/s/AKfycbzCe9N3pn0fBcW-FiTBp-e_TYIIRr0xL29AaVloScbu7S6Exim-ErtQvpgtJmwapLU_6w/exec";
-    const FRESHDESK_SECRET = "Lesmailspartent!"; // doit correspondre au SHARED_SECRET du script
+    // V9.55 — SÉCURITÉ : les URLs /exec et le secret partagé ne sont PLUS dans le HTML.
+    //   Tous les appels passent par la Cloud Function kbgProxy (jeton Firebase + rôle vérifiés),
+    //   qui ajoute elle-même le secret côté serveur. Les constantes ci-dessous ne sont que des étiquettes.
+    const FRESHDESK_PROXY_URL = 'kbgProxy:freshdesk';
+    const FRESHDESK_SECRET = ''; // ignoré : retiré avant envoi, injecté par le serveur
     // Connexion Google pour l'Admin (même client OAuth que les autres apps).
     const OAUTH_CLIENT_ID = "757658680772-ogalpu5olqd2fiovnbnj55j1g0lbq7rr.apps.googleusercontent.com";
     // V9.54 — liste blanche master déplacée CÔTÉ SERVEUR (paramètre ADMIN_EMAILS de la function kbgClaimAdmin).
     function decodeJwt(t) { try { const b = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); const j = decodeURIComponent(atob(b).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')); return JSON.parse(j); } catch (e) { return null; } }
 
     // PROXY FL / PROBON (inventaire FL, stock, import Probon, mails) — script dédié
-    const FL_PROXY_URL = "https://script.google.com/macros/s/AKfycbyVvvafumNfLZ7RzseUvoHaghPK7c-_7KqthgtV_VY9ulXe7sJIYEclWnratDbBJeDd/exec";
+    const FL_PROXY_URL = 'kbgProxy:fl';
 
-    // V9.43 — WEBHOOK CENTRAL RÉCEPTION (registre « Salariés »), MÊME script que l'appli réception.
-    // Sert UNIQUEMENT à valider un code perso côté serveur (action "verify-kbg-code").
-    // Les codes ne transitent jamais en clair dans le HTML : le serveur répond juste { valid }.
-    const RECEPTION_PROXY_URL = "https://script.google.com/macros/s/AKfycbzSMWziEuPvxY6UvM6FimJlFCTE1v9u1mWh3gJXbOtMVlHcb478_gASeIwZ1PMEw7-2Sw/exec";
-    // Valide un code perso Kelbongoo (1 seul code, pas de code magasin). Renvoie { valid, reason }.
-    async function verifyKbgCode(code) {
-      const res = await fetch(RECEPTION_PROXY_URL, { method: 'POST', body: JSON.stringify({ action: 'verify-kbg-code', code: String(code || '').trim() }) });
-      const text = await res.text();
-      try { return JSON.parse(text); }
-      catch (e) {
-        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-        throw new Error(`réponse non-JSON (déploiement réception en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
-      }
+    // V9.55 — Appel unique des proxies Apps Script via la Cloud Function kbgProxy.
+    async function kbProxy(target, payload, method) {
+      const p = { ...(payload || {}) };
+      delete p.secret;
+      const r = await kbCallable('kbgProxy')({ target, payload: p, method: method === 'GET' ? 'GET' : 'POST' });
+      return r.data;
     }
-
-    // Envoie au proxy Freshdesk et renvoie la réponse JSON. Si la réponse n'est pas du JSON
-    // (typiquement une page de login HTML → déploiement pas en accès « Tout le monde »),
-    // lève une erreur lisible avec le début de la réponse pour faciliter le diagnostic.
-    async function freshdeskPost(payload) {
-      const res = await fetch(FRESHDESK_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
-      const text = await res.text();
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-        throw new Error(`réponse non-JSON (déploiement en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
-      }
-    }
-
-    // Même logique que freshdeskPost mais vers le proxy FL/Probon dédié.
-    async function flPost(payload) {
-      // V9.46 — auto-retry : un flash réseau au boot renvoie parfois une page
-      // de login HTML au lieu du JSON ; on réessaie 3× avant d'échouer.
-      let lastSnippet = '';
+    async function freshdeskPost(payload) { return kbProxy('freshdesk', payload); }
+    // FL : auto-retry 3× conservé (réseau mobile capricieux au démarrage)
+    async function flPost(payload, method) {
+      let last = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt) await new Promise(r => setTimeout(r, 400 * attempt));
-        let text = '';
-        try {
-          const res = await fetch(FL_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
-          text = await res.text();
-          return JSON.parse(text);
-        } catch (e) {
-          lastSnippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-        }
+        try { return await kbProxy('fl', payload, method); }
+        catch (e) { last = e; if (e && /permission-denied|unauthenticated|invalid-argument/.test(e.code || '')) break; }
       }
-      throw new Error(`réponse non-JSON (proxy FL en accès « Tout le monde » ?) — ${lastSnippet || 'vide'}`);
+      throw new Error('Proxy FL : ' + kbErrMsg(last));
     }
 
     // PROXY STOCK (écriture inventaire matin/soir dans les feuilles de stock du jour,
     // alerte article manquant) — KBG_Stock_Proxy.gs déployé séparément.
-    // ⚠️ Colle ici l'URL /exec après déploiement, sinon l'écriture feuille est désactivée.
-    const STOCK_PROXY_URL = "https://script.google.com/macros/s/AKfycbzwxqhnOw5XaRZXdth641X15_U0DTUU4VTu20xUZarZHRKKA-mtU6OOXOCfV1B7erVDLA/exec";
-    async function stockPost(payload) {
-      if (!STOCK_PROXY_URL) throw new Error('Proxy stock non configuré (STOCK_PROXY_URL vide)');
-      const res = await fetch(STOCK_PROXY_URL, { method: 'POST', body: JSON.stringify(payload) });
-      const text = await res.text();
-      try { return JSON.parse(text); }
-      catch (e) {
-        const snippet = (text || '').slice(0, 140).replace(/\s+/g, ' ').trim();
-        throw new Error(`réponse non-JSON (proxy stock en accès « Tout le monde » ?) — ${snippet || 'vide'}`);
-      }
-    }
+    const STOCK_PROXY_URL = 'kbgProxy:stock'; // V9.55 : étiquette, l'URL /exec est côté serveur
+    async function stockPost(payload) { return kbProxy('stock', payload); }
 
     // Envoie l'alerte « retours PDP non traités » à rr@ + hg@.
     // Envoi 100% serveur via le proxy stock (action send_mail) — jamais d'ouverture de client mail.
@@ -1081,6 +1048,8 @@
       _key: (c, id) => `kb_distrib_${c}_${id || 'list'}`,
       async setDoc(c, id, data, opts = {}) {
         const merge = opts.replace ? false : true;
+        // V9.55 — garde-fou : aucun UUID PayZen ne part dans les commandes du jour
+        if (/^day_.+_orders$/.test(c) && data && Array.isArray(data.orders)) data = { ...data, orders: kbStripPayzen(data.orders) };
         if (firebaseConfigured) {
           await fb.setDoc(fb.doc(fb.db, c, id), { ...data, _ts: fb.serverTimestamp() }, { merge });
         } else {
@@ -1187,6 +1156,40 @@
     // NOUVEAU SYSTÈME DE CHARGEMENT (orders + produits + consommateurs JSON)
     // ============================================================
     const oid = (v) => (v && typeof v === 'object') ? (v.$oid || v.oid || '') : (v || '');
+
+    // V9.55 — UUID PayZen : jamais stockés dans les commandes (lisibles par tous les salariés).
+    //   Rangés dans payzen_private/{jour} (règles : MASTER uniquement), effacés par le serveur
+    //   dès que l'empreinte est régularisée, purge automatique à J+7, bouton « Détruire » côté master.
+    const KB_PZ_KEYS = ['payzen_uuid', 'payzenUuid', 'payzen_transaction_uuid', 'transaction_uuid', 'transactionUuid', 'payment_uuid', 'paymentUuid'];
+    const kbIsUuid = (v) => typeof v === 'string' && /^[0-9a-f]{32}$/i.test(v.trim());
+    function kbPayzenUuidOf(o) {
+      if (!o || typeof o !== 'object') return '';
+      for (const k of KB_PZ_KEYS) if (kbIsUuid(o[k])) return o[k].trim().toLowerCase();
+      for (const sub of ['payment', 'payzen', 'transaction', 'paiement']) {
+        const x = o[sub];
+        if (x && typeof x === 'object') for (const k of ['uuid', 'transaction_uuid', 'transactionUuid', ...KB_PZ_KEYS]) if (kbIsUuid(x[k])) return x[k].trim().toLowerCase();
+      }
+      return '';
+    }
+    function kbStripPayzen(orders) {
+      return (orders || []).map(o => {
+        if (!o || typeof o !== 'object') return o;
+        let hit = false; const c = { ...o };
+        for (const k of KB_PZ_KEYS) if (k in c) { delete c[k]; hit = true; }
+        return hit ? c : o;
+      });
+    }
+    // Extrait les UUID d'un export brut (Mongo) → payzen_private/{jour}. Master uniquement.
+    async function kbSavePayzenPrivate(dayKey, rawOrders) {
+      const arr = Array.isArray(rawOrders) ? rawOrders : ((rawOrders && rawOrders.orders) || []);
+      const byConsumer = {};
+      for (const o of arr) { const u = kbPayzenUuidOf(o); const cid = oid(o.consumer_id) || oid(o.consumerId); if (u && cid) byConsumer[cid] = u; }
+      const n = Object.keys(byConsumer).length;
+      if (!n) return 0;
+      if (!(window.__kbClaims && window.__kbClaims.admin === true) || !firebaseConfigured) return 0; // jamais hors master / hors ligne
+      await fb.setDoc(fb.doc(fb.db, 'payzen_private', dayKey), { dayKey, byConsumer, count: n, loadedAt: new Date().toISOString(), _ts: fb.serverTimestamp() }, { merge: true });
+      return n;
+    }
     const DISPATCH_TYPE = { 0: 'frais', 1: 'pain', 2: 'nd' };
 
     // v4_cache : la donnée est stockée en CHAÎNE JSON (un seul champ → une seule entrée
@@ -7189,7 +7192,7 @@
           if (amt.remise>0) reasons.push('remise '+fmtEuro(amt.remise));
           if (refund>0) reasons.push('remboursement distrib '+fmtEuro(refund));
           const cons = consumersByEmail && m.email ? consumersByEmail[String(m.email).toLowerCase()] : null;
-          rows.push({ id:m.consumerId||'', nom:displayName(m), email:m.email||'', tel:(cons&&(cons.telephone||cons.tel))||m.tel||'', site:m.site, initial, reel, ecart, reasons:reasons.join(' · '), payzenUuid: (m.payzen_uuid || m.payzenUuid || '') });
+          rows.push({ id:m.consumerId||'', nom:displayName(m), email:m.email||'', tel:(cons&&(cons.telephone||cons.tel))||m.tel||'', site:m.site, initial, reel, ecart, reasons:reasons.join(' · '), payzenUuid: '' });
         }
         return rows.sort((a,b)=>b.ecart-a.ecart);
       }, [empreOrders, empreRefundByOrder, consumersByEmail, emprePrep, empreFix]);
@@ -7211,7 +7214,22 @@
       const [payDone, setPayDone]     = React.useState({});
       const [uuidManual, setUuidManual] = React.useState({});
       const payRowKey = (r) => r.id || r.email || r.nom;
-      const payUuidOf = (r) => (r.payzenUuid || uuidManual[payRowKey(r)] || '').trim();
+      // V9.55 — coffre UUID du jour (règles : master uniquement ; vide pour les autres rôles)
+      const [pzVault, setPzVault] = React.useState({});
+      React.useEffect(() => {
+        if (!empreDay || !firebaseConfigured || !(window.__kbClaims && window.__kbClaims.admin === true)) { setPzVault({}); return; }
+        const unsub = fb.onSnapshot(fb.doc(fb.db, 'payzen_private', empreDay),
+          (snap) => setPzVault((snap.exists() && snap.data().byConsumer) || {}),
+          () => setPzVault({}));
+        return unsub;
+      }, [empreDay]);
+      const payUuidOf = (r) => ((r.id && pzVault[r.id]) || uuidManual[payRowKey(r)] || '').trim();
+      const destroyPzDay = async () => {
+        if (!empreDay) return;
+        if (!confirm(`Détruire définitivement tous les UUID PayZen du ${empreDay} ?`)) return;
+        try { await fb.deleteDoc(fb.doc(fb.db, 'payzen_private', empreDay)); setUuidManual({}); showToast('🗑️ UUID du jour détruits'); }
+        catch (e) { showToast('Erreur : ' + kbErrMsg(e)); }
+      };
       // V9.54 : le master est déjà admin par son jeton ; repli = compte email admin Firebase.
       React.useEffect(() => {
         const c = window.__kbClaims;
@@ -7234,7 +7252,9 @@
           // V9.54 : le serveur relit l'UUID et le plafond (empreinte initiale) dans Firestore.
           // L'UUID saisi à la main n'est utilisé que si aucun UUID n'est connu côté serveur.
           await kbCallable('kbgPayzenAdjust')({ dayKey: empreDay, consumerId: r.id, amountCents: r.reel, manualUuid: (uuidManual[key] || '').trim(), validate: true });
-          setPayDone(d => ({ ...d, [key]: 'ok' })); showToast(`✓ ${r.nom} → ${fmtEuro(r.reel)}`);
+          setPayDone(d => ({ ...d, [key]: 'ok' }));
+          setUuidManual(m => { const n = { ...m }; delete n[key]; return n; }); // UUID saisi : oublié aussitôt
+          showToast(`✓ ${r.nom} → ${fmtEuro(r.reel)} · UUID détruit`);
         } catch (e) {
           setPayDone(d => ({ ...d, [key]: 'err' })); showToast('❌ ' + ((e && e.message) || e));
         } finally { setPayBusy(b => ({ ...b, [key]: false })); }
@@ -7270,6 +7290,7 @@
                     ? <span style={{background:'#e7f5ec',color:'var(--accent-dark)',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>🔓 admin : {payAdmin.email}</span>
                     : <button className="btn-secondary" style={{padding:'5px 10px',fontSize:12}} onClick={loginAdmin}>🔐 Se connecter (admin)</button>}
                   {missing>0 && <span style={{background:'#fbe9d6',color:'#c86a00',padding:'3px 10px',borderRadius:8,fontSize:12,fontWeight:700}}>⚠️ {missing} sans UUID</span>}
+                  {Object.keys(pzVault).length>0 && <button className="btn-secondary" style={{padding:'5px 10px',fontSize:12,color:'var(--danger)'}} onClick={destroyPzDay}>🗑️ Détruire les UUID du jour ({Object.keys(pzVault).length})</button>}
                   <span style={{flex:1}} />
                   <button className="btn-primary" disabled={!payAdmin || !empreRows.some(r=>payUuidOf(r))}
                     onClick={async()=>{ for (const r of empreRows) if (payUuidOf(r) && !payBusy[payRowKey(r)] && payDone[payRowKey(r)]!=='ok') await majPayzenRow(r); }}>
@@ -8041,14 +8062,9 @@
       const loadList = React.useCallback(async ()=>{
         setError(''); setItems(null);
         try{
-          const url = `${FL_PROXY_URL}?action=get-mu-list&sheetId=${MU_SHEET_ID}&tab=${encodeURIComponent(MU_TAB)}&typeCol=TYPE&activeCol=ACTIF+%3F&typeVal=MU`;
-          let data=null, lastErr='';                       // V9.46 — auto-retry 3×
-          for(let attempt=0; attempt<3 && !data; attempt++){
-            if(attempt) await new Promise(r=>setTimeout(r,400*attempt));
-            try{ const resp=await fetch(url); data=await resp.json(); }
-            catch(err){ lastErr=err.message; data=null; }
-          }
-          if(!data) throw new Error(lastErr||'réponse illisible');
+          // V9.55 — via kbgProxy (GET côté serveur, secret ajouté par le serveur)
+          const data = await flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET');
+          if(!data) throw new Error('réponse illisible');
           if(data.success===false) throw new Error(data.error||'Lecture de la feuille impossible');
           const list = data.items||[];
           setItems(list);
@@ -13746,6 +13762,12 @@
 
           const res = parseOrdersJSON(v4Orders, prodById, consById);
           const dayKey = res.dateKey || targetDate;
+          // V9.55 — UUID PayZen → coffre master (payzen_private), jamais dans day_X_orders
+          try {
+            const rawV4 = typeof v4Orders === 'string' ? JSON.parse(v4Orders) : v4Orders;
+            const nPz = await kbSavePayzenPrivate(dayKey, rawV4);
+            if (nPz) showToast(`🔒 ${nPz} UUID PayZen rangés (master uniquement)`);
+          } catch (e) { console.warn('payzen_private', e); }
           // V9.52 — on conserve les commandes PrestaShop déjà fusionnées pour ce jour (Mongo ne les écrase pas)
           let psKeep = [];
           try { const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data'); psKeep = (ex && ex.orders) ? ex.orders.filter(o => o._ps) : []; } catch (_) {}
