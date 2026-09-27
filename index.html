@@ -626,7 +626,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.50';
+    const APP_VERSION = 'V9.51';
+    // V9.51 — MAJ FL › ajout depuis fichier produits : le proxy fl_sync refuse un catalogue
+    //   d'1 produit (« Catalogue trop petit »). On envoie le produit + les produits DÉJÀ dans
+    //   COMMANDE FL (sans effet), après un « preview » qui vérifie que SEUL ce produit sera ajouté.
     // V9.50 — MAJ FL : la liste 🆕 fichier produits prend TOUS les F&L du fichier produits
     //   (actifs ET inactifs sur le site ; si le cache n'a pas de catégorie → tous les produits),
     //   + ligne de diagnostic (nb produits en cache / F&L / à ajouter) + suggestion plus tolérante.
@@ -13242,8 +13245,22 @@
           const c = catalogFree.find(x => 'cat:' + (x.id || x.produit) === flRow);
           if (!c) { showToast('Produit introuvable dans le fichier produits'); setBusy(''); return; }
           try {
-            const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false,
-              catalog: [{ id: c.id, produit: c.produit, producer: c.producer, uv: c.uv }] });
+            const toItem = x => ({ id: x.id, produit: x.produit, producer: x.producer, uv: x.uv });
+            const target = toItem(c);
+            const same = (a, b) => (a.id && b.id && String(a.id) === String(b.id)) || _flNorm(a.produit) === _flNorm(b.produit);
+            // Rembourrage : produits du fichier produits DÉJÀ présents dans COMMANDE FL (aucun ajout).
+            const inSheet = new Set((data.flList || []).map(f => _flNorm(f.des)));
+            let cat = [target, ...catalog.filter(x => x !== c && inSheet.has(_flNorm(x.produit))).map(toItem)];
+            // Preview : seul le produit choisi doit être « à ajouter » ; on retire tout autre ajout prévu.
+            for (let pass = 0; pass < 3; pass++) {
+              const pv = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'preview', catalog: cat });
+              if (!pv || !pv.ok) throw new Error((pv && pv.error) || 'preview impossible');
+              const extra = (pv.toAdd || []).filter(a => !same(a, target));
+              if (!extra.length) break;
+              if (pass === 2) throw new Error('ajout annulé : d\'autres produits seraient ajoutés (' + extra.length + ')');
+              cat = cat.filter(x => x === target || !extra.some(a => same(a, x)));
+            }
+            const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_sync', op: 'apply', inactivate: false, catalog: cat });
             if (!r || !r.ok) throw new Error((r && r.error) || 'ajout impossible');
             const d2 = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_compare' });
             const f = d2 && d2.ok ? (d2.flList || []).find(x => (c.id && String(x.idSite || x.id || '') === c.id) || _flNorm(x.des) === _flNorm(c.produit)) : null;
