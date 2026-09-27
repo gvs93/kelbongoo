@@ -626,7 +626,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.49';
+    const APP_VERSION = 'V9.50';
+    // V9.50 — MAJ FL : la liste 🆕 fichier produits prend TOUS les F&L du fichier produits
+    //   (actifs ET inactifs sur le site ; si le cache n'a pas de catégorie → tous les produits),
+    //   + ligne de diagnostic (nb produits en cache / F&L / à ajouter) + suggestion plus tolérante.
     // V9.49 — F&L › MAJ FL › « Sur Rungis, pas dans COMMANDE FL » : la liste propose aussi
     //   les produits F&L du FICHIER PRODUITS Kelbongoo pas encore dans COMMANDE FL.
     //   Valider = fonctions EXISTANTES : fl_sync apply (ajout ligne : producteur, désignation,
@@ -13165,11 +13168,29 @@
       const [loading, setLoading] = React.useState(true);
       const [busy, setBusy] = React.useState('');      // clé en cours
       const [sel, setSel] = React.useState({});        // code Rungis -> {flRow, actif}
-      const [catalog, setCatalog] = React.useState([]); // FL du fichier produits (buildCatalogFLFrom)
+      const [catalog, setCatalog] = React.useState([]); // produits du fichier produits (F&L, actifs + inactifs)
+      const [catInfo, setCatInfo] = React.useState(null); // { total, fl, noCat } | { none:true }
 
       React.useEffect(() => {
         let alive = true;
-        (async () => { try { const p = await readCache('products'); if (alive && p) setCatalog(buildCatalogFLFrom(p)); } catch (e) {} })();
+        (async () => {
+          try {
+            const p = await readCache('products');
+            if (!alive) return;
+            if (!p || !Object.keys(p).length) { setCatInfo({ none: true }); return; }
+            const arr = Object.entries(p).map(([id, x]) => ({ id: String(id || '').trim(), ...(x || {}) }));
+            const hasCat = arr.some(x => String(x.category || '').trim());
+            const seen = new Set(), out = [];
+            for (const x of arr) {
+              const name = String(x.name || '').trim(); if (!name) continue;
+              if (hasCat && !isFLProduct(x)) continue;          // pas de catégorie dans le cache → on garde tout
+              const k = _flNorm(name) + '|' + _flNorm(x.producer); if (seen.has(k)) continue; seen.add(k);
+              out.push({ id: x.id, produit: name, producer: String(x.producer || '').trim(), uv: String(x.uv || '').trim(), inactif: x.active === false });
+            }
+            setCatalog(out);
+            setCatInfo({ total: arr.length, fl: out.length, noCat: !hasCat });
+          } catch (e) { if (alive) setCatInfo({ none: true, err: e.message }); }
+        })();
         return () => { alive = false; };
       }, []);
       // Produits du fichier produits PAS encore dans COMMANDE FL (ni par ID site, ni par nom).
@@ -13189,10 +13210,11 @@
         for (const c of catalogFree) {
           const b = tok(c.produit); if (!b.length) continue;
           const inter = a.filter(w => b.some(v => v === w || (w.length > 3 && v.length > 3 && (v.startsWith(w) || w.startsWith(v))))).length;
-          const sc = inter / Math.max(a.length, b.length);
+          if (!inter) continue;
+          const sc = inter / Math.max(a.length, b.length) + (c.inactif ? 0 : 0.01);
           if (sc > bs) { bs = sc; best = c; }
         }
-        return bs >= 0.3 ? { c: best, sim: Math.round(bs * 100) } : null;
+        return bs >= 0.25 ? { c: best, sim: Math.round(Math.min(1, bs) * 100) } : null;
       }, [catalogFree]);
 
       const load = React.useCallback(async () => {
@@ -13292,6 +13314,13 @@
           <div style={{ background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 8, padding: 10, marginBottom: 10 }}>
             <div style={{ fontWeight: 800, fontSize: 13 }}>🆕 Sur Rungis, pas dans COMMANDE FL ({missing.length})</div>
             <div style={{ fontSize: 11.5, color: 'var(--ink-mute)', margin: '4px 0 6px' }}>Choisis le produit : déjà dans COMMANDE FL (concordance) ou du fichier produits Kelbongoo (ligne ajoutée avec producteur, UV, type, MU, ID site). La validation écrit le code Probon + prix + colisage. La case Actif/Inactif est obligatoire.</div>
+            {catInfo && (
+              <div style={{ fontSize: 11.5, margin: '0 0 6px', padding: '4px 8px', borderRadius: 6, background: catInfo.none ? '#fdecea' : '#eef6ee', color: catInfo.none ? '#b03a2e' : '#2e7d32' }}>
+                {catInfo.none
+                  ? '⚠️ Aucun fichier produits en cache — charge-le dans Chargement pour proposer les produits à ajouter.'
+                  : `📦 Fichier produits : ${catInfo.total} produits · ${catInfo.fl} ${catInfo.noCat ? '(sans catégorie : tous proposés)' : 'F&L'} · ${catalogFree.length} pas encore dans COMMANDE FL`}
+              </div>
+            )}
             {missing.length === 0 && <div style={{ fontSize: 12, color: '#2e7d32' }}>✓ Tout est dans la liste.</div>}
             {missing.map((m, i) => {
               const pick = sel[m.code] || {};
@@ -13307,7 +13336,7 @@
                       </optgroup>
                       {catalogFree.length > 0 && (
                         <optgroup label="🆕 Fichier produits — à ajouter">
-                          {catalogFree.map(c => <option key={'cat:' + (c.id || c.produit)} value={'cat:' + (c.id || c.produit)}>🆕 {c.produit}{c.producer ? ` — ${c.producer}` : ''}</option>)}
+                          {catalogFree.map(c => <option key={'cat:' + (c.id || c.produit)} value={'cat:' + (c.id || c.produit)}>🆕 {c.produit}{c.producer ? ` — ${c.producer}` : ''}{c.inactif ? ' (inactif site)' : ''}</option>)}
                         </optgroup>
                       )}
                     </select>
