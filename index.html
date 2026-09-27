@@ -38,13 +38,15 @@
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
     import {
-      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword
+      getAuth, onAuthStateChanged, signInWithEmailAndPassword, signInWithCustomToken,
+      GoogleAuthProvider, signInWithPopup, signOut
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
     import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
     window.__firebase = {
       initializeApp, getFirestore, collection, doc, setDoc, getDoc, getDocs,
       onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp,
-      getAuth, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword,
+      getAuth, onAuthStateChanged, signInWithEmailAndPassword, signInWithCustomToken,
+      GoogleAuthProvider, signInWithPopup, signOut,
       getFunctions, httpsCallable
     };
     window.dispatchEvent(new Event('firebase-ready'));
@@ -587,9 +589,8 @@
       measurementId: "G-XYQF244BCR"
     };
 
-    const MASTER_PASSWORD = "Adminkelbongoo93!";
-    const PREP_PASSWORD = "Prepa2026";   // (legacy V9.42) — remplacé par le code perso en V9.43
-    const DISTRIB_PASSWORD = "Distrib2026";  // (legacy V9.42) — remplacé par le code perso en V9.43
+    // V9.54 — SÉCURITÉ : plus AUCUN mot de passe dans le HTML. Rôles = claims du jeton Firebase
+    //   posés côté serveur (Cloud Functions kbgLogin / kbgClaimAdmin), contrôlés par les règles Firestore.
     // V9.43 : déconnexion auto après 60 min sans interaction (comme l'appli réception).
     const INACTIVITY_MS = 60 * 60 * 1000; // 60 min
     const PREPARATEURS = ['Robin', 'Diana', 'Mamadou', 'Hamidou', 'Tom', 'Norman', 'Marjorie'];
@@ -626,7 +627,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.53';
+    const APP_VERSION = 'V9.54';
+    // V9.54 — SÉCURITÉ : fin de l'accès anonyme. Code perso → Cloud Function kbgLogin (anti force brute)
+    //   → jeton Firebase signé portant le rôle ; Master → Google + liste blanche serveur (kbgClaimAdmin).
+    //   Mots de passe retirés du HTML ; session localStorage validée contre le jeton ; PayZen via
+    //   kbgPayzenAdjust (UUID + plafond relus côté serveur) ; ré-ouverture via kbgVerifyMasterPin.
     // V9.53 — PrestaShop AUTOMATIQUE : dès 10h, dès qu'un poste Master ou Prépa est ouvert, les commandes
     //   du LENDEMAIN sont récupérées (module kbprepa) puis re-vérifiées toutes les 15 min.
     //   • Ajout seulement : jamais de retrait ni de renumérotation (casiers déjà attribués conservés).
@@ -862,8 +867,7 @@
     const FRESHDESK_SECRET = "Lesmailspartent!"; // doit correspondre au SHARED_SECRET du script
     // Connexion Google pour l'Admin (même client OAuth que les autres apps).
     const OAUTH_CLIENT_ID = "757658680772-ogalpu5olqd2fiovnbnj55j1g0lbq7rr.apps.googleusercontent.com";
-    const ADMIN_EMAILS = ["achat@probon.fr", "rr@probon.fr", "hg@probon.fr", "ga@pribon.org", "achat@pribon.org"];
-    function isAdminEmail(email) { return ADMIN_EMAILS.map(e => e.toLowerCase()).includes(String(email || '').toLowerCase().trim()); }
+    // V9.54 — liste blanche master déplacée CÔTÉ SERVEUR (paramètre ADMIN_EMAILS de la function kbgClaimAdmin).
     function decodeJwt(t) { try { const b = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); const j = decodeURIComponent(atob(b).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')); return JSON.parse(j); } catch (e) { return null; } }
 
     // PROXY FL / PROBON (inventaire FL, stock, import Probon, mails) — script dédié
@@ -983,38 +987,90 @@
     let fb = null;
     let firebaseConfigured = false;
 
+    // V9.54 — claims du jeton courant (source de vérité du rôle). null = non connecté.
+    window.__kbClaims = null;
+    async function kbRefreshClaims(force) {
+      const u = fb && fb.auth && fb.auth.currentUser;
+      if (!u) { window.__kbClaims = null; return null; }
+      try {
+        const t = await u.getIdTokenResult(!!force);
+        window.__kbClaims = { ...t.claims, uid: u.uid, email: u.email || '' };
+      } catch (e) {
+        // Hors-ligne avec jeton expiré : on garde l'uid (Firestore refusera de toute façon sans jeton valide)
+        window.__kbClaims = window.__kbClaims && window.__kbClaims.uid === u.uid ? window.__kbClaims : { uid: u.uid, email: u.email || '', _offline: true };
+      }
+      return window.__kbClaims;
+    }
+    function kbCallable(name) {
+      if (!window.__fns) throw new Error('Serveur non initialisé');
+      return window.__firebase.httpsCallable(window.__fns, name);
+    }
+    function kbErrMsg(e) {
+      const m = (e && (e.message || e.code)) || String(e);
+      if (/network|unavailable|internal|deadline/i.test(m)) return 'Serveur injoignable. Réessaie dans un instant.';
+      return m.replace(/^Firebase:\s*/, '');
+    }
+    // Code perso → jeton signé serveur (rôle distrib / prep)
+    async function kbStaffLogin(code, role, site) {
+      const r = await kbCallable('kbgLogin')({ code, role, site });
+      await window.__firebase.signInWithCustomToken(fb.auth, r.data.token);
+      const c = await kbRefreshClaims(true);
+      if (!c || c.kbRole !== role) throw new Error('Rôle non reconnu par le serveur.');
+      return { name: c.kbName || r.data.name || 'Kelbongoo', site: c.kbSite, uid: c.uid };
+    }
+    // Master : Google (popup) → vérif liste blanche serveur → claim admin
+    async function kbMasterGoogleLogin() {
+      const { GoogleAuthProvider, signInWithPopup } = window.__firebase;
+      const prov = new GoogleAuthProvider();
+      prov.setCustomParameters({ prompt: 'select_account' });
+      const cred = await signInWithPopup(fb.auth, prov);
+      try { await kbCallable('kbgClaimAdmin')({}); }
+      catch (e) { try { await window.__firebase.signOut(fb.auth); } catch (_) {} throw e; }
+      const c = await kbRefreshClaims(true);
+      if (!c || c.admin !== true) throw new Error('Droits master non accordés.');
+      return { email: cred.user.email, name: cred.user.displayName || cred.user.email, uid: c.uid };
+    }
+    // Master de secours : compte email/mot de passe Firebase portant déjà le claim admin
+    async function kbMasterPasswordLogin(email, pass) {
+      const cred = await window.__firebase.signInWithEmailAndPassword(fb.auth, email, pass);
+      const c = await kbRefreshClaims(true);
+      if (!c || c.admin !== true) { try { await window.__firebase.signOut(fb.auth); } catch (_) {} throw new Error('Compte sans droit master.'); }
+      return { email: cred.user.email, name: cred.user.email, uid: c.uid };
+    }
+    async function kbSignOut() {
+      window.__kbClaims = null;
+      try { if (fb && fb.auth) await window.__firebase.signOut(fb.auth); } catch (_) {}
+    }
+    // Session locale acceptée seulement si elle correspond au jeton Firebase (anti-falsification localStorage)
+    function kbSessionMatchesClaims(sess) {
+      const c = window.__kbClaims;
+      if (!sess || !c || !c.uid) return false;
+      if (sess.uid && sess.uid !== c.uid) return false;
+      if (c._offline) return !!sess.uid;
+      if (sess.role === 'master' || sess.isMaster) return c.admin === true;
+      return c.kbRole === sess.role;
+    }
+
     async function initFirebase() {
       if (FIREBASE_CONFIG.apiKey === "REMPLACE_MOI") return false;
       try {
-        const { initializeApp, getFirestore, getAuth, signInAnonymously, onAuthStateChanged } = window.__firebase;
-        const app = initializeApp(FIREBASE_CONFIG);
-        const db = getFirestore(app);
-        const auth = getAuth(app);
-        fb = { db, auth, ...window.__firebase };
-        window.__app = app;
-        try { window.__fns = window.__firebase.getFunctions(app, 'europe-west1'); } catch(_) {}
-
-        // Déjà authentifié (reconnexion) ? on ne réattend pas.
-        if (auth.currentUser) return true;
-
-        // V9.46 — jusqu'à 3 tentatives (12s) : le réseau mobile est capricieux au
-        // démarrage. Avant, un seul essai de 10s faisait basculer en Mode local.
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            await new Promise((resolve, reject) => {
-              const timer = setTimeout(() => reject(new Error('Auth timeout')), 12000);
-              const unsub = onAuthStateChanged(auth, (user) => {
-                if (user) { clearTimeout(timer); if (unsub) unsub(); resolve(); }
-              });
-              signInAnonymously(auth).catch(reject);
-            });
-            return true;
-          } catch (e) {
-            console.warn('Auth tentative ' + (attempt + 1) + ' échouée', e);
-            if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
-          }
+        const { initializeApp, getFirestore, getAuth, onAuthStateChanged } = window.__firebase;
+        if (!fb) {
+          const app = initializeApp(FIREBASE_CONFIG);
+          const db = getFirestore(app);
+          const auth = getAuth(app);
+          fb = { db, auth, ...window.__firebase };
+          window.__app = app;
+          try { window.__fns = window.__firebase.getFunctions(app, 'europe-west1'); } catch(_) {}
         }
-        return false;
+        // V9.54 — plus de connexion anonyme : on attend seulement la restauration
+        // éventuelle d'un utilisateur déjà connecté (persistance IndexedDB), 6 s max.
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 6000);
+          const unsub = onAuthStateChanged(fb.auth, () => { clearTimeout(timer); if (unsub) unsub(); resolve(); });
+        });
+        await kbRefreshClaims(false);
+        return true;
       } catch (e) { console.error("Firebase init failed", e); return false; }
     }
 
@@ -1082,6 +1138,10 @@
         if (firebaseConfigured) {
           return fb.onSnapshot(fb.collection(fb.db, c), (snap) => {
             callback(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+          }, (err) => {
+            // V9.54 : accès refusé (non connecté / rôle insuffisant) → liste vide, pas de plantage
+            if (err && err.code !== 'permission-denied') console.warn('subscribe ' + c, err);
+            try { callback([]); } catch (_) {}
           });
         } else {
           const fire = () => { this.getAll(c).then(callback); };
@@ -2392,40 +2452,25 @@
         return merged.length > 0 ? merged : SITES;
       }, [sitesOfDay, sitesWithPending]);
 
-      // ---- Connexion Google pour le rôle MASTER ----
-      const gRef = React.useRef(null);
-      const [gDown, setGDown] = React.useState(false);
+      // ---- V9.54 : Master = Firebase Auth Google + claim admin posé par le serveur ----
+      const [gDown, setGDown] = React.useState(false);   // affiche le repli email/mot de passe
       const [gErr, setGErr] = React.useState('');
+      const [gBusy, setGBusy] = React.useState(false);
+      const [mEmail, setMEmail] = React.useState('');
       const loginRef = React.useRef({});
       loginRef.current = { site, name, availableSites };
-      React.useEffect(() => {
-        if (!masterOpen) return;
-        setGErr(''); setGDown(false);
-        let n = 0;
-        const t = setInterval(() => {
-          n++;
-          if (window.google && google.accounts && google.accounts.id) {
-            clearInterval(t);
-            try {
-              google.accounts.id.initialize({
-                client_id: OAUTH_CLIENT_ID,
-                callback: (resp) => {
-                  const info = decodeJwt(resp.credential);
-                  if (!info) { setGErr('Jeton Google illisible.'); return; }
-                  if (String(info.email_verified) !== 'true') { setGErr('Email Google non vérifié.'); return; }
-                  if (!isAdminEmail(info.email)) { setGErr('Accès refusé : ' + info.email + " n'est pas autorisé."); return; }
-                  const L = loginRef.current;
-                  onLogin({ role: 'master', isMaster: true, site: L.site || (L.availableSites && L.availableSites[0]) || 'BOR', name: (L.name && L.name.trim()) || info.given_name || info.name || info.email, adminEmail: String(info.email).toLowerCase(), loggedAt: new Date().toISOString() });
-                }
-              });
-              if (gRef.current) { gRef.current.innerHTML = ''; google.accounts.id.renderButton(gRef.current, { theme: 'filled_blue', size: 'large', text: 'signin_with', width: 280 }); }
-              // Ouvre directement le sélecteur de compte Google (clic Master = auth directe).
-              try { google.accounts.id.prompt(); } catch (e) {}
-            } catch (e) { setGDown(true); }
-          } else if (n > 18) { clearInterval(t); setGDown(true); }
-        }, 400);
-        return () => clearInterval(t);
-      }, [masterOpen]);
+      const masterLogin = async (mode) => {
+        setGErr(''); setGBusy(true);
+        try {
+          const u = mode === 'password' ? await kbMasterPasswordLogin(mEmail.trim(), password) : await kbMasterGoogleLogin();
+          const L = loginRef.current;
+          onLogin({ role: 'master', isMaster: true, uid: u.uid, site: L.site || (L.availableSites && L.availableSites[0]) || 'BOR', name: (L.name && L.name.trim()) || u.name, adminEmail: u.email, loggedAt: new Date().toISOString() });
+        } catch (e) {
+          const code = (e && e.code) || '';
+          if (/popup-blocked|popup-closed|cancelled-popup|operation-not-supported|unauthorized-domain/.test(code)) setGDown(true);
+          setGErr(kbErrMsg(e));
+        } finally { setGBusy(false); setPassword(''); }
+      };
 
       // V9.43 : connexion par CODE PERSO unique (Prépa + Distrib), validé côté serveur
       // sur le même registre « Salariés » que l'appli réception. Master reste inchangé.
@@ -2434,29 +2479,23 @@
         if (role === 'distrib' && !site) { setError('Choisis un lieu.'); return; }
         const code = String(password || '').trim();
         if (!code) { setError('Entre ton code personnel.'); return; }
+        if (!firebaseConfigured) { setError('Connexion serveur indisponible (mode local).'); return; }
         setBusy(true);
         let r;
-        try { r = await verifyKbgCode(code); }
-        catch (e) { setBusy(false); setError('Serveur injoignable. Réessaie dans un instant.'); return; }
-        setBusy(false);
-        if (!r || !r.valid) { setError((r && r.reason) || 'Code personnel incorrect.'); return; }
-        // V9.44 : l'identité vient du CODE (prénom renvoyé par le serveur), plus de saisie libre.
-        const who = String((r && r.name) || '').trim() || 'Kelbongoo';
+        // V9.54 : code vérifié par la Cloud Function kbgLogin (anti force brute) → jeton Firebase signé.
+        // Le code n'est plus conservé dans la session.
+        try { r = await kbStaffLogin(code, role, site); }
+        catch (e) { setBusy(false); setPassword(''); setError(kbErrMsg(e)); return; }
+        setBusy(false); setPassword('');
+        const who = String(r.name || '').trim() || 'Kelbongoo';
         if (role === 'prep') {
-          onLogin({ role: 'prep', isPrep: true, site: 'ENTREPOT', name: who, code, loggedAt: new Date().toISOString() });
+          onLogin({ role: 'prep', isPrep: true, uid: r.uid, site: 'ENTREPOT', name: who, loggedAt: new Date().toISOString() });
         } else {
-          onLogin({ role: 'distrib', site, name: who, code, loggedAt: new Date().toISOString() });
+          onLogin({ role: 'distrib', uid: r.uid, site, name: who, loggedAt: new Date().toISOString() });
         }
       };
 
-      // Connexion de secours master par mot de passe (si Google indisponible).
-      const masterFallbackSubmit = () => {
-        setGErr('');
-        if (password !== MASTER_PASSWORD) { setGErr('Mot de passe master incorrect.'); return; }
-        const L = loginRef.current;
-        onLogin({ role: 'master', isMaster: true, site: (L.availableSites && L.availableSites[0]) || 'BOR', name: (L.name && L.name.trim()) || 'Master', loggedAt: new Date().toISOString() });
-      };
-      const closeMaster = () => { setMasterOpen(false); setGErr(''); setGDown(false); setPassword(''); };
+      const closeMaster = () => { setMasterOpen(false); setGErr(''); setGDown(false); setPassword(''); setMEmail(''); };
 
       return (
         <div className="login-shell">
@@ -2561,15 +2600,21 @@
                 <div className="fs-body" style={{textAlign:'center'}}>
                   Connexion avec un compte Google autorisé.
                 </div>
-                <div ref={gRef} style={{display:'flex',justifyContent:'center',minHeight:44,marginTop:14}}></div>
+                <div style={{display:'flex',justifyContent:'center',marginTop:14}}>
+                  <button className="btn-primary" style={{minWidth:260}} disabled={gBusy || !firebaseConfigured} onClick={() => masterLogin('google')}>
+                    {gBusy ? 'Vérification…' : 'Se connecter avec Google'}
+                  </button>
+                </div>
                 {gErr && <div style={{color:'var(--danger)',fontSize:12,marginTop:10,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{gErr}</div>}
+                {!gDown && <div style={{textAlign:'center',marginTop:10}}><button className="btn-secondary" style={{fontSize:11,padding:'4px 10px'}} onClick={() => setGDown(true)}>Compte email de secours</button></div>}
                 {gDown && (
                   <div style={{marginTop:14}}>
                     <div style={{fontSize:11,color:'var(--ink-mute)',marginBottom:6}}>
-                      Google indisponible — connexion de secours par mot de passe :
+                      Connexion de secours (compte master email / mot de passe Firebase) :
                     </div>
-                    <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" onKeyDown={e => e.key === 'Enter' && masterFallbackSubmit()} />
-                    <button className="btn-primary btn-block" style={{marginTop:10}} onClick={masterFallbackSubmit}>Se connecter</button>
+                    <input type="email" value={mEmail} onChange={e => setMEmail(e.target.value)} placeholder="email" autoComplete="username" />
+                    <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" style={{marginTop:6}} onKeyDown={e => e.key === 'Enter' && masterLogin('password')} />
+                    <button className="btn-primary btn-block" style={{marginTop:10}} disabled={gBusy} onClick={() => masterLogin('password')}>Se connecter</button>
                   </div>
                 )}
                 <div style={{marginTop:16,textAlign:'center'}}>
@@ -7167,26 +7212,28 @@
       const [uuidManual, setUuidManual] = React.useState({});
       const payRowKey = (r) => r.id || r.email || r.nom;
       const payUuidOf = (r) => (r.payzenUuid || uuidManual[payRowKey(r)] || '').trim();
+      // V9.54 : le master est déjà admin par son jeton ; repli = compte email admin Firebase.
+      React.useEffect(() => {
+        const c = window.__kbClaims;
+        if (c && c.admin === true && !payAdmin) setPayAdmin({ email: c.email || 'master', uid: c.uid });
+      }, []);
       const loginAdmin = async () => {
         const email = prompt('Email admin :'); if (!email) return;
         const pass  = prompt('Mot de passe :'); if (!pass) return;
-        try {
-          const { getAuth, signInWithEmailAndPassword } = window.__firebase;
-          const cred = await signInWithEmailAndPassword(getAuth(window.__app), email, pass);
-          const tok = await cred.user.getIdTokenResult();
-          if (!tok.claims.admin) { showToast('Compte sans droit admin'); return; }
-          setPayAdmin(cred.user); showToast('✓ Admin connecté');
-        } catch (e) { showToast('Échec connexion : ' + (e.code || e.message)); }
+        try { const u = await kbMasterPasswordLogin(email, pass); setPayAdmin(u); showToast('✓ Admin connecté'); }
+        catch (e) { showToast('Échec connexion : ' + kbErrMsg(e)); }
       };
       const majPayzenRow = async (r) => {
         const key = payRowKey(r), uuid = payUuidOf(r);
         if (!payAdmin) { showToast("Connecte-toi en admin d'abord"); return; }
         if (!uuid)     { showToast('⚠️ UUID PayZen manquant'); return; }
         if (!window.__fns) { showToast('Functions non initialisé (Firebase)'); return; }
+        if (!r.id) { showToast('⚠️ Client sans identifiant'); return; }
         setPayBusy(b => ({ ...b, [key]: true }));
         try {
-          const fn = window.__firebase.httpsCallable(window.__fns, 'updatePayzenTransaction');
-          await fn({ orderRef: r.id, transactionUuid: uuid, amountEuros: r.reel / 100, validate: true });
+          // V9.54 : le serveur relit l'UUID et le plafond (empreinte initiale) dans Firestore.
+          // L'UUID saisi à la main n'est utilisé que si aucun UUID n'est connu côté serveur.
+          await kbCallable('kbgPayzenAdjust')({ dayKey: empreDay, consumerId: r.id, amountCents: r.reel, manualUuid: (uuidManual[key] || '').trim(), validate: true });
           setPayDone(d => ({ ...d, [key]: 'ok' })); showToast(`✓ ${r.nom} → ${fmtEuro(r.reel)}`);
         } catch (e) {
           setPayDone(d => ({ ...d, [key]: 'err' })); showToast('❌ ' + ((e && e.message) || e));
@@ -7547,7 +7594,11 @@
       };
 
       const handleReopen = async () => {
-        if (reopenPwd !== MASTER_PASSWORD) { showToast('Mot de passe incorrect'); return; }
+        // V9.54 : master connecté → direct ; sinon code master vérifié par le serveur (kbgVerifyMasterPin)
+        if (!(window.__kbClaims && window.__kbClaims.admin === true)) {
+          try { await kbCallable('kbgVerifyMasterPin')({ pin: reopenPwd }); }
+          catch (e) { setReopenPwd(''); showToast(kbErrMsg(e)); return; }
+        }
         await storage.deleteDoc(`day_${activeDay()}_closure`, currentSite);
         setAskReopen(false);
         setReopenPwd('');
@@ -16153,6 +16204,8 @@
           // Expiration douce : si la dernière activité date de plus de 10 jours,
           // on oublie la session (évite qu'un téléphone perdu reste connecté indéfiniment).
           if (s.lastSeen && (Date.now() - new Date(s.lastSeen).getTime()) > 10 * 864e5) return null;
+          // V9.54 : une session écrite à la main dans localStorage ne vaut plus rien sans jeton serveur.
+          if (!kbSessionMatchesClaims(s)) { try { localStorage.removeItem('kb_session_v3'); } catch(_){} return null; }
           return s;
         } catch(e) { return null; }
       });
@@ -16348,6 +16401,7 @@
         else setTab('clients');
       };
       const handleLogout = () => {
+        kbSignOut();
         try { localStorage.removeItem('kb_session_v3'); } catch(e){}
         try { sessionStorage.removeItem('kb_session_v2'); } catch(e){}
         setSession(null);
