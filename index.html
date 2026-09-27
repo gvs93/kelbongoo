@@ -626,7 +626,20 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.51';
+    const APP_VERSION = 'V9.53';
+    // V9.53 — PrestaShop AUTOMATIQUE : dès 10h, dès qu'un poste Master ou Prépa est ouvert, les commandes
+    //   du LENDEMAIN sont récupérées (module kbprepa) puis re-vérifiées toutes les 15 min.
+    //   • Ajout seulement : jamais de retrait ni de renumérotation (casiers déjà attribués conservés).
+    //   • Un seul poste à la fois (verrou app_config/kbprepa_lock, 2 min) ; statut app_config/kbprepa_status.
+    //   • Commandes disparues côté PrestaShop (annulées) : comptées dans le statut, pas retirées.
+    //   • Passage test ↔ réel : les commandes PS du jour sont reconstruites dans le nouveau mode.
+    //   • Le bouton manuel utilise la même fusion (ajout seulement).
+    // V9.52 — Chargement du jour : lien PrestaShop (module kbprepa) + 🧪 mode test.
+    //   • Champ URL kbprepa mémorisé (Firestore app_config/kbprepa), date + bouton « Récupérer & fusionner ».
+    //   • Les commandes PrestaShop sont FUSIONNÉES avec celles du jour (flag _ps) et survivent
+    //     à un rechargement Mongo (handleV4Load les conserve). Mongo n'est jamais modifié.
+    //   • Mode test : nom client et chaque article préfixés « [TEST] », casiers fictifs en lettres
+    //     (A, B… AA) par site, jamais comptés dans le CA. Bouton pour retirer les commandes PS d'une date.
     // V9.51 — MAJ FL › ajout depuis fichier produits : le proxy fl_sync refuse un catalogue
     //   d'1 produit (« Catalogue trop petit »). On envoie le produit + les produits DÉJÀ dans
     //   COMMANDE FL (sans effet), après un « preview » qui vérifie que SEUL ce produit sera ajouté.
@@ -1241,6 +1254,141 @@
       orders.forEach((o, i) => { o.casiersFrais = [String(i + 1)]; o.frais = o.items.slice(); });
       return orders;
     }
+
+    // ── PRESTASHOP (nouveau site) : JSON du module kbprepa → commandes enrichies ──
+    // json = { ok, date, orders:[{ id_order, reference, site, slot, mode, customer:{firstname,lastname,email,phone}, items:[{name,manufacturer,category,qty,unit_price_cents,ean13}] }] }
+    // opts = { test:bool, prodById:{}, baseOrders:[] }
+    // Test : « [TEST] » devant le nom client et chaque article, casiers en LETTRES (A, B… AA) par site.
+    // Réel : casiers numérotés à la suite du plus grand casier existant du site (Mongo).
+    // V9.52 — tri casiers : numéros d'abord (ordre numérique), puis casiers test en lettres (A, B… AA)
+    function casCmp(a, b) { const na = parseInt(a, 10), nb = parseInt(b, 10); const ia = isNaN(na), ib = isNaN(nb); if (!ia && !ib) return na - nb; if (ia !== ib) return ia ? 1 : -1; const sa = String(a || ''), sb = String(b || ''); return sa.length - sb.length || sa.localeCompare(sb); }
+    function psLetters(n) { let s = ''; n = n + 1; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; }
+    function prestaToOrders(json, opts) {
+      const o0 = opts || {}; const test = !!o0.test; const T = test ? '[TEST] ' : '';
+      const list = (json && Array.isArray(json.orders)) ? json.orders : (Array.isArray(json) ? json : []);
+      const nrm = x => String(x || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+      const byName = {};
+      const pb = o0.prodById || {};
+      for (const k in pb) { const p = pb[k]; if (p && p.name) byName[nrm(p.name)] = p; }
+      const maxBySite = {};
+      for (const b of (o0.baseOrders || [])) {
+        const st = b.site || '';
+        for (const c of [...(b.casiersFrais || []), ...(b.casiersSec || [])]) { const n = parseInt(c, 10); if (!isNaN(n) && n > (maxBySite[st] || 0)) maxBySite[st] = n; }
+      }
+      const idxBySite = {};
+      const out = [];
+      for (const po of list) {
+        const site = String(po.site || 'PS').trim().toUpperCase();
+        const cu = po.customer || {};
+        const full = `${cu.firstname || ''} ${cu.lastname || ''}`.trim() || (cu.email || '') || '(client PrestaShop)';
+        const items = (po.items || []).filter(it => (parseInt(it.qty, 10) || 0) > 0).map(it => {
+          const m = byName[nrm(it.name)];
+          let cat = m ? (DISPATCH_TYPE[m.dispatchType] || 'frais') : (/pain|boulang/i.test(it.category || '') ? 'pain' : 'frais');
+          return { id: 'ps_' + (it.id_product || 0) + '_' + (it.id_attribute || 0), produit: T + (it.name || '(article)'), producteur: it.manufacturer || (m ? m.producer : ''), qty: parseInt(it.qty, 10) || 1, consumer_price: parseInt(it.unit_price_cents, 10) || 0, dispatchType: m ? m.dispatchType : null, cat, ean: it.ean13 || '', _test: test };
+        });
+        if (!items.length) continue;
+        const i = idxBySite[site] = (idxBySite[site] == null ? 0 : idxBySite[site] + 1);
+        const cas = test ? psLetters(i + ((o0.offsetBySite || {})[site] || 0)) : String((maxBySite[site] || 0) + i + 1);
+        const hasSec = items.some(x => x.cat !== 'frais');
+        out.push({
+          orderId: (test ? 'PST_' : 'PS_') + po.id_order, status: 1, site,
+          consumerId: 'ps_' + (cu.id || po.id_order), newClient: false,
+          name: T + full, email: String(cu.email || '').trim().toLowerCase(), tel: String(cu.phone || '').replace(/\s+/g, ''),
+          casiersFrais: items.some(x => x.cat === 'frais') ? [cas] : [], casiersSec: hasSec ? [cas] : [],
+          items, pains: items.filter(x => x.cat === 'pain'), nds: items.filter(x => x.cat === 'nd'), frais: items.filter(x => x.cat === 'frais'),
+          removed: [], reduced: [],
+          _ps: true, _test: test, psRef: po.reference || '', psSlot: po.slot || '', psMode: po.mode || '',
+        });
+      }
+      return out;
+    }
+    // ── V9.53 — Synchro PrestaShop (partagée : bouton Master + automatique) ──
+    const PS_AUTO_HOUR = 10;      // première synchro du lendemain à partir de cette heure
+    const PS_REFRESH_MIN = 15;    // re-vérification
+    const PS_ERROR_RETRY_MIN = 5; // nouvel essai après une erreur
+    function psUrlForDay(raw, dayKey) {
+      const u = new URL(String(raw).trim());
+      u.searchParams.delete('date'); u.searchParams.set('date', dayKey);
+      return u.toString();
+    }
+    async function psFetchJson(rawUrl, dayKey) {
+      let resp;
+      try { resp = await fetch(psUrlForDay(rawUrl, dayKey), { cache: 'no-store' }); }
+      catch (e) { throw new Error('Appel bloqué (réseau ou CORS). Module kbprepa › Origines autorisées : * ou https://gvs93.github.io'); }
+      let json; try { json = await resp.json(); } catch (_) { throw new Error('Réponse non JSON (HTTP ' + resp.status + ')'); }
+      if (!resp.ok || !json.ok) throw new Error(json.error || ('HTTP ' + resp.status));
+      return json;
+    }
+    const psIdOf = o => String(o.orderId || '').replace(/^PST?_/, '');
+    // Fusionne le JSON kbprepa dans day_<dayKey>_orders. Ajout seulement : les commandes PS déjà
+    // présentes gardent leurs casiers ; les commandes Mongo (sans _ps) ne sont jamais touchées.
+    async function psMergeDay(dayKey, json, opts) {
+      const test = !!(opts && opts.test);
+      const who = (opts && opts.who) || 'auto';
+      const existing = await storage.getDoc(`day_${dayKey}_orders`, 'data');
+      const ex = (existing && existing.orders) || [];
+      const base = ex.filter(o => !o._ps);
+      let keep = ex.filter(o => o._ps);
+      const modeSwitch = keep.some(o => !!o._test !== test);
+      if (modeSwitch) keep = [];
+      const list = (json && json.orders) || [];
+      const inJson = new Set(list.map(po => String(po.id_order)));
+      const known = new Set(keep.map(psIdOf));
+      const gone = keep.filter(o => !inJson.has(psIdOf(o))).length;
+      const offsetBySite = {};
+      keep.forEach(o => { offsetBySite[o.site] = (offsetBySite[o.site] || 0) + 1; });
+      const prodById = (await readCache('products')) || {};
+      const fresh = prestaToOrders({ orders: list.filter(po => !known.has(String(po.id_order))) }, { test, prodById, baseOrders: [...base, ...keep], offsetBySite });
+      const psFinal = [...keep, ...fresh];
+      const bySite = {}; psFinal.forEach(o => { bySite[o.site] = (bySite[o.site] || 0) + 1; });
+      const unknown = Object.keys(bySite).filter(k => /^PS\d+$/.test(k));
+      const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, written: false };
+      if (!fresh.length && !modeSwitch) return res;
+      if (!existing && !psFinal.length) return res;
+      const now = new Date().toISOString();
+      const src0 = existing && existing.source ? String(existing.source).replace(/\+?prestashop(-test)?/g, '') : '';
+      const merged = [...base, ...psFinal];
+      await storage.setDoc(`day_${dayKey}_orders`, 'data', {
+        orders: merged, count: merged.length,
+        source: (src0 ? src0 + '+' : '') + (test ? 'prestashop-test' : 'prestashop'),
+        targetDate: dayKey,
+        uploadedBy: (existing && existing.uploadedBy) || who,
+        uploadedAt: (existing && existing.uploadedAt) || now,
+        psTest: test, psCount: psFinal.length, psLoadedAt: now, psLoadedBy: who,
+      });
+      res.written = true;
+      return res;
+    }
+    async function psSetStatus(obj) {
+      try { await storage.setDoc('app_config', 'kbprepa_status', { ...obj, at: new Date().toISOString() }, { replace: true }); } catch (_) {}
+    }
+    // Synchro automatique : lendemain, dès PS_AUTO_HOUR, toutes les PS_REFRESH_MIN min, un seul poste à la fois.
+    async function psAutoSync(who) {
+      if (!firebaseConfigured) return null;
+      if (new Date().getHours() < PS_AUTO_HOUR) return null;
+      const cfg = (await storage.getDoc('app_config', 'kbprepa')) || {};
+      if (!cfg.url || cfg.auto === false) return null;
+      const dayKey = addDays(todayKey(), 1);
+      const st = await storage.getDoc('app_config', 'kbprepa_status');
+      if (st && st.dayKey === dayKey && st.at) {
+        const age = Date.now() - new Date(st.at).getTime();
+        if (age < (st.error ? PS_ERROR_RETRY_MIN : PS_REFRESH_MIN) * 60000) return null;
+      }
+      const lock = await storage.getDoc('app_config', 'kbprepa_lock');
+      if (lock && lock.at && lock.by !== who && (Date.now() - new Date(lock.at).getTime()) < 120000) return null;
+      await storage.setDoc('app_config', 'kbprepa_lock', { at: new Date().toISOString(), by: who || 'auto' }, { replace: true });
+      const by = (who || '?') + ' (auto)';
+      try {
+        const json = await psFetchJson(cfg.url, dayKey);
+        const r = await psMergeDay(dayKey, json, { test: !!cfg.test, who: by });
+        await psSetStatus({ dayKey, count: (json.orders || []).length, total: r.total, added: r.added, gone: r.gone, unknown: r.unknown, test: !!cfg.test, by, auto: true, error: '' });
+        return r;
+      } catch (e) {
+        await psSetStatus({ dayKey, count: null, added: 0, test: !!cfg.test, by, auto: true, error: String(e.message || e) });
+        return null;
+      }
+    }
+
     function parseConsumersById(jsonTextOrArr) {
       const data = typeof jsonTextOrArr === 'string' ? JSON.parse(jsonTextOrArr) : jsonTextOrArr;
       const arr = Array.isArray(data) ? data : (data.consumers || []);
@@ -1875,10 +2023,10 @@
     // Renvoie [{casier, qty}] (qty effectivement servie, casiers non servis omis)
     function attributeToCasiers(casiers, allocated, order = 'biggest') {
       const sorted = [...casiers].sort((a, b) => {
-        if (order === 'casier') return parseInt(a.casier, 10) - parseInt(b.casier, 10);
+        if (order === 'casier') return casCmp(a.casier, b.casier);
         // 'biggest' : plus grosse commande d'abord ; à égalité, casier croissant
         if (b.qty !== a.qty) return b.qty - a.qty;
-        return parseInt(a.casier, 10) - parseInt(b.casier, 10);
+        return casCmp(a.casier, b.casier);
       });
       const out = [];
       let left = allocated;
@@ -1889,7 +2037,7 @@
         left -= give;
       }
       // ré-ordonne le rendu par casier croissant pour rester lisible côté distributeur
-      return out.sort((a, b) => parseInt(a.casier, 10) - parseInt(b.casier, 10));
+      return out.sort((a, b) => casCmp(a.casier, b.casier));
     }
 
     function enrichOrders(orders, consumersByEmail) {
@@ -13448,6 +13596,16 @@
       const [progmagText, setProgmagText] = React.useState(null);
       const [progmagName, setProgmagName] = React.useState('');
       const [progmagDate, setProgmagDate] = React.useState(todayKey());
+      // V9.52 — PrestaShop (module kbprepa)
+      const [psUrl, setPsUrl] = React.useState(() => { try { return localStorage.getItem('kb_ps_url') || ''; } catch (_) { return ''; } });
+      const [psShowUrl, setPsShowUrl] = React.useState(false);
+      const [psTest, setPsTest] = React.useState(() => { try { return localStorage.getItem('kb_ps_test') !== '0'; } catch (_) { return true; } });
+      const [psDate, setPsDate] = React.useState(() => activeDay());
+      const [psResult, setPsResult] = React.useState(null);
+      const [psAuto, setPsAuto] = React.useState(true);
+      const [psStatus, setPsStatus] = React.useState(null);
+      React.useEffect(() => { (async () => { try { const d = await storage.getDoc('app_config', 'kbprepa'); if (d) { if (d.url && !psUrl) setPsUrl(d.url); if (typeof d.test === 'boolean') setPsTest(d.test); setPsAuto(d.auto !== false); } } catch (_) {} })(); }, []);
+      React.useEffect(() => storage.subscribe('app_config', arr => setPsStatus(arr.find(d => d.id === 'kbprepa_status') || null)), []);
       const [v4Result, setV4Result] = React.useState(null);   // {orders, missingConsumers, missingProducts}
       const [showSecours, setShowSecours] = React.useState(false); // ancien chargement PDF/CSV (repli)
 
@@ -13537,8 +13695,11 @@
 
           const res = parseOrdersJSON(v4Orders, prodById, consById);
           const dayKey = res.dateKey || targetDate;
+          // V9.52 — on conserve les commandes PrestaShop déjà fusionnées pour ce jour (Mongo ne les écrase pas)
+          let psKeep = [];
+          try { const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data'); psKeep = (ex && ex.orders) ? ex.orders.filter(o => o._ps) : []; } catch (_) {}
           await storage.setDoc(`day_${dayKey}_orders`, 'data', {
-            orders: res.orders,
+            orders: [...res.orders, ...psKeep],
             uploadedBy: session.name,
             uploadedAt: new Date().toISOString(),
             count: res.orders.length,
@@ -13603,6 +13764,42 @@
           if (dayKey !== todayKey()) {
             setTimeout(() => window.location.reload(), 1200);
           }
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+
+      // V9.52 — PrestaShop : mémorise l'URL + le mode test (local + Firestore pour tous les masters)
+      const psSaveConfig = async (url, test, auto) => {
+        const a = auto === undefined ? psAuto : !!auto;
+        try { localStorage.setItem('kb_ps_url', url || ''); localStorage.setItem('kb_ps_test', test ? '1' : '0'); } catch (_) {}
+        try { await storage.setDoc('app_config', 'kbprepa', { url: url || '', test: !!test, auto: a, updatedBy: session.name, updatedAt: new Date().toISOString() }); } catch (_) {}
+      };
+      const handlePrestaLoad = async () => {
+        if (!psUrl || !/^https?:\/\//i.test(psUrl.trim())) { showToast('Colle l\'URL du module kbprepa (PrestaShop › Configurer)'); return; }
+        if (!psDate) { showToast('Choisis la date de distribution'); return; }
+        setBusy(true); setPsResult(null);
+        try {
+          await psSaveConfig(psUrl.trim(), psTest);
+          const json = await psFetchJson(psUrl, psDate);
+          const r = await psMergeDay(psDate, json, { test: psTest, who: session.name });
+          await psSetStatus({ dayKey: psDate, count: (json.orders || []).length, total: r.total, added: r.added, gone: r.gone, unknown: r.unknown, test: psTest, by: session.name, auto: false, error: '' });
+          setPsResult({ ...r, date: psDate });
+          showToast(`✓ PrestaShop${psTest ? ' (TEST)' : ''} : +${r.added} nouvelle(s), ${r.total} au total (${psDate})`);
+          if (psDate !== activeDay() && window.confirm(`Commandes PrestaShop fusionnées pour le ${psDate}.\n\nAfficher cette date maintenant ?`)) setActiveDay(psDate);
+        } catch (e) { showToast('Erreur PrestaShop : ' + e.message); }
+        finally { setBusy(false); }
+      };
+      const handlePrestaRemove = async () => {
+        if (!window.confirm(`Retirer toutes les commandes PrestaShop du ${psDate} ?\n(Les commandes Mongo ne sont pas touchées.)`)) return;
+        setBusy(true);
+        try {
+          const existing = await storage.getDoc(`day_${psDate}_orders`, 'data');
+          if (!existing || !existing.orders) { showToast('Aucune commande pour cette date'); return; }
+          const base = existing.orders.filter(o => !o._ps);
+          const n = existing.orders.length - base.length;
+          await storage.setDoc(`day_${psDate}_orders`, 'data', { orders: base, count: base.length, source: String(existing.source || '').replace(/\+?prestashop(-test)?/g, '') || 'v4-json', psTest: false, psCount: 0, uploadedBy: session.name, uploadedAt: new Date().toISOString() });
+          setPsResult(null);
+          showToast(`✓ ${n} commande(s) PrestaShop retirée(s)`);
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
       };
@@ -13856,6 +14053,57 @@
                 <div style={{fontSize:11,color:'var(--ink-soft)',marginTop:6}}>Fusionné avec les commandes existantes de cette date, sous le site « TEST PROGMAG ». Date pré-remplie depuis le fichier (à vérifier).</div>
               </div>
             )}
+
+            {/* V9.52 — Nouveau site PrestaShop (module kbprepa) */}
+            <div style={{margin:'4px 0 10px',padding:10,border:'2px dashed '+(psTest?'#d97706':'var(--accent)'),borderRadius:10,background:psTest?'#fff7ed':'var(--accent-soft)'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:6}}>
+                <div style={{fontSize:13,fontWeight:800}}>🛒 Nouveau site PrestaShop (lien kbprepa)</div>
+                <label style={{display:'flex',alignItems:'center',gap:6,fontSize:13,fontWeight:800,color:psTest?'#b45309':'var(--ink-soft)',whiteSpace:'nowrap',cursor:'pointer'}}>
+                  <input type="checkbox" checked={psTest} onChange={e => { setPsTest(e.target.checked); psSaveConfig(psUrl.trim(), e.target.checked); }} />
+                  🧪 Mode test
+                </label>
+              </div>
+              <div style={{display:'flex',gap:6}}>
+                <input type={psShowUrl ? 'text' : 'password'} value={psUrl} placeholder="https://…/module/kbprepa/export?token=…" onChange={e => setPsUrl(e.target.value)} onBlur={() => psUrl && psSaveConfig(psUrl.trim(), psTest)} autoComplete="off" style={{flex:1,minWidth:0,padding:'7px 8px',borderRadius:6,border:'1px solid var(--line)',fontSize:12}} />
+                <button className="btn-ghost" style={{fontSize:12,padding:'4px 8px'}} onClick={() => setPsShowUrl(v => !v)}>{psShowUrl ? '🙈' : '👁'}</button>
+              </div>
+              <div style={{display:'flex',gap:6,alignItems:'center',marginTop:6}}>
+                <span style={{fontSize:12}}>📅</span>
+                <input type="date" value={psDate} onChange={e => setPsDate(e.target.value || todayKey())} style={{padding:'5px 8px',borderRadius:6,border:'1px solid var(--line)'}} />
+              </div>
+              <label style={{display:'flex',alignItems:'center',gap:6,fontSize:12,marginTop:8,cursor:'pointer'}}>
+                <input type="checkbox" checked={psAuto} onChange={e => { setPsAuto(e.target.checked); psSaveConfig(psUrl.trim(), psTest, e.target.checked); }} />
+                ⏱ Automatique : commandes du <b>lendemain</b> dès {PS_AUTO_HOUR}h, puis toutes les {PS_REFRESH_MIN} min (poste Master ou Prépa ouvert)
+              </label>
+              {psStatus && (() => {
+                const ago = psStatus.at ? Math.max(0, Math.round((Date.now() - new Date(psStatus.at).getTime()) / 60000)) : null;
+                return (
+                  <div style={{fontSize:12,padding:8,borderRadius:8,marginTop:6,background:psStatus.error?'#fdecea':'#fff',border:'1px solid var(--line)'}}>
+                    {psStatus.error
+                      ? <>⚠️ Dernière synchro en erreur ({psStatus.dayKey}, il y a {ago} min) : {psStatus.error}</>
+                      : <>✓ Dernière synchro {psStatus.auto ? 'auto' : 'manuelle'}{psStatus.test ? ' · TEST' : ''} : <b>{psStatus.total != null ? psStatus.total : psStatus.count}</b> commande(s) pour le {psStatus.dayKey}{psStatus.added ? ` · +${psStatus.added} nouvelle(s)` : ''} — il y a {ago} min ({psStatus.by})</>}
+                    {!psStatus.error && psStatus.gone > 0 && <div style={{marginTop:3,color:'#b45309',fontWeight:700}}>⚠️ {psStatus.gone} commande(s) chargée(s) n'existent plus côté PrestaShop (annulées ?) — non retirées automatiquement.</div>}
+                    {!psStatus.error && psStatus.unknown && psStatus.unknown.length > 0 && <div style={{marginTop:3,color:'#b91c1c',fontWeight:700}}>⚠️ Lieu(x) sans code site : {psStatus.unknown.join(', ')}</div>}
+                  </div>
+                );
+              })()}
+              <button className="btn-primary btn-block" disabled={busy || !psUrl} onClick={handlePrestaLoad} style={{marginTop:8,background:psTest?'#d97706':undefined,borderColor:psTest?'#d97706':undefined}}>
+                {busy ? 'Récupération…' : (psTest ? '🧪 Récupérer & fusionner (TEST)' : 'Récupérer & fusionner PrestaShop')}
+              </button>
+              <button className="btn-ghost btn-block" disabled={busy} onClick={handlePrestaRemove} style={{marginTop:4,fontSize:12}}>🗑 Retirer les commandes PrestaShop de cette date</button>
+              <div style={{fontSize:11,color:'var(--ink-soft)',marginTop:6}}>
+                {psTest
+                  ? 'Mode test : noms et articles marqués « [TEST] » en prépa/distrib, casiers fictifs en lettres (A, B…), hors CA. Le chargement Mongo n\'est pas touché.'
+                  : 'Mode réel : casiers numérotés à la suite des casiers Mongo du site. Charge le fichier Mongo AVANT 10h.'}
+              </div>
+              {psResult && (
+                <div className={psResult.unknown.length ? 'alert-red' : 'alert-success'} style={{marginTop:8,fontSize:12}}>
+                  ✓ +{psResult.added} nouvelle(s) · {psResult.total} commande(s) PrestaShop{psResult.test ? ' · TEST' : ''} · {psResult.date} — à côté de {psResult.base} commande(s) Mongo{psResult.modeSwitch ? ' · reconstruites (changement test/réel)' : ''}
+                  <div style={{marginTop:3}}>{Object.entries(psResult.bySite).map(([k, v]) => k + ' ' + v).join(' · ') || '—'}</div>
+                  {psResult.unknown.length > 0 && <div style={{marginTop:3,fontWeight:700}}>⚠️ Lieu(x) sans code site : {psResult.unknown.join(', ')} → compléter la table « Lieux de retrait » du module.</div>}
+                </div>
+              )}
+            </div>
 
             <button className="btn-primary btn-block" disabled={busy || !v4Orders} onClick={handleV4Load}>
               {busy ? 'Chargement…' : 'Charger la distribution'}
@@ -15989,6 +16237,17 @@
         if (viewAs === 'distrib' || viewAs === 'prep') return; // en vue distrib/prépa : on laisse Clients/Clôture
         if (tab === 'clients' || tab === 'closure') setTab('masterrecap');
       }, [session, tab, viewAs]);
+
+      // V9.53 — Synchro PrestaShop automatique sur les postes Master et Prépa (auto-limitée à 1 appel / 15 min).
+      React.useEffect(() => {
+        if (!session) return;
+        if (!(session.role === 'master' || session.isMaster || session.role === 'prep')) return;
+        let stop = false;
+        const run = () => { if (!stop) psAutoSync(session.name).catch(() => {}); };
+        const t0 = setTimeout(run, 8000);
+        const t = setInterval(run, 60000);
+        return () => { stop = true; clearTimeout(t0); clearInterval(t); };
+      }, [session && session.name, session && session.role]);
 
       // Si distrib (uniquement) sur admin/stats à l'ouverture, rediriger
       // Important : NE PAS affecter les prépas ni le master
