@@ -627,7 +627,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.56';
+    const APP_VERSION = 'V9.57';
     // V9.55 — SÉCURITÉ phase 2 : proxies Apps Script (Freshdesk, FL, Stock) via Cloud Function kbgProxy,
     //   plus d'URL /exec ni de secret dans le HTML ; UUID PayZen hors des commandes (coffre master
     //   payzen_private), effacés après régularisation, purge J+7, bouton « Détruire les UUID du jour ».
@@ -15926,6 +15926,9 @@
       const [body, setBody] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [ignorePassed, setIgnorePassed] = React.useState(false);
+      // V9.57 — envoi par lots de 40 (Freshdesk plante au-delà) + reprise si un lot échoue
+      const [progress, setProgress] = React.useState(null); // { done, total, lot, lots }
+      const [resume, setResume] = React.useState(null);     // { remaining:[emails], sent }
 
       // Sites présents dans les commandes du jour
       const sitesOfDay = React.useMemo(() => {
@@ -15952,19 +15955,56 @@
         setBody(t.body.replace(/\{SITE\}/g, siteTxt));
       };
 
+      // Toute modif du périmètre / du message annule une reprise en attente
+      React.useEffect(() => { setResume(null); }, [scope, site, ignorePassed, subject, body]);
+
+      const MAIL_BATCH_SIZE = 40;
+      const sendBatch = async (list, withBccSelf) => {
+        let last = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await new Promise(r => setTimeout(r, 2000));
+          try {
+            const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'client_bulk_mail',
+              subject, body, emails: list, bccSelf: withBccSelf ? MAIL_BCC_SELF : '' });
+            if (data && data.ok) return;
+            last = new Error((data && data.error) || 'réponse inconnue');
+          } catch (e) { last = e; }
+        }
+        throw last;
+      };
+
       const send = async () => {
         if (scope === 'site' && !site) { showToast('Choisis un local'); return; }
-        if (emails.length === 0) { showToast('Aucun client avec email dans ce périmètre'); return; }
+        const list = resume ? resume.remaining : emails;
+        const alreadySent = resume ? resume.sent : 0;
+        if (list.length === 0) { showToast('Aucun client avec email dans ce périmètre'); return; }
         if (!subject.trim() || !body.trim()) { showToast('Objet et message requis'); return; }
-        if (!confirm(`Envoyer ce mail à ${emails.length} client(s) en copie cachée (BCC) ?`)) return;
+        const lots = Math.ceil(list.length / MAIL_BATCH_SIZE);
+        const msg = resume
+          ? `Reprendre l'envoi : ${list.length} client(s) restant(s), ${lots} lot(s) de ${MAIL_BATCH_SIZE} max ?`
+          : `Envoyer ce mail à ${list.length} client(s) en copie cachée (BCC) ?\n${lots} lot(s) de ${MAIL_BATCH_SIZE} max.`;
+        if (!confirm(msg)) return;
         setBusy(true);
+        let sent = 0;
         try {
-          const data = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'client_bulk_mail',
-            subject, body, emails, bccSelf: MAIL_BCC_SELF });
-          if (!data.ok) { showToast('Erreur : ' + (data.error || 'inconnue')); setBusy(false); return; }
-          showToast(`✓ Mail envoyé à ${emails.length} client(s) depuis contact@ (BCC)`);
-        } catch (e) { showToast('Erreur réseau : ' + e.message); }
-        finally { setBusy(false); }
+          for (let i = 0; i < lots; i++) {
+            const chunk = list.slice(i * MAIL_BATCH_SIZE, (i + 1) * MAIL_BATCH_SIZE);
+            setProgress({ done: alreadySent + sent, total: alreadySent + list.length, lot: i + 1, lots });
+            try {
+              // Copie à hg@ une seule fois (1er lot du 1er envoi), pas à chaque lot
+              await sendBatch(chunk, !resume && i === 0);
+            } catch (e) {
+              const remaining = list.slice(i * MAIL_BATCH_SIZE);
+              setResume({ remaining, sent: alreadySent + sent });
+              showToast(`⚠️ Lot ${i + 1}/${lots} en échec (${kbErrMsg(e)}). ${alreadySent + sent} envoyé(s), ${remaining.length} restant(s) → « Reprendre »`);
+              return;
+            }
+            sent += chunk.length;
+            if (i < lots - 1) await new Promise(r => setTimeout(r, 1500));
+          }
+          setResume(null);
+          showToast(`✓ Mail envoyé à ${alreadySent + sent} client(s) depuis contact@ (BCC, ${lots} lot(s))`);
+        } finally { setBusy(false); setProgress(null); }
       };
 
       return (
@@ -15995,8 +16035,19 @@
           </div>
           <input value={subject} onChange={e=>setSubject(e.target.value)} placeholder="Objet du mail" style={{width:'100%',fontSize:15,padding:'8px'}} />
           <textarea value={body} onChange={e=>setBody(e.target.value)} placeholder="Message…" rows={7} style={{width:'100%',fontSize:14,padding:'8px',resize:'vertical'}} />
-          <button className="btn-primary btn-block" disabled={busy || emails.length===0} onClick={send}>
-            {busy ? 'Envoi…' : `Envoyer à ${emails.length} client(s) (BCC)`}
+          {progress && (
+            <div style={{fontSize:12,color:'var(--accent)'}}>
+              Lot {progress.lot}/{progress.lots} — {progress.done}/{progress.total} envoyé(s)…
+              <div style={{height:6,background:'var(--line, #e5e5e5)',borderRadius:3,marginTop:4}}>
+                <div style={{height:6,width:`${Math.round(100*progress.done/Math.max(1,progress.total))}%`,background:'var(--accent)',borderRadius:3}} />
+              </div>
+            </div>
+          )}
+          {resume && !busy && (
+            <div style={{fontSize:12,color:'var(--warn)'}}>⚠️ Envoi interrompu : {resume.sent} envoyé(s), {resume.remaining.length} restant(s).</div>
+          )}
+          <button className="btn-primary btn-block" disabled={busy || (!resume && emails.length===0)} onClick={send}>
+            {busy ? 'Envoi…' : resume ? `Reprendre (${resume.remaining.length} restant(s))` : `Envoyer à ${emails.length} client(s) (BCC)${emails.length > MAIL_BATCH_SIZE ? ` — ${Math.ceil(emails.length/MAIL_BATCH_SIZE)} lots` : ''}`}
           </button>
           {!FRESHDESK_PROXY_URL && <div style={{fontSize:11,color:'var(--warn)'}}>⚠️ FRESHDESK_PROXY_URL vide.</div>}
         </div>
