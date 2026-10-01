@@ -627,7 +627,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.57';
+    const APP_VERSION = 'V9.58';
     // V9.55 — SÉCURITÉ phase 2 : proxies Apps Script (Freshdesk, FL, Stock) via Cloud Function kbgProxy,
     //   plus d'URL /exec ni de secret dans le HTML ; UUID PayZen hors des commandes (coffre master
     //   payzen_private), effacés après régularisation, purge J+7, bouton « Détruire les UUID du jour ».
@@ -7990,7 +7990,11 @@
             <div style={{height:'100%',borderRadius:99,background:pct>=100?'#2e7d32':'#ef6c00',width:pct+'%',transition:'width .4s'}}/>
           </div>
           <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:'var(--ink-mute)',marginBottom:8}}>
-            <span>🎯 à faire : <b>{est||'—'}</b></span>
+            {item._reel ? (
+              <span>📦 Stock PDP <b>{item._reel.stock}</b> · 🧾 Cmd <b>{item._reel.commandes}</b> · 🎯 à faire <b style={{color:'#ef6c00'}}>{est}</b></span>
+            ) : (
+              <span>🎯 à faire : <b>{est||'—'}</b></span>
+            )}
             {doneCount>0 && <span style={{color:'#2e7d32'}}>✅ {doneCount} fait{doneCount>1?'s':''}</span>}
           </div>
           {!myActive && busyBy.length>0 && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>🧑 {busyBy.join(', ')} en cours…</div>}
@@ -8038,6 +8042,143 @@
       );
     }
 
+
+    // ============================================================
+    // V9.58 — MU RÉELLE : stock PDP de sachets (surplus de MU) reporté
+    // d'un jour sur l'autre.
+    //   Reste du soir = Stock PDP (début) + Fait − Commandes
+    //   → devient le Stock PDP du jour de MU suivant.
+    //   À faire = max(0, Commandes − Stock PDP).
+    // Commandes = colonne VENTES DU JOUR du Sheet FL (repli : ESTIMATION MU).
+    // Stockage : doc « _reel » dans la collection du jour mu_<AAAA-MM-JJ>
+    //   { items:{ <clé>:{product, stock, commandes} }, overrides:{ <clé>: n|null } }
+    // Point de départ (si aucun calcul antérieur) : colonne STOCK MU du Sheet
+    // (inventaire). Un inventaire FL validé APRÈS le dernier calcul ET ayant
+    // compté des sachets (nbMu > 0) remplace le calcul (= quantité réelle).
+    // ============================================================
+    const MU_REEL_DOC = '_reel';
+    function muKey(name){ return normalizeText(String(name||'')).replace(/[^a-z0-9]+/g,' ').trim(); } // clé Firestore sûre (pas de . / [ ])
+    function muShiftDate(dateKey, delta){
+      const [y,m,d] = String(dateKey).split('-').map(Number);
+      const dt = new Date(y, m-1, d+delta);
+      return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+    }
+    function muNum(v){ const n = parseFloat(String(v==null?'':v).replace(',','.')); return isNaN(n)?null:n; }
+    // Index du Sheet FL (lignes fl_read) : ventes du jour / stock MU / estimation par produit
+    function muFlIndex(flRows){
+      const out = {};
+      if(!flRows || !flRows.length) return out;
+      const H = flRows[0].map(h=>normalizeText(String(h||'')).trim());
+      const find=(preds)=>{ for(const p of preds){ const i=H.findIndex(h=>p(h)); if(i>=0) return i; } return -1; };
+      const iProd = find([h=>h==='designation', h=>h.includes('designation'), h=>h.includes('produit')]);
+      const iVen  = find([h=>h.includes('ventes du jour'), h=>h.includes('ventes')]);
+      const iStk  = find([h=>h==='stock mu', h=>h.includes('stock mu')]);
+      const iEst  = find([h=>h.includes('estimation')]);
+      if(iProd<0) return out;
+      for(let r=1;r<flRows.length;r++){
+        const row = flRows[r]; if(!row) continue;
+        const k = muKey(row[iProd]); if(!k || out[k]) continue;
+        out[k] = { ventes: iVen>=0?muNum(row[iVen]):null, stockMu: iStk>=0?muNum(row[iStk]):null, est: iEst>=0?muNum(row[iEst]):null };
+      }
+      return out;
+    }
+    // Sachets réellement faits par produit sur une journée (somme des MU validées)
+    function muFaitFromEntries(list){
+      const out = {};
+      (list||[]).forEach(e=>{ if(e && e.status==='done' && e.product){ const k=muKey(e.product); out[k]=(out[k]||0)+(e.done||0); } });
+      return out;
+    }
+    function muStockOfSnap(snap, k){
+      const ov = snap && snap.overrides ? snap.overrides[k] : null;
+      if(ov!=null && !isNaN(Number(ov))) return Number(ov);
+      const it = snap && snap.items ? snap.items[k] : null;
+      return it && it.stock!=null ? Number(it.stock)||0 : 0;
+    }
+    // Stock PDP au début de dateKey : { stock:{clé:n}, source, fromDate }
+    async function muComputeStartStock(dateKey, flIdx){
+      const LOOKBACK = 14;
+      const dates = []; for(let i=1;i<=LOOKBACK;i++) dates.push(muShiftDate(dateKey,-i)); // récent → ancien
+      const [snaps, invs] = await Promise.all([
+        Promise.all(dates.map(d=>storage.getDoc('mu_'+d, MU_REEL_DOC).catch(()=>null))),
+        Promise.all(dates.map(d=>storage.getDoc('fl_inventory_meta', d).catch(()=>null))),
+      ]);
+      let snapIdx = snaps.findIndex(x=>x && x.items);
+      // Inventaire FL ayant compté des sachets, le plus récent
+      let invIdx = invs.findIndex(x=>x && Number(x.nbMu||0)>0);
+      const fromSheet = (src, d)=>{ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return { stock, source:src, fromDate:d }; };
+      if(invIdx>=0 && (snapIdx<0 || invIdx<=snapIdx)) return fromSheet('inventaire', dates[invIdx]);
+      if(snapIdx<0) return fromSheet('sheet', null);
+      const d = dates[snapIdx], snap = snaps[snapIdx];
+      const fait = muFaitFromEntries(await storage.getAll('mu_'+d).catch(()=>[]));
+      const keys = new Set([...Object.keys(snap.items||{}), ...Object.keys(snap.overrides||{}), ...Object.keys(fait)]);
+      const stock = {};
+      keys.forEach(k=>{
+        const it = (snap.items||{})[k] || {};
+        const reste = muStockOfSnap(snap,k) + (fait[k]||0) - (Number(it.commandes)||0);
+        stock[k] = Math.max(0, Math.round(reste));
+      });
+      return { stock, source:'calc', fromDate:d };
+    }
+    // Hook : lignes MU réelle pour la journée (items = liste get-mu-list, entries = map mu_<jour>)
+    function useMuReel(dateKey, items, flRows, entries){
+      const flIdx = React.useMemo(()=>muFlIndex(flRows), [flRows]);
+      const [start,setStart] = React.useState(null);
+      const ready = items!==null && flRows!==null;
+      React.useEffect(()=>{
+        if(!ready) return;
+        let stop=false;
+        muComputeStartStock(dateKey, flIdx).then(r=>{ if(!stop) setStart(r); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null}); });
+        return ()=>{ stop=true; };
+      },[ready, dateKey, flIdx]);
+      const snapToday = entries ? entries[MU_REEL_DOC] : null;
+      const faitToday = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
+      const rows = React.useMemo(()=>{
+        const out = [];
+        (items||[]).forEach(it=>{
+          const name = muName(it), k = muKey(name);
+          const fl = flIdx[k];
+          const commandes = (fl && fl.ventes!=null) ? Math.max(0,Math.round(fl.ventes)) : Math.max(0,Math.round(muEst(it)));
+          const ov = snapToday && snapToday.overrides ? snapToday.overrides[k] : null;
+          const auto = start ? (start.stock[k]||0) : 0;
+          const stock = (ov!=null && !isNaN(Number(ov))) ? Number(ov) : auto;
+          const fait = faitToday[k]||0;
+          out.push({ key:k, name, uv:it.uv||'', item:it, commandes, stock, auto, overridden: ov!=null, fait,
+            aFaire: Math.max(0, commandes - stock), reste: stock + fait - commandes });
+        });
+        return out;
+      },[items, flIdx, start, snapToday, faitToday]);
+      const byKey = React.useMemo(()=>{ const m={}; rows.forEach(r=>{ m[r.key]=r; }); return m; },[rows]);
+      // Photo du jour (stock auto + commandes) → sert au report du lendemain
+      const lastSaved = React.useRef('');
+      React.useEffect(()=>{
+        if(!start || !ready || start.source==='erreur' || !rows.length) return;
+        const itemsMap = {}; rows.forEach(r=>{ itemsMap[r.key] = { product:r.name, stock:r.auto, commandes:r.commandes }; });
+        const sig = JSON.stringify(itemsMap);
+        if(sig===lastSaved.current) return;
+        const prev = snapToday && snapToday.items ? JSON.stringify(Object.fromEntries(Object.keys(itemsMap).map(k=>[k, snapToday.items[k] ? { product:snapToday.items[k].product, stock:snapToday.items[k].stock, commandes:snapToday.items[k].commandes } : null]))) : '';
+        lastSaved.current = sig;
+        if(prev===sig) return;
+        storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { date:dateKey, items:itemsMap, source:start.source, fromDate:start.fromDate||'', updatedAt:Date.now() }).catch(()=>{});
+      },[start, ready, rows, dateKey, snapToday]);
+      const setOverride = (k, v, by) => storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { overrides:{ [k]: v }, overriddenBy:{ [k]: v==null?null:{ by:by||'—', at:Date.now() } } });
+      return { rows, byKey, start, ready: !!start, setOverride };
+    }
+
+    // V9.58 — champ de recherche avec croix pour tout effacer d'un coup
+    function MuSearch({ value, onChange, placeholder }) {
+      const ref = React.useRef(null);
+      return (
+        <div style={{position:'relative',flex:1}}>
+          <input ref={ref} type="text" placeholder={placeholder} value={value} onChange={e=>onChange(e.target.value)}
+            style={{width:'100%',padding:'10px 40px 10px 10px',borderRadius:8,border:'1.5px solid #ddd',boxSizing:'border-box'}}/>
+          {value && (
+            <button type="button" aria-label="Effacer la recherche" onClick={()=>{ onChange(''); ref.current && ref.current.focus(); }}
+              style={{position:'absolute',right:4,top:'50%',transform:'translateY(-50%)',width:32,height:32,borderRadius:'50%',border:'none',background:'#e6e8ec',color:'#555',fontSize:16,fontWeight:900,lineHeight:'32px',padding:0,cursor:'pointer'}}>✕</button>
+          )}
+        </div>
+      );
+    }
+
     function MuDuJourPage({ session, setTab }) {
       const operator = session.name;
       const dateKey = todayKey();
@@ -8076,6 +8217,8 @@
       },[]);
       React.useEffect(()=>{ loadList(); },[loadList]);
       React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; arr.forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
+      // V9.58 — MU réelle : stock PDP reporté, à faire = commandes − stock
+      const reel = useMuReel(dateKey, items, flRows, entries);
 
       const byProduct = React.useMemo(()=>{
         const idx={};
@@ -8101,8 +8244,17 @@
         return list.sort((a,b)=> String(a.operator).localeCompare(String(b.operator)));
       },[entries]);
 
-      const plannedItems = React.useMemo(()=> (items||[]).filter(it=>muEst(it)>0), [items]);
-      const extraPool    = React.useMemo(()=> (items||[]).filter(it=>muEst(it)<=0), [items]);
+      // V9.58 — l'estimation devient « à faire » = max(0, commandes − stock PDP)
+      const effItems = React.useMemo(()=> (items||[]).map(it=>{
+        const r = reel.byKey[muKey(muName(it))];
+        if(!r) return it;
+        return { ...it, estimation: r.aFaire, _orig: muEst(it), _reel: { stock:r.stock, commandes:r.commandes } };
+      }), [items, reel.byKey]);
+      const hasNeed = (it)=> (it._reel ? it._reel.commandes>0 : muEst(it)>0);
+      const plannedAll   = React.useMemo(()=> effItems.filter(hasNeed), [effItems]);
+      const plannedItems = React.useMemo(()=> plannedAll.filter(it=>muEst(it)>0), [plannedAll]);
+      const coveredItems = React.useMemo(()=> plannedAll.filter(it=>muEst(it)<=0), [plannedAll]);
+      const extraPool    = React.useMemo(()=> effItems.filter(it=>!hasNeed(it)), [effItems]);
       const [extraAdded,setExtraAdded]=React.useState({});
       const addExtra=(it)=>setExtraAdded(p=>({ ...p, [muName(it)]:it }));
 
@@ -8188,9 +8340,14 @@
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap'}}>
             <h1 style={{margin:0,display:'flex',alignItems:'center',gap:8}}><MuGlyph size={24} /> MU <span style={{fontSize:12,fontWeight:400,color:'var(--ink-mute)'}}>en cours · mise en unité F&L</span></h1>
             {setTab && (
-              <button className="btn-secondary" style={{fontSize:13,padding:'6px 12px',whiteSpace:'nowrap'}} onClick={()=>setTab('mufaite')}>
-                ✅ MU réalisée →
-              </button>
+              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                <button className="btn-secondary" style={{fontSize:13,padding:'6px 12px',whiteSpace:'nowrap'}} onClick={()=>setTab('mufaite')}>
+                  ✅ MU réalisée →
+                </button>
+                <button className="btn-secondary" style={{fontSize:13,padding:'6px 12px',whiteSpace:'nowrap',color:'#2c4a8c',borderColor:'#b9c7e6'}} onClick={()=>setTab('mureel')}>
+                  📦 MU réelle →
+                </button>
+              </div>
             )}
           </div>
           <div style={{background:'#fff8f0',border:'1px solid #ffd8a8',borderRadius:10,padding:'8px 12px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
@@ -8213,7 +8370,7 @@
           )}
 
           <div style={{display:'flex',gap:8,alignItems:'center'}}>
-            <input type="text" placeholder="🔍 Chercher un fruit / légume…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,padding:10,borderRadius:8,border:'1.5px solid #ddd'}}/>
+            <MuSearch placeholder="🔍 Chercher un fruit / légume…" value={search} onChange={setSearch} />
             <button className="btn-secondary" onClick={()=>{loadList();loadFl();}}>↻</button>
           </div>
 
@@ -8240,6 +8397,12 @@
           {items!==null && !error && filtered.length===0 && plannedItems.length>0 && (
             <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)',margin:0}}>🎉 Toutes les MU prévues sont faites.</p></div>
           )}
+          {items!==null && coveredItems.length>0 && (()=>{ const cov = q ? coveredItems.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : coveredItems; return cov.length>0 && (
+            <div className="card" style={{background:'#f1f8e9',border:'1px solid #c5e1a5',padding:'8px 12px'}}>
+              <div style={{fontSize:12,fontWeight:700,color:'#33691e',marginBottom:4}}>✓ Couvert par le stock PDP — rien à faire ({cov.length})</div>
+              <div style={{fontSize:12,color:'#33691e'}}>{cov.map(it=>`${muName(it)} (stock ${it._reel.stock} · cmd ${it._reel.commandes})`).join(' · ')}</div>
+            </div>
+          ); })()}
 
           {items!==null && (
             <div>
@@ -8319,6 +8482,143 @@
       );
     }
 
+
+    /* ============================================================
+       V9.58 — MU RÉELLE : stock PDP de sachets par produit
+       Stock PDP (début) · Commandes · À faire · Fait · Reste ce soir.
+       Le « reste ce soir » devient le stock PDP du prochain jour de MU
+       → plus besoin d'inventaire MU (sauf contrôle ponctuel).
+       ============================================================ */
+    function MuReelPage({ session, setTab }) {
+      const operator = (session && session.name) || '—';
+      const dateKey = todayKey();
+      const [items,setItems]=React.useState(null);
+      const [flRows,setFlRows]=React.useState(null);
+      const [err,setErr]=React.useState('');
+      const [entries,setEntries]=React.useState({});
+      const [search,setSearch]=React.useState('');
+      const [filter,setFilter]=React.useState('besoin'); // besoin | stock | tout
+      const [editKey,setEditKey]=React.useState(null);
+      const [editVal,setEditVal]=React.useState('');
+      const load = React.useCallback(async ()=>{
+        setErr(''); setItems(null); setFlRows(null);
+        try{
+          const [mu, fl] = await Promise.all([
+            flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'),
+            flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:MU_TAB, ts:Date.now() }).catch(e=>({ ok:false, error:e.message })),
+          ]);
+          if(!mu || mu.success===false) throw new Error((mu&&mu.error)||'liste MU illisible');
+          setItems(mu.items||[]);
+          if(!fl || fl.ok===false){ setFlRows([]); setErr('Sheet FL indisponible ('+((fl&&fl.error)||'?')+') — commandes = estimation MU.'); }
+          else setFlRows(fl.rows||[]);
+        }catch(e){ setItems([]); setFlRows([]); setErr('Chargement impossible : '+e.message); }
+      },[]);
+      React.useEffect(()=>{ load(); },[load]);
+      React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; (arr||[]).forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
+      const reel = useMuReel(dateKey, items, flRows, entries);
+
+      const q = search.trim() ? muStrip(search.toLowerCase()) : null;
+      const rows = React.useMemo(()=>{
+        let l = reel.rows.slice();
+        if(filter==='besoin') l = l.filter(r=>r.commandes>0 || r.fait>0);
+        else if(filter==='stock') l = l.filter(r=>r.stock>0 || r.reste>0);
+        if(q) l = l.filter(r=>muStrip(r.name.toLowerCase()).includes(q));
+        return l.sort((a,b)=> (b.aFaire-a.aFaire) || a.name.localeCompare(b.name));
+      },[reel.rows, filter, q]);
+      const tot = React.useMemo(()=> reel.rows.reduce((t,r)=>({ stock:t.stock+r.stock, cmd:t.cmd+r.commandes, aFaire:t.aFaire+r.aFaire, fait:t.fait+r.fait, reste:t.reste+Math.max(0,r.reste) }), {stock:0,cmd:0,aFaire:0,fait:0,reste:0}), [reel.rows]);
+
+      const src = reel.start;
+      const srcLabel = !src ? 'Calcul du stock PDP…'
+        : src.source==='calc' ? `Stock PDP = reste calculé de la MU du ${src.fromDate}`
+        : src.source==='inventaire' ? `Stock PDP = inventaire (sachets) du ${src.fromDate} — colonne STOCK MU`
+        : src.source==='sheet' ? 'Stock PDP = colonne STOCK MU du Sheet (point de départ, aucun calcul antérieur)'
+        : 'Stock PDP indisponible (erreur de lecture) — compté à 0';
+
+      const saveEdit = (r)=>{ const v=Math.max(0,parseInt(editVal,10)||0); reel.setOverride(r.key, v, operator); setEditKey(null); setEditVal(''); };
+      const resetAuto = (r)=>{ reel.setOverride(r.key, null, operator); setEditKey(null); setEditVal(''); };
+      const cell = (label, val, color)=>(
+        <div style={{textAlign:'center',minWidth:52}}>
+          <div style={{fontSize:18,fontWeight:900,color:color||'inherit',lineHeight:1.1}}>{val}</div>
+          <div style={{fontSize:10,color:'var(--ink-mute)'}}>{label}</div>
+        </div>
+      );
+
+      return (
+        <div className="stack">
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+            <h1 style={{margin:0}}>📦 MU réelle <span style={{fontSize:12,fontWeight:400,color:'var(--ink-mute)'}}>stock PDP de sachets</span></h1>
+            {setTab && (
+              <button className="btn-secondary" style={{fontSize:13,padding:'6px 12px',whiteSpace:'nowrap'}} onClick={()=>setTab('mudujour')}>
+                ← Retour à la MU en cours
+              </button>
+            )}
+          </div>
+          <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
+            <div style={{fontWeight:700,marginBottom:4}}>{srcLabel}</div>
+            <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + Fait − Commandes → devient le stock PDP du prochain jour de MU.</div>
+          </div>
+          {reel.rows.length>0 && (
+            <div className="card" style={{display:'flex',justifyContent:'space-around',flexWrap:'wrap',gap:8,padding:'10px 8px'}}>
+              {cell('Stock PDP', tot.stock, '#2c4a8c')}
+              {cell('Commandes', tot.cmd)}
+              {cell('À faire', tot.aFaire, '#ef6c00')}
+              {cell('Fait', tot.fait, '#2e7d32')}
+              {cell('Reste ce soir', tot.reste, '#2c4a8c')}
+            </div>
+          )}
+          <div style={{display:'flex',gap:8,alignItems:'center'}}>
+            <MuSearch placeholder="🔍 Chercher un fruit / légume…" value={search} onChange={setSearch} />
+            <button className="btn-secondary" onClick={load}>↻</button>
+          </div>
+          <div className="filter-row" style={{marginBottom:0}}>
+            <div className={`chip ${filter==='besoin'?'selected':''}`} onClick={()=>setFilter('besoin')}>Commandés / faits</div>
+            <div className={`chip ${filter==='stock'?'selected':''}`} onClick={()=>setFilter('stock')}>En stock</div>
+            <div className={`chip ${filter==='tout'?'selected':''}`} onClick={()=>setFilter('tout')}>Tout ({reel.rows.length})</div>
+          </div>
+          {err && <div className="card" style={{background:'#fff3e0',border:'1px solid #ffcc80'}}><p style={{fontSize:12,color:'#bf6000',margin:0}}>{err}</p></div>}
+          {items===null && <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)',margin:0}}>Chargement…</p></div>}
+          {items!==null && rows.length===0 && <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)',margin:0}}>Aucun produit{q?` pour « ${search.trim()} »`:''}.</p></div>}
+          {rows.map(r=>(
+            <div key={r.key} className="card" style={{borderLeft:'3px solid '+(r.reste<0?'var(--danger)':r.aFaire>0?'#ef6c00':'#2e7d32'),padding:'10px 12px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:15,fontWeight:800,lineHeight:1.15}}>{r.name}</div>
+                  {r.uv && <div style={{fontSize:11,color:'var(--ink-mute)'}}>📏 {r.uv}</div>}
+                  {r.overridden && <div style={{fontSize:11,color:'#b45309'}}>✏️ stock corrigé à la main (auto : {r.auto})</div>}
+                </div>
+                {r.reste<0
+                  ? <div style={{fontSize:12,fontWeight:800,color:'var(--danger)',whiteSpace:'nowrap'}}>manque {-r.reste}</div>
+                  : <div style={{fontSize:12,fontWeight:700,color:'#2c4a8c',whiteSpace:'nowrap'}}>reste {r.reste}</div>}
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',marginTop:8,gap:4}}>
+                {cell('Stock PDP', r.stock, '#2c4a8c')}
+                {cell('Commandes', r.commandes)}
+                {cell('À faire', r.aFaire, r.aFaire>0?'#ef6c00':'#2e7d32')}
+                {cell('Fait', r.fait, '#2e7d32')}
+              </div>
+              {editKey===r.key ? (
+                <div style={{background:'#f7f9ff',borderRadius:10,padding:10,marginTop:8}}>
+                  <div style={{textAlign:'center',fontSize:12,fontWeight:700,color:'#555',marginBottom:6}}>Stock PDP réel (sachets comptés)</div>
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:12}}>
+                    <button className="btn-secondary" style={{width:44,height:44,borderRadius:'50%',fontSize:22,fontWeight:900}} onClick={()=>setEditVal(s=>String(Math.max(0,(parseInt(s,10)||0)-1)))}>−</button>
+                    <input type="number" inputMode="numeric" value={editVal} onChange={e=>setEditVal(e.target.value)} onFocus={e=>e.target.select()} style={{width:72,textAlign:'center',fontSize:28,fontWeight:900,border:'none',background:'transparent'}}/>
+                    <button className="btn-secondary" style={{width:44,height:44,borderRadius:'50%',fontSize:22,fontWeight:900}} onClick={()=>setEditVal(s=>String((parseInt(s,10)||0)+1))}>+</button>
+                  </div>
+                  <div style={{display:'flex',gap:8,marginTop:8,flexWrap:'wrap'}}>
+                    <button className="btn-secondary" onClick={()=>{setEditKey(null);setEditVal('');}}>← Annuler</button>
+                    {r.overridden && <button className="btn-secondary" onClick={()=>resetAuto(r)}>↺ Auto ({r.auto})</button>}
+                    <button className="btn-primary" style={{flex:1,background:'#2c4a8c'}} onClick={()=>saveEdit(r)}>💾 Enregistrer</button>
+                  </div>
+                </div>
+              ) : (
+                <button className="btn-secondary" style={{marginTop:8,fontSize:12,padding:'6px 10px'}} onClick={()=>{setEditKey(r.key);setEditVal(String(r.stock));}}>✏️ Corriger le stock PDP</button>
+              )}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
     /* ============================================================
        MU RÉALISÉE — revenir sur une MU validée du jour
        Corriger la quantité, rouvrir pour reprendre, ou supprimer
@@ -8367,8 +8667,7 @@
           </div>
 
           <div style={{display:'flex',gap:8,alignItems:'center'}}>
-            <input type="text" placeholder="🔍 Chercher une MU réalisée…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,padding:10,borderRadius:8,border:'1.5px solid #ddd'}}/>
-            {search && <button className="btn-secondary" onClick={()=>setSearch('')}>✕</button>}
+            <MuSearch placeholder="🔍 Chercher une MU réalisée…" value={search} onChange={setSearch} />
           </div>
 
           {allDone.length===0 && (
@@ -16690,6 +16989,7 @@
             {tab === 'prepajour' && <PrepaDuJourPage session={effSession} />}
             {tab === 'mudujour' && <MuDuJourPage session={effSession} setTab={setTab} />}
             {tab === 'mufaite' && <MuDonePage session={effSession} setTab={setTab} />}
+            {tab === 'mureel' && <MuReelPage session={effSession} setTab={setTab} />}
             {tab === 'prepdispatch' && <><ManquantsMailPanel orders={orders} session={effSession} /><PrepDispatchPage session={effSession} setSession={setSession} /></>}
             {tab === 'pdpreturns' && <PdpReturnsPage session={effSession} catalogue={catalogue} />}
             {tab === 'dlcwatch' && <DlcWatchPage session={effSession} products={products} orders={orders} catalogue={catalogue} />}
@@ -16701,7 +17001,7 @@
               <button className={tab==='prepajour'?'active':''} onClick={()=>setTab('prepajour')}>
                 <span className="tab-icon">🥬</span>Prépa du jour
               </button>
-              <button className={(tab==='mudujour'||tab==='mufaite')?'active':''} onClick={()=>setTab('mudujour')}>
+              <button className={(tab==='mudujour'||tab==='mufaite'||tab==='mureel')?'active':''} onClick={()=>setTab('mudujour')}>
                 <span className="tab-icon"><MuGlyph size={20} /></span>MU
               </button>
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
