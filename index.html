@@ -8124,11 +8124,12 @@
       const iStk  = find([h=>h==='stock mu', h=>h.includes('stock mu')]);
       const iEst  = find([h=>h.includes('estimation')]);
       const iId   = find([h=>h.includes('id site'), h=>h==='id kbg', h=>h==='id']);
+      const iAct  = find([h=>h.includes('actif')]);
       if(iProd<0) return out;
       for(let r=1;r<flRows.length;r++){
         const row = flRows[r]; if(!row) continue;
         const k = muKey(row[iProd]); if(!k || out[k]) continue;
-        out[k] = { name: String(row[iProd]||'').trim(), id: iId>=0 ? String(row[iId]||'').trim() : '', ventes: iVen>=0?muNum(row[iVen]):null, stockMu: iStk>=0?muNum(row[iStk]):null, est: iEst>=0?muNum(row[iEst]):null };
+        out[k] = { actif: iAct<0 ? true : !/^(non|inactif)/.test(normalizeText(String(row[iAct]||'')).trim()), name: String(row[iProd]||'').trim(), id: iId>=0 ? String(row[iId]||'').trim() : '', ventes: iVen>=0?muNum(row[iVen]):null, stockMu: iStk>=0?muNum(row[iStk]):null, est: iEst>=0?muNum(row[iEst]):null };
       }
       return out;
     }
@@ -8159,13 +8160,19 @@
       if(c1.length===1 || (c1.length>1 && c1[0].extra<c1[1].extra)) return c1[0].k;
       return null;
     }
-    function muExactFromLines(lines, flIdx){
+    // alias = concordances enregistrées par l'opérateur (app_config/mu_alias.map) :
+    //   { <nom normalisé du fichier> : <clé produit Sheet FL> | '__ignore__' (pas un produit MU) }
+    //   Stockées dans l'appli UNIQUEMENT — le Sheet FL n'est jamais modifié.
+    function muExactFromLines(lines, flIdx, alias){
       const byId = {}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.id) byId[v.id]=k; });
-      const exact = {}; let matched = 0, unmatched = 0; const unmatchedNames = {}; const fuzzy = {};
+      const exact = {}; let matched = 0, unmatched = 0, ignored = 0; const unmatchedNames = {}; const fuzzy = {}; const aliased = {};
       (lines||[]).forEach(l=>{
         const q = Number(l.qty)||0; if(q<=0) return;
         let k = (l.id && byId[String(l.id).trim()]) || null;
         const nm = String(l.name||'').replace(/^\[TEST\]\s*/,'');
+        const al = (!k && alias && nm) ? alias[_flNorm(nm)] : null;
+        if(al === '__ignore__'){ ignored++; return; }
+        if(al && flIdx[al]){ k = al; aliased[k] = nm; }
         if(!k){ const nk = muKey(nm); if(nk && flIdx[nk]) k = nk; }
         if(!k && nm){ k = muFuzzyKey(nm, flIdx); if(k) fuzzy[k] = nm; }
         if(k){ exact[k] = (exact[k]||0) + q; matched++; }
@@ -8177,7 +8184,7 @@
       const likely = Object.keys(unmatchedNames).filter(n=>{ const A=_flSig(n); if(!A.length) return false;
         if(A.length<=2 && heads.has(A[0])) return true;                                   // ex. « Carotte Rainbow Bio »
         return flSigs.some(S=>S.filter(t=>A.includes(t)).length>=2); }).map(n=>({ name:n, qty:unmatchedNames[n] }));
-      return { exact, matched, unmatched, unmatchedNames, fuzzy, likely };
+      return { exact, matched, unmatched, unmatchedNames, fuzzy, likely, ignored, aliased };
     }
     // V9.59e — PDF « Totaux » de l'ancien site (totals-AAAA-MM-JJ.pdf) : tableau produit × lieu.
     // pages = [[{text, x, top, w}]] (mots PDF.js). Colonnes = codes lieux de l'en-tête « Totaux » ;
@@ -9599,10 +9606,28 @@
       React.useEffect(() => { const u = storage.subscribe('mu_' + dateKey, arr => { setSnap((arr || []).find(x => x.id === MU_REEL_DOC) || null); }); return u; }, [dateKey]);
       const flIdx = React.useMemo(() => muFlIndex(flRows), [flRows]);
       const ready = flRows !== null && Object.keys(flIdx).length > 0;
-      const analyse = (lines, meta) => {
-        const r = muExactFromLines(lines, flIdx);
-        const fileDays = Object.keys(meta.dates || {});
-        setRes({ ...r, ...meta, fileDays }); setConfirmed(false);
+      // V9.59f — concordances manuelles (nom du fichier → produit du Sheet FL / « pas de MU »), gardées dans l'appli
+      const [alias, setAlias] = React.useState({});
+      React.useEffect(() => { const u = storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'mu_alias'); setAlias((d && d.map) || {}); }); return u; }, []);
+      const [lastInput, setLastInput] = React.useState(null);
+      const [showAllUnk, setShowAllUnk] = React.useState(false);
+      const [pick, setPick] = React.useState({});
+      const [showAlias, setShowAlias] = React.useState(false);
+      const analyse = (lines, meta) => { setLastInput({ lines, meta }); setConfirmed(false); };
+      React.useEffect(() => {
+        if (!lastInput) return;
+        const r = muExactFromLines(lastInput.lines, flIdx, alias);
+        const fileDays = Object.keys(lastInput.meta.dates || {});
+        setRes({ ...r, ...lastInput.meta, fileDays });
+      }, [lastInput, alias, flIdx]);
+      const flOptions = React.useMemo(() => Object.entries(flIdx).map(([k, v]) => ({ k, name: v.name || k, actif: v.actif !== false })).sort((a, b) => (b.actif - a.actif) || a.name.localeCompare(b.name, 'fr')), [flIdx]);
+      const saveAlias = async (name, val) => {
+        try { await storage.setDoc('app_config', 'mu_alias', { map: { ...alias, [_flNorm(name)]: val }, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true }); showToast(val === '__ignore__' ? `« ${name} » : pas un produit MU (retenu)` : `« ${name} » lié à « ${(flIdx[val] && flIdx[val].name) || val} » (retenu)`); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const removeAlias = async (nk) => {
+        const next = { ...alias }; delete next[nk];
+        try { await storage.setDoc('app_config', 'mu_alias', { map: next, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true }); } catch (e) { showToast('Erreur : ' + e.message); }
       };
       const onFile = async (e) => {
         const f = e.target.files && e.target.files[0]; e.target.value = '';
@@ -9744,17 +9769,37 @@
                 </div>
               )}
               {res.totaux && <div style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '4px 0' }}>📄 PDF Totaux : {res.totaux.n} produits · lieux {res.totaux.sites}</div>}
-              {res.likely && res.likely.length > 0 && (
-                <div style={{ fontSize: 12, margin: '6px 0', padding: '6px 8px', borderRadius: 8, background: '#fff3e0', color: '#8a4b00' }}>
-                  ⚠️ Non reconnus (nom différent du Sheet FL ?) : {res.likely.map(x => `${x.name} (${x.qty})`).join(' · ')}
-                </div>
-              )}
+              {(() => {
+                const unk = showAllUnk ? Object.keys(res.unmatchedNames || {}).map(n => ({ name: n, qty: res.unmatchedNames[n] })).sort((a, b) => a.name.localeCompare(b.name, 'fr')) : (res.likely || []);
+                const nAll = Object.keys(res.unmatchedNames || {}).length;
+                if (!nAll) return null;
+                return (
+                  <div style={{ margin: '6px 0', padding: '8px', borderRadius: 8, background: '#fff3e0', border: '1px solid #ffcc80' }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: '#8a4b00' }}>⚠️ Produits non reconnus — à lier au Sheet FL ou à écarter</div>
+                    <div style={{ fontSize: 11, color: '#8a4b00', marginBottom: 6 }}>Le lien est retenu pour les prochains fichiers. Le Sheet FL n'est pas modifié.</div>
+                    {unk.length === 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Aucun produit F&amp;L probable parmi les non reconnus.</div>}
+                    {unk.map(x => (
+                      <div key={x.name} style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', padding: '6px 0', borderTop: '1px solid #ffe0b2' }}>
+                        <div style={{ flex: '1 1 200px', fontSize: 13 }}><b>{x.name}</b> <span style={{ color: 'var(--ink-mute)' }}>× {x.qty}</span></div>
+                        <select value={pick[x.name] || ''} onChange={e => setPick(p => ({ ...p, [x.name]: e.target.value }))} style={{ flex: '1 1 200px', fontSize: 13, padding: '6px' }}>
+                          <option value="">— Produit du Sheet FL —</option>
+                          {flOptions.map(o => <option key={o.k} value={o.k}>{o.name}{o.actif ? '' : ' (inactif)'}</option>)}
+                        </select>
+                        <button className="btn-primary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={!pick[x.name]} onClick={() => saveAlias(x.name, pick[x.name])}>🔗 Lier</button>
+                        <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => saveAlias(x.name, '__ignore__')}>🚫 Pas de MU</button>
+                      </div>
+                    ))}
+                    <button className="btn-ghost" style={{ fontSize: 12, marginTop: 4 }} onClick={() => setShowAllUnk(v => !v)}>{showAllUnk ? '▲ Seulement les F&L probables' : `▼ Voir tous les non reconnus (${nAll})`}</button>
+                  </div>
+                );
+              })()}
+              {res.ignored > 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>🚫 {res.ignored} produit(s) marqué(s) « pas de MU » ignoré(s).</div>}
               <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus ({res.matched} lignes) · {res.unmatched} ligne(s) hors F&amp;L ignorée(s)</div>
               {res.matched === 0 && <div style={{ color: 'var(--danger)', fontSize: 13 }}>Aucun fruit / légume reconnu dans ce fichier.</div>}
               <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
                 {preview.map(x => (
                   <div key={x.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 10px', borderBottom: '1px solid #f0f0f0', fontSize: 13 }}>
-                    <span>{x.name}{res.fuzzy && res.fuzzy[x.k] ? <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> ≈ « {res.fuzzy[x.k]} »</span> : null}</span><span><b>{x.q}</b>{x.est != null && <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> (estim. {Math.round(x.est)})</span>}</span>
+                    <span>{x.name}{res.aliased && res.aliased[x.k] ? <span style={{ color: '#2c4a8c', fontSize: 11 }}> 🔗 « {res.aliased[x.k]} »</span> : (res.fuzzy && res.fuzzy[x.k] ? <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> ≈ « {res.fuzzy[x.k]} »</span> : null)}</span><span><b>{x.q}</b>{x.est != null && <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> (estim. {Math.round(x.est)})</span>}</span>
                   </div>
                 ))}
               </div>
@@ -9765,6 +9810,19 @@
                 </label>
               )}
               <button className="btn-primary btn-lg" style={{ width: '100%', marginTop: 10 }} disabled={!canSave} onClick={save}>{saving ? 'Enregistrement…' : '✅ Valider : MU exacte'}</button>
+            </div>
+          )}
+          {Object.keys(alias).length > 0 && (
+            <div className="card">
+              <div style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer', fontWeight: 700, fontSize: 13 }} onClick={() => setShowAlias(v => !v)}>
+                <span>🔗 Concordances enregistrées ({Object.keys(alias).length})</span><span>{showAlias ? '▲' : '▼'}</span>
+              </div>
+              {showAlias && Object.entries(alias).sort((a, b) => a[0].localeCompare(b[0])).map(([nk, v]) => (
+                <div key={nk} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, fontSize: 12, padding: '5px 0', borderTop: '1px solid #f0f0f0' }}>
+                  <span>{nk} → <b>{v === '__ignore__' ? '🚫 pas de MU' : ((flIdx[v] && flIdx[v].name) || v)}</b></span>
+                  <button className="btn-secondary" style={{ fontSize: 11, padding: '3px 8px' }} onClick={() => removeAlias(nk)}>Retirer</button>
+                </div>
+              ))}
             </div>
           )}
         </div>
