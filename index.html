@@ -8210,10 +8210,12 @@
         });
         if(!rows.length) continue;
         words.forEach(w=>{
-          if(w.x < 92 || w.x >= originX) return;              // colonne « produit » uniquement
+          if(w.x >= originX) return;
           if(/^totaux$/i.test(w.text)) return;
           let best=null, bd=1e9; rows.forEach(r=>{ const d=Math.abs(r.top-w.top); if(d<bd){ bd=d; best=r; } });
-          if(best && bd <= 30) best.words.push(w);
+          if(!best || bd > 30) return;
+          if(w.x < 92) (best.pwords = best.pwords || []).push(w);  // colonne « producteur »
+          else best.words.push(w);                                   // colonne « produit »
         });
         rows.forEach(r=>{
           if(!r.words.length) return;                          // ligne de total
@@ -8225,7 +8227,9 @@
           const name = (cut>0 ? txt.slice(0,cut) : txt).join(' ').replace(/\s+/g,' ').trim();
           const unit = cut>0 ? txt.slice(cut).join(' ') : '';
           const total = Object.values(r.by).reduce((s,n)=>s+n,0);
-          products.push({ name, unit, by:r.by, total });
+          const pl = []; (r.pwords||[]).sort((a,b)=>a.top-b.top || a.x-b.x).forEach(w=>{ const L=pl.find(l=>Math.abs(l.top-w.top)<2.5); if(L) L.ws.push(w); else pl.push({ top:w.top, ws:[w] }); });
+          const producer = pl.sort((a,b)=>a.top-b.top).map(l=>l.ws.sort((a,b)=>a.x-b.x).map(w=>w.text).join(' ')).join(' ').replace(/\s+/g,' ').trim();
+          products.push({ name, unit, producer, by:r.by, total });
         });
       }
       return { cols: cols ? cols.map(c=>c.code) : [], products };
@@ -9042,6 +9046,7 @@
       (prepArr || []).forEach(d => {
         if (d.id === 'meta') prep.meta = d;
         else if (d.id === 'dromy') prep.dromy = d;
+        else if (d.id === 'totaux') { try { prep.totaux = { rows: JSON.parse(d.json || '[]'), file: d.file, at: d.at, by: d.by }; } catch (e) {} }
         else if (String(d.id).startsWith('cs|')) prep.casiers[decodeURIComponent(d.id.slice(3))] = d.nums || [];
       });
       return { ordersDoc: od, orders: (od && od.orders) || [], prep };
@@ -9277,14 +9282,15 @@
       }, [day, tick]);
       return [st, () => setTick(t => t + 1)];
     }
-    function kbDayCheck(day, data) {
+    function kbDayCheck(day, data, allowTotaux) {
       const od = data.ordersDoc;
       const mismatch = !!(od && od.targetDate && od.targetDate !== day);
-      return { count: (data.orders || []).length, mismatch, targetDate: od && od.targetDate, ok: !data.loading && !mismatch && (data.orders || []).length > 0 };
+      const tot = !!(allowTotaux && data.prep && data.prep.totaux && (data.prep.totaux.rows || []).length);
+      return { count: (data.orders || []).length, mismatch, tot, targetDate: od && od.targetDate, ok: !data.loading && !mismatch && ((data.orders || []).length > 0 || tot) };
     }
-    function KbPrintDatePick({ day, setDay, data, confirmed, setConfirmed, what }) {
+    function KbPrintDatePick({ day, setDay, data, confirmed, setConfirmed, what, allowTotaux }) {
       const today = todayKey(), act = activeDay();
-      const chk = kbDayCheck(day, data); const od = data.ordersDoc;
+      const chk = kbDayCheck(day, data, allowTotaux); const od = data.ordersDoc;
       const change = (v) => { setDay(v); setConfirmed(false); };
       return (
         <div className="card" style={{ borderLeft: '4px solid var(--accent)' }}>
@@ -9296,6 +9302,7 @@
           <div style={{ fontSize: 22, fontWeight: 900, margin: '10px 0 6px', textTransform: 'capitalize' }}>{kbDateLong(day)}</div>
           {data.loading ? <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Vérification des commandes…</div>
             : chk.mismatch ? <div style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 700 }}>❌ Les commandes enregistrées pour ce jour portent la date du {formatDateShort(chk.targetDate)} — impression bloquée. Recharge les bonnes commandes.</div>
+            : chk.tot ? <div style={{ fontSize: 13, color: '#2e7d32', fontWeight: 700 }}>✅ PDF Totaux chargé pour cette date ({data.prep.totaux.file || 'totals'}{data.prep.totaux.at ? ` · ${new Date(data.prep.totaux.at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}` : ''}{data.prep.totaux.by ? ` · ${data.prep.totaux.by}` : ''})</div>
             : chk.count > 0 ? <div style={{ fontSize: 13, color: '#2e7d32', fontWeight: 700 }}>✅ {chk.count} commande{chk.count > 1 ? 's' : ''} chargée{chk.count > 1 ? 's' : ''} pour cette date{od && od.source ? ` · source ${od.source}` : ''}{od && od.uploadedAt ? ` · chargées le ${new Date(od.uploadedAt).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}` : ''}</div>
             : <div style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 700 }}>❌ Aucune commande chargée pour le {formatDateShort(day)}{data.error ? ` (${data.error})` : ''}.</div>}
           {!data.loading && day < today && <div style={{ fontSize: 12, color: 'var(--warn)', marginTop: 4 }}>⚠️ Date passée.</div>}
@@ -9319,14 +9326,24 @@
       const [prodOff, setProdOff] = React.useState({});
       const [includeTest, setIncludeTest] = React.useState(false);
 
+      const fromTot = !!(data.prep && data.prep.totaux && (data.prep.totaux.rows || []).length);
       const allLines = React.useMemo(() => {
         const out = [];
+        // V9.59g — priorité au PDF Totaux chargé à 10h (quantités définitives par lieu, colonne producteur)
+        if (data.prep && data.prep.totaux && (data.prep.totaux.rows || []).length) {
+          data.prep.totaux.rows.forEach(([name, producer, by]) => {
+            const isPain = /brut|boulang|pain/i.test(producer || '');
+            if (!isPain) return;
+            Object.entries(by || {}).forEach(([site, q]) => { if (q > 0) out.push({ site, produit: name, producteur: producer || '', qty: q, test: false }); });
+          });
+          return out;
+        }
         (data.orders || []).forEach(o => {
           const site = String(o.site || '').toUpperCase();
           (o.items || []).forEach(it => { if (it.cat === 'pain') out.push({ site, produit: it.produit || '(pain)', producteur: it.producteur || '', qty: parseInt(it.qty, 10) || 0, test: !!(o._test || it._test) }); });
         });
         return out;
-      }, [data.orders]);
+      }, [data.orders, data.prep]);
       const hasTest = allLines.some(l => l.test);
       const producers = React.useMemo(() => [...new Set(allLines.map(l => l.producteur || '—'))].sort((a, b) => a.localeCompare(b, 'fr')), [allLines]);
       const prodSig = producers.join('|');
@@ -9350,7 +9367,7 @@
         return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')).map(x => ({ produit: x.produit, qty: x.qty, detail: x.by.join(' · ') }));
       })();
       const total = recap.reduce((s, x) => s + x.qty, 0);
-      const chk = kbDayCheck(day, data);
+      const chk = kbDayCheck(day, data, true);
       const canPrint = confirmed && chk.ok && siteBlocks.length > 0;
       // Feuilles par boutique (1 A4 par carton) · une seule boutique · récap général seul
       const printSites = (blocks, suffix) => { if (!canPrint || !blocks.length) return; kbOpenPdf(generatePainPDF(day, blocks, null), `Dispatch_pain_${day}${suffix || ''}.pdf`); };
@@ -9360,7 +9377,10 @@
           <KbBackToHub setTab={setTab} />
           <h1 style={{ margin: 0 }}>🍞 Impression dispatch pain</h1>
           <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Une feuille A4 par boutique : nom + code en gros, nombre de pains de chaque sorte à mettre dans son carton. La feuille se glisse ensuite dans le carton.</p>
-          <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" />
+          <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" allowTotaux />
+          {!data.loading && (fromTot
+            ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>📄 Source : <b>PDF Totaux</b> chargé à 10h ({data.prep.totaux.file || 'totals'}) — quantités par boutique de l'ancien site.</div>
+            : <div className="alert-warning" style={{ fontSize: 12 }}>Source : commandes de l'appli. Le PDF Totaux (chargé à 10h dans « Chargement des commandes ») sera utilisé dès qu'il est chargé.</div>)}
           {producers.length > 1 && (
             <div className="card">
               <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Producteurs inclus</div>
@@ -9640,7 +9660,7 @@
             const t = kbParseTotalsWords(await kbPdfWords(buf));
             if (!t.cols.length || !t.products.length) { setErr('PDF non reconnu : il faut le PDF « Totaux » de l\u2019ancien site (totals-AAAA-MM-JJ.pdf).'); return; }
             const m = f.name.match(/(\d{4}-\d{2}-\d{2})/);
-            analyse(t.products.map(p => ({ name: p.name, qty: p.total })), { fileName: f.name, kind: 'TOTAUX', dates: m ? { [m[1]]: 1 } : {}, totaux: { n: t.products.length, sites: t.cols.join(' ') } });
+            analyse(t.products.map(p => ({ name: p.name, qty: p.total })), { fileName: f.name, kind: 'TOTAUX', dates: m ? { [m[1]]: 1 } : {}, totaux: { n: t.products.length, sites: t.cols.join(' ') }, totRows: t.products.map(p => [p.name, p.producer, p.by, p.unit]) });
           } catch (x) { setErr('Lecture du PDF impossible : ' + x.message); }
           return;
         }
@@ -9715,6 +9735,10 @@
         if (!canSave) return;
         setSaving(true);
         try {
+          // V9.59g — PDF Totaux : quantités par lieu gardées pour la distribution (dispatch pain, etc.)
+          if (lastInput && lastInput.meta && lastInput.meta.totRows) {
+            await storage.setDoc(`day_${forDay}_prep`, 'totaux', { json: JSON.stringify(lastInput.meta.totRows), file: res.fileName, at: new Date().toISOString(), by: session.name, day: forDay }, { replace: true });
+          }
           await storage.setDoc('mu_' + dateKey, MU_REEL_DOC, { exactJson: JSON.stringify(res.exact), exactFor: forDay, exactSource: 'manuel', exactFile: res.fileName, exactAt: Date.now(), exactBy: session.name, exactLines: res.matched, exactUnmatched: res.unmatched });
           showToast('✅ Commandes chargées : la MU est maintenant exacte');
           setRes(null); setConfirmed(false);
