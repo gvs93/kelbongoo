@@ -627,7 +627,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.58';
+    const APP_VERSION = 'V9.59';
+    // V9.59 — Prépa : onglet « Suivi & impression » → impression dispatch pain (A4 par lieu, nom + code
+    //   en gros), étiquettes livraison domicile (planche 2×4) + CSV Dromy (envoi auto à la clôture si
+    //   activé dans Pilotage › Dromy), chargement des commandes (provisoire ancien site) → MU exacte.
+    //   MU : à faire = estimation (6h +15 %) − stock PDP, puis exact après chargement des commandes ;
+    //   stock PDP = inventaire du soir lu dans Firestore (fl_inventory_<jour>) ; lecture du Sheet FL sur
+    //   l'onglet réel « COMMANDE FL » ; inventaire du soir : sachets µ pré-remplis avec le reste calculé.
     // V9.55 — SÉCURITÉ phase 2 : proxies Apps Script (Freshdesk, FL, Stock) via Cloud Function kbgProxy,
     //   plus d'URL /exec ni de secret dans le HTML ; UUID PayZen hors des commandes (coffre master
     //   payzen_private), effacés après régularisation, purge J+7, bouton « Détruire les UUID du jour ».
@@ -1357,6 +1363,8 @@
           orderId: (test ? 'PST_' : 'PS_') + po.id_order, status: 1, site,
           consumerId: 'ps_' + (cu.id || po.id_order), newClient: false,
           name: T + full, email: String(cu.email || '').trim().toLowerCase(), tel: String(cu.phone || '').replace(/\s+/g, ''),
+          firstname: String(cu.firstname || '').trim(), lastname: String(cu.lastname || '').trim(),
+          addr: kbAddrFrom(po) || null, depotPorte: kbDepotPorte(po),
           casiersFrais: items.some(x => x.cat === 'frais') ? [cas] : [], casiersSec: hasSec ? [cas] : [],
           items, pains: items.filter(x => x.cat === 'pain'), nds: items.filter(x => x.cat === 'nd'), frais: items.filter(x => x.cat === 'frais'),
           removed: [], reduced: [],
@@ -1464,8 +1472,11 @@
         if (!id) continue;
         byId[id] = {
           nom: `${c.firstname || ''} ${c.lastname || ''}`.trim(),
+          firstname: String(c.firstname || '').trim(), lastname: String(c.lastname || '').trim(),
           email: (c.email || '').trim().toLowerCase(),
           tel: (c.telephone || c.phone || '').replace(/\s+/g, ''),
+          addr: kbAddrFrom(c),   // V9.59 — adresse (livraison domicile → fichier Dromy), si présente dans l'export
+          depotPorte: kbDepotPorte(c),
         };
       }
       return byId;
@@ -1534,6 +1545,12 @@
           name: cons ? cons.nom : (`${o.firstname||''} ${o.lastname||''}`.trim() || String(o.consumer_name||o.name||'').trim() || String(o.consumer_email||o.email||'').trim() || '(client inconnu)'),
           email: cons ? cons.email : String(o.consumer_email||o.email||'').trim().toLowerCase(),
           tel: cons ? cons.tel : String(o.tel||o.telephone||o.phone||'').replace(/\s+/g,''),
+          // V9.59 — infos livraison à domicile (étiquettes + fichier Dromy). Best-effort sur l'export Mongo.
+          firstname: cons ? (cons.firstname || '') : String(o.firstname || '').trim(),
+          lastname: cons ? (cons.lastname || '') : String(o.lastname || '').trim(),
+          addr: kbAddrFrom(o) || (cons ? cons.addr || null : null),
+          slot: String(o.delivery_slot || o.slot || o.delivery_time || o.creneau || ((o.delivery_window && o.delivery_window.start) ? (o.delivery_window.start + '-' + (o.delivery_window.end || '')) : '') || ''),
+          depotPorte: (kbDepotPorte(o) != null ? kbDepotPorte(o) : (cons ? (cons.depotPorte != null ? cons.depotPorte : null) : null)),
           casiersFrais: (o.bacs_frais || []).map(String),
           casiersSec: (o.bacs_sec || []).map(String),
           items,
@@ -5505,10 +5522,34 @@
       const parisToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Paris' });
       const editable = invDate === parisToday;
 
+      // V9.59 — Pré-remplissage des sachets µ : l'appli connaît le stock PDP du matin, la MU faite
+      // et les commandes → reste attendu = stock + fait − commandes (exactes si chargées).
+      // Affiché en orange « auto » tant que personne n'a corrigé ; écrit tel quel à la validation.
+      const [muPrefill, setMuPrefill] = React.useState({ map: null, exact: false });
+      React.useEffect(() => {
+        if (!editable) { setMuPrefill({ map: null, exact: false }); return; }
+        let stop = false;
+        (async () => {
+          try {
+            const [snap, ents] = await Promise.all([storage.getDoc('mu_' + invDate, MU_REEL_DOC), storage.getAll('mu_' + invDate)]);
+            if (!snap || !snap.items) { if (!stop) setMuPrefill({ map: null, exact: false }); return; }
+            const fait = muFaitFromEntries(ents || []);
+            const keys = new Set([...Object.keys(snap.items || {}), ...Object.keys(fait)]);
+            const map = {};
+            keys.forEach(k => { map[k] = Math.max(0, Math.round(muStockOfSnap(snap, k) + (fait[k] || 0) - muCmdOfSnap(snap, k))); });
+            if (!stop) setMuPrefill({ map, exact: !!muExactOf(snap) });
+          } catch (e) { if (!stop) setMuPrefill({ map: null, exact: false }); }
+        })();
+        return () => { stop = true; };
+      }, [invDate, editable]);
+      const preMu = (it) => (muPrefill.map ? muPrefill.map[muKey(it.produit)] : undefined);
+      const effMu = (it) => { const c = counts[it.key]; if (c) return c.mu || 0; const p = preMu(it); return p != null ? p : 0; };
+      const isAutoMu = (it) => !counts[it.key] && (preMu(it) || 0) > 0;
+
       const setQty = async (item, field, value) => {
         if (!editable) { showToast('🔒 Inventaire verrouillé (jour passé) — lecture seule'); return; }
         const v = Math.max(0, parseFloat(String(value).replace(',', '.')) || 0);
-        const prev = counts[item.key] || { colis: 0, mu: 0 };
+        const prev = counts[item.key] || { colis: 0, mu: (preMu(item) || 0) };
         const next = { ...prev, [field]: v };
         await storage.setDoc(`fl_inventory_${invDate}`, item.key, {
           id: item.key, producer: item.producer, produit: item.produit, uv: item.uv,
@@ -5536,7 +5577,7 @@
         const lines = [['Producteur','Produit','UV','Actif','Colis en stock','Stock Mu']];
         for (const it of entryItems) {
           const c = counts[it.key] || {};
-          lines.push([it.producer, it.produit, it.uv, it.actif ? 'Actif' : 'Inactif', c.colis ?? '', c.mu ?? '']);
+          lines.push([it.producer, it.produit, it.uv, it.actif ? 'Actif' : 'Inactif', c.colis ?? '', counts[it.key] ? (c.mu ?? '') : (preMu(it) ?? '')]);
         }
         const csv = lines.map(r => r.map(v => {
           const s = String(v ?? '');
@@ -5565,8 +5606,9 @@
         if (!editable) { showToast('🔒 Trop tard : cet inventaire n\'est plus modifiable (verrouillé à minuit, heure de France).'); return; }
         const payloadItems = entryItems.map(it => {
           const c = counts[it.key] || {};
-          return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: c.mu || 0 };
+          return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: effMu(it) };
         });
+        const autoItems = entryItems.filter(isAutoMu);
         const reValidation = !!lastValidated;
         const confirmMsg = reValidation
           ? `Re-valider les modifications de l'inventaire FL du ${invDate} ?\n\nLes quantités seront réécrites dans « ${FL_SHEET_TAB} », et une nouvelle photo horodatée sera ajoutée à l'historique du mois.`
@@ -5576,6 +5618,14 @@
         try {
           const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_write_stock', tab: FL_SHEET_TAB, date: invDate, items: payloadItems });
           if (!data.ok) { showToast('Erreur écriture Sheet : ' + (data.error || 'inconnue')); setValidating(false); return; }
+          // V9.59 — les sachets pré-remplis (non corrigés) sont enregistrés comme comptés → le stock PDP
+          // de demain les reprend tels quels (inventaire Firestore = source du stock MU).
+          for (const it of autoItems) {
+            try {
+              await storage.setDoc(`fl_inventory_${invDate}`, it.key, { id: it.key, producer: it.producer, produit: it.produit, uv: it.uv,
+                colis: 0, mu: preMu(it) || 0, prefilled: true, countedBy: session.name, countedAt: new Date().toISOString() });
+            } catch (e) {}
+          }
           const meta = {
             date: invDate, validatedBy: session.name, validatedAt: new Date().toISOString(),
             written: data.written || 0, notFound: (data.notFound || []).length,
@@ -5595,7 +5645,7 @@
             const backupItems = [];
             entryItems.forEach(it => {
               const c = counts[it.key] || {};
-              const colis = c.colis || 0, mu = c.mu || 0;
+              const colis = c.colis || 0, mu = effMu(it);
               if (colis > 0) backupItems.push({ id: it.key, producteur: it.producer, produit: it.produit, unite: 'cagette', qty: colis });
               if (mu > 0)    backupItems.push({ id: it.key, producteur: it.producer, produit: it.produit, unite: 'sachet µ', qty: mu });
             });
@@ -5627,8 +5677,8 @@
       const filtered = (q ? entryItems.filter(it => normalizeText(it.producer + ' ' + it.produit).includes(q)) : entryItems);
 
       const nbColis = entryItems.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
-      const nbMu = entryItems.reduce((t,it)=>t + ((counts[it.key]?.mu)||0), 0);
-      const nbSaisis = entryItems.filter(it => { const c = counts[it.key]; return c && (c.colis>0 || c.mu>0); }).length;
+      const nbMu = entryItems.reduce((t,it)=>t + effMu(it), 0);
+      const nbSaisis = entryItems.filter(it => { const c = counts[it.key]; return (c && (c.colis>0 || c.mu>0)) || isAutoMu(it); }).length;
 
       const renderRow = (it) => {
         const c = counts[it.key] || {};
@@ -5639,7 +5689,7 @@
         if (String(it.type || '').trim().toLowerCase() === 'sachet' && !it.muKilo) missingFields.push('MU en kilo');
         const incomplete = missingFields.length > 0;
         const bump = (field, delta) => {
-          const cur = c[field] || 0;
+          const cur = field === 'mu' ? effMu(it) : (c[field] || 0);
           setQty(it, field, Math.max(0, Math.round((cur + delta) * 10) / 10));
         };
         const bg = incomplete ? 'rgba(224,49,49,0.10)'
@@ -5672,7 +5722,7 @@
               {/* MU : sachets µ (stepper compact) */}
               <div style={{display:'flex',alignItems:'center',gap:2}}>
                 <button onClick={function(){bump('mu',-1)}} style={{width:30,height:44,fontSize:18,border:'1px solid var(--border)',borderRadius:8,background:'var(--cream,#faf8f0)',cursor:'pointer',lineHeight:1}}>−</button>
-                <QtyInputDec value={c.mu ?? 0} onCommit={function(v){setQty(it,'mu',v)}} style={{width:46,height:44,textAlign:'center',fontSize:15,padding:'0 2px'}} />
+                <QtyInputDec value={effMu(it)} onCommit={function(v){setQty(it,'mu',v)}} style={{width:46,height:44,textAlign:'center',fontSize:15,padding:'0 2px',color:isAutoMu(it)?'#ef6c00':undefined,fontStyle:isAutoMu(it)?'italic':undefined,borderColor:isAutoMu(it)?'#ffb74d':undefined}} />
                 <button onClick={function(){bump('mu',1)}} style={{width:30,height:44,fontSize:18,border:'1px solid var(--border)',borderRadius:8,background:'var(--cream,#faf8f0)',cursor:'pointer',lineHeight:1}}>+</button>
               </div>
             </div>
@@ -5735,6 +5785,14 @@
             </div>
           ) : null}
 
+          {editable && muPrefill.map && (
+            <div className="alert-info" style={{fontSize:12,borderLeft:'3px solid #ef6c00'}}>
+              🧮 <b>Sachets µ pré-remplis</b> (en orange) avec le stock calculé : stock PDP du matin + MU faite − commandes {muPrefill.exact ? 'exactes' : 'estimées (pas de chargement des commandes à 10h)'}. Vérifie et corrige si besoin — la valeur est enregistrée à la validation.
+            </div>
+          )}
+          {editable && !muPrefill.map && (
+            <div className="alert-warning" style={{fontSize:12}}>Sachets µ non pré-remplis : la page MU n'a pas été ouverte aujourd'hui (pas de calcul du jour). Compte les sachets à la main.</div>
+          )}
           <div className="stat-grid">
             <div className="stat"><div className="stat-value">{nbSaisis}/{entryItems.length}</div><div className="stat-label">Produits saisis</div></div>
             <div className="stat"><div className="stat-value">{nbColis}</div><div className="stat-label">Colis (cagettes)</div></div>
@@ -8074,12 +8132,46 @@
       const iVen  = find([h=>h.includes('ventes du jour'), h=>h.includes('ventes')]);
       const iStk  = find([h=>h==='stock mu', h=>h.includes('stock mu')]);
       const iEst  = find([h=>h.includes('estimation')]);
+      const iId   = find([h=>h.includes('id site'), h=>h==='id kbg', h=>h==='id']);
       if(iProd<0) return out;
       for(let r=1;r<flRows.length;r++){
         const row = flRows[r]; if(!row) continue;
         const k = muKey(row[iProd]); if(!k || out[k]) continue;
-        out[k] = { ventes: iVen>=0?muNum(row[iVen]):null, stockMu: iStk>=0?muNum(row[iStk]):null, est: iEst>=0?muNum(row[iEst]):null };
+        out[k] = { name: String(row[iProd]||'').trim(), id: iId>=0 ? String(row[iId]||'').trim() : '', ventes: iVen>=0?muNum(row[iVen]):null, stockMu: iStk>=0?muNum(row[iStk]):null, est: iEst>=0?muNum(row[iEst]):null };
       }
+      return out;
+    }
+    // V9.59 — Commandes EXACTES du jour de MU (chargées à 10h : fichier ancien site, ou commandes
+    // déjà présentes dans l'appli pour la distribution suivante). Stockées en chaîne JSON dans le doc
+    // _reel (exactJson) : remplacée d'un bloc à chaque chargement (pas de fusion de clés périmées).
+    function muExactOf(snap){
+      if(!snap || !snap.exactJson) return null;
+      try { const o = JSON.parse(snap.exactJson); return (o && typeof o==='object') ? o : null; } catch(e){ return null; }
+    }
+    // Commandes retenues pour un produit sur une journée : exactes si chargées, sinon estimation (6h + 15 %).
+    function muCmdOfSnap(snap, k){
+      const ex = muExactOf(snap);
+      if(ex) return Math.max(0, Number(ex[k])||0);
+      const it = snap && snap.items ? snap.items[k] : null;
+      return it ? Math.max(0, Number(it.commandes)||0) : 0;
+    }
+    // Agrège des lignes {id, name, qty} sur les produits du Sheet FL (pivot = ID SITE KBG, repli = nom).
+    function muExactFromLines(lines, flIdx){
+      const byId = {}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.id) byId[v.id]=k; });
+      const exact = {}; let matched = 0, unmatched = 0; const unmatchedNames = {};
+      (lines||[]).forEach(l=>{
+        const q = Number(l.qty)||0; if(q<=0) return;
+        let k = (l.id && byId[String(l.id).trim()]) || null;
+        if(!k){ const nk = muKey(String(l.name||'').replace(/^\[TEST\]\s*/,'')); if(nk && flIdx[nk]) k = nk; }
+        if(k){ exact[k] = (exact[k]||0) + q; matched++; }
+        else { unmatched++; const n = String(l.name||l.id||'?'); unmatchedNames[n] = (unmatchedNames[n]||0) + q; }
+      });
+      return { exact, matched, unmatched, unmatchedNames };
+    }
+    // Lignes produits d'une liste de commandes de l'appli (day_<J>_orders) — hors commandes [TEST]
+    function muLinesFromOrders(orders){
+      const out = [];
+      (orders||[]).forEach(o=>{ if(o && o._test) return; (o.items||[]).forEach(it=>{ if(it && !it._test) out.push({ id: it.id, name: it.produit, qty: Number(it.qty)||0 }); }); });
       return out;
     }
     // Sachets réellement faits par produit sur une journée (somme des MU validées)
@@ -8106,18 +8198,28 @@
       // Inventaire FL ayant compté des sachets, le plus récent
       let invIdx = invs.findIndex(x=>x && Number(x.nbMu||0)>0);
       const fromSheet = (src, d)=>{ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return { stock, source:src, fromDate:d }; };
-      if(invIdx>=0 && (snapIdx<0 || invIdx<=snapIdx)) return fromSheet('inventaire', dates[invIdx]);
+      if(invIdx>=0 && (snapIdx<0 || invIdx<=snapIdx)){
+        // V9.59 — l'inventaire du soir fait foi : on lit les sachets comptés directement dans
+        // Firestore (fl_inventory_<jour>), plus dans une colonne de Sheet (onglet erroné en V9.58).
+        const d = dates[invIdx];
+        const docs = await storage.getAll('fl_inventory_'+d).catch(()=>[]);
+        if(docs && docs.length){
+          const stock = {};
+          docs.forEach(e=>{ const k = muKey(e.produit); if(!k) return; stock[k] = (stock[k]||0) + Math.max(0, Math.round(Number(e.mu)||0)); });
+          return { stock, source:'inventaire', fromDate:d, inv: invs[invIdx] };
+        }
+        return fromSheet('inventaire', d);
+      }
       if(snapIdx<0) return fromSheet('sheet', null);
       const d = dates[snapIdx], snap = snaps[snapIdx];
       const fait = muFaitFromEntries(await storage.getAll('mu_'+d).catch(()=>[]));
-      const keys = new Set([...Object.keys(snap.items||{}), ...Object.keys(snap.overrides||{}), ...Object.keys(fait)]);
+      const keys = new Set([...Object.keys(snap.items||{}), ...Object.keys(snap.overrides||{}), ...Object.keys(fait), ...Object.keys(muExactOf(snap)||{})]);
       const stock = {};
       keys.forEach(k=>{
-        const it = (snap.items||{})[k] || {};
-        const reste = muStockOfSnap(snap,k) + (fait[k]||0) - (Number(it.commandes)||0);
+        const reste = muStockOfSnap(snap,k) + (fait[k]||0) - muCmdOfSnap(snap,k);
         stock[k] = Math.max(0, Math.round(reste));
       });
-      return { stock, source:'calc', fromDate:d };
+      return { stock, source:'calc', fromDate:d, exact: !!muExactOf(snap) };
     }
     // Hook : lignes MU réelle pour la journée (items = liste get-mu-list, entries = map mu_<jour>)
     function useMuReel(dateKey, items, flRows, entries){
@@ -8132,27 +8234,50 @@
       },[ready, dateKey, flIdx]);
       const snapToday = entries ? entries[MU_REEL_DOC] : null;
       const faitToday = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
+      // V9.59 — commandes exactes : chargement manuel (prépa, 10h) prioritaire ; sinon commandes de la
+      // distribution suivante déjà présentes dans l'appli (PrestaShop / export Mongo) chargées après 10h.
+      const nextDay = muShiftDate(dateKey, 1);
+      const [nextOrders, setNextOrders] = React.useState(null);
+      React.useEffect(()=>{
+        const u = storage.subscribe(`day_${nextDay}_orders`, arr=>{ const d=(arr||[]).find(x=>x.id==='data') || null; setNextOrders(d); });
+        return u;
+      },[nextDay]);
+      React.useEffect(()=>{
+        if(!ready || !nextOrders || !Object.keys(flIdx).length) return;
+        if(snapToday && snapToday.exactSource==='manuel') return;            // le chargement manuel fait foi
+        const at = nextOrders.psLoadedAt || nextOrders.uploadedAt || '';
+        if(!at || new Date(at).getTime() < new Date(dateKey+'T10:00:00').getTime()) return; // avant la clôture des commandes
+        const res = muExactFromLines(muLinesFromOrders(nextOrders.orders), flIdx);
+        if(!res.matched) return;
+        const json = JSON.stringify(res.exact);
+        if(snapToday && snapToday.exactJson===json) return;
+        storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: json, exactFor: nextDay, exactSource:'auto', exactFile:'commandes de l’appli ('+(nextOrders.source||'?')+')', exactAt: Date.now(), exactBy:'auto', exactLines: res.matched, exactUnmatched: res.unmatched }).catch(()=>{});
+      },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, dateKey, nextDay]);
+      const exact = muExactOf(snapToday);
       const rows = React.useMemo(()=>{
         const out = [];
         (items||[]).forEach(it=>{
           const name = muName(it), k = muKey(name);
           const fl = flIdx[k];
-          const commandes = (fl && fl.ventes!=null) ? Math.max(0,Math.round(fl.ventes)) : Math.max(0,Math.round(muEst(it)));
+          // Estimation = commandes notées à 6h + 15-20 % (colonne ESTIMATION MU) ; repli : ventes du jour.
+          const estim = (fl && fl.est!=null) ? Math.max(0,Math.round(fl.est))
+            : (muEst(it)>0 ? Math.max(0,Math.round(muEst(it))) : ((fl && fl.ventes!=null) ? Math.max(0,Math.round(fl.ventes)) : 0));
+          const commandes = exact ? Math.max(0, Math.round(Number(exact[k])||0)) : estim;
           const ov = snapToday && snapToday.overrides ? snapToday.overrides[k] : null;
           const auto = start ? (start.stock[k]||0) : 0;
           const stock = (ov!=null && !isNaN(Number(ov))) ? Number(ov) : auto;
           const fait = faitToday[k]||0;
-          out.push({ key:k, name, uv:it.uv||'', item:it, commandes, stock, auto, overridden: ov!=null, fait,
+          out.push({ key:k, name, uv:it.uv||'', item:it, commandes, estim, exact: !!exact, stock, auto, overridden: ov!=null, fait,
             aFaire: Math.max(0, commandes - stock), reste: stock + fait - commandes });
         });
         return out;
       },[items, flIdx, start, snapToday, faitToday]);
       const byKey = React.useMemo(()=>{ const m={}; rows.forEach(r=>{ m[r.key]=r; }); return m; },[rows]);
-      // Photo du jour (stock auto + commandes) → sert au report du lendemain
+      // Photo du jour (stock auto + commandes ESTIMÉES ; les exactes sont dans exactJson) → report du lendemain
       const lastSaved = React.useRef('');
       React.useEffect(()=>{
         if(!start || !ready || start.source==='erreur' || !rows.length) return;
-        const itemsMap = {}; rows.forEach(r=>{ itemsMap[r.key] = { product:r.name, stock:r.auto, commandes:r.commandes }; });
+        const itemsMap = {}; rows.forEach(r=>{ itemsMap[r.key] = { product:r.name, stock:r.auto, commandes:r.estim }; });
         const sig = JSON.stringify(itemsMap);
         if(sig===lastSaved.current) return;
         const prev = snapToday && snapToday.items ? JSON.stringify(Object.fromEntries(Object.keys(itemsMap).map(k=>[k, snapToday.items[k] ? { product:snapToday.items[k].product, stock:snapToday.items[k].stock, commandes:snapToday.items[k].commandes } : null]))) : '';
@@ -8161,7 +8286,26 @@
         storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { date:dateKey, items:itemsMap, source:start.source, fromDate:start.fromDate||'', updatedAt:Date.now() }).catch(()=>{});
       },[start, ready, rows, dateKey, snapToday]);
       const setOverride = (k, v, by) => storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { overrides:{ [k]: v }, overriddenBy:{ [k]: v==null?null:{ by:by||'—', at:Date.now() } } });
-      return { rows, byKey, start, ready: !!start, setOverride };
+      const cmdInfo = exact
+        ? { exact:true, source: snapToday.exactSource, file: snapToday.exactFile||'', at: snapToday.exactAt, by: snapToday.exactBy, forDay: snapToday.exactFor }
+        : { exact:false };
+      return { rows, byKey, start, ready: !!start, setOverride, cmdInfo, flIdx };
+    }
+
+    // V9.59 — bandeau « commandes estimées / exactes » (MU en cours + MU réelle)
+    function MuCmdBanner({ info, setTab }) {
+      if(!info) return null;
+      if(info.exact) return (
+        <div style={{background:'#e8f5e9',border:'1px solid #a5d6a7',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#1b5e20'}}>
+          ✅ <b>MU exacte</b> : commandes réelles de la distribution du {info.forDay ? formatDateShort(info.forDay) : '?'} ({info.source==='auto'?'chargées automatiquement':'chargées'}{info.by && info.by!=='auto' ? ' par '+info.by : ''}{info.at ? ' à '+muTime(info.at) : ''}{info.file ? ' · '+info.file : ''}).
+        </div>
+      );
+      return (
+        <div style={{background:'#fff8e1',border:'1px solid #ffe082',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#8d6e00',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          <span>⏳ <b>MU estimée</b> : commandes notées à 6h + 15-20 %. À 10h, charge les commandes à préparer pour avoir la MU exacte.</span>
+          {setTab && <button className="btn-secondary" style={{fontSize:12,padding:'5px 10px'}} onClick={()=>setTab('muload')}>📥 Charger les commandes</button>}
+        </div>
+      );
     }
 
     // V9.58 — champ de recherche avec croix pour tout effacer d'un coup
@@ -8196,7 +8340,7 @@
       const loadFl = React.useCallback(async ()=>{
         setFlErr('');
         try{
-          const data = await flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:MU_TAB, ts:Date.now() });
+          const data = await flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }); // V9.59 : vrai nom d'onglet (MU_TAB n'existe plus dans le classeur)
           if(!data || data.ok===false) throw new Error((data&&data.error)||'lecture impossible');
           setFlRows(data.rows||[]);
         }catch(e){ setFlRows([]); setFlErr('Produits commandés indisponibles : '+e.message); }
@@ -8354,6 +8498,8 @@
             <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Préparateur</div><div style={{fontSize:20,fontWeight:900,color:'#ef6c00'}}>{operator}</div></div>
             <div style={{textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>Tes sachets : <b style={{color:'#ef6c00'}}>{totals.mine}</b><br/>Total du jour : <b>{totals.all}</b></div>
           </div>
+          <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
+          {flErr && <div style={{background:'#fff3e0',border:'1px solid #ffcc80',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#bf6000'}}>⚠️ {flErr} — stock PDP et commandes non fiables.</div>}
 
           {activeNow.length>0 && (
             <div className="mu-live">
@@ -8505,7 +8651,7 @@
         try{
           const [mu, fl] = await Promise.all([
             flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'),
-            flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:MU_TAB, ts:Date.now() }).catch(e=>({ ok:false, error:e.message })),
+            flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }).catch(e=>({ ok:false, error:e.message })),
           ]);
           if(!mu || mu.success===false) throw new Error((mu&&mu.error)||'liste MU illisible');
           setItems(mu.items||[]);
@@ -8529,8 +8675,8 @@
 
       const src = reel.start;
       const srcLabel = !src ? 'Calcul du stock PDP…'
-        : src.source==='calc' ? `Stock PDP = reste calculé de la MU du ${src.fromDate}`
-        : src.source==='inventaire' ? `Stock PDP = inventaire (sachets) du ${src.fromDate} — colonne STOCK MU`
+        : src.source==='calc' ? `Stock PDP = reste calculé de la MU du ${formatDateShort(src.fromDate)} (stock + fait − commandes ${src.exact?'exactes':'estimées'})`
+        : src.source==='inventaire' ? `Stock PDP = inventaire du soir du ${formatDateShort(src.fromDate)}${src.inv && src.inv.validatedBy ? ` (${src.inv.validatedBy}${src.inv.validatedAt ? ', '+muTime(src.inv.validatedAt) : ''})` : ''} — sachets comptés`
         : src.source==='sheet' ? 'Stock PDP = colonne STOCK MU du Sheet (point de départ, aucun calcul antérieur)'
         : 'Stock PDP indisponible (erreur de lecture) — compté à 0';
 
@@ -8555,12 +8701,13 @@
           </div>
           <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
             <div style={{fontWeight:700,marginBottom:4}}>{srcLabel}</div>
-            <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + Fait − Commandes → devient le stock PDP du prochain jour de MU.</div>
+            <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + Fait − Commandes → pré-remplit l'inventaire du soir, puis devient le stock PDP du prochain jour de MU.</div>
           </div>
+          <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
           {reel.rows.length>0 && (
             <div className="card" style={{display:'flex',justifyContent:'space-around',flexWrap:'wrap',gap:8,padding:'10px 8px'}}>
               {cell('Stock PDP', tot.stock, '#2c4a8c')}
-              {cell('Commandes', tot.cmd)}
+              {cell(reel.cmdInfo.exact ? 'Cmd exactes' : 'Cmd estimées', tot.cmd)}
               {cell('À faire', tot.aFaire, '#ef6c00')}
               {cell('Fait', tot.fait, '#2e7d32')}
               {cell('Reste ce soir', tot.reste, '#2c4a8c')}
@@ -8592,7 +8739,7 @@
               </div>
               <div style={{display:'flex',justifyContent:'space-between',marginTop:8,gap:4}}>
                 {cell('Stock PDP', r.stock, '#2c4a8c')}
-                {cell('Commandes', r.commandes)}
+                {cell(r.exact ? 'Cmd exactes' : 'Cmd estimées', r.commandes)}
                 {cell('À faire', r.aFaire, r.aFaire>0?'#ef6c00':'#2e7d32')}
                 {cell('Fait', r.fait, '#2e7d32')}
               </div>
@@ -8722,31 +8869,795 @@
     }
 
     /* ============================================================
-       SUIVI (Prépa) — hub regroupant Retours PDP / DLC / Pertes
-       Réduit le nombre d'onglets en bas (usage à une main).
+       V9.59 — SUIVI & IMPRESSION (Prépa)
+       • Impression dispatch pain : 1 feuille A4 par lieu (nom + code en GROS,
+         nombre de pains par produit en très gros) — mise en cartons à 5h.
+       • Impression étiquettes livraison (domicile) : planche A4 2×4 autocollante
+         (même gabarit que l'ancien deliverylabels), 1 étiquette par carton.
+       • Fichier Dromy (CSV, colonnes identiques au modèle Dromy) : téléchargeable,
+         et envoyé automatiquement à la clôture de la prépa si activé (Pilotage › Dromy).
+       Stockage : aucune nouvelle collection Firestore.
+         - réglages : app_config/dromy { enabled, to, defaultSlot, dateFmt }
+         - par jour : day_<J>_prep/dromy { door:{<client>:bool}, sent:{at,by,ok,…} }
+       ============================================================ */
+    const KB_LOGO_JPG = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCACMAWgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD7LooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK83+NWp+KtFistR0W9kt7AZjuPLRSVckbSxIPB6fX61M5ckbmGJxCw9J1Gm0ux6RRXhvhj4v6taukOu2yX8PQzRAJKPfH3W/SvX/AA5r+k+ILH7ZpV2k6Dh16Oh9GU8g1MKsZ7GGEzGhitIPXs9zSdlRCzEBQMknsK8r+D3iCbWvGvia4ldit1smjUn7qKxVQP8AgJWvQfF85tvCmrXCsFaOymYEnHOw4rwv4HXv2Lx9bQltq3UEkBz64DD9VrOrO1SKOTH4h08XQh0v+en6n0RRRRXQeyFFZPiXxHo/h20+06reJAG+4g+Z5D/sqOTUfg3xBH4m0htTgsri1gMrJF52MyKMfMMds5H4Gp5le3Uy9vT9p7O/vdjaoooqjUKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAqK8tre8tZbW6hSaCVSkkbjIYHqCKlooE0mrM+efif4Cn8MTG/si02kyvhSeWgJ6K3qPRvwPPXlND1fUNE1GPUNMuWgnTuOQw/usO49q+q7+0t76zms7uFZoJkKSIw4ZT1FfMPjrw/L4Z8SXOluWaIfvLeQ/xxn7p+o5B9wa8+vS9m+aJ8fm2X/VJqtR0T/BnsmmeLbPxr4B1eAIkWpJYSie2JzzsOHX1Un8QeD7+E6NfyabqlnqUOd9tKky474IOPxHH41JoWqXejarBqNk+2WJuh+66n7ysO4I4IqpKUMrmJSiFiVUnOBngVlOq52b3Rw4vHSxKhKXxR/pM+t7K5hu7KG8gfdDNGsiN6qRkfpXmvxB+Klvp5k07w4Y7q6BKvdH5ooz/s/3z+n1rzKXxnrbeEbbw1HP5NpCGVnQkPIhOQhPZRnGB1p/w/8AB994r1Lyot0NjCR9puMcKP7q+rH07dT79EsRKdow3PWr5xVxPLSwy957/wDA/wAy/wCCPDeq+PfEL3mpXNxJaxsDeXTtlj3Ea+59uAPwr6FsrW3srSK0tYUhghQJHGowFUdAKqaPY6XoWnQ6ZZLFbQRL8qlhk+pOepPc1fjkSRd0bq49VOa3pU1BeZ7WX5esJTu9ZPdjqKRN20byN3tS1sd4UUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFebfF34kp4YB0jSAk2ryJlnOClsD0JHdj1C/iewOOIxFPDwc6j0OvBYKtjayo0Vdv8PNnXeKvFeg+GbcS6xqEUDMMpEPmkf8A3VHJ+vSvLtb+OuJGTRdB3KD8st3LjP8AwBf8a8b1C8u9QvJLy+uZbm5lOXllbczfj/SrFpAI1DuPnP6V85/aeKxdTlo+7H72fTZthMq4Zwar41OrUlpGN7Xf+S6t39LtI9Cb4x+NZX3JaaREp6AwOf5vmsXxl4u1LxZJay6pY2ME1srKsltuBZTg4IYnoRn8TXMyXUScZLH2qE33pF+Zqni4U9J1W/x/JHx9bBcQ57QcaWAjCnLbTlfk7ykm/W1i5RUdvJ5se/bjnGKZcXKRfKPmb09K6HXpxh7RvQ+Ho5DmFfHSy+nTbqxbTStpbR3e1vO9ierJ1DVPsSWQ1W/S1T7sMc5RB6nC4H41iPczMfvbR6DiozJIf+WjfnXnVcypS05W0fpeU+HGc4T95HExpSfZNv79PwLstmHOTI5P+3zUSrd2jb4JZI8c7onKkflUAkkHSRvzp63M6/8ALQn681xTq4Wf2XF+R9jhMs4pwT/3qnWj2mnH7nFN39b+h0mh/EPxjo7L9n1y5mjX/lldHzlI9Pm5H4EV6p4M+NWm30iWviS1Gmynj7TGS0JPuPvJ+o968DkYuxYgAn0GKbToZjiMPL3JXXZ/1oe/iciwePpJ1qSjNr7O6frZX+aPtWCaK4hSaCVJYnAZHRgysPUEdRT6+XPhp8QdS8H3SwOZLvSHbMtrnlP9qPPQ+3Q/XmvpjR9SstX02DUdOuEuLWdd0cingj+h7Edq+swGYU8ZHTSS3R+a5zklbK6nvawez/R9mW6KKK9A8UKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAormZfH3g6ORo28Q2O5Tg4YkfmBir2ieKPD+tXLW2l6ta3UyruMaN82PXB7c1KnF6XMY4mjJ8qmm/VGxRVPVtU07SbYXOp3tvaQltoeZwoJ9BnvWLF4+8HSOFXxDY5P95yB+ZFDlFbsc69KDtKST9TpqKq6bqNhqVv8AaNPvbe7izjfDIHAPpxWHL4+8HRyNG3iCy3KSDhiefqBQ5JbsJV6UEnKSSfmdNRXL/wDCwfBn/Qw2f5t/hR/wsHwZ/wBDDZ/m3+FL2ke5H1zD/wA6+9HUUVUsdSsL3TE1O1u4ZbN0LicN8m0dTntjBrEk8feDo3KN4hscj+65I/MCm5RW7LlXpQScpJX8zpqKzdE17RtaVzpWpWt5sALiKQErnpkdRWlTTT2LjOM1eLujmviT4ni8J+FbjUyFe5b91axno8pzjPsOSfYV8pXlzcXl3Nd3Uzz3Ezl5ZHOS7HqTXpP7ROtSah4zh0aJi0OnxKNo5zLJgn9No/OuS/4Qbxl/0LGq/wDgOa+OzavUxNdwgm1HTTv1P1bhnCUMvwcatWSUqmurS06L9fmYELKsqswyAcmpLi5eXgfKvpW3/wAIN4y/6FjVf/Ac1BeeEfFNnCZrrw7qsUY6sbZiB+QNeeliIQcVFpddGehVweV4nGwxlRxlUirRu00tb3S2v576KxiUUf04ormPcLiS+TZLj7zZx7c1TPJzR6flXSaT4E8YapEJbPw9fGNhlXkURAj23kZrplKriOWMU3ZWstTwMvyzB5PKtXlJKVWcpSk7LdtpekU/vu+pzdFdbdfDbxxbReZJ4cumX0idJD+SsTXL3VvPaztb3UEsEyHDRyoVZfqDzWVSjUp/HFr1R7FHFUK/8Kal6NP8iKiitjRvC3iPWbcXGl6JfXcDMVEscfyZHUbjxUxhKbtFXZdSrClHmnJJebsY9FbWpeFPE+nQNPfaBqVvCmd0jW7bVx3JGQB71i0ShKDtJWCnVp1VeEk15O4V6N8EPGreHdcXSb6YjSr+QKdx4hlPAf2B4B/A9q5HS/C/iPVLUXWnaFqN1btwssUBKn6Hv+FJqnhjxHpdqbrUtC1G1txw0ssBCjPHJ7V0YeVahNVoJ6eWhxY2OExlOWFqyWulrq6f+aPsGiuJ+C/iRvEXgm3a4k33tkfs1wSeWKj5WP1XH45rtq+8o1Y1qaqR2Z+MYvDTwteVGe8XYKKhvLq2s4GuLu4it4V+88rhVH4mubm+IvguKQo2v25I7ojuPzCkVblFbs4qlelT+OSXq7HVUVzFp8QPBtzII4vEFoGJx+83Rj82Aro7eaG4hWa3ljliYZV0YMpHsRTUk9mOnWp1Pgkn6MkooqG9u7Wyt2uLy5ht4V+9JK4VR+JpltpK7JqK5WX4i+C4nKNr9uSP7iOw/MLireleNPCuqTCGy1yzeRuFRm2MfoGxmp54vqYLF0JOymr+qN+iiiqOgKKKyta8R6Fo3GqaraWr9djyDf8A989f0pNpbkznGCvJ2Rq0VyY+JHgkkAa9Fz6xSD/2Wt7SNY0rV4TLpmoW12g6+VIGK/UdR+NJTi9mZwxFGo7Qmm/JovUUUVRsfIGT613vwH/5H5f+vOX+a1wNdF4A1xPDurXWqHBlSxlSBT/FK20KPp3PsK8mm0pps/OsFUjTxEJy2TN744+IBqvin+zbeTda6aDHweDKfvn8OF/A1wKBnYKoZmYgADqSegFEjtI7O7F3YlmY9STyTXofwN8MnVdfOs3MebTTyCmRw8xHA/4CPm+u2nrVn6miVTMMV5yf3L/gI9Q+H3htfDPg5bORR9rmQzXRH/PQr0+gGB+FfNQJwK+vLr/j2l/3D/KvkMdBW+KioqKR6ufUo0o0oR2Sf6C5PrRk+tdn8IPD2meJPEN1ZarFJLDHaGVQkhQht6jqPYmvU/8AhVXg3/nyuf8AwKk/xrKFCU1dHBhcpr4qn7SDVvP/AIYyvAZJ+Bl9k5/0a96/8Drw0E4HPavpzV9JsdE+HWp6Zp0RitobC42qWLHlGJJJ5PJr5jHQfSqxEeVRT7HRnFJ0o0act1Gx6p+zn/yGtX/69ov/AENq9sNeJ/s5/wDIZ1f/AK9ov/Q2r2w11Yb+Gj3ck/3OPz/M+SPF92b74iandZyH1RsH2Em0foBX1vgelfG9w7SeI5JHOWe+LMfUmWvsivEyGXNKrLu1+p+n8ZQVOnhoLomv/SQ49qK8x/aB1zWND0nSZtH1GeykkumV2iI+YBCcHI6Zrc+Dmv6n4k8FRahq2GuVmki80Jt80KeGwOO+DjuK9eOMg8Q8PbVK/kfMzyqrHAxxt1yt2t16/wCRhfHLwRp+peH7rxDZW6Q6nZRmWRo1x58Y+8G9SByD14xXzzBFLPOkEEbSyyMERFGSzE4AHuTX1149uobPwVrVxOQI1sZs57koQB+JIrwf9nvRo9S8drdTqGTTbczgEZHmHCr+WSfwFeDm2EjPFwjDRy3/AMz7LhrM6lHLK1Sq7qnt9233/mepfC74baf4ZtIr7UoYrvWWGWkYblg/2U9x3bqfYV6DRXn3xa+Iq+D/ACbCxt47rU508wLITsiTOAzY5JPOBx0Ne9+4wNHtFf1958d/tmcYu3xTl9y/ySPQawPGvhLRvFemta6lbr5oU+TcoMSwn1B9PY8GvP8A4bfF641nXYdH8QWltA9y2y3uLfKrv7Kyknr0BB6445r1+ijXoY2k+XVdULFYTGZTiEp+7Japp/kz4+8XaBfeGdeuNIvwDJEQUkUYWVD91x7H9CCO1e/fs9/8k1tv+vmf/wBDNYP7TOkJJpGma4igSQTG2kbHJRwSM/Rl/wDHq3/2e/8Akmtt/wBfM/8A6Ga8XAYb6tmMqa2tp6aH1mc5g8fkVOtLfmSfqk/z3PQWUMpUgEHqK+Vfiv4ZPhfxlc2kUZWyuD9otDjgIx5X/gJyPpivquuD+N3hg+IfB0k1vHvvtOJuIMDllA+dPxHP1Ar0c3wn1ig2t46r9UeHwzmf1HGKMn7k9H+j+X5Nln4I/wDJLdE/65yf+jXqX4yf8ky13/r2/wDZlqL4I/8AJLdEx/zzk/8ARr1L8Zf+SZa7/wBe3/sy1a/5F/8A25/7aYy/5Hb/AOvv/t55R+zfqzWnjC60pmPlX9sWUf8ATSM5H/jpavafG/iS08L6FLqNyN7/AHIIgeZZD0H07k9gDXzV8K7o2nxH0KYMFzdiMk+jgr/7NXZ/HjV5L3xeumh8wafEqhQePMcBmP1xtH4VwZPiGsI12f56/wCY/Eap9RrqvDeaX36r8kcl4m8Qar4ivzd6rdNK2fkjHEcQ9FXt/P1NZVFeteC/hJHe6ZFfeIbu4geZQ6W0GAyA9NzEHn2A4rqjCVR6H49Qw1fG1Hy6vq2eTZr179nKO6LaxJ5ri0URKI8nb5hySQOmcY/SrGu/Bm0aLdomqzRSD+C7AdT+KgEfka77wR4dt/C/h+HS4H81wS80uMeZIepx2HQAegFdFGhKM7s9nLMqxFHFKdRWS/EZ458TWfhbQ31C5HmSMdkEIODK57ew7k9hXzl4l8Qar4iv2u9VummbPyRjiOMeir0H16+tdb8edVe98ZjTw58mwhVQueN7jcx/LaPwrz2oxFVyly9EcmcY6das6Sfux0+YuTSHng817B4Q+EVtc6TFd6/d3UVxMgcQQFV8oHkBiQcn16Yri/iR4Mn8I6hEFnNzY3OfImK4YEdVYevfPes5UZxjzNHJWy3EUaXtZx0/rc2Phf8AEO80a8h0vWLh7jS5GCK8jZa2J6EE8lPUduo9K98BBGQeK+P/AK19EfD/AMRF/hWmq3L75NPt5UkLH7xiBxn3IC104aq/hZ7WR4+T5qNR6JXXp1ML4vfEGfTbh9A0Kby7pQPtVyvWLI+4v+1jqe316eLSSPLK0sjs8jnLOxJZj6knk066nmurmW6uHLzTOZJGPdmOSfzNanhDQLzxLrsOl2ZCFwWklIyIkHVj+gx3JFc05yqyPExOJq46t67Ix6nsLy7sLtLuyuZba4Q5WSNtrD/PpXs998GdJOnFbLVL1L0Lw821o2b3UAED6Hj3rxjULS4sL6eyu4zHPBIY5EPZgcGlOnKnuLE4GvhGnUVrnv8A8KPHH/CUWb2V/tTVbZAXKjAmTpvA7HPUe49eCvFvAOqNo/jHTL4PtQTrHL7o/wArfoc/hRXbQrc0feep9PlWYqrRtVlqtPUwqKK1fDOiXGvXlxZ2jfv47SS4jTGfMKY+T2Jz+deek27I+OhCU5csdzK7ccmvpz4ZW+l23gnTU0iVZoGi3tJjBeQ/fLDsc5GO2MV8x13vwe8Y/wDCPat/Zt9LjTLxwCSeIZDwH+h4B/A9q3w81CWp6mTYqGHr+/s9L9j3+6/49pf9w/yr5DHQV9eXPNrIf9g/yr5DHQVrjOh6HEe9P5/oS29xcWzl7a4mgYjBaOQoSPTIrqfhrq2q/wDCeaOn2+8lWS4COjTswKkHOQTj3/Cn/Cbw3p3ifX7mx1Pz/KjtTKvlPtO7eo646YJr13w/8NvDeiavBqlot408BJj82bcoJBGcY96yo0pytJbHDl2X4iq41oP3U+/Zm34z/wCRO1n/AK8J/wD0Wa+Vh0H0r6q8af8AIn6z/wBeE/8A6LNfKo6D6Vpi/iR1cRfxYejPVP2c/wDkM6v/ANe0X/obV7Ya8Q/Z4lii1jVjLIkYNvHjcwGfmb1r2kXdqxCrcwkk4AEg5rbDfw0erkjSwcfn+Z8fXcZh8TTREglL9lJHQ4lxX2PXyb45tTZfEvVbcjGNULDjszhh+jV9ZV42RR5ZVY9mv1P0/jGoqlPDTXVN/eomX4g8P6Lr8cEes6fDepA5eNZc4ViMZxnnj1q/Z21vZ2sdraQRQQRrtSONQqqPQAdK85+PfiHWvD2k6XNot/JZyTXLJIyKrblCE4+YHvWz8HfEOpeJvBceoarta5SeSEyKm0ShSMNgcd8cdxXqRxNL61Kil71t+587UwGJWXQxTleneyV3o9em33HHftG3XiYafFaR2Yj0AspmuI33GR+yuP4VB6dQTjntVP8AZejUz6/KR84W3UH2/eGvZ9TsrbUdPnsLyJZbe4jMciHoVIwa8R/Z6kGmeONe0KSTLeWVU5+8YZSp/HDZrzq9B0sxp1W7qV16aHuYPGLEZFXw0Y2cLPTqrrV+emp7selfLHxpnkn+JusmQ58t0jX2URrj+Zr6nrwH9oTwnfQ+IG8TWlvJNZXUarcMi58mRRtycdAQBz6g+1aZ7TlPDJx6O7/Ex4Or06WPam7c0Wl63T/Q8qtJHhuoZo22vHIrKfQggg19pL90V8qfDHwlfeKPEttGtu4sIJVku5mUhAgOdue7NjGPx7V9WDpXPw/TlGE5taO1vlc7eN69OdWlSi/einf52t+R55+0Iqt8NrglQStzARnsd4H9TS/s9/8AJNbb/r5n/wDQzVL9pC9WDwNBZ7sPd3qAD1VAWP8AIVd/Z7/5Jrbf9fM//oZrpTTzR2/l/U8+UWuHU31qfpb9D0Kiub+KE81r8P8AWrm2laKaK1Z43U4KsMEH86m8A+IoPFHhe01aLCyOuydB/wAs5V4YfnyPYivT9tH2vsutrngfVJ/VvrK+G/L6O119/wCho6LplrpGnrYWSbLdJJHROy73LkD2BY4rnvjL/wAky13/AK9v/Zlrrq5H4y/8ky13/r2/9mWs8VFRw00v5X+Rtl85Tx9KUnducfzR84+Av+R60LH/AEEYP/QxW78SXZ/H2tljki7YfgAAKq/B2za9+JejIBxFM07ewRGP88VtfGWza0+IWoEghbgRzofUFQD+qmvAymL+ryl5/obeLD5pUUui/O/+RzehRpNrmnxSLuR7qJWHqC4BFfWYr5Bid4pUljba6MGU+hByDX054G8V6d4n0qKeCaNbwIPtFtu+eNu/HdfQ17mEkldHwHDtWEXODersZfj/AOIdp4T1OLT3024vJ3hE2VkVFAJIAycnse1J4D+Idp4r1KXTo9MubSZITLlnV0wCAeRyOSO1eb/H2ZJfHKIuMxWUatznks5/rU37Pn/I6XX/AF4P/wChpT9tL2vL0NFmVd5h7Hm929tjnPiezP8AEHWyxJIucc+gVQKy/DUUc/iPTIJV3RyXkKsvqC4yK6D4yWRs/iHqJxhbgJOvvuUA/qprlLWeS2uormFtssLrIh9GU5H6iuWek3fueBifcxU+bpJ/mfXYrz34/RI/gZZGUForyIqfTOQf0NdV4U8Rab4i0mK/sZ0JZR5sRYbom7qw/wA5rzD48+KLK9S28P2E6T+VL5106HKqwBCpnoTySfTivQrTXs2z7DMsRS+pylfSS08zyavUPB8sg+BniYBsBZnA47Msef515fXtPgDRpLj4JanD5eXv1uJYxjlsDC/qlcVBNyduzPl8rhKdWSj/ACy/I8XPWvWv2cYYzea1cFf3ixwoD6Alyf5CvJM5GfXmu4+DXiS18PeJZEv5BFaXsYiaQ9I3BypPtyQfTNTRaU02Z5ZUjTxcJT2/4B9EV85/GuJI/iLf7FC744nb3JQAn9BX0Bf6pp9jp76hd3kENqi7jKzjbj29fw618yeNdZ/4SDxTf6sqssc0mIlbqEUBVz74GfxrqxclypHv8Q1YexjC+t7/AIMx1YqwZThgcg+hoq3otm+oaxZWEa7muLhIgPqwH8qK5IU5S2PnMPhK1dN01sU6774D/wDI/L/15y/zWtu5+Ct2Cfs2vwMM8eZbEHH4Ma6D4c/De58Ma7/at1qsVwwheIRRwlR82Ock+3pWtOjNTTaPRwWV4qniISlCyT7r/M88+MXhv+wfFTz26bbLUN08WBwj5+dPzOfo3tXE19Q+O/DFr4q0NtPnfyZVbzIJguTG4747gjIIrzXTfgvfG6/4mWtW6W4/5942Z2/76wB+tOrh5c3urQvH5PW9u3RjeL/A2fgz4tk1XRptAvmd7qygLRSHJ3w9ACfVeB7jHoa8PHQV9VeHPDmk+H9Naw0u2EMb/wCscnLyHGMs3c15VN8FtREziHXLQxZOzfA27HbOD1q6tKbjFb2N8fl2LnRpR+Jxvf8AC255lYX17YStLY3lxayMu0vDIUJHXGR2q7/wkviL/oPap/4Fyf4133/Cl9W/6Dlj/wB+H/xo/wCFL6t/0HLH/vy/+NYqjVXQ82OW4+Ksov71/mdF4L1K81P4LanLfXElxLHb3kfmSOWZgFJGSeT1x+FeFDoPpX034T8KRaR4J/4Ry5mE4ljlWeRBt3eZnOPwOPwrzmX4LaiJWEOu2jRg/KXgYMR74OK1q0pyUdD0cfl+Kq06Vo3aVmeVEA9QD9aFYxMJY8K6HcpHBBHINep/8KX1b/oOWP8A34f/ABp9v8F9Q8+P7RrdoYdw8wJC24rnnGT1xWPsKnY8tZTjL/B+X+Zznxv057fx7p+pkfLqUEEpIHG9SFb9Np/Gvo2vP/jd4bfV/By3VjCGvNJcXMKhclkH31A+gBx/s1zdv8d7DyI/P8PXfm7Rv8udCue+M84rGFSlgcTU9q7KVmvxv+J+1VKGJzfL8OqEeZ07xlqvK2/ken+JPDmi+I4YYdasI7yOBy8auzAKxGM8EdqvafZ2mn2cVnY20VtbxLtjiiQKqj2Aryb/AIXvpf8A0L9//wB/o6iuPjxZiP8A0fw5dM//AE0uVUfoDW39p4FSc+ZX72d/yOX/AFfziUFTcHyrZcysvxsewXtzBZ2kt3cyrFBChkkdjgKoGST+FfJ2leJ5tM8ff8JRbIxzeyTtGTy8bsdyfUqcfXFaHjr4jeIPFkRtLh47PTyQTa2+cPjpvY8t9OB7VxteDmeZrETj7LaOt/M+z4e4flgaNT6zZuas12Xb53PsvQtVsda0q31PTp1ntp03Iw/UH0I6EdjV0jPWvknwV4y1zwldmXS7gGFzmW2ly0UnuR2PuOfrXrGk/HTSXjUarot7byfxG3dZV/Uqa9nC51QqRXtXyy/A+VzHhLGUKjeHXPDp3+a/yPXgABgDFI7KilmICgZJJ6V5VffHLw5HFmz0rVJ5OyuqRj89x/lXm/jv4n6/4oheyXZpunNw0EDEtIPR36kewwPrV185w1KPuvmfZf5mOD4VzDETSqR5I9W/8t/63JPjb4ui8T+J1hsJfM07Tw0ULg8SuT87j24AHsM969Y/Z7/5Jrbf9fM//oZr5pr1H4a/FO18KeGk0a50e4ufLleQSxTKM7mzggjjH1rw8vx0VjJVq7tdP9D7DO8nm8rhhMJG/K1287v72evfFr/km2v/APXk9eN/ALxT/Yvig6PdSkWWpkIuTwk44U/8CHy/981p+NfjDaa74Yv9HttDuYmvIjEZJZ1wgPfA6/pXkSsyuHRirKcqwOCCOhFa5hmEPrUK1F3sv6Rz5HklVZdVwuLjy8z8n0Vnp2Z9r1yPxl/5Jlrv/Xt/7MtefaL8c/JsIIdU0KWedIwsk8Nwo8xgPvbSOM/WqfjD4qv4u0abwzpXh6ZZtRKwI0k4LElhwFA659/evUr5rhalCUYy1aelnvY+cwfDmY0MXTnOn7sZJt3VrJ77k/7M+imTUdT1+RPkhQWsJI6s2Gf8gF/Ouv8Ajb4Tn1vSotW06Iy3tiCGjUZaSI8kD1IPIH1rqPAXh+Lwx4Ws9IjId41LTSAffkY5Y/nwPYCt2urBYT2OGVKW/X1PE4krwzfE1G/hei9Fs/1Pj+lRmRg6MysOhU4I/GvoPxn8MNF12eS9s3bTL1yWdolDRyH1ZPX3BFcLcfBvxGj4h1DTJU7Es6H8tprOWHnF7H5vXybFUpWUeZd0ebMSzFmJJJySTkmvRv2e/wDkdLr/AK8H/wDQ0qa1+DWvuw+06npsK552b3OPyFd98Pvh9Z+E7uS+F/PeXckRiLFQiBSQTheT1A5Jq6NGamm0dGXZZio4iNSUbJMzPjh4Um1jTItZ0+Ey3lipEkajLSRHk49Sp5x6E14PX2BXA+MvhdouuXD3tjI2mXjnLmNA0Tn1KcYPuCK1r0HJ80T0M1yiVeftqO/VHz8CQcg4PtSV6TP8G/EayYhv9LlTsxd1P5bTV3SfgxfvKp1XWLaKPqVtkLsfbLYA/I1zKhUfQ8KOVYtu3Izzvw1ot9r+sQaXYJmWU8sR8sa93PsP16d6+o9H0+30rSrXTbVcQ20Sxpn0A6n3ql4W8NaR4asja6VbeXuOZJXO6SQ+rN3+nQVsV20KPs1rufU5Xlv1OLcneT/qx83fFPwrN4b8QyvFEf7Ou3Mls4HC55MZ9x29se9chX1rq+mWGr2ElhqVrHc28g+ZHH6j0PuOa8r134MBpTJomrhEJ4iu0J2/8DXn8xXPVwzveJ4+PySqpudBXT6djx/sB2HQelJXo6fB3xOXAa80pR3PmucfhtrqPDPwe060lWfXL1tQI5EEamOP8TnLD8qyjh6jexwUsoxdSVuS3qYPwI8LS3Wqf8JLdxFbW2ytrkf6yQjBYeygkZ9T7UV7ZBFFBCkMEaRxoAqIgwFA6ADtRXoU6apxsj7DA4OOEpKmvn6j6KKK0OwKKKKACiiigAooooAKKKKACiiigAr51+NPw9m0G9m17SYS2kTvulRR/wAerk88f3Ceh7dPSvoqmTxRTwvDNGkkUilXRxlWB6gjuK48dgoYunyS36PserlGbVcsr+0hqnuu6/z7M+KqK9n+I3wclR5dS8Ijehyz6ezYK/8AXNj1H+yfwPavHbu2uLS5e2u4JbeeM4eOVCrKfcHmvicTg6uGly1F8+h+t5fmmGzCnz0JX7rqvVf0iKiiiuY9AKKKKACiiigAooooAKKK0fD+h6tr9+tlpFjNdzE8hB8qD1Zjwo+tOMXJ2irsmc404uU3ZLqzOHJwK+gPgh8PJNGVfEWuQbdQkT/RYGHNuhHLN6OR+Q9ycXfhl8KrHw88Wqay0V/qi/MigZitz/sg/eb/AGj07Ada9Lr6nK8pdJqtW36Lt6n5zxFxMsRF4bCP3XvLv5Ly79/Tcooor6E+HCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACsbxP4X0HxJAItY02G5KjCSY2yJ/usORWzRUzhGa5ZK6NKVWdKSnTbTXVaHiniP4GAlpfD+slfSC9XI/wC+1/qK4LWPhn420wkvokt0n9+0YSg/gPm/SvqiivJrZHhqmsbx9P8Agn0uF4vzCgrTamvNa/erfjc+MLywv7Jit5Y3VsR1E0LJ/MVV3LnG9fzr7YZVZSrAEHqDzVKfRtIn/wBfpdjLzn57dG59eRXDLh1/Zqfh/wAE9mnxyre/R+6X/APjTcv95fzoDKTgMpPsa+xf+Ed8P/8AQD0z/wABI/8ACrVvpunW+PIsLWLAwNkKrgenAqVw9PrU/D/glvjin0ov7/8AgHyDp+ia1qDBbDSNQuienlWzsPzxiut0T4SeNNRKtLYw6dE38V1MAR/wFcn+VfTdFdNPh+ivjk3+H+Z5+I42xU1alTUfW7/y/I8m8M/BHRrRkm1y/n1JxgmKMeVF9Dg7j+Yr07SdM0/SbNLPTbOC0t06RxIFH146n3q3RXrYfCUcOv3cbfn958zjczxeNd682/Lp9y0Ciiiuk4AooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD/2Q==';
+    const DROMY_DEFAULT_TO = 'facturation@dromy.fr, oweis@dromy.fr, dispatch@dromy.fr';
+    const DROMY_DEFAULT_SLOT = '09:00-13:00';
+    const DROMY_HEADERS = ['Recipient_Name','Recipient_Phone','Notification','Recipient_Notes','Address_Line1','Address_Line2','City/Town','Postal_Code','State/Province','Country','Latitude','Longitude','Task_details','Pickup','completeAfter','completeBefore','Organization','Driver','Team','Quantity','Client Name','ServiceTime'];
+
+    // Texte sûr pour jsPDF (police standard = Latin-1) : espaces insécables fines, guillemets, emoji…
+    function kbPdfTxt(s) {
+      return String(s == null ? '' : s)
+        .replace(/[    ]/g, ' ')
+        .replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, '"')
+        .replace(/[–—]/g, '-').replace(/…/g, '...')
+        .replace(/œ/g, 'oe').replace(/Œ/g, 'OE')
+        .replace(/[^\x00-\xFF]/g, '').replace(/\s+/g, ' ').trim();
+    }
+    function kbDateLong(dayKey) { return formatDateFR(new Date(dayKey + 'T12:00:00')); }
+    function kbPrintSite(code) { return String((SITE_NAMES[code]) || (PDJ_SITE_LABELS[code]) || code || '').toUpperCase(); }
+    function kbPhoneFR(p) {
+      let d = String(p || '').replace(/[^\d+]/g, '');
+      if (d.startsWith('+33')) d = '0' + d.slice(3);
+      else if (d.startsWith('0033')) d = '0' + d.slice(4);
+      else if (/^33\d{9}$/.test(d)) d = '0' + d.slice(2);
+      d = d.replace(/\D/g, '');
+      if (/^[1-9]\d{8}$/.test(d)) d = '0' + d; // 612345678 → 0612345678
+      return d;
+    }
+    // Nom / prénom : champs dédiés si présents, sinon découpe « Prénom NOM » (nom = mots en MAJUSCULES de fin).
+    function kbSplitName(o) {
+      const fn = String((o && o.firstname) || '').trim(), ln = String((o && o.lastname) || '').trim();
+      if (fn || ln) return { prenom: fn, nom: ln };
+      const full = String((o && o.name) || '').replace(/^\[TEST\]\s*/, '').trim();
+      const parts = full.split(/\s+/).filter(Boolean);
+      if (parts.length <= 1) return { prenom: '', nom: full };
+      let i = parts.length;
+      while (i > 1 && /[A-Z]/.test(parts[i - 1]) && parts[i - 1] === parts[i - 1].toUpperCase()) i--;
+      if (i === parts.length) i = parts.length - 1;
+      return { prenom: parts.slice(0, i).join(' '), nom: parts.slice(i).join(' ') };
+    }
+    // Adresse : objet « structuré » (PrestaShop kbprepa ≥ 1.2 : address_detail ; Mongo : address{…}),
+    // sinon chaîne « adresse, CP Ville » (kbprepa 1.1).
+    function kbAddrParse(s) {
+      const t = String(s || '').trim();
+      const m = t.match(/^(.*?)[,\s]+(\d{5})\s+(.+)$/);
+      return m ? { line1: m[1].replace(/[,\s]+$/, ''), line2: '', cp: m[2], city: m[3].trim() } : { line1: t, line2: '', cp: '', city: '' };
+    }
+    function kbAddrFrom(src) {
+      if (!src || typeof src !== 'object') return null;
+      const pick = (o, ks) => { for (const k of ks) { const v = o && o[k]; if (v != null && typeof v !== 'object' && String(v).trim() !== '') return String(v).trim(); } return ''; };
+      const cands = [src.address_detail, src.delivery_address, src.deliveryAddress, src.shipping_address,
+        (src.address && typeof src.address === 'object' && !Array.isArray(src.address)) ? src.address : null,
+        Array.isArray(src.addresses) ? src.addresses[0] : null, src].filter(x => x && typeof x === 'object');
+      for (const a of cands) {
+        const l1 = pick(a, ['address1', 'address_line1', 'addressLine1', 'line1', 'street', 'rue', 'adresse', 'address_1']) || (a === src ? '' : pick(a, ['address', 'label']));
+        const cp = pick(a, ['postcode', 'postal_code', 'postalCode', 'zip', 'zipcode', 'zip_code', 'code_postal', 'cp']);
+        const city = pick(a, ['city', 'ville', 'town', 'locality']);
+        if (!l1 && !cp && !city) continue;
+        const l2 = [pick(a, ['address2', 'address_line2', 'addressLine2', 'line2', 'complement', 'address_complement', 'additional_info']),
+                    pick(a, ['other', 'details', 'address_details', 'instructions', 'comment', 'delivery_instructions', 'digicode'])].filter(Boolean).join(' · ');
+        return { line1: l1, line2: l2, cp, city };
+      }
+      if (typeof src.address === 'string' && src.address.trim()) return kbAddrParse(src.address);
+      return null;
+    }
+    // Dépôt porte : champ explicite si présent, sinon détection dans le complément d'adresse ; null = inconnu.
+    function kbDepotPorte(o) {
+      if (!o || typeof o !== 'object') return null;
+      for (const k of ['depot_porte', 'depotPorte', 'door_drop', 'leave_at_door', 'deposit_door']) {
+        if (o[k] != null && o[k] !== '') { const v = o[k]; return v === true || v === 1 || /^(1|true|oui|yes|y|vrai)$/i.test(String(v)); }
+      }
+      const a = o.addr || o.address_detail || null;
+      const txt = normalizeText([a && a.line2, a && a.other, typeof o.address === 'string' ? o.address : ''].filter(Boolean).join(' '));
+      if (/pas de depot|ne pas deposer|pas depot|sans depot/.test(txt)) return false;
+      if (/depot porte|depot devant|deposer devant|laisser devant|devant la porte|deposer sur le palier/.test(txt)) return true;
+      return null;
+    }
+    // Créneau « 15h-18h », « Jeudi 15-18h », « 09:00-13:00 » → { start:'15:00', end:'18:00' }
+    function kbSlotParse(s) {
+      const m = String(s || '').match(/(\d{1,2})\s*(?:[hH:]\s*(\d{2})?)?\s*(?:-|–|à|a)\s*(\d{1,2})\s*(?:[hH:]\s*(\d{2})?)?/);
+      if (!m) return null;
+      const h1 = parseInt(m[1], 10), h2 = parseInt(m[3], 10);
+      if (h1 > 23 || h2 > 24 || h2 <= h1) return null;
+      const p = (h, mm) => String(h).padStart(2, '0') + ':' + String(mm ? parseInt(mm, 10) : 0).padStart(2, '0');
+      return { start: p(h1, m[2]), end: p(Math.min(h2, 23), m[4]) };
+    }
+    // Commandes + état prépa d'un jour (lecture seule)
+    async function kbLoadDayData(day) {
+      const [od, prepArr] = await Promise.all([
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        storage.getAll(`day_${day}_prep`).catch(() => []),
+      ]);
+      const prep = { casiers: {}, meta: null, dromy: null };
+      (prepArr || []).forEach(d => {
+        if (d.id === 'meta') prep.meta = d;
+        else if (d.id === 'dromy') prep.dromy = d;
+        else if (String(d.id).startsWith('cs|')) prep.casiers[decodeURIComponent(d.id.slice(3))] = d.nums || [];
+      });
+      return { ordersDoc: od, orders: (od && od.orders) || [], prep };
+    }
+    // Casiers/cartons d'un client : même règle que « Prépa du jour » (casier d'origine + « Casier plein → +1 »)
+    function kbClientCasiers(prep, site, client, order) {
+      const k = site + '||' + client;
+      if (prep.casiers[k] && prep.casiers[k].length) return prep.casiers[k].map(String);
+      const c = (order.casiersFrais && order.casiersFrais[0]) || (order.casiersSec && order.casiersSec[0]);
+      return (c != null && c !== '') ? [String(c)] : [];
+    }
+    // Lignes « livraison à domicile » (1 par client, regroupement par nom comme la prépa)
+    function kbDomRows(data, opts) {
+      const includeTest = !!(opts && opts.includeTest);
+      const door = (data.prep.dromy && data.prep.dromy.door) || {};
+      const seen = {}, out = [];
+      for (const o of (data.orders || [])) {
+        if (String(o.site || '').toUpperCase() !== 'DOM') continue;
+        if (!includeTest && o._test) continue;
+        if (!(o.items || []).length) continue;
+        const client = o.name || '(client)';
+        if (seen[client]) continue;
+        seen[client] = 1;
+        const nm = kbSplitName(o);
+        const cartons = kbClientCasiers(data.prep, 'DOM', client, o).slice().sort(casCmp);
+        const slotRaw = o.psSlot || o.slot || '';
+        const auto = o.depotPorte != null ? !!o.depotPorte : null;
+        const depot = (door[client] != null) ? !!door[client] : (auto === true);
+        const addr = o.addr || null;
+        const r = { client, prenom: nm.prenom, nom: nm.nom, email: o.email || '', tel: kbPhoneFR(o.tel), addr, slotRaw, slot: kbSlotParse(slotRaw),
+          cartons, depot, depotAuto: auto, depotForced: door[client] != null, test: !!o._test, missing: [] };
+        if (!cartons.length) r.missing.push('carton');
+        if (!addr || !addr.line1) r.missing.push('adresse');
+        if (addr && !addr.cp) r.missing.push('code postal');
+        if (!r.tel) r.missing.push('téléphone');
+        if (!r.slot) r.missing.push('créneau');
+        out.push(r);
+      }
+      return out.sort((a, b) => casCmp(a.cartons[0] || 'ZZZ', b.cartons[0] || 'ZZZ') || a.client.localeCompare(b.client));
+    }
+    function kbCsvCell(v) { const s = String(v == null ? '' : v); return /[",\n\r;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+    function kbDromyFmtDate(day, hhmm, fmt) { const [y, m, d] = day.split('-'); return (fmt === 'fr' ? `${d}/${m}/${y}` : `${y}-${m}-${d}`) + ' ' + hhmm; }
+    function buildDromyCsv(day, rows, cfg) {
+      const c = cfg || {};
+      const def = kbSlotParse(c.defaultSlot || DROMY_DEFAULT_SLOT) || { start: '09:00', end: '13:00' };
+      const lines = [DROMY_HEADERS.join(',')];
+      rows.forEach(r => {
+        const sl = r.slot || def;
+        const task = `bacs sec : [${r.cartons.join(', ')}] / ${r.tel} / ${r.depot ? 'Dépôt porte' : 'Pas dépôt porte'}`;
+        const a = r.addr || {};
+        const vals = [
+          `${r.prenom} ${String(r.nom || '').toUpperCase()}`.trim(), // Recipient_Name
+          r.tel,                       // Recipient_Phone
+          'FAUX',                      // Notification
+          r.email,                     // Recipient_Notes
+          a.line1 || '',               // Address_Line1
+          a.line2 || '',               // Address_Line2
+          a.city || '',                // City/Town
+          a.cp || '',                  // Postal_Code
+          '',                          // State/Province
+          'FRANCE',                    // Country
+          '', '',                      // Latitude, Longitude
+          task,                        // Task_details
+          'FALSE',                     // Pickup
+          kbDromyFmtDate(day, sl.start, c.dateFmt), // completeAfter
+          kbDromyFmtDate(day, sl.end, c.dateFmt),   // completeBefore
+          '', '',                      // Organization, Driver
+          'KELBONGOO',                 // Team
+          r.cartons.length,            // Quantity
+          'KELBONGOO',                 // Client Name
+          '',                          // ServiceTime
+        ];
+        lines.push(vals.map(kbCsvCell).join(','));
+      });
+      return '﻿' + lines.join('\r\n') + '\r\n';
+    }
+    function kbDromyFileName(day) { const [y, m, d] = day.split('-'); return `KELBONGOO_Livraisons_${d}-${m}-${y}.csv`; }
+    function kbDownloadText(text, name, mime) {
+      const blob = new Blob([text], { type: mime || 'text/csv;charset=utf-8' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+      document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+    }
+    function kbOpenPdf(doc, name) {
+      try { doc.save(name); } catch (e) {}
+      try { const u = doc.output('bloburl'); window.open(u, '_blank'); } catch (e) {}
+    }
+    // Envoi du CSV Dromy (serveur, pièce jointe) + trace dans day_<J>_prep/dromy.sent
+    async function kbSendDromy(day, by, opts) {
+      const cfg = (await storage.getDoc('app_config', 'dromy').catch(() => null)) || {};
+      const data = await kbLoadDayData(day);
+      const rows = kbDomRows(data, { includeTest: false });
+      if (!rows.length) return { ok: false, skipped: true, error: 'Aucune livraison à domicile ce jour' };
+      const csv = buildDromyCsv(day, rows, cfg);
+      const b64 = btoa(unescape(encodeURIComponent(csv)));
+      const to = String(cfg.to || DROMY_DEFAULT_TO);
+      const cartons = rows.reduce((s, r) => s + r.cartons.length, 0);
+      const anomalies = rows.filter(r => r.missing.length).map(r => `- ${r.prenom} ${String(r.nom).toUpperCase()} : ${r.missing.join(', ')} manquant(s)`);
+      const subject = `Kelbongoo · Livraisons à domicile du ${formatDateShort(day)} · ${rows.length} clients · ${cartons} cartons`;
+      const body = `Bonjour,\n\nVeuillez trouver en pièce jointe le fichier des livraisons à domicile Kelbongoo du ${kbDateLong(day)} : ${rows.length} client(s), ${cartons} carton(s).\n` +
+        (anomalies.length ? `\nÀ vérifier :\n${anomalies.join('\n')}\n` : '') + `\nBonne journée,\nKelbongoo`;
+      let r;
+      try { r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to, subject, body, attachment: { dataB64: b64, mimeType: 'text/csv', name: kbDromyFileName(day) } }); }
+      catch (e) { r = { ok: false, error: e.message }; }
+      const log = { at: new Date().toISOString(), by: by || '—', to, count: rows.length, cartons, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue'), auto: !!(opts && opts.auto) };
+      try { await storage.setDoc(`day_${day}_prep`, 'dromy', { sent: log }); } catch (_) {}
+      return log;
+    }
+
+    // ---------- PDF : dispatch pain (1 page A4 par lieu) ----------
+    function generatePainPDF(day, siteBlocks, recap) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const PT = 0.3528, L = 12, R = 198;
+      const dateTxt = kbPdfTxt('Distribution du ' + kbDateLong(day));
+      const fit = (txt, maxW, size, minSize, style) => { doc.setFont('helvetica', style || 'bold'); let fs = size; doc.setFontSize(fs); while (fs > minSize && doc.getTextWidth(txt) > maxW) { fs -= 1; doc.setFontSize(fs); } return fs; };
+      const oneLine = (txt, maxW) => { let t = txt; if (doc.getTextWidth(t) <= maxW) return t; while (t.length > 3 && doc.getTextWidth(t + '...') > maxW) t = t.slice(0, -1); return t + '...'; };
+      let first = true;
+      const newPage = () => { if (!first) doc.addPage(); first = false; };
+      // Récap global (ce qu'on doit recevoir de Brut de Pain)
+      if (recap && recap.length) {
+        newPage();
+        doc.setTextColor(0); fit('RÉCAP PAINS - TOTAL À RECEVOIR', R - L, 30, 16); doc.text('RÉCAP PAINS - TOTAL À RECEVOIR', L, 22);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(14); doc.text(dateTxt, L, 31);
+        const tot = recap.reduce((s, x) => s + x.qty, 0);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.text(`TOTAL : ${tot} pain${tot > 1 ? 's' : ''}`, R, 31, { align: 'right' });
+        doc.setLineWidth(0.6); doc.line(L, 35, R, 35);
+        let y = 46; const h = Math.max(8, Math.min(16, 238 / recap.length));
+        recap.forEach((x, i) => {
+          if (y > 285) { doc.addPage(); y = 20; }
+          if (i % 2 === 0) { doc.setFillColor(242, 242, 242); doc.rect(L, y - h * 0.72, R - L, h, 'F'); }
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(14, h * 1.5)); doc.setTextColor(0);
+          doc.text(oneLine(kbPdfTxt(x.produit), 120), L + 2, y);
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(Math.min(10, h * 1.1)); doc.setTextColor(90);
+          doc.text(oneLine(kbPdfTxt(x.detail), 50), 150, y, { align: 'right' });
+          doc.setTextColor(0); doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(18, h * 1.9)); doc.text(String(x.qty), R - 2, y, { align: 'right' });
+          y += h;
+        });
+      }
+      // 1 page (ou plus si très long) par lieu
+      siteBlocks.forEach(b => {
+        const lines = b.lines; const total = lines.reduce((s, x) => s + x.qty, 0);
+        const TOP = 64, BOTTOM = 276, MINH = 13, MAXH = 26;
+        const perPage = Math.max(1, Math.floor((BOTTOM - TOP) / MINH));
+        const pages = []; for (let i = 0; i < lines.length; i += perPage) pages.push(lines.slice(i, i + perPage));
+        if (!pages.length) pages.push([]);
+        pages.forEach((chunk, pi) => {
+          newPage();
+          doc.setTextColor(0);
+          // Code en GROS (cartouche noir à droite)
+          doc.setFillColor(0, 0, 0); doc.roundedRect(146, 8, 52, 36, 3, 3, 'F');
+          doc.setTextColor(255, 255, 255); const fsc = fit(b.code, 46, 64, 30); doc.setFontSize(fsc);
+          doc.text(b.code, 172, 26 + (fsc * PT) / 2.8, { align: 'center' });
+          // Nom du lieu en GROS
+          doc.setTextColor(0); const nm = kbPdfTxt(b.name); const fsn = fit(nm, 128, 54, 22);
+          if (doc.getTextWidth(nm) <= 128) doc.text(nm, L, 30);
+          else { const parts = doc.splitTextToSize(nm, 128).slice(0, 2); doc.setFontSize(Math.max(22, fsn)); doc.text(parts, L, 21); }
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(13); doc.text(dateTxt + (pages.length > 1 ? `  (page ${pi + 1}/${pages.length})` : ''), L, 52);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(20); doc.text(`${total} PAIN${total > 1 ? 'S' : ''}`, R, 54, { align: 'right' });
+          doc.setLineWidth(0.8); doc.line(L, 58, R, 58);
+          const h = Math.max(MINH, Math.min(MAXH, (BOTTOM - TOP) / Math.max(1, chunk.length)));
+          let y = TOP;
+          chunk.forEach((x, i) => {
+            if (i % 2 === 0) { doc.setFillColor(240, 240, 240); doc.rect(L, y, R - L, h, 'F'); }
+            const mid = y + h / 2;
+            // quantité très grosse dans une case
+            doc.setDrawColor(0); doc.setLineWidth(0.7); doc.rect(R - 36, y + 1.2, 34, h - 2.4);
+            doc.setFont('helvetica', 'bold'); const fq = Math.min(48, (h - 3) / PT * 0.95); doc.setFontSize(fq);
+            doc.text(String(x.qty), R - 19, mid + (fq * PT) * 0.36, { align: 'center' });
+            // nom du pain
+            const fp = Math.min(22, Math.max(13, h * 1.05)); doc.setFontSize(fp);
+            doc.text(oneLine(kbPdfTxt(x.produit), R - L - 44), L + 3, mid + (fp * PT) * 0.36 - (x.producteur && h >= 18 ? 2.2 : 0));
+            if (x.producteur && h >= 18) { doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90); doc.text(oneLine(kbPdfTxt(x.producteur), R - L - 44), L + 3, mid + 6); doc.setTextColor(0); }
+            y += h;
+          });
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(11); doc.setTextColor(60);
+          doc.rect(L, 283, 5, 5); doc.text('Carton complet  -  vérifié par : ____________________', L + 8, 287);
+          doc.setFont('helvetica', 'bold'); doc.text(`${b.code} · ${total} pain${total > 1 ? 's' : ''}`, R, 287, { align: 'right' });
+          doc.setTextColor(0);
+        });
+      });
+      return doc;
+    }
+
+    // ---------- PDF : étiquettes livraison (planche A4 2×4, gabarit de l'ancien deliverylabels) ----------
+    function generateDomLabelsPDF(day, rows) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const labels = [];
+      rows.forEach(r => { const n = r.cartons.length; r.cartons.forEach((c, i) => labels.push({ r, num: c, k: i + 1, n })); });
+      labels.sort((a, b) => casCmp(a.num, b.num) || a.k - b.k);
+      const X0 = 11.64, Y0 = 9.88, W = 92.1, H = 69.0, G = [52, 140, 62];
+      labels.forEach((Lb, idx) => {
+        const pos = idx % 8; if (idx > 0 && pos === 0) doc.addPage();
+        const x = X0 + (pos % 2) * W, y = Y0 + Math.floor(pos / 2) * H;
+        doc.setDrawColor(0); doc.setLineWidth(0.3); doc.rect(x, y, W, H);
+        try { doc.addImage(KB_LOGO_JPG, 'JPEG', x + 4.9, y + 4.9, 31.4, 12.2); } catch (e) {}
+        doc.setTextColor(0); doc.setFont('times', 'normal'); doc.setFontSize(18);
+        doc.text(`${Lb.k} / ${Lb.n}`, x + W - 5, y + 12.6, { align: 'right' });
+        const field = (label, val, yy) => {
+          doc.setFont('times', 'normal'); doc.setFontSize(12); doc.setTextColor(0); doc.text(label, x + 4.8, yy);
+          const lw = doc.getTextWidth(label) + 1.4; const v = kbPdfTxt(val);
+          doc.setFont('times', 'bold'); let fs = 16; doc.setFontSize(fs);
+          while (fs > 9 && doc.getTextWidth(v) > W - 9 - lw) { fs -= 0.5; doc.setFontSize(fs); }
+          doc.text(v, x + 4.8 + lw, yy);
+        };
+        field('Nom :', String(Lb.r.nom || '').toUpperCase() + (Lb.r.test ? ' [TEST]' : ''), y + 28);
+        field('Prénom :', Lb.r.prenom || '', y + 36.5);
+        doc.setTextColor(G[0], G[1], G[2]); doc.setFont('times', 'normal'); doc.setFontSize(12);
+        doc.text('Numéro de bac :', x + 4.8, y + 58);
+        const lw = doc.getTextWidth('Numéro de bac :') + 1.6;
+        doc.setFont('times', 'bold'); doc.setFontSize(19); doc.text(String(Lb.num), x + 4.8 + lw, y + 58.3);
+        // pictogramme « sec » (cercle + carotte stylisée)
+        const cx = x + 76.6, cy = y + 52; doc.setDrawColor(G[0], G[1], G[2]); doc.setLineWidth(0.6); doc.circle(cx, cy, 5.3);
+        doc.setFillColor(G[0], G[1], G[2]); doc.triangle(cx - 2.8, cy + 2.8, cx + 0.2, cy - 1.4, cx + 1.4, cy - 0.2, 'F');
+        doc.setLineWidth(0.5); doc.line(cx + 0.9, cy - 0.9, cx + 2.6, cy - 3.0); doc.line(cx + 0.9, cy - 0.9, cx + 3.2, cy - 1.6);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.text('sec', cx, y + 62.3, { align: 'center' });
+        doc.setTextColor(0); doc.setDrawColor(0);
+      });
+      return doc;
+    }
+
+    // ---------- Sélecteur de date + vérification (commun aux impressions) ----------
+    function useKbDayData(day) {
+      const [st, setSt] = React.useState({ loading: true, orders: [], prep: { casiers: {} } });
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false; setSt({ loading: true, orders: [], prep: { casiers: {} } });
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '')) { setSt({ loading: false, orders: [], prep: { casiers: {} }, error: 'Date invalide' }); return; }
+        kbLoadDayData(day).then(d => { if (!stop) setSt({ loading: false, ...d }); })
+          .catch(e => { if (!stop) setSt({ loading: false, orders: [], prep: { casiers: {} }, error: e.message }); });
+        return () => { stop = true; };
+      }, [day, tick]);
+      return [st, () => setTick(t => t + 1)];
+    }
+    function kbDayCheck(day, data) {
+      const od = data.ordersDoc;
+      const mismatch = !!(od && od.targetDate && od.targetDate !== day);
+      return { count: (data.orders || []).length, mismatch, targetDate: od && od.targetDate, ok: !data.loading && !mismatch && (data.orders || []).length > 0 };
+    }
+    function KbPrintDatePick({ day, setDay, data, confirmed, setConfirmed, what }) {
+      const today = todayKey(), act = activeDay();
+      const chk = kbDayCheck(day, data); const od = data.ordersDoc;
+      const change = (v) => { setDay(v); setConfirmed(false); };
+      return (
+        <div className="card" style={{ borderLeft: '4px solid var(--accent)' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 700 }}>📅 Distribution du</span>
+            <input type="date" value={day} onChange={e => change(e.target.value)} style={{ width: 'auto', fontSize: 16, padding: '6px 8px' }} />
+            {day !== act && <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => change(act)}>↺ Distribution active ({formatDateShort(act)})</button>}
+          </div>
+          <div style={{ fontSize: 22, fontWeight: 900, margin: '10px 0 6px', textTransform: 'capitalize' }}>{kbDateLong(day)}</div>
+          {data.loading ? <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Vérification des commandes…</div>
+            : chk.mismatch ? <div style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 700 }}>❌ Les commandes enregistrées pour ce jour portent la date du {formatDateShort(chk.targetDate)} — impression bloquée. Recharge les bonnes commandes.</div>
+            : chk.count > 0 ? <div style={{ fontSize: 13, color: '#2e7d32', fontWeight: 700 }}>✅ {chk.count} commande{chk.count > 1 ? 's' : ''} chargée{chk.count > 1 ? 's' : ''} pour cette date{od && od.source ? ` · source ${od.source}` : ''}{od && od.uploadedAt ? ` · chargées le ${new Date(od.uploadedAt).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}` : ''}</div>
+            : <div style={{ fontSize: 13, color: 'var(--danger)', fontWeight: 700 }}>❌ Aucune commande chargée pour le {formatDateShort(day)}{data.error ? ` (${data.error})` : ''}.</div>}
+          {!data.loading && day < today && <div style={{ fontSize: 12, color: 'var(--warn)', marginTop: 4 }}>⚠️ Date passée.</div>}
+          {!data.loading && day !== act && <div style={{ fontSize: 12, color: 'var(--warn)', marginTop: 4 }}>⚠️ Ce n'est pas la distribution active de l'appli ({formatDateShort(act)}).</div>}
+          <label style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 10, fontWeight: 800, fontSize: 14, opacity: chk.ok ? 1 : 0.5 }}>
+            <input type="checkbox" checked={confirmed && chk.ok} disabled={!chk.ok} onChange={e => setConfirmed(e.target.checked)} style={{ width: 24, height: 24, flex: '0 0 auto' }} />
+            Je confirme : {what || 'impression'} pour la distribution du {formatDateShort(day)}
+          </label>
+        </div>
+      );
+    }
+    function KbBackToHub({ setTab }) {
+      return setTab ? <button className="btn-secondary" style={{ fontSize: 13, padding: '6px 12px', alignSelf: 'flex-start' }} onClick={() => setTab('suivi')}>← Suivi &amp; impression</button> : null;
+    }
+
+    // ---------- Page : impression dispatch pain ----------
+    function PrintPainPage({ session, setTab }) {
+      const [day, setDay] = React.useState(() => activeDay());
+      const [confirmed, setConfirmed] = React.useState(false);
+      const [data, reload] = useKbDayData(day);
+      const [prodOff, setProdOff] = React.useState({});
+      const [includeTest, setIncludeTest] = React.useState(false);
+      const [withRecap, setWithRecap] = React.useState(true);
+      const allLines = React.useMemo(() => {
+        const out = [];
+        (data.orders || []).forEach(o => {
+          const site = String(o.site || '').toUpperCase();
+          (o.items || []).forEach(it => { if (it.cat === 'pain') out.push({ site, produit: it.produit || '(pain)', producteur: it.producteur || '', qty: parseInt(it.qty, 10) || 0, test: !!(o._test || it._test) }); });
+        });
+        return out;
+      }, [data.orders]);
+      const hasTest = allLines.some(l => l.test);
+      const producers = React.useMemo(() => [...new Set(allLines.map(l => l.producteur || '—'))].sort((a, b) => a.localeCompare(b, 'fr')), [allLines]);
+      const prodSig = producers.join('|');
+      React.useEffect(() => {
+        // Par défaut : si un producteur « Brut de pain » existe, on n'imprime que ses pains.
+        const brut = producers.filter(p => /brut/i.test(p));
+        const off = {}; if (brut.length && brut.length < producers.length) producers.forEach(p => { if (!brut.includes(p)) off[p] = true; });
+        setProdOff(off);
+      }, [prodSig]);
+      const lines = allLines.filter(l => l.qty > 0 && !prodOff[l.producteur || '—'] && (includeTest || !l.test));
+      const siteBlocks = (() => {
+        const by = {};
+        lines.forEach(l => { const m = (by[l.site] = by[l.site] || {}); const k = l.produit + '||' + l.producteur; m[k] = m[k] || { produit: l.produit, producteur: l.producteur, qty: 0 }; m[k].qty += l.qty; });
+        const order = (c) => { const i = SITES.indexOf(c); return i < 0 ? 999 : i; };
+        return Object.keys(by).sort((a, b) => kbPrintSite(a).localeCompare(kbPrintSite(b), 'fr') || order(a) - order(b))
+          .map(code => ({ code, name: kbPrintSite(code), lines: Object.values(by[code]).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')) }));
+      })();
+      const recap = (() => {
+        const m = {};
+        siteBlocks.forEach(b => b.lines.forEach(x => { const k = x.produit + '||' + x.producteur; m[k] = m[k] || { produit: x.produit, qty: 0, by: [] }; m[k].qty += x.qty; m[k].by.push(`${b.code} ${x.qty}`); }));
+        return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')).map(x => ({ produit: x.produit, qty: x.qty, detail: x.by.join(' · ') }));
+      })();
+      const total = recap.reduce((s, x) => s + x.qty, 0);
+      const chk = kbDayCheck(day, data);
+      const canPrint = confirmed && chk.ok && siteBlocks.length > 0;
+      const print = () => {
+        if (!canPrint) return;
+        const doc = generatePainPDF(day, siteBlocks, withRecap ? recap : null);
+        kbOpenPdf(doc, `Dispatch_pain_${day}.pdf`);
+      };
+      return (
+        <div className="stack">
+          <KbBackToHub setTab={setTab} />
+          <h1 style={{ margin: 0 }}>🍞 Impression dispatch pain</h1>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Une feuille A4 par lieu : nom + code en gros, nombre de pains de chaque sorte à mettre dans le carton du lieu.</p>
+          <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" />
+          {producers.length > 1 && (
+            <div className="card">
+              <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Producteurs inclus</div>
+              <div className="chip-group">
+                {producers.map(p => <div key={p} className={`chip ${!prodOff[p] ? 'selected' : ''}`} onClick={() => setProdOff(o => ({ ...o, [p]: !o[p] }))}>{!prodOff[p] ? '✓ ' : ''}{p}</div>)}
+              </div>
+            </div>
+          )}
+          <div className="card" style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', fontSize: 13 }}>
+            <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}><input type="checkbox" checked={withRecap} onChange={e => setWithRecap(e.target.checked)} style={{ width: 18, height: 18 }} /> Page récap (total à recevoir)</label>
+            {hasTest && <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}><input type="checkbox" checked={includeTest} onChange={e => setIncludeTest(e.target.checked)} style={{ width: 18, height: 18 }} /> Inclure les commandes [TEST]</label>}
+            <button className="btn-secondary" style={{ fontSize: 12 }} onClick={reload}>↻ Recharger</button>
+          </div>
+          <button className="btn-primary btn-lg" disabled={!canPrint} onClick={print} style={{ fontSize: 17, padding: 16 }}>
+            🖨️ Imprimer — {siteBlocks.length} lieu{siteBlocks.length > 1 ? 'x' : ''} · {total} pain{total > 1 ? 's' : ''}
+          </button>
+          {!confirmed && chk.ok && <div style={{ fontSize: 12, color: 'var(--warn)', textAlign: 'center' }}>Coche « Je confirme » pour imprimer.</div>}
+          {!data.loading && chk.ok && siteBlocks.length === 0 && <div className="card"><p style={{ margin: 0, fontSize: 13, color: 'var(--ink-mute)' }}>Aucun pain commandé pour cette distribution{producers.length ? ' (avec les producteurs cochés)' : ''}.</p></div>}
+          {siteBlocks.map(b => {
+            const t = b.lines.reduce((s, x) => s + x.qty, 0);
+            return (
+              <div key={b.code} className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#111', color: '#fff', padding: '10px 14px', gap: 10 }}>
+                  <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.1 }}>{b.name}</div>
+                  <div style={{ fontSize: 30, fontWeight: 900, border: '2px solid #fff', borderRadius: 8, padding: '0 10px' }}>{b.code}</div>
+                </div>
+                {b.lines.map((x, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 14px', background: i % 2 ? '#fff' : '#f4f4f4' }}>
+                    <div style={{ minWidth: 0 }}><div style={{ fontSize: 17, fontWeight: 800 }}>{x.produit}</div>{x.producteur && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{x.producteur}</div>}</div>
+                    <div style={{ fontSize: 34, fontWeight: 900, minWidth: 64, textAlign: 'center', border: '2px solid #111', borderRadius: 8 }}>{x.qty}</div>
+                  </div>
+                ))}
+                <div style={{ textAlign: 'right', padding: '6px 14px', fontWeight: 800 }}>{t} pain{t > 1 ? 's' : ''}</div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ---------- Page : étiquettes livraison + fichier Dromy ----------
+    function PrintLabelsPage({ session, setTab, embedded }) {
+      const showToast = React.useContext(ToastContext);
+      const [day, setDay] = React.useState(() => activeDay());
+      const [confirmed, setConfirmed] = React.useState(false);
+      const [data, reload] = useKbDayData(day);
+      const [includeTest, setIncludeTest] = React.useState(false);
+      const [force, setForce] = React.useState(false);
+      const [cfg, setCfg] = React.useState({});
+      const [sending, setSending] = React.useState(false);
+      React.useEffect(() => { storage.getDoc('app_config', 'dromy').then(d => setCfg(d || {})).catch(() => {}); }, []);
+      const rows = React.useMemo(() => kbDomRows(data, { includeTest }), [data, includeTest]);
+      const hasTest = (data.orders || []).some(o => String(o.site || '').toUpperCase() === 'DOM' && o._test);
+      const closed = !!(data.prep && data.prep.meta && data.prep.meta.closed);
+      const chk = kbDayCheck(day, data);
+      const nCartons = rows.reduce((s, r) => s + r.cartons.length, 0);
+      const ready = confirmed && chk.ok && rows.length > 0 && (closed || force);
+      const sent = data.prep && data.prep.dromy && data.prep.dromy.sent;
+      const toggleDoor = async (r) => {
+        try { await storage.setDoc(`day_${day}_prep`, 'dromy', { door: { [r.client]: !r.depot } }); reload(); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const labels = () => { if (!ready) return; kbOpenPdf(generateDomLabelsPDF(day, rows), `Etiquettes_livraison_${day}.pdf`); };
+      const csv = () => { if (!ready) return; kbDownloadText(buildDromyCsv(day, rows, cfg), kbDromyFileName(day)); };
+      const send = async () => {
+        if (!ready || !session.isMaster) return;
+        if (!confirm(`Envoyer le fichier des livraisons du ${formatDateShort(day)} (${rows.filter(r => !r.test).length} clients) à :\n${cfg.to || DROMY_DEFAULT_TO} ?`)) return;
+        setSending(true);
+        try { const lg = await kbSendDromy(day, session.name, { auto: false }); showToast(lg.ok ? `✉️ Envoyé à Dromy (${lg.count} clients, ${lg.cartons} cartons)` : ('⚠️ ' + lg.error)); reload(); }
+        finally { setSending(false); }
+      };
+      return (
+        <div className="stack">
+          {!embedded && <KbBackToHub setTab={setTab} />}
+          <h1 style={{ margin: 0 }}>🏷️ Étiquettes livraison {embedded ? '& fichier Dromy' : ''}</h1>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Livraison à domicile (DOM) : une étiquette par carton (planche A4 autocollante 2 × 4) + fichier CSV Dromy.</p>
+          <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="étiquettes livraison" />
+          {!data.loading && chk.ok && (closed
+            ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>🔒 Prépa clôturée{data.prep.meta.closedBy ? ` par ${data.prep.meta.closedBy}` : ''} — nombre de cartons définitif.</div>
+            : <div className="alert-warning" style={{ fontSize: 13 }}>⏳ Prépa pas encore clôturée : le nombre de cartons peut encore changer. Les étiquettes se génèrent après la clôture.
+                {session.isMaster && <label style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 }}><input type="checkbox" checked={force} onChange={e => setForce(e.target.checked)} style={{ width: 18, height: 18 }} /> Générer quand même (master)</label>}
+              </div>)}
+          {hasTest && <label className="card" style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13 }}><input type="checkbox" checked={includeTest} onChange={e => setIncludeTest(e.target.checked)} style={{ width: 18, height: 18 }} /> Inclure les commandes [TEST] (jamais envoyées à Dromy automatiquement)</label>}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn-primary btn-lg" style={{ flex: '1 1 220px', fontSize: 16 }} disabled={!ready} onClick={labels}>🏷️ Étiquettes PDF ({nCartons} carton{nCartons > 1 ? 's' : ''})</button>
+            <button className="btn-secondary" style={{ flex: '1 1 160px' }} disabled={!ready} onClick={csv}>⬇️ CSV Dromy</button>
+            {session.isMaster && <button className="btn-secondary" style={{ flex: '1 1 160px', color: '#2c4a8c', borderColor: '#b9c7e6' }} disabled={!ready || sending} onClick={send}>{sending ? 'Envoi…' : '✉️ Envoyer à Dromy'}</button>}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
+            Envoi automatique à la clôture : <b style={{ color: cfg.enabled ? '#2e7d32' : 'var(--ink-mute)' }}>{cfg.enabled ? 'ACTIVÉ' : 'désactivé'}</b> (Pilotage › Dromy)
+            {sent && <span> · Dernier envoi : {sent.ok ? '✅' : '❌'} {new Date(sent.at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })} par {sent.by}{sent.auto ? ' (auto)' : ''}{sent.ok ? ` · ${sent.count} clients` : ` · ${sent.error}`}</span>}
+          </div>
+          {!data.loading && chk.ok && rows.length === 0 && <div className="card"><p style={{ margin: 0, fontSize: 13, color: 'var(--ink-mute)' }}>Aucune livraison à domicile pour cette distribution.</p></div>}
+          {rows.map(r => (
+            <div key={r.client} className="card" style={{ padding: '10px 12px', borderLeft: '3px solid ' + (r.missing.length ? 'var(--warn)' : '#2e7d32') }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 15, fontWeight: 800 }}>{String(r.nom).toUpperCase()} <span style={{ fontWeight: 600 }}>{r.prenom}</span>{r.test && <span className="badge badge-info" style={{ marginLeft: 6 }}>TEST</span>}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
+                    {r.addr && r.addr.line1 ? `${r.addr.line1}${r.addr.line2 ? ' · ' + r.addr.line2 : ''}, ${r.addr.cp} ${r.addr.city}` : '📍 adresse manquante'}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>📞 {r.tel || '—'} · 🕑 {r.slot ? `${r.slot.start}–${r.slot.end}` : `créneau inconnu → ${cfg.defaultSlot || DROMY_DEFAULT_SLOT}`}</div>
+                  {r.missing.length > 0 && <div style={{ fontSize: 11, color: 'var(--warn)', fontWeight: 700 }}>⚠️ Manque : {r.missing.join(', ')}</div>}
+                </div>
+                <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  <div style={{ fontSize: 22, fontWeight: 900 }}>{r.cartons.length} 📦</div>
+                  <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>[{r.cartons.join(', ')}]</div>
+                </div>
+              </div>
+              <button className="btn-secondary" style={{ marginTop: 8, fontSize: 12, padding: '6px 10px', color: r.depot ? '#2e7d32' : 'var(--ink-soft)', borderColor: r.depot ? '#a5d6a7' : undefined }} onClick={() => toggleDoor(r)}>
+                {r.depot ? '🚪 Dépôt porte' : '🙅 Pas dépôt porte'}{r.depotForced ? ' (modifié)' : (r.depotAuto == null ? ' (par défaut)' : ' (client)')} · changer
+              </button>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ---------- Pilotage › Dromy (master) ----------
+    function DromyPilotagePage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [cfg, setCfg] = React.useState(null);
+      const [saving, setSaving] = React.useState(false);
+      React.useEffect(() => { storage.getDoc('app_config', 'dromy').then(d => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'iso', ...(d || {}) })).catch(() => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'iso' })); }, []);
+      if (!cfg) return <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Chargement…</p></div>;
+      const save = async (patch) => {
+        const next = { ...cfg, ...patch };
+        if (!kbSlotParse(next.defaultSlot)) { showToast('Créneau par défaut invalide (ex : 09:00-13:00)'); return; }
+        setSaving(true);
+        try {
+          await storage.setDoc('app_config', 'dromy', { enabled: !!next.enabled, to: String(next.to || '').trim() || DROMY_DEFAULT_TO, defaultSlot: next.defaultSlot, dateFmt: next.dateFmt === 'fr' ? 'fr' : 'iso', updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true });
+          setCfg(next); showToast('✓ Réglages Dromy enregistrés');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setSaving(false); }
+      };
+      return (
+        <div className="stack">
+          <div className="card" style={{ borderLeft: '4px solid ' + (cfg.enabled ? '#2e7d32' : 'var(--ink-mute)') }}>
+            <h3 style={{ marginTop: 0 }}>🚚 Envoi mail Dromy</h3>
+            <p style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 0 }}>À la clôture de la prépa, le fichier CSV des livraisons à domicile (format Dromy) part automatiquement par mail. À activer quand on passe à 100 % sur l'appli.</p>
+            <label style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 16, fontWeight: 800 }}>
+              <input type="checkbox" checked={!!cfg.enabled} disabled={saving} onChange={e => save({ enabled: e.target.checked })} style={{ width: 26, height: 26 }} />
+              {cfg.enabled ? '✅ Envoi automatique ACTIVÉ' : 'Activer l\'envoi mail Dromy'}
+            </label>
+            <div style={{ marginTop: 12, fontSize: 13 }}>
+              <div style={{ fontWeight: 700 }}>Destinataires</div>
+              <input value={cfg.to} onChange={e => setCfg({ ...cfg, to: e.target.value })} style={{ width: '100%', fontSize: 13 }} />
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
+                <div><div style={{ fontWeight: 700 }}>Créneau si inconnu</div><input value={cfg.defaultSlot} onChange={e => setCfg({ ...cfg, defaultSlot: e.target.value })} style={{ width: 140 }} /></div>
+                <div><div style={{ fontWeight: 700 }}>Format des dates</div>
+                  <select value={cfg.dateFmt} onChange={e => setCfg({ ...cfg, dateFmt: e.target.value })} style={{ width: 'auto' }}>
+                    <option value="iso">2026-10-03 09:00</option><option value="fr">03/10/2026 09:00</option>
+                  </select></div>
+              </div>
+              <button className="btn-primary" style={{ marginTop: 10 }} disabled={saving} onClick={() => save({})}>💾 Enregistrer</button>
+              {cfg.updatedBy && <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>Modifié par {cfg.updatedBy} le {new Date(cfg.updatedAt).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}</div>}
+            </div>
+          </div>
+          <PrintLabelsPage session={session} embedded />
+        </div>
+      );
+    }
+
+    // ---------- V9.59 — Chargement des commandes (PROVISOIRE ancien site) → MU exacte ----------
+    // À 10h (clôture des commandes), le préparateur charge le fichier des commandes à préparer :
+    // l'appli en tire la quantité EXACTE de chaque fruit / légume → « à faire » exact = commandes − stock PDP.
+    // Formats acceptés : export JSON des commandes (Mongo, comme le Chargement master) ou CSV/TSV avec
+    // une colonne produit (ou ID produit) + une colonne quantité. Quand PrestaShop sera à 100 %,
+    // les commandes du lendemain sont lues automatiquement → ce bouton ne servira plus.
+    function kbDateFromCell(v) {
+      const t = String(v || '').trim();
+      let m = t.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+      m = t.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+      return '';
+    }
+    function kbParseMuOrdersFile(text, name) {
+      const raw = String(text || '').replace(/^﻿/, '');
+      const t = raw.trimStart();
+      if (t[0] === '[' || t[0] === '{') {
+        let data; try { data = JSON.parse(t); } catch (e) { return { error: 'JSON illisible : ' + e.message }; }
+        const arr = Array.isArray(data) ? data : (data.orders || []);
+        if (!arr.length) return { error: 'Aucune commande dans le fichier JSON.' };
+        const lines = []; const dates = {};
+        arr.forEach(o => {
+          if (o.status === 8 || o.status === 0) return; // annulée / panier
+          const dIso = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date || o.day || '';
+          if (dIso) { const d = new Date(dIso); if (!isNaN(d)) { const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; dates[k] = (dates[k] || 0) + 1; } }
+          (o.items || []).forEach(it => lines.push({ id: oid(it.producerproduct_id) || it.id || '', name: it.product_name || it.name || it.produit || '', qty: Number(it.quantity != null ? it.quantity : it.qty) || 0 }));
+        });
+        return { kind: 'JSON', lines, dates, nOrders: arr.length };
+      }
+      const parsed = Papa.parse(raw, { header: true, skipEmptyLines: true, transformHeader: h => String(h || '').trim() });
+      const hdr = (parsed.meta && parsed.meta.fields) || [];
+      const H = hdr.map(h => normalizeText(h).trim());
+      const find = (preds) => { for (const p of preds) { const i = H.findIndex(p); if (i >= 0) return hdr[i]; } return null; };
+      const cProd = find([h => h === 'produit' || h === 'designation' || h === 'product' || h === 'article' || h === 'libelle', h => h.includes('designation'), h => h.includes('produit') && !h.includes('id'), h => h.includes('product') && !h.includes('id'), h => h.includes('article')]);
+      const cId = find([h => h.includes('producerproduct'), h => h === 'id produit' || h === 'product_id' || h === 'id_produit', h => h.includes('id site')]);
+      const cQty = find([h => h.includes('quantit'), h => h === 'qty' || h === 'qte' || h === 'quantity', h => h === 'nb' || h === 'nombre', h => h === 'total']);
+      const cDate = find([h => h.includes('date de distribution') || h.includes('distribution'), h => h === 'date' || h.includes('date')]);
+      if (!cProd && !cId) return { error: `Ce fichier ne contient pas les produits commandés (colonnes trouvées : ${hdr.join(' | ') || 'aucune'}). Il faut l'export des commandes AVEC le détail des produits et quantités.` };
+      if (!cQty) return { error: `Colonne quantité introuvable (colonnes : ${hdr.join(' | ')}).` };
+      const lines = []; const dates = {};
+      (parsed.data || []).forEach(row => {
+        const q = parseFloat(String(row[cQty] || '').replace(',', '.')) || 0;
+        lines.push({ id: cId ? String(row[cId] || '').trim() : '', name: cProd ? String(row[cProd] || '').trim() : '', qty: q });
+        if (cDate) { const d = kbDateFromCell(row[cDate]); if (d) dates[d] = (dates[d] || 0) + 1; }
+      });
+      return { kind: 'CSV', lines, dates, cols: { produit: cProd, id: cId, qty: cQty, date: cDate } };
+    }
+    function MuOrdersLoadPage({ session, setTab }) {
+      const showToast = React.useContext(ToastContext);
+      const dateKey = todayKey();
+      const [forDay, setForDay] = React.useState(() => addDays(todayKey(), 1));
+      const [flRows, setFlRows] = React.useState(null);
+      const [flErr, setFlErr] = React.useState('');
+      const [snap, setSnap] = React.useState(null);
+      const [res, setRes] = React.useState(null);   // { exact, matched, unmatched, unmatchedNames, fileName, kind, fileDays }
+      const [err, setErr] = React.useState('');
+      const [confirmed, setConfirmed] = React.useState(false);
+      const [saving, setSaving] = React.useState(false);
+      React.useEffect(() => {
+        flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() })
+          .then(d => { if (!d || d.ok === false) throw new Error((d && d.error) || 'lecture impossible'); setFlRows(d.rows || []); })
+          .catch(e => { setFlRows([]); setFlErr('Sheet FL illisible : ' + e.message); });
+      }, []);
+      React.useEffect(() => { const u = storage.subscribe('mu_' + dateKey, arr => { setSnap((arr || []).find(x => x.id === MU_REEL_DOC) || null); }); return u; }, [dateKey]);
+      const flIdx = React.useMemo(() => muFlIndex(flRows), [flRows]);
+      const ready = flRows !== null && Object.keys(flIdx).length > 0;
+      const analyse = (lines, meta) => {
+        const r = muExactFromLines(lines, flIdx);
+        const fileDays = Object.keys(meta.dates || {});
+        setRes({ ...r, ...meta, fileDays }); setConfirmed(false);
+      };
+      const onFile = async (e) => {
+        const f = e.target.files && e.target.files[0]; e.target.value = '';
+        if (!f) return; setErr(''); setRes(null);
+        try {
+          const text = await new Promise((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(String(fr.result || '')); fr.onerror = () => ko(fr.error || new Error('lecture')); fr.readAsText(f, 'utf-8'); });
+          const p = kbParseMuOrdersFile(text, f.name);
+          if (p.error) { setErr(p.error); return; }
+          if (!p.lines.length) { setErr('Aucune ligne produit dans le fichier.'); return; }
+          analyse(p.lines, { fileName: f.name, kind: p.kind, dates: p.dates });
+        } catch (x) { setErr('Lecture impossible : ' + x.message); }
+      };
+      const fromApp = async () => {
+        setErr(''); setRes(null);
+        const od = await storage.getDoc(`day_${forDay}_orders`, 'data').catch(() => null);
+        if (!od || !(od.orders || []).length) { setErr(`Aucune commande chargée dans l'appli pour le ${formatDateShort(forDay)}.`); return; }
+        analyse(muLinesFromOrders(od.orders), { fileName: `commandes de l'appli (${od.source || '?'})`, kind: 'APPLI', dates: od.targetDate ? { [od.targetDate]: 1 } : {} });
+      };
+      const dateBad = res && res.fileDays.length > 0 && !res.fileDays.includes(forDay);
+      const canSave = res && res.matched > 0 && !dateBad && confirmed && !saving;
+      const save = async () => {
+        if (!canSave) return;
+        setSaving(true);
+        try {
+          await storage.setDoc('mu_' + dateKey, MU_REEL_DOC, { exactJson: JSON.stringify(res.exact), exactFor: forDay, exactSource: 'manuel', exactFile: res.fileName, exactAt: Date.now(), exactBy: session.name, exactLines: res.matched, exactUnmatched: res.unmatched });
+          showToast('✅ Commandes chargées : la MU est maintenant exacte');
+          setRes(null); setConfirmed(false);
+          if (setTab) setTab('mudujour');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setSaving(false); }
+      };
+      const cancelExact = async () => {
+        if (!confirm('Revenir à la MU estimée (commandes 6h + 15 %) ?')) return;
+        await storage.setDoc('mu_' + dateKey, MU_REEL_DOC, { exactJson: '', exactFor: '', exactSource: '', exactFile: '', exactAt: null, exactBy: session.name });
+        showToast('MU revenue à l’estimation');
+      };
+      const cur = muExactOf(snap);
+      const preview = res ? Object.entries(res.exact).map(([k, q]) => ({ name: (flIdx[k] && flIdx[k].name) || k, q, est: flIdx[k] && flIdx[k].est })).sort((a, b) => a.name.localeCompare(b.name, 'fr')) : [];
+      return (
+        <div className="stack">
+          <KbBackToHub setTab={setTab} />
+          <h1 style={{ margin: 0 }}>📥 Chargement des commandes <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-mute)' }}>(provisoire ancien site)</span></h1>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>À 10h, charge le fichier des commandes à préparer : la MU passe d'une estimation (commandes 6h + 15-20 %) à la quantité <b>exacte</b> de chaque fruit et légume.</p>
+          {cur
+            ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>✅ MU exacte en cours : distribution du {formatDateShort(snap.exactFor)} · {snap.exactFile || '—'} · {snap.exactBy}{snap.exactAt ? ' à ' + muTime(snap.exactAt) : ''}
+                <button className="btn-secondary" style={{ fontSize: 11, padding: '3px 8px', marginLeft: 8 }} onClick={cancelExact}>Annuler</button></div>
+            : <div className="alert-warning" style={{ fontSize: 13 }}>⏳ MU actuellement estimée.</div>}
+          {flErr && <div className="alert-warning" style={{ fontSize: 13 }}>{flErr}</div>}
+          <div className="card" style={{ borderLeft: '4px solid var(--accent)' }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 700 }}>📅 Commandes de la distribution du</span>
+              <input type="date" value={forDay} onChange={e => { setForDay(e.target.value); setRes(null); setConfirmed(false); }} style={{ width: 'auto', fontSize: 16 }} />
+            </div>
+            <div style={{ fontSize: 20, fontWeight: 900, margin: '8px 0', textTransform: 'capitalize' }}>{kbDateLong(forDay)}</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <label className="btn-primary" style={{ cursor: ready ? 'pointer' : 'not-allowed', opacity: ready ? 1 : 0.5, padding: '12px 16px', textAlign: 'center', flex: '1 1 200px' }}>
+                📄 Choisir le fichier (CSV / JSON)
+                <input type="file" accept=".csv,.txt,.tsv,.json,text/csv,application/json" onChange={onFile} disabled={!ready} style={{ display: 'none' }} />
+              </label>
+              <button className="btn-secondary" style={{ flex: '1 1 200px' }} disabled={!ready} onClick={fromApp}>📦 Commandes déjà dans l'appli</button>
+            </div>
+            {!ready && !flErr && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Chargement de la liste F&amp;L…</div>}
+          </div>
+          {err && <div className="alert-warning" style={{ fontSize: 13, borderLeft: '3px solid var(--danger)' }}>❌ {err}</div>}
+          {res && (
+            <div className="card">
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>{res.fileName}</div>
+              {dateBad
+                ? <div style={{ color: 'var(--danger)', fontWeight: 800, fontSize: 14 }}>❌ Mauvaise date : le fichier contient les commandes du {res.fileDays.map(formatDateShort).join(', ')}, pas du {formatDateShort(forDay)}. Chargement bloqué.</div>
+                : res.fileDays.length ? <div style={{ color: '#2e7d32', fontWeight: 700, fontSize: 13 }}>✅ Date du fichier vérifiée : {formatDateShort(forDay)}</div>
+                : <div style={{ color: 'var(--warn)', fontWeight: 700, fontSize: 13 }}>⚠️ Le fichier n'indique pas de date : vérifie que ce sont bien les commandes du {formatDateShort(forDay)}.</div>}
+              <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus ({res.matched} lignes) · {res.unmatched} ligne(s) hors F&amp;L ignorée(s)</div>
+              {res.matched === 0 && <div style={{ color: 'var(--danger)', fontSize: 13 }}>Aucun fruit / légume reconnu dans ce fichier.</div>}
+              <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
+                {preview.map(x => (
+                  <div key={x.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 10px', borderBottom: '1px solid #f0f0f0', fontSize: 13 }}>
+                    <span>{x.name}</span><span><b>{x.q}</b>{x.est != null && <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> (estim. {Math.round(x.est)})</span>}</span>
+                  </div>
+                ))}
+              </div>
+              {!dateBad && res.matched > 0 && (
+                <label style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 10, fontWeight: 800 }}>
+                  <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} style={{ width: 24, height: 24 }} />
+                  Je confirme : commandes de la distribution du {formatDateShort(forDay)}
+                </label>
+              )}
+              <button className="btn-primary btn-lg" style={{ width: '100%', marginTop: 10 }} disabled={!canSave} onClick={save}>{saving ? 'Enregistrement…' : '✅ Valider : MU exacte'}</button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       SUIVI & IMPRESSION (Prépa) — hub : impressions + chargement commandes
+       + Retours PDP / DLC / Pertes. Réduit le nombre d'onglets en bas.
        ============================================================ */
     function PrepSuiviHub({ setTab }) {
-      const items = [
-        { key:'pdpreturns', icon:'↩️', label:'Retours PDP', desc:'Retours des points de distribution' },
-        { key:'dlcwatch',   icon:'🟠', label:'DLC',         desc:'Surveillance des dates courtes' },
-        { key:'losses',     icon:'🗑️', label:'Pertes',      desc:'Saisie des pertes' },
+      const groups = [
+        { title: '🖨️ Impression', items: [
+          { key:'printpain',   icon:'🍞', label:'Impression dispatch pain',       desc:'1 feuille A4 par lieu — mise en cartons à 5h' },
+          { key:'printlabels', icon:'🏷️', label:'Impression étiquettes livraison', desc:'Livraison à domicile — 1 étiquette par carton (après clôture)' },
+        ]},
+        { title: '📥 Commandes', items: [
+          { key:'muload', icon:'📥', label:'Chargement des commandes (provisoire ancien site)', desc:'À 10h : fichier des commandes à préparer → MU exacte' },
+        ]},
+        { title: '🧭 Suivi', items: [
+          { key:'pdpreturns', icon:'↩️', label:'Retours PDP', desc:'Retours des points de distribution' },
+          { key:'dlcwatch',   icon:'🟠', label:'DLC',         desc:'Surveillance des dates courtes' },
+          { key:'losses',     icon:'🗑️', label:'Pertes',      desc:'Saisie des pertes' },
+        ]},
       ];
       return (
         <div className="stack">
-          <h1>🧭 Suivi</h1>
-          <div style={{display:'grid',gridTemplateColumns:'1fr',gap:12}}>
-            {items.map(it=>(
-              <button key={it.key} onClick={()=>setTab(it.key)}
-                style={{display:'flex',alignItems:'center',gap:16,padding:'18px 16px',textAlign:'left',cursor:'pointer',border:'1px solid var(--line)',borderRadius:'var(--radius)',background:'var(--bg-card)',width:'100%',boxShadow:'var(--shadow-sm)'}}>
-                <span style={{fontSize:38,lineHeight:1}}>{it.icon}</span>
-                <span style={{display:'flex',flexDirection:'column'}}>
-                  <span style={{fontSize:20,fontWeight:800,color:'var(--ink)'}}>{it.label}</span>
-                  <span style={{fontSize:13,color:'var(--ink-mute)'}}>{it.desc}</span>
-                </span>
-                <span style={{marginLeft:'auto',fontSize:26,color:'var(--ink-mute)'}}>›</span>
-              </button>
-            ))}
-          </div>
+          <h1>🧭 Suivi &amp; impression</h1>
+          {groups.map(g => (
+            <div key={g.title}>
+              <div style={{fontSize:12,fontWeight:800,letterSpacing:'.05em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'6px 2px'}}>{g.title}</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr',gap:10}}>
+                {g.items.map(it=>(
+                  <button key={it.key} onClick={()=>setTab(it.key)}
+                    style={{display:'flex',alignItems:'center',gap:16,padding:'16px 16px',textAlign:'left',cursor:'pointer',border:'1px solid var(--line)',borderRadius:'var(--radius)',background:'var(--bg-card)',width:'100%',boxShadow:'var(--shadow-sm)'}}>
+                    <span style={{fontSize:34,lineHeight:1}}>{it.icon}</span>
+                    <span style={{display:'flex',flexDirection:'column'}}>
+                      <span style={{fontSize:18,fontWeight:800,color:'var(--ink)'}}>{it.label}</span>
+                      <span style={{fontSize:13,color:'var(--ink-mute)'}}>{it.desc}</span>
+                    </span>
+                    <span style={{marginLeft:'auto',fontSize:26,color:'var(--ink-mute)'}}>›</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       );
     }
@@ -8904,6 +9815,14 @@
         }
         await storage.setDoc(`day_${day}_prep`, 'meta', { closed:true, closedBy:user, closedAt:new Date().toISOString() });
         showToast(`✅ Prépa clôturée · ${Object.keys(agg).length} produit(s) → Manquants & ND`);
+        // V9.59 — Livraison à domicile : fichier Dromy envoyé automatiquement si activé (Pilotage › Dromy)
+        try {
+          const cfgD = await storage.getDoc('app_config', 'dromy');
+          if (cfgD && cfgD.enabled) {
+            const lg = await kbSendDromy(day, user, { auto:true });
+            showToast(lg.ok ? `✉️ Fichier Dromy envoyé (${lg.count} clients, ${lg.cartons} cartons)` : (lg.skipped ? 'Pas de livraison à domicile : rien envoyé à Dromy' : '⚠️ Envoi Dromy échoué : ' + lg.error + ' — renvoyer depuis Pilotage › Dromy'));
+          }
+        } catch (e) { showToast('⚠️ Envoi Dromy : ' + e.message); }
       };
 
       // ---- rendu d'une carte produit ----
@@ -9004,6 +9923,7 @@
               <p>Clôturée par <b>{prep.closedBy||'—'}</b>. Les ruptures ont été envoyées dans <b>Manquants &amp; ND</b> avec le motif pré-rempli.</p>
               <p className="pdj-cnums">{done} déposés · {rupt} ruptures · {rows.length} lignes</p>
               <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>La prépa n'est plus modifiable. Toute correction passe désormais par <b>Manquants &amp; ND</b> (infos, raisons) ou <b>Dispatch dernière minute</b>.</p>
+              <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>🏷️ Étiquettes livraison et 🍞 dispatch pain : onglet <b>Suivi &amp; impression</b>.</p>
             </div>
           </div>
         );
@@ -11870,6 +12790,7 @@
         { k: 'manq',  label: 'Manq. & Rem.',  icon: '💸' },
         { k: 'temp',  label: 'Température',    icon: '🌡️' },
         { k: 'codes', label: 'Codes-barres',  icon: '🏷️' },
+        { k: 'dromy', label: 'Dromy',         icon: '🚚' },
         { k: 'histo', label: 'Historique',    icon: '📜' },
       ];
       const [sub, setSub] = React.useState(() => { try { return localStorage.getItem('kbg_suivi_sub') || 'ca'; } catch (e) { return 'ca'; } });
@@ -11890,6 +12811,7 @@
           {sub === 'manq'  && <ManquantsHistoryPage session={session} />}
           {sub === 'temp'  && <TempMasterPage session={session} />}
           {sub === 'codes' && <BarcodesManagerPage session={session} />}
+          {sub === 'dromy' && <DromyPilotagePage session={session} />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
       );
@@ -16995,6 +17917,9 @@
             {tab === 'dlcwatch' && <DlcWatchPage session={effSession} products={products} orders={orders} catalogue={catalogue} />}
             {tab === 'losses' && <LossesPage session={effSession} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
             {tab === 'suivi' && <PrepSuiviHub setTab={setTab} />}
+            {tab === 'printpain' && <PrintPainPage session={effSession} setTab={setTab} />}
+            {tab === 'printlabels' && <PrintLabelsPage session={effSession} setTab={setTab} />}
+            {tab === 'muload' && <MuOrdersLoadPage session={effSession} setTab={setTab} />}
             {tab === 'inventory' && <InventoryPage session={effSession} />}
             {tab === 'admin' && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
             <div className="tab-bar">
@@ -17007,8 +17932,8 @@
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
                 <span className="tab-icon">🚚</span>Manquants & ND
               </button>
-              <button className={['suivi','pdpreturns','dlcwatch','losses'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
-                <span className="tab-icon">🧭</span>Suivi
+              <button className={['suivi','pdpreturns','dlcwatch','losses','printpain','printlabels','muload'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
+                <span className="tab-icon">🖨️</span>Suivi &amp; impression
               </button>
               <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
                 <span className="tab-icon">📋</span>Inventaire
