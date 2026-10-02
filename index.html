@@ -9471,6 +9471,20 @@
       const cId = find([h => h.includes('producerproduct'), h => h === 'id produit' || h === 'product_id' || h === 'id_produit', h => h.includes('id site')]);
       const cQty = find([h => h.includes('quantit'), h => h === 'qty' || h === 'qte' || h === 'quantity', h => h === 'nb' || h === 'nombre', h => h === 'total']);
       const cDate = find([h => h.includes('date de distribution') || h.includes('distribution'), h => h === 'date' || h.includes('date')]);
+      // V9.59c — fichier « commandes-globale » de l'ancien site (ID;Consommateur;Adresse mail;Local;Montant;Status) :
+      // liste des commandes à préparer SANS les produits → on garde les ID « compilée » et on reprend le détail
+      // des produits dans les commandes déjà chargées dans l'appli (même ID Mongo).
+      const cOrderId = find([h => h === 'id']);
+      const cStatus = find([h => h === 'status' || h === 'statut']);
+      if (!cProd && !cQty && cOrderId && cStatus) {
+        const ids = {}; const statusCount = {}; let nAll = 0;
+        (parsed.data || []).forEach(row => {
+          const id = String(row[cOrderId] || '').trim(); if (!id) return; nAll++;
+          const st = normalizeText(String(row[cStatus] || '')).trim(); statusCount[st] = (statusCount[st] || 0) + 1;
+          if (st === 'compilee') ids[id] = { site: String(row[find([h => h === 'local'])] || '').trim().toUpperCase(), montant: Number(row[find([h => h === 'montant'])]) || 0 };
+        });
+        return { kind: 'GLOBALE', ids, statusCount, nAll, lines: [], dates: {} };
+      }
       if (!cProd && !cId) return { error: `Ce fichier ne contient pas les produits commandés (colonnes trouvées : ${hdr.join(' | ') || 'aucune'}). Il faut l'export des commandes AVEC le détail des produits et quantités.` };
       if (!cQty) return { error: `Colonne quantité introuvable (colonnes : ${hdr.join(' | ')}).` };
       const lines = []; const dates = {};
@@ -9512,9 +9526,52 @@
           const text = await new Promise((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(String(fr.result || '')); fr.onerror = () => ko(fr.error || new Error('lecture')); fr.readAsText(f, 'utf-8'); });
           const p = kbParseMuOrdersFile(text, f.name);
           if (p.error) { setErr(p.error); return; }
+          if (p.kind === 'GLOBALE') { await fromGlobale(p, f.name); return; }
+          if (p.kind === 'JSON' && pendingIds) {
+            // export JSON choisi après le fichier globale : on ne garde que les commandes « compilée » de la liste
+            await fromGlobale(pendingIds.p, pendingIds.name, JSON.parse(text.replace(/^\uFEFF/, '').trim()));
+            return;
+          }
           if (!p.lines.length) { setErr('Aucune ligne produit dans le fichier.'); return; }
           analyse(p.lines, { fileName: f.name, kind: p.kind, dates: p.dates });
         } catch (x) { setErr('Lecture impossible : ' + x.message); }
+      };
+      const [pendingIds, setPendingIds] = React.useState(null);
+      // Croise la liste « commandes-globale » (ID compilée) avec le détail produits des commandes :
+      // celles déjà dans l'appli (day_<J>_orders), ou un export JSON choisi en complément.
+      const fromGlobale = async (p, name, rawJson) => {
+        const idList = Object.keys(p.ids);
+        if (!idList.length) { setErr('Aucune commande « compilée » dans ce fichier.'); return; }
+        let orders = [], srcLabel = '';
+        if (rawJson) {
+          const arr = Array.isArray(rawJson) ? rawJson : (rawJson.orders || []);
+          const dates = {};
+          orders = arr.map(o => {
+            const dIso = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date || '';
+            if (dIso) { const d = new Date(dIso); if (!isNaN(d)) { const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; dates[k] = 1; } }
+            return { orderId: oid(o._id), items: (o.items || []).map(it => ({ id: oid(it.producerproduct_id), produit: '', qty: Number(it.quantity) || 0 })) };
+          });
+          srcLabel = 'export JSON';
+          p = { ...p, dates };
+        } else {
+          const od = await storage.getDoc(`day_${forDay}_orders`, 'data').catch(() => null);
+          orders = (od && od.orders) || [];
+          srcLabel = `commandes de l'appli du ${formatDateShort(forDay)}`;
+          if (od && od.targetDate) p = { ...p, dates: { [od.targetDate]: 1 } };
+        }
+        const byId = {}; orders.forEach(o => { if (o && o.orderId) byId[o.orderId] = o; });
+        const found = idList.filter(id => byId[id] && (byId[id].items || []).length);
+        if (!found.length) {
+          setPendingIds({ p, name });
+          setErr(`${idList.length} commandes « compilée » lues, mais leur détail produits n'est pas dans l'appli pour le ${formatDateShort(forDay)}. Choisis maintenant l'export JSON des commandes (même bouton) pour compléter.`);
+          return;
+        }
+        setPendingIds(null);
+        const kept = found.map(id => byId[id]);
+        const psOrders = rawJson ? [] : orders.filter(o => o._ps && !o._test); // nouveau site : pas dans le fichier de l'ancien site
+        const missing = idList.filter(id => !found.includes(id));
+        analyse(muLinesFromOrders([...kept, ...psOrders]), { fileName: `${name} × ${srcLabel}`, kind: 'GLOBALE', dates: p.dates || {},
+          globale: { total: idList.length, found: found.length, missing: missing.length, ps: psOrders.length, ignored: Object.entries(p.statusCount).filter(([s]) => s !== 'compilee').map(([s, n]) => `${n} ${s}`).join(', ') } });
       };
       const fromApp = async () => {
         setErr(''); setRes(null);
@@ -9546,7 +9603,7 @@
         <div className="stack">
           <KbBackToHub setTab={setTab} />
           <h1 style={{ margin: 0 }}>📥 Chargement des commandes <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-mute)' }}>(provisoire ancien site)</span></h1>
-          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>À 10h, charge le fichier des commandes à préparer : la MU passe d'une estimation (commandes 6h + 15-20 %) à la quantité <b>exacte</b> de chaque fruit et légume.</p>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>À 10h, charge le fichier <b>commandes-globale</b> (liste des commandes « compilée ») : l'appli reprend le détail produits de ces commandes. Sinon : export JSON des commandes. </p>
           {cur
             ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>✅ MU exacte en cours : distribution du {formatDateShort(snap.exactFor)} · {snap.exactFile || '—'} · {snap.exactBy}{snap.exactAt ? ' à ' + muTime(snap.exactAt) : ''}
                 <button className="btn-secondary" style={{ fontSize: 11, padding: '3px 8px', marginLeft: 8 }} onClick={cancelExact}>Annuler</button></div>
@@ -9575,6 +9632,12 @@
                 ? <div style={{ color: 'var(--danger)', fontWeight: 800, fontSize: 14 }}>❌ Mauvaise date : le fichier contient les commandes du {res.fileDays.map(formatDateShort).join(', ')}, pas du {formatDateShort(forDay)}. Chargement bloqué.</div>
                 : res.fileDays.length ? <div style={{ color: '#2e7d32', fontWeight: 700, fontSize: 13 }}>✅ Date du fichier vérifiée : {formatDateShort(forDay)}</div>
                 : <div style={{ color: 'var(--warn)', fontWeight: 700, fontSize: 13 }}>⚠️ Le fichier n'indique pas de date : vérifie que ce sont bien les commandes du {formatDateShort(forDay)}.</div>}
+              {res.globale && (
+                <div style={{ fontSize: 13, margin: '6px 0', padding: '6px 8px', borderRadius: 8, background: res.globale.missing ? '#fff3e0' : '#e8f5e9' }}>
+                  📋 {res.globale.found}/{res.globale.total} commandes « compilée » retrouvées{res.globale.ps ? ` + ${res.globale.ps} commande(s) du nouveau site` : ''}{res.globale.ignored ? ` · ignorées : ${res.globale.ignored}` : ''}
+                  {res.globale.missing > 0 && <div style={{ color: '#bf6000', fontWeight: 700 }}>⚠️ {res.globale.missing} commande(s) du fichier sans détail produits dans l'appli → non comptées. Recharge l'export JSON des commandes pour les inclure.</div>}
+                </div>
+              )}
               <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus ({res.matched} lignes) · {res.unmatched} ligne(s) hors F&amp;L ignorée(s)</div>
               {res.matched === 0 && <div style={{ color: 'var(--danger)', fontSize: 13 }}>Aucun fruit / légume reconnu dans ce fichier.</div>}
               <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
