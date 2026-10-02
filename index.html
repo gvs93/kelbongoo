@@ -8147,17 +8147,100 @@
       return it ? Math.max(0, Number(it.commandes)||0) : 0;
     }
     // Agrège des lignes {id, name, qty} sur les produits du Sheet FL (pivot = ID SITE KBG, repli = nom).
+    // V9.59e — rapprochement par nom quand l'ID manque (fichier « totals » de l'ancien site) :
+    // 1) même nom normalisé ; 2) produit FL contenant TOUS les mots significatifs du nom (le plus proche,
+    //    sans ex-aequo). Sinon : non rapproché (jamais de supposition).
+    const _muSigCache = new WeakMap();
+    function muFuzzyKey(name, flIdx){
+      const A = _flSig(name); if(!A.length || !flIdx) return null;
+      let sigs = _muSigCache.get(flIdx);
+      if(!sigs){ sigs = Object.entries(flIdx).map(([k,v])=>({ k, S:_flSig(v.name||k) })); _muSigCache.set(flIdx, sigs); }
+      const c1 = sigs.filter(x=>x.S.length && A.every(t=>x.S.includes(t))).map(x=>({ k:x.k, extra:x.S.length-A.length })).sort((a,b)=>a.extra-b.extra);
+      if(c1.length===1 || (c1.length>1 && c1[0].extra<c1[1].extra)) return c1[0].k;
+      return null;
+    }
     function muExactFromLines(lines, flIdx){
       const byId = {}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.id) byId[v.id]=k; });
-      const exact = {}; let matched = 0, unmatched = 0; const unmatchedNames = {};
+      const exact = {}; let matched = 0, unmatched = 0; const unmatchedNames = {}; const fuzzy = {};
       (lines||[]).forEach(l=>{
         const q = Number(l.qty)||0; if(q<=0) return;
         let k = (l.id && byId[String(l.id).trim()]) || null;
-        if(!k){ const nk = muKey(String(l.name||'').replace(/^\[TEST\]\s*/,'')); if(nk && flIdx[nk]) k = nk; }
+        const nm = String(l.name||'').replace(/^\[TEST\]\s*/,'');
+        if(!k){ const nk = muKey(nm); if(nk && flIdx[nk]) k = nk; }
+        if(!k && nm){ k = muFuzzyKey(nm, flIdx); if(k) fuzzy[k] = nm; }
         if(k){ exact[k] = (exact[k]||0) + q; matched++; }
         else { unmatched++; const n = String(l.name||l.id||'?'); unmatchedNames[n] = (unmatchedNames[n]||0) + q; }
       });
-      return { exact, matched, unmatched, unmatchedNames };
+      // non rapprochés qui ressemblent à un F&L (même 1er mot qu'un produit du Sheet) → à vérifier
+      const flSigs = Object.entries(flIdx||{}).map(([k,v])=>_flSig(v.name||k)).filter(x=>x.length);
+      const heads = new Set(flSigs.map(x=>x[0]));
+      const likely = Object.keys(unmatchedNames).filter(n=>{ const A=_flSig(n); if(!A.length) return false;
+        if(A.length<=2 && heads.has(A[0])) return true;                                   // ex. « Carotte Rainbow Bio »
+        return flSigs.some(S=>S.filter(t=>A.includes(t)).length>=2); }).map(n=>({ name:n, qty:unmatchedNames[n] }));
+      return { exact, matched, unmatched, unmatchedNames, fuzzy, likely };
+    }
+    // V9.59e — PDF « Totaux » de l'ancien site (totals-AAAA-MM-JJ.pdf) : tableau produit × lieu.
+    // pages = [[{text, x, top, w}]] (mots PDF.js). Colonnes = codes lieux de l'en-tête « Totaux » ;
+    // une ligne produit = une rangée de nombres (1 par lieu) ; le nom (colonne du milieu, sur plusieurs
+    // lignes) est rattaché à la rangée la plus proche, conditionnement (sachet, pièce…) retiré.
+    const KB_UNIT_RE = /^(sachet|sachets|pi[eè]ce|pieces?|barquette|botte|paquet|bo[iî]te|pot|bouteille|filet|sac|bocal|flacon|tranche|lot|unit[eé]|vrac|bouquet|carton|plateau|kg|g|l|cl)\b/i;
+    function kbParseTotalsWords(pages){
+      let cols = null; const products = [];
+      for(const words of pages){
+        if(!cols){
+          const tot = words.find(w=>/^totaux$/i.test(w.text));
+          if(tot){ const hs = words.filter(w=>Math.abs(w.top-tot.top)<4 && /^[A-Z]{2,4}$/.test(w.text)); if(hs.length) cols = hs.map(w=>({ code:w.text, xc:w.x+(w.w||0)/2 })).sort((a,b)=>a.xc-b.xc); }
+        }
+        if(!cols) continue;
+        const firstX = cols[0].xc - 22, originX = cols[0].xc - 34;
+        const nums = words.filter(w=>/^\d+$/.test(w.text) && (w.x+(w.w||0)/2) >= firstX).sort((a,b)=>a.top-b.top);
+        const groups = [];
+        nums.forEach(w=>{ const g = groups.find(g=>Math.abs(g.top-w.top)<3); if(g) g.items.push(w); else groups.push({ top:w.top, items:[w] }); });
+        const rows = groups.filter(g=>g.items.length >= Math.max(2, cols.length-1)).map(g=>{
+          const by = {};
+          g.items.forEach(w=>{ const xc=w.x+(w.w||0)/2; let best=cols[0], bd=1e9; cols.forEach(c=>{ const d=Math.abs(c.xc-xc); if(d<bd){ bd=d; best=c; } }); by[best.code]=(by[best.code]||0)+parseInt(w.text,10); });
+          return { top:g.top, by, words:[] };
+        });
+        if(!rows.length) continue;
+        words.forEach(w=>{
+          if(w.x < 92 || w.x >= originX) return;              // colonne « produit » uniquement
+          if(/^totaux$/i.test(w.text)) return;
+          let best=null, bd=1e9; rows.forEach(r=>{ const d=Math.abs(r.top-w.top); if(d<bd){ bd=d; best=r; } });
+          if(best && bd <= 30) best.words.push(w);
+        });
+        rows.forEach(r=>{
+          if(!r.words.length) return;                          // ligne de total
+          const lines = [];
+          r.words.sort((a,b)=>a.top-b.top || a.x-b.x).forEach(w=>{ const L=lines.find(l=>Math.abs(l.top-w.top)<2.5); if(L) L.ws.push(w); else lines.push({ top:w.top, ws:[w] }); });
+          lines.sort((a,b)=>a.top-b.top);
+          const txt = lines.map(l=>l.ws.sort((a,b)=>a.x-b.x).map(w=>w.text).join(' '));
+          let cut = txt.findIndex((t,i)=>i>0 && KB_UNIT_RE.test(t) && (/\(/.test(t) || /^\S+$/.test(t.trim())));
+          const name = (cut>0 ? txt.slice(0,cut) : txt).join(' ').replace(/\s+/g,' ').trim();
+          const unit = cut>0 ? txt.slice(cut).join(' ') : '';
+          const total = Object.values(r.by).reduce((s,n)=>s+n,0);
+          products.push({ name, unit, by:r.by, total });
+        });
+      }
+      return { cols: cols ? cols.map(c=>c.code) : [], products };
+    }
+    async function kbPdfWords(arrayBuffer){
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const pages = [];
+      for(let p=1;p<=pdf.numPages;p++){
+        const page = await pdf.getPage(p);
+        const vh = page.getViewport({ scale:1 }).height;
+        const content = await page.getTextContent();
+        const words = [];
+        content.items.forEach(it=>{
+          const str = String(it.str||''); if(!str.trim()) return;
+          const x0 = it.transform[4], top = vh - it.transform[5], W = it.width || 0;
+          // un item peut contenir plusieurs mots : on les découpe (x approximé au prorata)
+          const parts = str.split(/(\s+)/); let off = 0;
+          parts.forEach(pt=>{ if(pt.trim()){ const x = x0 + (str.length ? W*off/str.length : 0); words.push({ text:pt, x, top, w: str.length ? W*pt.length/str.length : 0 }); } off += pt.length; });
+        });
+        pages.push(words);
+      }
+      return pages;
     }
     // Lignes produits d'une liste de commandes de l'appli (day_<J>_orders) — hors commandes [TEST]
     function muLinesFromOrders(orders){
@@ -9070,6 +9153,49 @@
       const oneLine = (txt, maxW) => { let t = txt; if (doc.getTextWidth(t) <= maxW) return t; while (t.length > 3 && doc.getTextWidth(t + '...') > maxW) t = t.slice(0, -1); return t + '...'; };
       let first = true;
       const newPage = () => { if (!first) doc.addPage(); first = false; };
+      // 1 page (ou plus si très long) par lieu
+      siteBlocks.forEach(b => {
+        const lines = b.lines; const total = lines.reduce((s, x) => s + x.qty, 0);
+        const TOP = 64, BOTTOM = 276, MINH = 13, MAXH = 26;
+        const perPage = Math.max(1, Math.floor((BOTTOM - TOP) / MINH));
+        const pages = []; for (let i = 0; i < lines.length; i += perPage) pages.push(lines.slice(i, i + perPage));
+        if (!pages.length) pages.push([]);
+        pages.forEach((chunk, pi) => {
+          newPage();
+          doc.setTextColor(0);
+          // Code en GROS (cartouche noir à droite)
+          doc.setFillColor(0, 0, 0); doc.roundedRect(146, 8, 52, 36, 3, 3, 'F');
+          doc.setTextColor(255, 255, 255); const fsc = fit(b.code, 46, 64, 30); doc.setFontSize(fsc);
+          doc.text(b.code, 172, 26 + (fsc * PT) / 2.8, { align: 'center' });
+          // Nom du lieu en GROS
+          doc.setTextColor(0); const nm = kbPdfTxt(b.name); const fsn = fit(nm, 128, 54, 22);
+          if (doc.getTextWidth(nm) <= 128) doc.text(nm, L, 30);
+          else { const parts = doc.splitTextToSize(nm, 128).slice(0, 2); doc.setFontSize(Math.max(22, fsn)); doc.text(parts, L, 21); }
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.text('À METTRE DANS LE CARTON ' + b.code, L, 46);
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(12); doc.text(dateTxt + (pages.length > 1 ? `  (page ${pi + 1}/${pages.length})` : ''), L, 54);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(20); doc.text(`${total} PAIN${total > 1 ? 'S' : ''}`, R, 54, { align: 'right' });
+          doc.setLineWidth(0.8); doc.line(L, 58, R, 58);
+          const h = Math.max(MINH, Math.min(MAXH, (BOTTOM - TOP) / Math.max(1, chunk.length)));
+          let y = TOP;
+          chunk.forEach((x, i) => {
+            if (i % 2 === 0) { doc.setFillColor(240, 240, 240); doc.rect(L, y, R - L, h, 'F'); }
+            const mid = y + h / 2;
+            // quantité très grosse dans une case
+            doc.setDrawColor(0); doc.setLineWidth(0.7); doc.rect(R - 36, y + 1.2, 34, h - 2.4);
+            doc.setFont('helvetica', 'bold'); const fq = Math.min(48, (h - 3) / PT * 0.95); doc.setFontSize(fq);
+            doc.text(String(x.qty), R - 19, mid + (fq * PT) * 0.36, { align: 'center' });
+            // nom du pain
+            const fp = Math.min(22, Math.max(13, h * 1.05)); doc.setFontSize(fp);
+            doc.text(oneLine(kbPdfTxt(x.produit), R - L - 44), L + 3, mid + (fp * PT) * 0.36 - (x.producteur && h >= 18 ? 2.2 : 0));
+            if (x.producteur && h >= 18) { doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90); doc.text(oneLine(kbPdfTxt(x.producteur), R - L - 44), L + 3, mid + 6); doc.setTextColor(0); }
+            y += h;
+          });
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(11); doc.setTextColor(60);
+          doc.rect(L, 283, 5, 5); doc.text('Carton complet  -  vérifié par : ________________', L + 8, 287); doc.setFontSize(9); doc.text('Glisser cette feuille dans le carton ' + b.code, L + 8, 292); doc.setFontSize(11);
+          doc.setFont('helvetica', 'bold'); doc.text(`${b.code} · ${total} pain${total > 1 ? 's' : ''}`, R, 287, { align: 'right' });
+          doc.setTextColor(0);
+        });
+      });
       // Récap global (ce qu'on doit recevoir de Brut de Pain)
       if (recap && recap.length) {
         newPage();
@@ -9090,48 +9216,6 @@
           y += h;
         });
       }
-      // 1 page (ou plus si très long) par lieu
-      siteBlocks.forEach(b => {
-        const lines = b.lines; const total = lines.reduce((s, x) => s + x.qty, 0);
-        const TOP = 64, BOTTOM = 276, MINH = 13, MAXH = 26;
-        const perPage = Math.max(1, Math.floor((BOTTOM - TOP) / MINH));
-        const pages = []; for (let i = 0; i < lines.length; i += perPage) pages.push(lines.slice(i, i + perPage));
-        if (!pages.length) pages.push([]);
-        pages.forEach((chunk, pi) => {
-          newPage();
-          doc.setTextColor(0);
-          // Code en GROS (cartouche noir à droite)
-          doc.setFillColor(0, 0, 0); doc.roundedRect(146, 8, 52, 36, 3, 3, 'F');
-          doc.setTextColor(255, 255, 255); const fsc = fit(b.code, 46, 64, 30); doc.setFontSize(fsc);
-          doc.text(b.code, 172, 26 + (fsc * PT) / 2.8, { align: 'center' });
-          // Nom du lieu en GROS
-          doc.setTextColor(0); const nm = kbPdfTxt(b.name); const fsn = fit(nm, 128, 54, 22);
-          if (doc.getTextWidth(nm) <= 128) doc.text(nm, L, 30);
-          else { const parts = doc.splitTextToSize(nm, 128).slice(0, 2); doc.setFontSize(Math.max(22, fsn)); doc.text(parts, L, 21); }
-          doc.setFont('helvetica', 'normal'); doc.setFontSize(13); doc.text(dateTxt + (pages.length > 1 ? `  (page ${pi + 1}/${pages.length})` : ''), L, 52);
-          doc.setFont('helvetica', 'bold'); doc.setFontSize(20); doc.text(`${total} PAIN${total > 1 ? 'S' : ''}`, R, 54, { align: 'right' });
-          doc.setLineWidth(0.8); doc.line(L, 58, R, 58);
-          const h = Math.max(MINH, Math.min(MAXH, (BOTTOM - TOP) / Math.max(1, chunk.length)));
-          let y = TOP;
-          chunk.forEach((x, i) => {
-            if (i % 2 === 0) { doc.setFillColor(240, 240, 240); doc.rect(L, y, R - L, h, 'F'); }
-            const mid = y + h / 2;
-            // quantité très grosse dans une case
-            doc.setDrawColor(0); doc.setLineWidth(0.7); doc.rect(R - 36, y + 1.2, 34, h - 2.4);
-            doc.setFont('helvetica', 'bold'); const fq = Math.min(48, (h - 3) / PT * 0.95); doc.setFontSize(fq);
-            doc.text(String(x.qty), R - 19, mid + (fq * PT) * 0.36, { align: 'center' });
-            // nom du pain
-            const fp = Math.min(22, Math.max(13, h * 1.05)); doc.setFontSize(fp);
-            doc.text(oneLine(kbPdfTxt(x.produit), R - L - 44), L + 3, mid + (fp * PT) * 0.36 - (x.producteur && h >= 18 ? 2.2 : 0));
-            if (x.producteur && h >= 18) { doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90); doc.text(oneLine(kbPdfTxt(x.producteur), R - L - 44), L + 3, mid + 6); doc.setTextColor(0); }
-            y += h;
-          });
-          doc.setFont('helvetica', 'normal'); doc.setFontSize(11); doc.setTextColor(60);
-          doc.rect(L, 283, 5, 5); doc.text('Carton complet  -  vérifié par : ____________________', L + 8, 287);
-          doc.setFont('helvetica', 'bold'); doc.text(`${b.code} · ${total} pain${total > 1 ? 's' : ''}`, R, 287, { align: 'right' });
-          doc.setTextColor(0);
-        });
-      });
       return doc;
     }
 
@@ -9227,7 +9311,7 @@
       const [data, reload] = useKbDayData(day);
       const [prodOff, setProdOff] = React.useState({});
       const [includeTest, setIncludeTest] = React.useState(false);
-      const [withRecap, setWithRecap] = React.useState(true);
+
       const allLines = React.useMemo(() => {
         const out = [];
         (data.orders || []).forEach(o => {
@@ -9261,16 +9345,14 @@
       const total = recap.reduce((s, x) => s + x.qty, 0);
       const chk = kbDayCheck(day, data);
       const canPrint = confirmed && chk.ok && siteBlocks.length > 0;
-      const print = () => {
-        if (!canPrint) return;
-        const doc = generatePainPDF(day, siteBlocks, withRecap ? recap : null);
-        kbOpenPdf(doc, `Dispatch_pain_${day}.pdf`);
-      };
+      // Feuilles par boutique (1 A4 par carton) · une seule boutique · récap général seul
+      const printSites = (blocks, suffix) => { if (!canPrint || !blocks.length) return; kbOpenPdf(generatePainPDF(day, blocks, null), `Dispatch_pain_${day}${suffix || ''}.pdf`); };
+      const printRecap = () => { if (!canPrint) return; kbOpenPdf(generatePainPDF(day, [], recap), `Recap_pain_${day}.pdf`); };
       return (
         <div className="stack">
           <KbBackToHub setTab={setTab} />
           <h1 style={{ margin: 0 }}>🍞 Impression dispatch pain</h1>
-          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Une feuille A4 par lieu : nom + code en gros, nombre de pains de chaque sorte à mettre dans le carton du lieu.</p>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Une feuille A4 par boutique : nom + code en gros, nombre de pains de chaque sorte à mettre dans son carton. La feuille se glisse ensuite dans le carton.</p>
           <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" />
           {producers.length > 1 && (
             <div className="card">
@@ -9281,13 +9363,13 @@
             </div>
           )}
           <div className="card" style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', fontSize: 13 }}>
-            <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}><input type="checkbox" checked={withRecap} onChange={e => setWithRecap(e.target.checked)} style={{ width: 18, height: 18 }} /> Page récap (total à recevoir)</label>
             {hasTest && <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}><input type="checkbox" checked={includeTest} onChange={e => setIncludeTest(e.target.checked)} style={{ width: 18, height: 18 }} /> Inclure les commandes [TEST]</label>}
             <button className="btn-secondary" style={{ fontSize: 12 }} onClick={reload}>↻ Recharger</button>
           </div>
-          <button className="btn-primary btn-lg" disabled={!canPrint} onClick={print} style={{ fontSize: 17, padding: 16 }}>
-            🖨️ Imprimer — {siteBlocks.length} lieu{siteBlocks.length > 1 ? 'x' : ''} · {total} pain{total > 1 ? 's' : ''}
+          <button className="btn-primary btn-lg" disabled={!canPrint} onClick={() => printSites(siteBlocks)} style={{ fontSize: 17, padding: 16 }}>
+            🖨️ Feuilles par boutique — {siteBlocks.length} carton{siteBlocks.length > 1 ? 's' : ''} (1 A4 par boutique)
           </button>
+          <button className="btn-secondary" disabled={!canPrint} onClick={printRecap}>📋 Récap général — {total} pain{total > 1 ? 's' : ''} à recevoir</button>
           {!confirmed && chk.ok && <div style={{ fontSize: 12, color: 'var(--warn)', textAlign: 'center' }}>Coche « Je confirme » pour imprimer.</div>}
           {!data.loading && chk.ok && siteBlocks.length === 0 && <div className="card"><p style={{ margin: 0, fontSize: 13, color: 'var(--ink-mute)' }}>Aucun pain commandé pour cette distribution{producers.length ? ' (avec les producteurs cochés)' : ''}.</p></div>}
           {siteBlocks.map(b => {
@@ -9304,7 +9386,10 @@
                     <div style={{ fontSize: 34, fontWeight: 900, minWidth: 64, textAlign: 'center', border: '2px solid #111', borderRadius: 8 }}>{x.qty}</div>
                   </div>
                 ))}
-                <div style={{ textAlign: 'right', padding: '6px 14px', fontWeight: 800 }}>{t} pain{t > 1 ? 's' : ''}</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 14px', gap: 8 }}>
+                  <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={!canPrint} onClick={() => printSites([b], '_' + b.code)}>🖨️ Imprimer la feuille {b.code}</button>
+                  <span style={{ fontWeight: 800 }}>{t} pain{t > 1 ? 's' : ''}</span>
+                </div>
               </div>
             );
           })}
@@ -9522,6 +9607,18 @@
       const onFile = async (e) => {
         const f = e.target.files && e.target.files[0]; e.target.value = '';
         if (!f) return; setErr(''); setRes(null);
+        // V9.59e — PDF « Totaux » de l'ancien site (totals-AAAA-MM-JJ.pdf) : quantités par produit et par lieu
+        if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
+          try {
+            if (!window.pdfjsLib) { setErr('PDF.js non chargé : recharge la page.'); return; }
+            const buf = await new Promise((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(new Uint8Array(fr.result)); fr.onerror = () => ko(fr.error || new Error('lecture')); fr.readAsArrayBuffer(f); });
+            const t = kbParseTotalsWords(await kbPdfWords(buf));
+            if (!t.cols.length || !t.products.length) { setErr('PDF non reconnu : il faut le PDF « Totaux » de l\u2019ancien site (totals-AAAA-MM-JJ.pdf).'); return; }
+            const m = f.name.match(/(\d{4}-\d{2}-\d{2})/);
+            analyse(t.products.map(p => ({ name: p.name, qty: p.total })), { fileName: f.name, kind: 'TOTAUX', dates: m ? { [m[1]]: 1 } : {}, totaux: { n: t.products.length, sites: t.cols.join(' ') } });
+          } catch (x) { setErr('Lecture du PDF impossible : ' + x.message); }
+          return;
+        }
         try {
           const text = await new Promise((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(String(fr.result || '')); fr.onerror = () => ko(fr.error || new Error('lecture')); fr.readAsText(f, 'utf-8'); });
           const p = kbParseMuOrdersFile(text, f.name);
@@ -9563,7 +9660,15 @@
         const found = idList.filter(id => byId[id] && (byId[id].items || []).length);
         if (!found.length) {
           setPendingIds({ p, name });
-          setErr(`${idList.length} commandes « compilée » lues, mais leur détail produits n'est pas dans l'appli pour le ${formatDateShort(forDay)}. Choisis maintenant l'export JSON des commandes (même bouton) pour compléter.`);
+          const withItems = orders.filter(o => (o.items || []).length).length;
+          const why = rawJson
+            ? `aucune de ces commandes n'est dans l'export JSON choisi (${orders.length} commandes dedans) — vérifie que c'est l'export de la même distribution.`
+            : !orders.length
+              ? `aucune commande n'est encore chargée dans l'appli pour le ${formatDateShort(forDay)}.`
+              : !withItems
+                ? `les ${orders.length} commandes du ${formatDateShort(forDay)} ont été chargées SANS les produits (fichier CSV au Chargement master).`
+                : `les ${orders.length} commandes chargées pour le ${formatDateShort(forDay)} ne correspondent pas à ces ID (autre distribution ?).`;
+          setErr(`${idList.length} commandes « compilée » lues. Ce fichier ne contient pas les produits, et ${why} → Choisis maintenant l'export JSON des commandes (même bouton) pour avoir les quantités.`);
           return;
         }
         setPendingIds(null);
@@ -9598,12 +9703,12 @@
         showToast('MU revenue à l’estimation');
       };
       const cur = muExactOf(snap);
-      const preview = res ? Object.entries(res.exact).map(([k, q]) => ({ name: (flIdx[k] && flIdx[k].name) || k, q, est: flIdx[k] && flIdx[k].est })).sort((a, b) => a.name.localeCompare(b.name, 'fr')) : [];
+      const preview = res ? Object.entries(res.exact).map(([k, q]) => ({ k, name: (flIdx[k] && flIdx[k].name) || k, q, est: flIdx[k] && flIdx[k].est })).sort((a, b) => a.name.localeCompare(b.name, 'fr')) : [];
       return (
         <div className="stack">
           <KbBackToHub setTab={setTab} />
           <h1 style={{ margin: 0 }}>📥 Chargement des commandes <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-mute)' }}>(provisoire ancien site)</span></h1>
-          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>À 10h, charge le fichier <b>commandes-globale</b> (liste des commandes « compilée ») : l'appli reprend le détail produits de ces commandes. Sinon : export JSON des commandes. </p>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>À 10h, charge le PDF <b>Totaux</b> de l'ancien site (<code>totals-AAAA-MM-JJ.pdf</code>) : l'appli lit la quantité de chaque produit et la MU devient exacte.</p>
           {cur
             ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>✅ MU exacte en cours : distribution du {formatDateShort(snap.exactFor)} · {snap.exactFile || '—'} · {snap.exactBy}{snap.exactAt ? ' à ' + muTime(snap.exactAt) : ''}
                 <button className="btn-secondary" style={{ fontSize: 11, padding: '3px 8px', marginLeft: 8 }} onClick={cancelExact}>Annuler</button></div>
@@ -9617,8 +9722,8 @@
             <div style={{ fontSize: 20, fontWeight: 900, margin: '8px 0', textTransform: 'capitalize' }}>{kbDateLong(forDay)}</div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <label className="btn-primary" style={{ cursor: ready ? 'pointer' : 'not-allowed', opacity: ready ? 1 : 0.5, padding: '12px 16px', textAlign: 'center', flex: '1 1 200px' }}>
-                📄 Choisir le fichier (CSV / JSON)
-                <input type="file" accept=".csv,.txt,.tsv,.json,text/csv,application/json" onChange={onFile} disabled={!ready} style={{ display: 'none' }} />
+                📄 Choisir le fichier (PDF Totaux / CSV / JSON)
+                <input type="file" accept=".pdf,.csv,.txt,.tsv,.json,application/pdf,text/csv,application/json" onChange={onFile} disabled={!ready} style={{ display: 'none' }} />
               </label>
               <button className="btn-secondary" style={{ flex: '1 1 200px' }} disabled={!ready} onClick={fromApp}>📦 Commandes déjà dans l'appli</button>
             </div>
@@ -9638,12 +9743,18 @@
                   {res.globale.missing > 0 && <div style={{ color: '#bf6000', fontWeight: 700 }}>⚠️ {res.globale.missing} commande(s) du fichier sans détail produits dans l'appli → non comptées. Recharge l'export JSON des commandes pour les inclure.</div>}
                 </div>
               )}
+              {res.totaux && <div style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '4px 0' }}>📄 PDF Totaux : {res.totaux.n} produits · lieux {res.totaux.sites}</div>}
+              {res.likely && res.likely.length > 0 && (
+                <div style={{ fontSize: 12, margin: '6px 0', padding: '6px 8px', borderRadius: 8, background: '#fff3e0', color: '#8a4b00' }}>
+                  ⚠️ Non reconnus (nom différent du Sheet FL ?) : {res.likely.map(x => `${x.name} (${x.qty})`).join(' · ')}
+                </div>
+              )}
               <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus ({res.matched} lignes) · {res.unmatched} ligne(s) hors F&amp;L ignorée(s)</div>
               {res.matched === 0 && <div style={{ color: 'var(--danger)', fontSize: 13 }}>Aucun fruit / légume reconnu dans ce fichier.</div>}
               <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
                 {preview.map(x => (
                   <div key={x.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 10px', borderBottom: '1px solid #f0f0f0', fontSize: 13 }}>
-                    <span>{x.name}</span><span><b>{x.q}</b>{x.est != null && <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> (estim. {Math.round(x.est)})</span>}</span>
+                    <span>{x.name}{res.fuzzy && res.fuzzy[x.k] ? <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> ≈ « {res.fuzzy[x.k]} »</span> : null}</span><span><b>{x.q}</b>{x.est != null && <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}> (estim. {Math.round(x.est)})</span>}</span>
                   </div>
                 ))}
               </div>
@@ -9671,7 +9782,7 @@
           { key:'printlabels', icon:'🏷️', label:'Impression étiquettes livraison', desc:'Livraison à domicile — 1 étiquette par carton (après clôture)' },
         ]},
         { title: '📥 Commandes', items: [
-          { key:'muload', icon:'📥', label:'Chargement des commandes (provisoire ancien site)', desc:'À 10h : fichier des commandes à préparer → MU exacte' },
+          { key:'muload', icon:'📥', label:'Chargement des commandes (provisoire ancien site)', desc:'À 10h : PDF Totaux de l\u2019ancien site → MU exacte' },
         ]},
         { title: '🧭 Suivi', items: [
           { key:'pdpreturns', icon:'↩️', label:'Retours PDP', desc:'Retours des points de distribution' },
