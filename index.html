@@ -5522,34 +5522,26 @@
       const parisToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Paris' });
       const editable = invDate === parisToday;
 
-      // V9.59 — Pré-remplissage des sachets µ : l'appli connaît le stock PDP du matin, la MU faite
-      // et les commandes → reste attendu = stock + fait − commandes (exactes si chargées).
-      // Affiché en orange « auto » tant que personne n'a corrigé ; écrit tel quel à la validation.
-      const [muPrefill, setMuPrefill] = React.useState({ map: null, exact: false });
-      React.useEffect(() => {
-        if (!editable) { setMuPrefill({ map: null, exact: false }); return; }
-        let stop = false;
-        (async () => {
-          try {
-            const [snap, ents] = await Promise.all([storage.getDoc('mu_' + invDate, MU_REEL_DOC), storage.getAll('mu_' + invDate)]);
-            if (!snap || !snap.items) { if (!stop) setMuPrefill({ map: null, exact: false }); return; }
-            const fait = muFaitFromEntries(ents || []);
-            const keys = new Set([...Object.keys(snap.items || {}), ...Object.keys(fait)]);
-            const map = {};
-            keys.forEach(k => { map[k] = Math.max(0, Math.round(muStockOfSnap(snap, k) + (fait[k] || 0) - muCmdOfSnap(snap, k))); });
-            if (!stop) setMuPrefill({ map, exact: !!muExactOf(snap) });
-          } catch (e) { if (!stop) setMuPrefill({ map: null, exact: false }); }
-        })();
-        return () => { stop = true; };
-      }, [invDate, editable]);
-      const preMu = (it) => (muPrefill.map ? muPrefill.map[muKey(it.produit)] : undefined);
-      const effMu = (it) => { const c = counts[it.key]; if (c) return c.mu || 0; const p = preMu(it); return p != null ? p : 0; };
-      const isAutoMu = (it) => !counts[it.key] && (preMu(it) || 0) > 0;
+      // V9.59b — Sachets µ des produits MU : AUTOMATIQUES (stock tenu par l'appli : stock du matin
+      // + MU réalisée − commandes). Non saisis à la main ; écrits dans la colonne STOCK MU à la
+      // validation. Les autres produits F&L gardent la saisie manuelle.
+      const [muAuto, setMuAuto] = React.useState({ map: null, exact: false, loaded: false });
+      const loadMuAuto = React.useCallback(async () => {
+        try {
+          const st = await muComputeStartStock(muShiftDate(invDate, 1), {});
+          if (st && st.source === 'calc' && st.fromDate === invDate) { const r = { map: st.stock, exact: !!st.exact, loaded: true }; setMuAuto(r); return r; }
+        } catch (e) {}
+        const r = { map: null, exact: false, loaded: true }; setMuAuto(r); return r;
+      }, [invDate]);
+      React.useEffect(() => { if (editable) loadMuAuto(); else setMuAuto({ map: null, exact: false, loaded: true }); }, [invDate, editable, loadMuAuto]);
+      const isMuAuto = (it, m) => { const mp = (m || muAuto).map; return !!(mp && Object.prototype.hasOwnProperty.call(mp, muKey(it.produit))); };
+      const effMu = (it, m) => { const mp = (m || muAuto).map; if (isMuAuto(it, m)) return mp[muKey(it.produit)] || 0; const c = counts[it.key]; return (c && c.mu) || 0; };
 
       const setQty = async (item, field, value) => {
         if (!editable) { showToast('🔒 Inventaire verrouillé (jour passé) — lecture seule'); return; }
         const v = Math.max(0, parseFloat(String(value).replace(',', '.')) || 0);
-        const prev = counts[item.key] || { colis: 0, mu: (preMu(item) || 0) };
+        if (field === 'mu' && isMuAuto(item)) { showToast('Stock MU automatique (calculé par l\u2019appli) — correction dans MU › MU réelle'); return; }
+        const prev = counts[item.key] || { colis: 0, mu: 0 };
         const next = { ...prev, [field]: v };
         await storage.setDoc(`fl_inventory_${invDate}`, item.key, {
           id: item.key, producer: item.producer, produit: item.produit, uv: item.uv,
@@ -5577,7 +5569,7 @@
         const lines = [['Producteur','Produit','UV','Actif','Colis en stock','Stock Mu']];
         for (const it of entryItems) {
           const c = counts[it.key] || {};
-          lines.push([it.producer, it.produit, it.uv, it.actif ? 'Actif' : 'Inactif', c.colis ?? '', counts[it.key] ? (c.mu ?? '') : (preMu(it) ?? '')]);
+          lines.push([it.producer, it.produit, it.uv, it.actif ? 'Actif' : 'Inactif', c.colis ?? '', effMu(it)]);
         }
         const csv = lines.map(r => r.map(v => {
           const s = String(v ?? '');
@@ -5604,11 +5596,11 @@
       const validate = async () => {
         if (!entryItems.length) return;
         if (!editable) { showToast('🔒 Trop tard : cet inventaire n\'est plus modifiable (verrouillé à minuit, heure de France).'); return; }
+        const fresh = await loadMuAuto(); // stock MU recalculé au moment de valider (MU faites jusqu'ici)
         const payloadItems = entryItems.map(it => {
           const c = counts[it.key] || {};
-          return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: effMu(it) };
+          return { producer: it.producer, produit: it.produit, colis: c.colis || 0, mu: effMu(it, fresh) };
         });
-        const autoItems = entryItems.filter(isAutoMu);
         const reValidation = !!lastValidated;
         const confirmMsg = reValidation
           ? `Re-valider les modifications de l'inventaire FL du ${invDate} ?\n\nLes quantités seront réécrites dans « ${FL_SHEET_TAB} », et une nouvelle photo horodatée sera ajoutée à l'historique du mois.`
@@ -5618,14 +5610,6 @@
         try {
           const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_write_stock', tab: FL_SHEET_TAB, date: invDate, items: payloadItems });
           if (!data.ok) { showToast('Erreur écriture Sheet : ' + (data.error || 'inconnue')); setValidating(false); return; }
-          // V9.59 — les sachets pré-remplis (non corrigés) sont enregistrés comme comptés → le stock PDP
-          // de demain les reprend tels quels (inventaire Firestore = source du stock MU).
-          for (const it of autoItems) {
-            try {
-              await storage.setDoc(`fl_inventory_${invDate}`, it.key, { id: it.key, producer: it.producer, produit: it.produit, uv: it.uv,
-                colis: 0, mu: preMu(it) || 0, prefilled: true, countedBy: session.name, countedAt: new Date().toISOString() });
-            } catch (e) {}
-          }
           const meta = {
             date: invDate, validatedBy: session.name, validatedAt: new Date().toISOString(),
             written: data.written || 0, notFound: (data.notFound || []).length,
@@ -5678,7 +5662,7 @@
 
       const nbColis = entryItems.reduce((t,it)=>t + ((counts[it.key]?.colis)||0), 0);
       const nbMu = entryItems.reduce((t,it)=>t + effMu(it), 0);
-      const nbSaisis = entryItems.filter(it => { const c = counts[it.key]; return (c && (c.colis>0 || c.mu>0)) || isAutoMu(it); }).length;
+      const nbSaisis = entryItems.filter(it => { const c = counts[it.key]; return (c && (c.colis>0 || c.mu>0)) || (isMuAuto(it) && effMu(it) > 0); }).length;
 
       const renderRow = (it) => {
         const c = counts[it.key] || {};
@@ -5719,12 +5703,19 @@
                   color: (c.colis>0) ? 'var(--accent-dark)' : 'var(--ink-mute)'}}>
                 🥬 {fmtCagette(c.colis ?? 0)}
               </button>
-              {/* MU : sachets µ (stepper compact) */}
+              {/* MU : sachets µ — automatique pour les produits MU, stepper sinon */}
+              {isMuAuto(it) ? (
+                <div title="Stock MU tenu par l'appli (stock + MU réalisée − commandes)" style={{width:106,height:44,borderRadius:8,border:'1px dashed #ffb74d',background:'#fff8f0',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',lineHeight:1.05}}>
+                  <span style={{fontSize:16,fontWeight:800,color:'#ef6c00'}}>{effMu(it)}</span>
+                  <span style={{fontSize:9,color:'#b45309'}}>🔒 auto</span>
+                </div>
+              ) : (
               <div style={{display:'flex',alignItems:'center',gap:2}}>
                 <button onClick={function(){bump('mu',-1)}} style={{width:30,height:44,fontSize:18,border:'1px solid var(--border)',borderRadius:8,background:'var(--cream,#faf8f0)',cursor:'pointer',lineHeight:1}}>−</button>
-                <QtyInputDec value={effMu(it)} onCommit={function(v){setQty(it,'mu',v)}} style={{width:46,height:44,textAlign:'center',fontSize:15,padding:'0 2px',color:isAutoMu(it)?'#ef6c00':undefined,fontStyle:isAutoMu(it)?'italic':undefined,borderColor:isAutoMu(it)?'#ffb74d':undefined}} />
+                <QtyInputDec value={effMu(it)} onCommit={function(v){setQty(it,'mu',v)}} style={{width:46,height:44,textAlign:'center',fontSize:15,padding:'0 2px'}} />
                 <button onClick={function(){bump('mu',1)}} style={{width:30,height:44,fontSize:18,border:'1px solid var(--border)',borderRadius:8,background:'var(--cream,#faf8f0)',cursor:'pointer',lineHeight:1}}>+</button>
               </div>
+              )}
             </div>
             {fracOpen===it.key && (
               <FractionPad value={c.colis ?? 0} label="cagettes"
@@ -5785,13 +5776,13 @@
             </div>
           ) : null}
 
-          {editable && muPrefill.map && (
+          {editable && muAuto.map && (
             <div className="alert-info" style={{fontSize:12,borderLeft:'3px solid #ef6c00'}}>
-              🧮 <b>Sachets µ pré-remplis</b> (en orange) avec le stock calculé : stock PDP du matin + MU faite − commandes {muPrefill.exact ? 'exactes' : 'estimées (pas de chargement des commandes à 10h)'}. Vérifie et corrige si besoin — la valeur est enregistrée à la validation.
+              🔒 <b>Sachets µ des produits MU : automatiques</b> — stock tenu par l'appli (stock du matin + MU réalisée par les préparateurs − commandes {muAuto.exact ? 'exactes' : 'estimées'}). Pas besoin de les compter : ils sont écrits dans STOCK MU à la validation. Erreur ? → MU › MU réelle › Corriger le stock PDP.
             </div>
           )}
-          {editable && !muPrefill.map && (
-            <div className="alert-warning" style={{fontSize:12}}>Sachets µ non pré-remplis : la page MU n'a pas été ouverte aujourd'hui (pas de calcul du jour). Compte les sachets à la main.</div>
+          {editable && muAuto.loaded && !muAuto.map && (
+            <div className="alert-warning" style={{fontSize:12}}>Stock MU automatique indisponible : la page MU n'a pas été ouverte aujourd'hui. Sachets à saisir à la main.</div>
           )}
           <div className="stat-grid">
             <div className="stat"><div className="stat-value">{nbSaisis}/{entryItems.length}</div><div className="stat-label">Produits saisis</div></div>
@@ -8187,30 +8178,18 @@
       return it && it.stock!=null ? Number(it.stock)||0 : 0;
     }
     // Stock PDP au début de dateKey : { stock:{clé:n}, source, fromDate }
+    // V9.59b — RÈGLE : le stock MU PDP est TENU PAR L'APPLI, jamais recompté à la main.
+    //   Stock fin de journée = stock début + MU réalisée par les préparateurs − commandes
+    //   (exactes si chargées, sinon colonne ESTIMATION MU qui contient déjà les +15-20 %).
+    //   Seule correction possible : « Corriger le stock PDP » (MU réelle). L'inventaire du soir
+    //   ne sert plus de source : c'est l'appli qui y écrit le stock MU (colonne STOCK MU du Sheet).
+    //   Point de départ si aucun calcul antérieur (≤ 14 j) : colonne STOCK MU du Sheet.
     async function muComputeStartStock(dateKey, flIdx){
       const LOOKBACK = 14;
       const dates = []; for(let i=1;i<=LOOKBACK;i++) dates.push(muShiftDate(dateKey,-i)); // récent → ancien
-      const [snaps, invs] = await Promise.all([
-        Promise.all(dates.map(d=>storage.getDoc('mu_'+d, MU_REEL_DOC).catch(()=>null))),
-        Promise.all(dates.map(d=>storage.getDoc('fl_inventory_meta', d).catch(()=>null))),
-      ]);
-      let snapIdx = snaps.findIndex(x=>x && x.items);
-      // Inventaire FL ayant compté des sachets, le plus récent
-      let invIdx = invs.findIndex(x=>x && Number(x.nbMu||0)>0);
-      const fromSheet = (src, d)=>{ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return { stock, source:src, fromDate:d }; };
-      if(invIdx>=0 && (snapIdx<0 || invIdx<=snapIdx)){
-        // V9.59 — l'inventaire du soir fait foi : on lit les sachets comptés directement dans
-        // Firestore (fl_inventory_<jour>), plus dans une colonne de Sheet (onglet erroné en V9.58).
-        const d = dates[invIdx];
-        const docs = await storage.getAll('fl_inventory_'+d).catch(()=>[]);
-        if(docs && docs.length){
-          const stock = {};
-          docs.forEach(e=>{ const k = muKey(e.produit); if(!k) return; stock[k] = (stock[k]||0) + Math.max(0, Math.round(Number(e.mu)||0)); });
-          return { stock, source:'inventaire', fromDate:d, inv: invs[invIdx] };
-        }
-        return fromSheet('inventaire', d);
-      }
-      if(snapIdx<0) return fromSheet('sheet', null);
+      const snaps = await Promise.all(dates.map(d=>storage.getDoc('mu_'+d, MU_REEL_DOC).catch(()=>null)));
+      const snapIdx = snaps.findIndex(x=>x && x.items);
+      if(snapIdx<0){ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return { stock, source:'sheet', fromDate:null }; }
       const d = dates[snapIdx], snap = snaps[snapIdx];
       const fait = muFaitFromEntries(await storage.getAll('mu_'+d).catch(()=>[]));
       const keys = new Set([...Object.keys(snap.items||{}), ...Object.keys(snap.overrides||{}), ...Object.keys(fait), ...Object.keys(muExactOf(snap)||{})]);
@@ -8302,7 +8281,7 @@
       );
       return (
         <div style={{background:'#fff8e1',border:'1px solid #ffe082',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#8d6e00',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-          <span>⏳ <b>MU estimée</b> : commandes notées à 6h + 15-20 %. À 10h, charge les commandes à préparer pour avoir la MU exacte.</span>
+          <span>⏳ <b>MU estimée</b> : colonne ESTIMATION MU du Sheet (commandes de 6h, +15-20 % déjà compris). À 10h, charge les commandes à préparer pour avoir la MU exacte.</span>
           {setTab && <button className="btn-secondary" style={{fontSize:12,padding:'5px 10px'}} onClick={()=>setTab('muload')}>📥 Charger les commandes</button>}
         </div>
       );
@@ -8676,7 +8655,7 @@
       const src = reel.start;
       const srcLabel = !src ? 'Calcul du stock PDP…'
         : src.source==='calc' ? `Stock PDP = reste calculé de la MU du ${formatDateShort(src.fromDate)} (stock + fait − commandes ${src.exact?'exactes':'estimées'})`
-        : src.source==='inventaire' ? `Stock PDP = inventaire du soir du ${formatDateShort(src.fromDate)}${src.inv && src.inv.validatedBy ? ` (${src.inv.validatedBy}${src.inv.validatedAt ? ', '+muTime(src.inv.validatedAt) : ''})` : ''} — sachets comptés`
+        : src.source==='inventaire' ? `Stock PDP = inventaire du ${formatDateShort(src.fromDate)}`
         : src.source==='sheet' ? 'Stock PDP = colonne STOCK MU du Sheet (point de départ, aucun calcul antérieur)'
         : 'Stock PDP indisponible (erreur de lecture) — compté à 0';
 
@@ -8701,7 +8680,7 @@
           </div>
           <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
             <div style={{fontWeight:700,marginBottom:4}}>{srcLabel}</div>
-            <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + Fait − Commandes → pré-remplit l'inventaire du soir, puis devient le stock PDP du prochain jour de MU.</div>
+            <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + MU réalisée − Commandes → écrit automatiquement dans l'inventaire du soir (STOCK MU) et devient le stock PDP du prochain jour de MU.</div>
           </div>
           <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
           {reel.rows.length>0 && (
@@ -9014,7 +8993,7 @@
       return out.sort((a, b) => casCmp(a.cartons[0] || 'ZZZ', b.cartons[0] || 'ZZZ') || a.client.localeCompare(b.client));
     }
     function kbCsvCell(v) { const s = String(v == null ? '' : v); return /[",\n\r;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
-    function kbDromyFmtDate(day, hhmm, fmt) { const [y, m, d] = day.split('-'); return (fmt === 'fr' ? `${d}/${m}/${y}` : `${y}-${m}-${d}`) + ' ' + hhmm; }
+    function kbDromyFmtDate(day, hhmm, fmt) { const [y, m, d] = day.split('-'); return (fmt === 'iso' ? `${y}-${m}-${d}` : `${d}/${m}/${y}`) + ' ' + hhmm; } // défaut = format du fichier Dromy : JJ/MM/AAAA HH:MM
     function buildDromyCsv(day, rows, cfg) {
       const c = cfg || {};
       const def = kbSlotParse(c.defaultSlot || DROMY_DEFAULT_SLOT) || { start: '09:00', end: '13:00' };
@@ -9416,14 +9395,14 @@
       const showToast = React.useContext(ToastContext);
       const [cfg, setCfg] = React.useState(null);
       const [saving, setSaving] = React.useState(false);
-      React.useEffect(() => { storage.getDoc('app_config', 'dromy').then(d => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'iso', ...(d || {}) })).catch(() => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'iso' })); }, []);
+      React.useEffect(() => { storage.getDoc('app_config', 'dromy').then(d => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'fr', ...(d || {}) })).catch(() => setCfg({ enabled: false, to: DROMY_DEFAULT_TO, defaultSlot: DROMY_DEFAULT_SLOT, dateFmt: 'fr' })); }, []);
       if (!cfg) return <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Chargement…</p></div>;
       const save = async (patch) => {
         const next = { ...cfg, ...patch };
         if (!kbSlotParse(next.defaultSlot)) { showToast('Créneau par défaut invalide (ex : 09:00-13:00)'); return; }
         setSaving(true);
         try {
-          await storage.setDoc('app_config', 'dromy', { enabled: !!next.enabled, to: String(next.to || '').trim() || DROMY_DEFAULT_TO, defaultSlot: next.defaultSlot, dateFmt: next.dateFmt === 'fr' ? 'fr' : 'iso', updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true });
+          await storage.setDoc('app_config', 'dromy', { enabled: !!next.enabled, to: String(next.to || '').trim() || DROMY_DEFAULT_TO, defaultSlot: next.defaultSlot, dateFmt: next.dateFmt === 'iso' ? 'iso' : 'fr', updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true });
           setCfg(next); showToast('✓ Réglages Dromy enregistrés');
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setSaving(false); }
@@ -9444,7 +9423,7 @@
                 <div><div style={{ fontWeight: 700 }}>Créneau si inconnu</div><input value={cfg.defaultSlot} onChange={e => setCfg({ ...cfg, defaultSlot: e.target.value })} style={{ width: 140 }} /></div>
                 <div><div style={{ fontWeight: 700 }}>Format des dates</div>
                   <select value={cfg.dateFmt} onChange={e => setCfg({ ...cfg, dateFmt: e.target.value })} style={{ width: 'auto' }}>
-                    <option value="iso">2026-10-03 09:00</option><option value="fr">03/10/2026 09:00</option>
+                    <option value="fr">03/10/2026 09:00 (format Dromy)</option><option value="iso">2026-10-03 09:00</option>
                   </select></div>
               </div>
               <button className="btn-primary" style={{ marginTop: 10 }} disabled={saving} onClick={() => save({})}>💾 Enregistrer</button>
