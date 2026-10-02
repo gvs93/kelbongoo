@@ -8176,15 +8176,16 @@
         if(!k){ const nk = muKey(nm); if(nk && flIdx[nk]) k = nk; }
         if(!k && nm){ k = muFuzzyKey(nm, flIdx); if(k) fuzzy[k] = nm; }
         if(k){ exact[k] = (exact[k]||0) + q; matched++; }
-        else { unmatched++; const n = String(l.name||l.id||'?'); unmatchedNames[n] = (unmatchedNames[n]||0) + q; }
+        else { unmatched++; const n = String(l.name||l.id||'?'); unmatchedNames[n] = (unmatchedNames[n]||0) + q; (unmatchedNames.__meta = unmatchedNames.__meta || {})[n] = { producer: l.producer || '', id: l.id || '' }; }
       });
       // non rapprochés qui ressemblent à un F&L (même 1er mot qu'un produit du Sheet) → à vérifier
       const flSigs = Object.entries(flIdx||{}).map(([k,v])=>_flSig(v.name||k)).filter(x=>x.length);
       const heads = new Set(flSigs.map(x=>x[0]));
+      const meta = unmatchedNames.__meta || {}; delete unmatchedNames.__meta;
       const likely = Object.keys(unmatchedNames).filter(n=>{ const A=_flSig(n); if(!A.length) return false;
         if(A.length<=2 && heads.has(A[0])) return true;                                   // ex. « Carotte Rainbow Bio »
         return flSigs.some(S=>S.filter(t=>A.includes(t)).length>=2); }).map(n=>({ name:n, qty:unmatchedNames[n] }));
-      return { exact, matched, unmatched, unmatchedNames, fuzzy, likely, ignored, aliased };
+      return { exact, matched, unmatched, unmatchedNames, unmatchedMeta: meta, fuzzy, likely, ignored, aliased };
     }
     // V9.59e — PDF « Totaux » de l'ancien site (totals-AAAA-MM-JJ.pdf) : tableau produit × lieu.
     // pages = [[{text, x, top, w}]] (mots PDF.js). Colonnes = codes lieux de l'en-tête « Totaux » ;
@@ -8233,6 +8234,19 @@
         });
       }
       return { cols: cols ? cols.map(c=>c.code) : [], products };
+    }
+    // V9.59i — lit un PDF Totaux (File) et l'enregistre pour la distribution : day_<J>_prep/totaux.
+    // Retourne { ok, error, t, day }. La date du nom de fichier doit être celle demandée.
+    async function kbLoadTotauxFile(f, day, by){
+      if(!window.pdfjsLib) return { ok:false, error:'PDF.js non chargé : recharge la page.' };
+      const m = String(f.name||'').match(/(\d{4}-\d{2}-\d{2})/);
+      if(m && day && m[1] !== day) return { ok:false, error:`Mauvais fichier : c'est le PDF Totaux du ${formatDateShort(m[1])}, pas du ${formatDateShort(day)}.` };
+      const buf = await new Promise((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(new Uint8Array(fr.result)); fr.onerror = () => ko(fr.error || new Error('lecture')); fr.readAsArrayBuffer(f); });
+      const t = kbParseTotalsWords(await kbPdfWords(buf));
+      if(!t.cols.length || !t.products.length) return { ok:false, error:'PDF non reconnu : il faut le PDF « Totaux » de l\u2019ancien site (totals-AAAA-MM-JJ.pdf).' };
+      const d = (m && m[1]) || day;
+      await storage.setDoc(`day_${d}_prep`, 'totaux', { json: JSON.stringify(t.products.map(p => [p.name, p.producer, p.by, p.unit])), file: f.name, at: new Date().toISOString(), by: by || '—', day: d }, { replace: true });
+      return { ok:true, t, day:d, noDate: !m };
     }
     async function kbPdfWords(arrayBuffer){
       const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -9325,6 +9339,16 @@
       const [data, reload] = useKbDayData(day);
       const [prodOff, setProdOff] = React.useState({});
       const [includeTest, setIncludeTest] = React.useState(false);
+      const [totBusy, setTotBusy] = React.useState(false);
+      const [totErr, setTotErr] = React.useState('');
+      const showToastP = React.useContext(ToastContext);
+      const onTotFile = async (e) => {
+        const f = e.target.files && e.target.files[0]; e.target.value = ''; if (!f) return;
+        setTotErr(''); setTotBusy(true);
+        try { const r = await kbLoadTotauxFile(f, day, session && session.name); if (!r.ok) setTotErr(r.error); else { showToastP(`✅ PDF Totaux chargé : ${r.t.products.length} produits`); setConfirmed(false); reload(); } }
+        catch (x) { setTotErr('Lecture du PDF impossible : ' + x.message); }
+        finally { setTotBusy(false); }
+      };
 
       const fromTot = !!(data.prep && data.prep.totaux && (data.prep.totaux.rows || []).length);
       const allLines = React.useMemo(() => {
@@ -9380,7 +9404,12 @@
           <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" allowTotaux />
           {!data.loading && (fromTot
             ? <div className="alert-info" style={{ fontSize: 13, borderLeft: '3px solid #2e7d32' }}>📄 Source : <b>PDF Totaux</b> chargé à 10h ({data.prep.totaux.file || 'totals'}) — quantités par boutique de l'ancien site.</div>
-            : <div className="alert-warning" style={{ fontSize: 12 }}>Source : commandes de l'appli. Le PDF Totaux (chargé à 10h dans « Chargement des commandes ») sera utilisé dès qu'il est chargé.</div>)}
+            : <div className="alert-warning" style={{ fontSize: 12 }}>Pas encore de PDF Totaux pour le {formatDateShort(day)} : charge-le ci-dessous (ou dans « Chargement des commandes »).</div>)}
+          <label className={fromTot ? 'btn-secondary' : 'btn-primary'} style={{ cursor: 'pointer', textAlign: 'center', padding: '12px 16px', opacity: totBusy ? 0.6 : 1 }}>
+            {totBusy ? '⏳ Lecture du PDF…' : (fromTot ? '📄 Recharger le PDF Totaux' : `📄 Charger le PDF Totaux du ${formatDateShort(day)}`)}
+            <input type="file" accept=".pdf,application/pdf" onChange={onTotFile} disabled={totBusy} style={{ display: 'none' }} />
+          </label>
+          {totErr && <div className="alert-warning" style={{ fontSize: 13, borderLeft: '3px solid var(--danger)' }}>❌ {totErr}</div>}
           {producers.length > 1 && (
             <div className="card">
               <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Producteurs inclus</div>
@@ -9630,7 +9659,6 @@
       const [alias, setAlias] = React.useState({});
       React.useEffect(() => { const u = storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'mu_alias'); setAlias((d && d.map) || {}); }); return u; }, []);
       const [lastInput, setLastInput] = React.useState(null);
-      const [showAllUnk, setShowAllUnk] = React.useState(false);
       const [pick, setPick] = React.useState({});
       const [showAlias, setShowAlias] = React.useState(false);
       const analyse = (lines, meta) => { setLastInput({ lines, meta }); setConfirmed(false); };
@@ -9640,6 +9668,21 @@
         const fileDays = Object.keys(lastInput.meta.dates || {});
         setRes({ ...r, ...lastInput.meta, fileDays });
       }, [lastInput, alias, flIdx]);
+      // V9.59h — « non reconnus » = UNIQUEMENT les fruits & légumes : producteur présent dans le Sheet FL,
+      // ou produit de catégorie « Fruits, Légumes » dans le catalogue de l'appli. Le reste (épicerie,
+      // crèmerie, boucherie…) n'est jamais proposé.
+      const [catFL, setCatFL] = React.useState({ names: new Set(), ids: new Set() });
+      React.useEffect(() => { readCache('products').then(pb => { const names = new Set(), ids = new Set(); Object.entries(pb || {}).forEach(([id, p]) => { const c = normalizeText((p && p.category) || ''); if (c.indexOf('fruit') >= 0 && c.indexOf('legume') >= 0) { ids.add(id); if (p.name) names.add(_flNorm(p.name)); } }); setCatFL({ names, ids }); }).catch(() => {}); }, []);
+      const flProducers = React.useMemo(() => {
+        const set = new Set(); if (!flRows || !flRows.length) return set;
+        const H = flRows[0].map(h => normalizeText(String(h || '')).trim()); const i = H.findIndex(h => h === 'producteur' || h.includes('producteur'));
+        if (i < 0) return set; for (let r = 1; r < flRows.length; r++) { const v = _flNorm((flRows[r] || [])[i]); if (v) set.add(v); } return set;
+      }, [flRows]);
+      const isFLLine = (name, m) => {
+        if (m && m.producer && flProducers.has(_flNorm(m.producer))) return true;
+        if (m && m.id && catFL.ids.has(String(m.id))) return true;
+        return catFL.names.has(_flNorm(name));
+      };
       const flOptions = React.useMemo(() => Object.entries(flIdx).map(([k, v]) => ({ k, name: v.name || k, actif: v.actif !== false })).sort((a, b) => (b.actif - a.actif) || a.name.localeCompare(b.name, 'fr')), [flIdx]);
       const saveAlias = async (name, val) => {
         try { await storage.setDoc('app_config', 'mu_alias', { map: { ...alias, [_flNorm(name)]: val }, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true }); showToast(val === '__ignore__' ? `« ${name} » : pas un produit MU (retenu)` : `« ${name} » lié à « ${(flIdx[val] && flIdx[val].name) || val} » (retenu)`); }
@@ -9660,7 +9703,9 @@
             const t = kbParseTotalsWords(await kbPdfWords(buf));
             if (!t.cols.length || !t.products.length) { setErr('PDF non reconnu : il faut le PDF « Totaux » de l\u2019ancien site (totals-AAAA-MM-JJ.pdf).'); return; }
             const m = f.name.match(/(\d{4}-\d{2}-\d{2})/);
-            analyse(t.products.map(p => ({ name: p.name, qty: p.total })), { fileName: f.name, kind: 'TOTAUX', dates: m ? { [m[1]]: 1 } : {}, totaux: { n: t.products.length, sites: t.cols.join(' ') }, totRows: t.products.map(p => [p.name, p.producer, p.by, p.unit]) });
+            // V9.59i — quantités par lieu enregistrées tout de suite (dispatch pain), sans attendre la validation MU
+            if (m) { try { await storage.setDoc(`day_${m[1]}_prep`, 'totaux', { json: JSON.stringify(t.products.map(p => [p.name, p.producer, p.by, p.unit])), file: f.name, at: new Date().toISOString(), by: session.name, day: m[1] }, { replace: true }); } catch (x) { showToast('⚠️ Totaux non enregistrés pour le pain : ' + x.message); } }
+            analyse(t.products.map(p => ({ name: p.name, producer: p.producer, qty: p.total })), { fileName: f.name, kind: 'TOTAUX', dates: m ? { [m[1]]: 1 } : {}, totaux: { n: t.products.length, sites: t.cols.join(' ') }, totRows: t.products.map(p => [p.name, p.producer, p.by, p.unit]) });
           } catch (x) { setErr('Lecture du PDF impossible : ' + x.message); }
           return;
         }
@@ -9794,14 +9839,12 @@
               )}
               {res.totaux && <div style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '4px 0' }}>📄 PDF Totaux : {res.totaux.n} produits · lieux {res.totaux.sites}</div>}
               {(() => {
-                const unk = showAllUnk ? Object.keys(res.unmatchedNames || {}).map(n => ({ name: n, qty: res.unmatchedNames[n] })).sort((a, b) => a.name.localeCompare(b.name, 'fr')) : (res.likely || []);
-                const nAll = Object.keys(res.unmatchedNames || {}).length;
-                if (!nAll) return null;
+                const unk = Object.keys(res.unmatchedNames || {}).filter(n => isFLLine(n, (res.unmatchedMeta || {})[n])).map(n => ({ name: n, qty: res.unmatchedNames[n] })).sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+                if (!unk.length) return null;
                 return (
                   <div style={{ margin: '6px 0', padding: '8px', borderRadius: 8, background: '#fff3e0', border: '1px solid #ffcc80' }}>
-                    <div style={{ fontSize: 13, fontWeight: 800, color: '#8a4b00' }}>⚠️ Produits non reconnus — à lier au Sheet FL ou à écarter</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: '#8a4b00' }}>⚠️ Fruits &amp; légumes non reconnus ({unk.length}) — à lier au Sheet FL ou à écarter</div>
                     <div style={{ fontSize: 11, color: '#8a4b00', marginBottom: 6 }}>Le lien est retenu pour les prochains fichiers. Le Sheet FL n'est pas modifié.</div>
-                    {unk.length === 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Aucun produit F&amp;L probable parmi les non reconnus.</div>}
                     {unk.map(x => (
                       <div key={x.name} style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', padding: '6px 0', borderTop: '1px solid #ffe0b2' }}>
                         <div style={{ flex: '1 1 200px', fontSize: 13 }}><b>{x.name}</b> <span style={{ color: 'var(--ink-mute)' }}>× {x.qty}</span></div>
@@ -9813,12 +9856,11 @@
                         <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => saveAlias(x.name, '__ignore__')}>🚫 Pas de MU</button>
                       </div>
                     ))}
-                    <button className="btn-ghost" style={{ fontSize: 12, marginTop: 4 }} onClick={() => setShowAllUnk(v => !v)}>{showAllUnk ? '▲ Seulement les F&L probables' : `▼ Voir tous les non reconnus (${nAll})`}</button>
                   </div>
                 );
               })()}
               {res.ignored > 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>🚫 {res.ignored} produit(s) marqué(s) « pas de MU » ignoré(s).</div>}
-              <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus ({res.matched} lignes) · {res.unmatched} ligne(s) hors F&amp;L ignorée(s)</div>
+              <div style={{ fontSize: 13, margin: '6px 0' }}><b>{Object.keys(res.exact).length}</b> fruits &amp; légumes reconnus · les autres rayons (épicerie, crèmerie…) sont ignorés</div>
               {res.matched === 0 && <div style={{ color: 'var(--danger)', fontSize: 13 }}>Aucun fruit / légume reconnu dans ce fichier.</div>}
               <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
                 {preview.map(x => (
