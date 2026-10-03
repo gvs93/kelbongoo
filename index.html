@@ -627,7 +627,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.59';
+    const APP_VERSION = 'V9.60';
+    // V9.60 — Distrib › Suivi › Non récupérés : fiche façon distribution (ancien casier en gros, 🥬 ND à
+    //   ajouter, 🍞 pain, frais déjà en casier), consigne « rien dans les rolls », date de récup prévue,
+    //   🖨️ feuille A4 à mettre dans le casier (NOM + date), bouton « 📦 Rangé en casier ».
     // V9.59 — Prépa : onglet « Suivi & impression » → impression dispatch pain (A4 par lieu, nom + code
     //   en gros), étiquettes livraison domicile (planche 2×4) + CSV Dromy (envoi auto à la clôture si
     //   activé dans Pilotage › Dromy), chargement des commandes (provisoire ancien site) → MU exacte.
@@ -4345,6 +4348,40 @@
       );
     }
 
+    // V9.59j — Feuille à mettre dans le casier d'une commande non récupérée (A4 paysage, nom en très gros)
+    function generateNonRecupSheetPDF(f, info) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+      const W = 297, L = 15, R = W - 15;
+      // consumer_name = « NOM Prénom » (displayName) : mots en MAJUSCULES du début = nom
+      const nm = (() => { const parts = String(f.consumer_name || f.clientName || '').trim().split(/\s+/).filter(Boolean); let i = 0;
+        while (i < parts.length && /[A-Z]/.test(parts[i]) && parts[i] === parts[i].toUpperCase()) i++;
+        if (i > 0 && i < parts.length) return { nom: parts.slice(0, i).join(' '), prenom: parts.slice(i).join(' ') };
+        return kbSplitName({ name: parts.join(' ') }); })();
+      const nom = kbPdfTxt(String(nm.nom || f.consumer_name || '').toUpperCase()), prenom = kbPdfTxt(nm.prenom || '');
+      doc.setFillColor(0, 0, 0); doc.rect(0, 0, W, 22, 'F');
+      doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold'); doc.setFontSize(20);
+      doc.text('COMMANDE KELBONGOO NON RECUPEREE', L, 14);
+      doc.setFontSize(14); doc.text(kbPdfTxt(f.site || ''), R, 14, { align: 'right' });
+      doc.setTextColor(0);
+      let fs = 90; doc.setFontSize(fs); while (fs > 30 && doc.getTextWidth(nom) > R - L) { fs -= 2; doc.setFontSize(fs); }
+      doc.text(nom, L, 60);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(36); doc.text(prenom, L, 80);
+      doc.setFontSize(18); doc.setFont('helvetica', 'normal');
+      doc.text(kbPdfTxt('Distribution du ' + kbDateLong(f.distribDate || f.day || todayKey())), L, 98);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(26);
+      doc.text(kbPdfTxt('Récupération prévue le : ' + (f.pickupDate ? formatDateShort(f.pickupDate) : '____ / ____')), L, 116);
+      const cas = (info && info.casiers) || [];
+      if (cas.length) { doc.setFontSize(20); doc.text(kbPdfTxt('Ancien casier : ' + cas.join(', ')), R, 98, { align: 'right' }); }
+      const lines = [...((info && info.nds) || []).map(p => 'ND : ' + p.produit + ' x' + (p.qty || 1)), ...((info && info.pains) || []).map(p => 'Pain : ' + p.produit + ' x' + (p.qty || 1))];
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(12);
+      let y = 132; lines.slice(0, 14).forEach(t => { doc.text(kbPdfTxt(t), L, y); y += 6; });
+      if (lines.length > 14) doc.text(`+ ${lines.length - 14} autre(s)`, L, y);
+      doc.setFontSize(11); doc.setTextColor(90);
+      doc.text(kbPdfTxt('Ne rien laisser dans les rolls Kelbongoo : tout dans ce casier.'), L, 200);
+      return doc;
+    }
+
     // ----- Sous-page Non-récup (ancien contenu de FollowUpPage) -----
     function NonRecupSubPage({ session, currentSite, consumersByEmail }) {
       const showToast = React.useContext(ToastContext);
@@ -4433,6 +4470,41 @@
         showToast('✓ Transmis à Henry');
       };
 
+      // V9.59j — commande d'origine (casiers, produits ND / pain) relue dans day_<J>_orders + prépa du jour
+      const [dayInfo, setDayInfo] = React.useState({});
+      const datesKey = [...new Set(visible.map(f => f.distribDate || f.day).filter(Boolean))].sort().join('|');
+      React.useEffect(() => {
+        let stop = false;
+        const ds = datesKey ? datesKey.split('|') : [];
+        ds.filter(d => !dayInfo[d]).forEach(d => {
+          kbLoadDayData(d).then(data => {
+            if (stop) return;
+            const byId = {};
+            (data.orders || []).forEach(o => {
+              const site = String(o.site || '').toUpperCase(), client = o.name || '(client)';
+              const cas = [...new Set([...kbClientCasiers(data.prep, site, client, o), ...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String))].sort(casCmp);
+              byId[o.orderId] = { order: o, casiers: cas };
+            });
+            setDayInfo(m => ({ ...m, [d]: byId }));
+          }).catch(() => { if (!stop) setDayInfo(m => ({ ...m, [d]: {} })); });
+        });
+        return () => { stop = true; };
+      }, [datesKey]);
+      const orderInfo = (f) => { const m = dayInfo[f.distribDate || f.day]; return (m && m[f.orderId]) || null; };
+      const setPickupDate = async (f, v) => {
+        await storage.setDoc('followups', f.id || f.orderId, { ...f, pickupDate: v || '', updatedBy: session.name, updatedAt: new Date().toISOString() });
+      };
+      const markStored = async (f, cas) => {
+        const v = prompt('Rangé dans quel casier ? (numéro)', String(cas || f.storedCasier || ''));
+        if (v === null) return;
+        await storage.setDoc('followups', f.id || f.orderId, { ...f, storedCasier: v.trim(), storedAt: new Date().toISOString(), storedBy: session.name, updatedBy: session.name, updatedAt: new Date().toISOString() });
+        showToast(`📦 Rangé en casier ${v.trim()} ✓`);
+      };
+      const printSheet = (f, info) => {
+        try { kbOpenPdf(generateNonRecupSheetPDF(f, info), `Non_recupere_${(f.consumer_name || 'client').replace(/\W+/g, '_')}.pdf`); }
+        catch (e) { showToast('Erreur PDF : ' + e.message); }
+      };
+
       const enriched = visible.map(f => {
         if (f.phone || f.email) return f;
         const cached = consumersByEmail && consumersByEmail[f.email];
@@ -4465,6 +4537,14 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Distrib : appellent les clients avec téléphone. Master : email aux autres.
           </p>
+          <div style={{background:'#fff8e1',border:'2px solid #f0b429',borderRadius:12,padding:'10px 12px',fontSize:13,lineHeight:1.45}}>
+            <div style={{fontWeight:900,fontSize:15,marginBottom:4}}>📦 Commande non récupérée : que faire ?</div>
+            <div>1️⃣ <b>Rien ne reste dans les rolls Kelbongoo.</b></div>
+            <div>2️⃣ Prendre l'<b>ancien casier</b> du client (numéro affiché).</div>
+            <div>3️⃣ Y <b>ajouter les produits 🥬 ND</b> (et 🍞 pain) listés sur sa fiche.</div>
+            <div>4️⃣ Mettre une <b>feuille avec son NOM + la date de récupération prévue</b> (bouton 🖨️ Feuille).</div>
+            <div>5️⃣ Ranger le casier, puis cliquer <b>📦 Rangé en casier</b>.</div>
+          </div>
 
           {alertCount > 0 && (
             <div className="alert-red">
@@ -4518,6 +4598,38 @@
                           </div>
                           {f.status && f.status !== 'pending' && <span className="badge badge-info">{f.status}</span>}
                         </div>
+                        {(() => {
+                          const info = orderInfo(f);
+                          const items = (f.items && f.items.length) ? f.items : ((info && info.order && info.order.items) || []);
+                          const nds = items.filter(x => x.cat === 'nd'), pains = items.filter(x => x.cat === 'pain'), frais = items.filter(x => x.cat === 'frais');
+                          const cas = (info && info.casiers && info.casiers.length) ? info.casiers : (f.casiers || []);
+                          const L = (arr) => arr.map(p => (p.produit || '?') + ((p.qty || 1) > 1 ? ` ×${p.qty}` : '')).join(', ');
+                          return (
+                            <div style={{marginTop:8,border:'1px solid var(--line)',borderRadius:10,overflow:'hidden'}}>
+                              <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',padding:'6px 10px',background:'var(--bg-muted)'}}>
+                                <span style={{fontSize:12,color:'var(--ink-mute)'}}>Ancien casier</span>
+                                {cas.length ? cas.map(c => <span key={c} style={{fontSize:20,fontWeight:900,background:'#111',color:'#fff',borderRadius:8,padding:'0 10px'}}>{c}</span>)
+                                  : <span style={{fontSize:12,color:'var(--ink-mute)'}}>{info ? '— (pas de casier)' : 'chargement…'}</span>}
+                                {f.storedCasier && <span className="badge" style={{background:'#e8f5e9',color:'#1b5e20',marginLeft:'auto'}}>📦 Rangé casier {f.storedCasier}</span>}
+                              </div>
+                              {nds.length > 0 && (
+                                <div style={{padding:'8px 10px',background:'#e8f5e9',borderTop:'1px solid var(--line)'}}>
+                                  <div style={{fontWeight:900,color:'#1b5e20',fontSize:13}}>🥬 ND à AJOUTER dans le casier :</div>
+                                  {nds.map((p, i) => <div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:14,fontWeight:700,padding:'2px 0'}}><span>{p.produit}</span><span>×{p.qty || 1}</span></div>)}
+                                </div>
+                              )}
+                              {pains.length > 0 && <div style={{padding:'6px 10px',fontSize:13,color:'var(--warn)',borderTop:'1px solid var(--line)'}}>🍞 Pain : {L(pains)}</div>}
+                              {frais.length > 0 && <div style={{padding:'6px 10px',fontSize:12,color:'var(--ink-mute)',borderTop:'1px solid var(--line)'}}>🧊 Déjà dans le casier : {frais.length} produit{frais.length > 1 ? 's' : ''} frais</div>}
+                              {!items.length && <div style={{padding:'6px 10px',fontSize:12,color:'var(--ink-mute)'}}>Détail des produits indisponible.</div>}
+                              <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap',padding:'6px 10px',borderTop:'1px solid var(--line)'}}>
+                                <span style={{fontSize:12}}>Récup prévue le</span>
+                                <input type="date" value={f.pickupDate || ''} onChange={e => setPickupDate(f, e.target.value)} style={{width:'auto',fontSize:13,padding:'4px 6px'}} />
+                                <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={() => printSheet(f, { casiers: cas, nds, pains })}>🖨️ Feuille</button>
+                                <button className="btn-primary" style={{padding:'6px 10px',fontSize:12,background:'#2e7d32'}} onClick={() => markStored(f, cas[0])}>📦 Rangé en casier</button>
+                              </div>
+                            </div>
+                          );
+                        })()}
                         <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap'}}>
                           {f.hasPhone ? (
                             <>
@@ -7606,6 +7718,7 @@
               hasPhone: !!(cached?.telephone || o.telephone),
               day, distribDate: day,
               items: o.items || [],
+              casiers: [...new Set([...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String))],
               status: 'pending',
               createdBy: session.name,
               createdAt: new Date().toISOString(),
@@ -7649,6 +7762,7 @@
               day: activeDay(),
               distribDate: activeDay(),
               items: o.items || [],
+              casiers: [...new Set([...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String))],
               status: 'pending',
               createdBy: session.name,
               createdAt: new Date().toISOString(),
