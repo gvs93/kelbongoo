@@ -627,7 +627,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.74';
+    const APP_VERSION = 'V9.75';
+    // V9.75 — Prépa › Par produit : un produit TERMINÉ (tout déposé / rupture) disparaît de la liste → « ✅ Dispatch fait
+    //   (N produits) » repliable en bas (rouvrir pour corriger). « Suivant » saute les produits terminés.
+    //   Mails clients : récap à la clôture de la prépa (casiers en gros, hors casier, ruptures, dernière minute probable)
+    //   + rappel le jour J 60 min avant l'ouverture (lieu, horaires, casiers, résultat ND dernière minute).
+    //   Pilotage : 📍 Lieux & horaires (code, nom, type, adresse, horaires mer→sam) et 📧 Mails clients (off/test/réel,
+    //   aperçu, dépôt, état serveur, annulation). Envoi serveur : KBG_ClientMails.gs (proxy stock).
     // V9.74 — Casiers : chaque client démarre avec TOUS ses casiers du JSON (ex. Henry = 1 et 2) ; la puce affiche
     //   « 1·2 ». On peut supprimer un casier inutilisé (✕, s'il en reste au moins un) → son n° redevient attribuable.
     //   Unicité par lieu = casiers en cours de chaque client (JSON ou modifiés dans l'appli). Plus de « 📌 ancien site ».
@@ -10733,6 +10739,423 @@
       );
     }
 
+
+    // ============================================================
+    // V9.75 — LIEUX & HORAIRES (Master › Pilotage › 📍 Lieux & horaires)
+    // app_config/lieux = { sites: { BIC: { name, type, adresse, hours: { 3:'14:00-20:00', … } } } }
+    // Jours JS : 3=mer, 4=jeu, 5=ven, 6=sam. Les mails clients (rappel J-60 min) lisent ces horaires.
+    // ============================================================
+    const KB_LIEUX_DOW = [[3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam']];
+    const KB_JOURS = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+    const KB_MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    function kbCmDate(dayKey) { const d = new Date(dayKey + 'T12:00:00'); return `${KB_JOURS[d.getDay()]} ${d.getDate()} ${KB_MOIS[d.getMonth()]}`; }
+    function kbLieuxDefault() {
+      const sites = {};
+      SITES.forEach(c => {
+        const hours = {};
+        if (c === 'BIC') { hours[3] = '14:00-20:00'; hours[4] = '14:00-20:00'; hours[5] = '14:00-20:00'; hours[6] = '10:00-20:00'; }
+        sites[c] = { name: SITE_NAMES[c] || c, type: c === 'DOM' ? 'domicile' : (BOUTIQUES.includes(c) ? 'boutique' : 'camion'), adresse: '', hours };
+      });
+      return { sites };
+    }
+    function kbLieuxMerge(saved) {
+      const def = kbLieuxDefault();
+      const s = (saved && saved.sites) || {};
+      Object.keys(s).forEach(c => { def.sites[c] = { ...(def.sites[c] || { name: c, type: 'camion', adresse: '', hours: {} }), ...s[c], hours: { ...((def.sites[c] || {}).hours || {}), ...((s[c] && s[c].hours) || {}) } }; });
+      return def;
+    }
+    async function kbLieuxLoad() { try { return kbLieuxMerge(await storage.getDoc('app_config', 'lieux')); } catch (e) { return kbLieuxDefault(); } }
+    // Horaires d'un lieu pour un jour donné → { start:'14:00', end:'20:00' } ou null
+    function kbLieuHours(lieux, site, dayKey) {
+      const L = lieux && lieux.sites && lieux.sites[site]; if (!L) return null;
+      const dow = new Date(dayKey + 'T12:00:00').getDay();
+      return kbSlotParse((L.hours || {})[dow] || '');
+    }
+
+    function KbLieuxPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [lieux, setLieux] = React.useState(null);
+      const [saving, setSaving] = React.useState(false);
+      const [newCode, setNewCode] = React.useState('');
+      React.useEffect(() => { kbLieuxLoad().then(setLieux); }, []);
+      if (!lieux) return <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Chargement…</p></div>;
+      const codes = Object.keys(lieux.sites).sort((a, b) => { const t = x => ({ boutique: 0, camion: 1, domicile: 2 })[lieux.sites[x].type] ?? 3; return t(a) - t(b) || a.localeCompare(b); });
+      const upd = (c, patch) => setLieux(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], ...patch } } }));
+      const updH = (c, dow, v) => setLieux(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], hours: { ...(l.sites[c].hours || {}), [dow]: v } } } }));
+      const save = async () => {
+        const bad = [];
+        codes.forEach(c => KB_LIEUX_DOW.forEach(([d, lb]) => { const v = String((lieux.sites[c].hours || {})[d] || '').trim(); if (v && !kbSlotParse(v)) bad.push(`${c} ${lb} « ${v} »`); }));
+        if (bad.length) { showToast('Horaire invalide (ex : 14:00-20:00) : ' + bad.slice(0, 3).join(', ')); return; }
+        setSaving(true);
+        try {
+          const sites = {};
+          codes.forEach(c => { const L = lieux.sites[c]; const h = {}; KB_LIEUX_DOW.forEach(([d]) => { const p = kbSlotParse((L.hours || {})[d] || ''); if (p) h[d] = p.start + '-' + p.end; }); sites[c] = { name: String(L.name || c).trim(), type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h }; });
+          await storage.setDoc('app_config', 'lieux', { sites, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true });
+          setLieux({ sites }); showToast('✓ Lieux & horaires enregistrés');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setSaving(false); }
+      };
+      const addLieu = () => {
+        const c = newCode.trim().toUpperCase();
+        if (!/^[A-Z0-9]{2,5}$/.test(c)) { showToast('Code lieu : 2 à 5 lettres/chiffres (ex : BIC)'); return; }
+        if (lieux.sites[c]) { showToast('Ce code existe déjà'); return; }
+        setLieux(l => ({ sites: { ...l.sites, [c]: { name: c, type: 'camion', adresse: '', hours: {} } } })); setNewCode('');
+      };
+      const inp = { width: '100%', padding: '7px 8px', border: '1px solid var(--line)', borderRadius: 8, fontSize: 14, boxSizing: 'border-box' };
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '12px 14px' }}>
+            <strong style={{ fontSize: 15 }}>📍 Lieux &amp; horaires de distribution</strong>
+            <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0 0' }}>Horaires au format <b>14:00-20:00</b>. Case vide = pas de distribution ce jour-là. Les mails clients (récap à la clôture + rappel 60 min avant l'ouverture) utilisent ces horaires et ce nom. Le point vert = jour de distribution prévu au calendrier.</p>
+          </div>
+          {codes.map(c => {
+            const L = lieux.sites[c];
+            return (
+              <div key={c} className="card" style={{ padding: '10px 12px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 120px', gap: 8, alignItems: 'center' }}>
+                  <span style={{ fontWeight: 900, fontSize: 18 }}>{c}</span>
+                  <input style={inp} value={L.name || ''} onChange={e => upd(c, { name: e.target.value })} placeholder="Nom affiché au client" />
+                  <select style={inp} value={L.type || 'camion'} onChange={e => upd(c, { type: e.target.value })}>
+                    <option value="boutique">🏪 Boutique</option><option value="camion">🚚 Camion</option><option value="domicile">🏠 Domicile</option>
+                  </select>
+                </div>
+                <input style={{ ...inp, marginTop: 6 }} value={L.adresse || ''} onChange={e => upd(c, { adresse: e.target.value })} placeholder="Adresse (affichée dans le mail client)" />
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginTop: 6 }}>
+                  {KB_LIEUX_DOW.map(([d, lb]) => {
+                    const planned = (DISTRIB_SCHEDULE[d] || []).includes(c);
+                    const v = (L.hours || {})[d] || '';
+                    const ok = !v || kbSlotParse(v);
+                    const endHint = DISTRIB_END[c] && DISTRIB_END[c][d] ? `fin ${DISTRIB_END[c][d]}h` : '';
+                    return (
+                      <label key={d} style={{ fontSize: 12, fontWeight: 700 }}>
+                        <span>{planned ? '🟢' : '⚪'} {lb}</span>
+                        <input style={{ ...inp, fontSize: 13, borderColor: ok ? 'var(--line)' : 'var(--danger)' }} value={v} onChange={e => updH(c, d, e.target.value)} placeholder={planned ? (endHint || 'hh:mm-hh:mm') : '—'} />
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          <div className="card" style={{ padding: '10px 12px', display: 'flex', gap: 8 }}>
+            <input style={{ ...inp, flex: 1 }} value={newCode} onChange={e => setNewCode(e.target.value)} placeholder="Nouveau code lieu (ex : NEW)" />
+            <button className="btn-secondary" onClick={addLieu}>➕ Ajouter</button>
+          </div>
+          <button className="btn-primary" disabled={saving} onClick={save} style={{ position: 'sticky', bottom: 8 }}>{saving ? 'Enregistrement…' : '💾 Enregistrer les lieux & horaires'}</button>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // V9.75 — MAILS CLIENTS
+    //  • À la clôture de la prépa : récap commande (casiers en gros, produits, hors casier, ruptures,
+    //    dernière minute probable).
+    //  • Le jour J, 60 min avant l'ouverture du lieu : rappel (lieu, horaires, casiers, résultat ND dernière minute).
+    //  Envoi SERVEUR : l'appli dépose les mails (proxy stock, action client_mails_stage) ; un déclencheur
+    //  Apps Script (toutes les 5 min) envoie ceux dont l'heure est passée. Re-dépôt automatique (postes
+    //  Master/Prépa, toutes les 2 min) dès que le dispatch dernière minute change ; un mail déjà envoyé n'est jamais renvoyé.
+    //  Mode (Pilotage › 📧 Mails clients) : off | test (3 clients → KB_RECAP_TO) | live. Défaut : test.
+    // ============================================================
+    const KB_CM_TEST_N = 3;
+    const kbNorm = (s) => muStrip(String(s || '').replace(/^\[TEST\]\s*/, '').toLowerCase()).replace(/[^a-z0-9]+/g, ' ').trim();
+    function kbHash(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + '_' + str.length; }
+    async function kbClientMailsCfg() { try { const d = await storage.getDoc('app_config', 'clientmails'); return { mode: 'test', ...(d || {}) }; } catch (e) { return { mode: 'test' }; } }
+
+    // Lecture de l'état prépa (mêmes règles que « Prépa du jour »)
+    function kbParsePrepDocs(arr) {
+      const P = { status: {}, nd: {}, lm: {}, casiers: {}, remCli: {}, remAll: {}, ndOff: {}, meta: null, cmails: null };
+      (arr || []).forEach(d => {
+        const id = d.id;
+        if (id === 'meta') { P.meta = d; return; }
+        if (id === 'cmails') { P.cmails = d; return; }
+        const bar = id.indexOf('|'); if (bar < 0) return;
+        const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
+        if (pfx === 'st') P.status[key] = d.v;
+        else if (pfx === 'nd') P.nd[key] = d;
+        else if (pfx === 'lm') P.lm[key] = true;
+        else if (pfx === 'cs') P.casiers[key] = (d.nums || []).map(String);
+        else if (pfx === 'rc') P.remCli[key] = d;
+        else if (pfx === 'ra') P.remAll[key] = d;
+        else if (pfx === 'nx') P.ndOff[key] = true;
+      });
+      return P;
+    }
+    async function kbClientMailsLoad(day) {
+      const [od, prepArr, lmArr, lieux] = await Promise.all([
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        storage.getAll(`day_${day}_prep`).catch(() => []),
+        storage.getAll(`day_${day}_lastminute`).catch(() => []),
+        kbLieuxLoad(),
+      ]);
+      return { orders: (od && od.orders) || [], prep: kbParsePrepDocs(prepArr), lastmin: lmArr || [], lieux };
+    }
+
+    // Construit la liste des clients avec leur commande classée
+    function kbClientMailsClients(day, data) {
+      const { orders, prep, lastmin } = data;
+      const by = {};
+      orders.forEach(o => {
+        if (o._test) return;
+        const site = String(o.site || '').toUpperCase();
+        const name = o.name || '(client)';
+        const ck = site + '||' + name;
+        if (!by[ck]) by[ck] = { site, name, emails: [], firstname: '', jsonCas: [], slot: '', items: [] };
+        const c = by[ck];
+        const em = String(o.email || '').trim().toLowerCase();
+        if (em && /@/.test(em) && !c.emails.includes(em)) c.emails.push(em);
+        if (!c.firstname) c.firstname = String(o.firstname || '').trim() || (kbSplitName ? (kbSplitName(o).firstname || '') : '');
+        if (!c.slot && o.slot) c.slot = o.slot;
+        ((o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : (o.casiersSec || [])).forEach(n => { const v = String(n).trim(); if (v && !c.jsonCas.includes(v)) c.jsonCas.push(v); });
+        (o.items || []).forEach(it => c.items.push({ product: it.produit || '(produit)', producer: it.producteur || '', qty: it.qty || 1, cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais', type: it.type || it.format || '' }));
+      });
+      const lmIdx = {}; (lastmin || []).forEach(l => { const k = kbNorm(l.produit); (lmIdx[k] = lmIdx[k] || []).push(l); });
+      return Object.values(by).filter(c => c.items.length).map(c => {
+        const casiers = c.site === 'DOM' ? [] : (prep.casiers[c.site + '||' + c.name] || c.jsonCas);
+        const out = { ...c, casiers, casier: [], hors: [], lm: [], rupt: [] };
+        c.items.forEach(it => {
+          const K = c.site + '||' + c.name + '||' + it.product, PK = c.site + '||' + it.product;
+          const rem = prep.remCli[K] || prep.remAll[PK];
+          const line = { ...it, rem: rem ? { pct: rem.pct, reason: rem.reason } : null };
+          const ndOn = !!prep.nd[PK] || (it.cat === 'nd' && !prep.ndOff[PK] && !prep.lm[PK]);
+          if (prep.lm[PK]) {
+            // Résultat du dispatch dernière minute (s'il a eu lieu)
+            const docs = lmIdx[kbNorm(it.product)] || [];
+            let lmState = 'attente', lmQty = 0;
+            if (docs.length) {
+              lmState = 'non';
+              docs.forEach(l => (((l.allocBySite || {})[c.site]) || []).forEach(a => {
+                if (casiers.map(String).includes(String(a.casier))) { lmState = 'ok'; lmQty += a.qty || 0; }
+                else if (String(a.casier) === 'ND' && lmState !== 'ok') lmState = 'nd';
+              }));
+            }
+            out.lm.push({ ...line, lmState, lmQty });
+          }
+          else if (prep.status[K] === 'rupture') out.rupt.push(line);
+          else if (ndOn) out.hors.push(line);
+          else out.casier.push(line);
+        });
+        return out;
+      }).sort((a, b) => a.site.localeCompare(b.site) || casCmp(a.casiers[0], b.casiers[0]) || a.name.localeCompare(b.name));
+    }
+
+    // ---- rendu HTML (mail) ----
+    function kbMailHtml(kind, day, c, lieu, hours) {
+      const G = '#2e7d32', jour = kbCmDate(day);
+      const first = c.firstname || String(c.name).split(' ')[0];
+      const lieuNom = (lieu && lieu.name) || SITE_NAMES[c.site] || c.site;
+      const qte = (l) => `${l.qty > 1 ? `<b>${l.qty} ×</b> ` : ''}${kbEsc(l.product)}${l.type ? ` <span style="color:#777">· ${kbEsc(l.type)}</span>` : ''}`;
+      const rem = (l) => l.rem ? ` <span style="color:#a3125b;font-weight:700">· remise -${l.rem.pct}%${l.rem.reason ? ' (' + kbEsc(l.rem.reason) + ')' : ''}</span>` : '';
+      const list = (arr, fn) => arr.map(l => `<tr><td style="padding:7px 0;border-bottom:1px solid #eee;font-size:15px;line-height:1.35">${fn(l)}</td></tr>`).join('');
+      const section = (title, color, sub, rows) => rows ? `<tr><td style="padding:18px 0 4px"><div style="font-size:16px;font-weight:800;color:${color}">${title}</div>${sub ? `<div style="font-size:13px;color:#666;margin-top:2px">${sub}</div>` : ''}<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:6px">${rows}</table></td></tr>` : '';
+      const isDom = c.site === 'DOM';
+      const horaire = hours ? `${hours.start.replace(':', 'h')} – ${hours.end.replace(':', 'h')}` : '';
+      const casBox = isDom
+        ? `<div style="font-size:15px;color:#555">Livraison à domicile</div><div style="font-size:28px;font-weight:900;color:${G};margin-top:4px">${horaire ? 'Entre ' + horaire : kbEsc(c.slot || '')}</div>`
+        : `<div style="font-size:15px;color:#555">${c.casiers.length > 1 ? 'Vos casiers' : 'Votre casier'}</div><div style="font-size:54px;line-height:1.1;font-weight:900;color:${G};letter-spacing:1px;margin-top:4px">${c.casiers.length ? c.casiers.map(kbEsc).join(' · ') : '—'}</div>`;
+      const lieuBox = isDom ? '' : `<div style="margin-top:12px;font-size:16px"><b>📍 ${kbEsc(lieuNom)}</b> <span style="color:#777">(${kbEsc(c.site)})</span>${lieu && lieu.adresse ? `<br><span style="color:#555;font-size:14px">${kbEsc(lieu.adresse)}</span>` : ''}<br>🗓️ ${kbEsc(jour)}${horaire ? ` · 🕑 <b>${horaire}</b>` : ''}</div>`;
+      let intro, sections = '';
+      const lmLabel = (l) => {
+        if (kind === 'cloture' || l.lmState === 'attente') return `${qte(l)} <span style="color:#7c3aed;font-weight:700">· arrivage du jour, ajouté si reçu</span>`;
+        if (l.lmState === 'ok') return `${qte(l)} <span style="color:${G};font-weight:700">· ✅ reçu, dans votre casier</span>`;
+        if (l.lmState === 'nd') return `${qte(l)} <span style="color:#7c3aed;font-weight:700">· remis par le distributeur (hors casier), selon arrivage</span>`;
+        return `<span style="text-decoration:line-through;color:#999">${qte(l)}</span> <span style="color:#c62828;font-weight:700">· finalement indisponible, non facturé</span>`;
+      };
+      if (kind === 'cloture') {
+        intro = `Bonjour ${kbEsc(first)},<br><br>Votre commande pour le <b>${kbEsc(jour)}</b> vient d'être préparée. Voici le récapitulatif.`;
+        sections += section(`🧺 Dans votre casier (${c.casier.reduce((a, l) => a + l.qty, 0)} article${c.casier.reduce((a, l) => a + l.qty, 0) > 1 ? 's' : ''})`, '#222', '', list(c.casier, l => qte(l) + rem(l)));
+        sections += section('🤲 Hors casier', '#7a3a12', 'Remis en main propre par le distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>' + rem(l)));
+        sections += section('🟣 Dernière minute (probable)', '#7c3aed', 'Produits attendus le jour de la distribution : ajoutés s\'ils arrivent, sinon non facturés.', list(c.lm, lmLabel));
+        sections += section('🚫 En rupture', '#c62828', 'Non disponibles : ils ne vous seront pas facturés.', list(c.rupt, l => `<span style="text-decoration:line-through;color:#999">${qte(l)}</span>`));
+      } else {
+        intro = isDom
+          ? `Bonjour ${kbEsc(first)},<br><br>Votre commande Kelbongoo est livrée <b>aujourd'hui</b>${horaire ? ` entre <b>${horaire}</b>` : ''}.`
+          : `Bonjour ${kbEsc(first)},<br><br>Votre commande vous attend <b>aujourd'hui</b>${horaire ? ` entre <b>${horaire}</b>` : ''} à <b>${kbEsc(lieuNom)}</b>.`;
+        sections += section('🟣 Dernière minute', '#7c3aed', '', list(c.lm, lmLabel));
+        sections += section('🤲 Hors casier', '#7a3a12', 'À demander au distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>'));
+        if (c.rupt.length) sections += section('🚫 En rupture (non facturé)', '#c62828', '', list(c.rupt, l => `<span style="text-decoration:line-through;color:#999">${qte(l)}</span>`));
+      }
+      const footer = `Paiement débité le jour du retrait, ruptures et remises déduites. Poids ±10 % au même prix.<br>Une question ? Répondez à ce mail ou écrivez à <a href="mailto:contact@kelbongoo.com" style="color:${G}">contact@kelbongoo.com</a>.`;
+      return `<!doctype html><html><body style="margin:0;padding:0;background:#f3f1ec;font-family:Arial,Helvetica,sans-serif;color:#222">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f1ec;padding:16px 0"><tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:14px;overflow:hidden">
+<tr><td style="background:${G};padding:16px 22px;color:#fff;font-size:22px;font-weight:900">🥬 Kelbongoo<div style="font-size:14px;font-weight:600;opacity:.9;margin-top:2px">${kind === 'cloture' ? 'Votre commande est prête' : 'Rappel : votre commande vous attend'}</div></td></tr>
+<tr><td style="padding:20px 22px 4px;font-size:15px;line-height:1.5">${intro}</td></tr>
+<tr><td style="padding:14px 22px"><div style="border:3px solid ${G};border-radius:14px;padding:14px 16px;text-align:center;background:#f1f8e9">${casBox}${lieuBox}</div></td></tr>
+<tr><td style="padding:0 22px"><table width="100%" cellpadding="0" cellspacing="0">${sections}</table></td></tr>
+<tr><td style="padding:22px;font-size:12px;color:#777;line-height:1.5">${footer}<br><br>À très vite,<br><b>L'équipe Kelbongoo</b></td></tr>
+</table></td></tr></table></body></html>`;
+    }
+    function kbMailText(kind, day, c, lieu, hours) {
+      const L = [];
+      const horaire = hours ? `${hours.start}-${hours.end}` : '';
+      L.push(`Bonjour ${c.firstname || String(c.name).split(' ')[0]},`, '');
+      L.push(kind === 'cloture' ? `Votre commande Kelbongoo pour le ${kbCmDate(day)} est prête.` : `Votre commande vous attend aujourd'hui${horaire ? ' ' + horaire : ''}.`);
+      if (c.site !== 'DOM') L.push(`CASIER${c.casiers.length > 1 ? 'S' : ''} : ${c.casiers.join(' · ') || '-'}`, `Lieu : ${(lieu && lieu.name) || c.site} (${c.site})${lieu && lieu.adresse ? ' - ' + lieu.adresse : ''}${horaire ? ' - ' + horaire : ''}`);
+      const sec = (t, arr, fn) => { if (arr.length) { L.push('', t); arr.forEach(l => L.push('- ' + fn(l))); } };
+      const q = (l) => `${l.qty > 1 ? l.qty + ' x ' : ''}${l.product}`;
+      if (kind === 'cloture') sec('Dans votre casier :', c.casier, l => q(l) + (l.rem ? ` (remise -${l.rem.pct}%)` : ''));
+      sec('Hors casier (remis par le distributeur) :', c.hors, l => q(l) + ' (hors casier)');
+      sec('Dernière minute :', c.lm, l => q(l) + (kind === 'cloture' || l.lmState === 'attente' ? ' - ajouté si reçu' : l.lmState === 'ok' ? ' - reçu, dans votre casier' : l.lmState === 'nd' ? ' - remis par le distributeur selon arrivage' : ' - indisponible, non facturé'));
+      sec('En rupture (non facturé) :', c.rupt, q);
+      L.push('', 'Paiement débité le jour du retrait, ruptures et remises déduites.', '', "L'équipe Kelbongoo");
+      return L.join('\n');
+    }
+
+    // Liste des mails à déposer pour un jour (closure + rappel)
+    function kbClientMailsBuild(day, data, cfg, nowMs) {
+      const now = nowMs || Date.now();
+      const clients = kbClientMailsClients(day, data);
+      const mails = [], noEmail = [], noHours = new Set();
+      let list = clients;
+      if (cfg.mode === 'test') list = clients.filter(c => c.emails.length).slice(0, KB_CM_TEST_N);
+      list.forEach(c => {
+        if (!c.emails.length) { noEmail.push(c.site + ' · ' + c.name); return; }
+        const lieu = data.lieux.sites[c.site] || null;
+        const hours = (c.site === 'DOM' && kbSlotParse(c.slot)) || kbLieuHours(data.lieux, c.site, day);
+        const startMs = hours ? new Date(`${day}T${hours.start}:00`).getTime() : null;
+        const endMs = hours ? new Date(`${day}T${hours.end}:00`).getTime() : null;
+        const realTo = c.emails.join(', ');
+        const to = cfg.mode === 'live' ? realTo : KB_RECAP_TO;
+        const tag = cfg.mode === 'live' ? '' : `[TEST → ${realTo}] `;
+        const base = { date: day, site: c.site, client: c.name };
+        const cas = c.site === 'DOM' ? '' : ` · casier${c.casiers.length > 1 ? 's' : ''} ${c.casiers.join('·')}`;
+        if (!startMs || now < startMs) {
+          mails.push({ ...base, key: `${day}|cloture|${c.site}|${c.name}`, type: 'cloture', to, sendAt: new Date(now).toISOString(),
+            subject: `${tag}Kelbongoo · votre commande du ${kbCmDate(day)} est prête${cas}`,
+            htmlBody: kbMailHtml('cloture', day, c, lieu, hours), body: kbMailText('cloture', day, c, lieu, hours) });
+        }
+        if (!hours) { noHours.add(c.site); return; }
+        if (now > endMs) return;
+        mails.push({ ...base, key: `${day}|rappel|${c.site}|${c.name}`, type: 'rappel', to, sendAt: new Date(startMs - 60 * 60000).toISOString(),
+          subject: `${tag}Kelbongoo · rappel : à récupérer aujourd'hui ${hours.start.replace(':', 'h')}-${hours.end.replace(':', 'h')}${c.site === 'DOM' ? '' : ' · ' + ((lieu && lieu.name) || c.site)}${cas}`,
+          htmlBody: kbMailHtml('rappel', day, c, lieu, hours), body: kbMailText('rappel', day, c, lieu, hours) });
+      });
+      return { mails, noEmail, noHours: [...noHours], clients: clients.length };
+    }
+
+    // Dépôt (idempotent) : ne re-dépose que si le contenu a changé. Les mails déjà envoyés ne sont jamais renvoyés (serveur).
+    let __kbCmBusy = false;
+    async function kbStageClientMails(day, by, opts) {
+      const o = opts || {};
+      if (!day || __kbCmBusy) return { ok: false, skipped: 'busy' };
+      __kbCmBusy = true;
+      try {
+        const meta = await storage.getDoc(`day_${day}_prep`, 'meta').catch(() => null);
+        if (!meta || !meta.closed) return { ok: false, skipped: 'prépa non clôturée' };
+        const cfg = await kbClientMailsCfg();
+        if (cfg.mode === 'off') return { ok: false, skipped: 'mails clients désactivés (Pilotage › Mails clients)' };
+        const data = await kbClientMailsLoad(day);
+        const b = kbClientMailsBuild(day, data, cfg);
+        const sig = kbHash(cfg.mode + '|' + JSON.stringify(b.mails.map(m => [m.key, m.to, m.sendAt.slice(0, 13), m.type === 'cloture' ? '' : m.htmlBody])));
+        const prev = data.prep.cmails;
+        if (!o.force && prev && prev.sig === sig && !prev.err) return { ok: true, unchanged: true, count: b.mails.length };
+        if (!b.mails.length) return { ok: true, count: 0, noEmail: b.noEmail.length, noHours: b.noHours };
+        for (let i = 0; i < b.mails.length; i += 25) {
+          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'client_mails_stage', date: day, mails: b.mails.slice(i, i + 25) });
+          if (!r || r.ok === false) throw new Error((r && r.error) || 'réponse vide du proxy (action client_mails_stage installée ?)');
+        }
+        const n = (t) => b.mails.filter(m => m.type === t).length;
+        await storage.setDoc(`day_${day}_prep`, 'cmails', { sig, at: new Date().toISOString(), by: by || '', mode: cfg.mode, count: b.mails.length, cloture: n('cloture'), rappel: n('rappel'), clients: b.clients, noEmail: b.noEmail.slice(0, 50), noHours: b.noHours, err: '' }, { replace: true });
+        return { ok: true, count: b.mails.length, cloture: n('cloture'), rappel: n('rappel'), mode: cfg.mode, noEmail: b.noEmail.length, noHours: b.noHours };
+      } catch (e) {
+        try { await storage.setDoc(`day_${day}_prep`, 'cmails', { err: String(e && e.message || e), errAt: new Date().toISOString(), by: by || '' }); } catch (_) {}
+        return { ok: false, error: String(e && e.message || e) };
+      } finally { __kbCmBusy = false; }
+    }
+
+    // Master › Pilotage › 📧 Mails clients
+    function KbClientMailsPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [day, setDay] = React.useState(activeDay());
+      const [cfg, setCfg] = React.useState(null);
+      const [st, setSt] = React.useState(null);
+      const [srv, setSrv] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [prev, setPrev] = React.useState(null); // { list, i, kind }
+      React.useEffect(() => { kbClientMailsCfg().then(setCfg); }, []);
+      React.useEffect(() => storage.subscribe(`day_${day}_prep`, (arr) => { const P = kbParsePrepDocs(arr); setSt({ meta: P.meta, cm: P.cmails }); }), [day]);
+      const setMode = async (mode) => {
+        if (mode === 'live' && !confirm('Passer en RÉEL : les mails partent aux vrais clients. Confirmer ?')) return;
+        try { await storage.setDoc('app_config', 'clientmails', { mode, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true }); setCfg(c => ({ ...c, mode })); showToast('✓ Mode mails clients : ' + mode); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const stageNow = async () => { setBusy(true); const r = await kbStageClientMails(day, session.name, { force: true }); setBusy(false); showToast(r.ok ? `✉️ ${r.count || 0} mail(s) déposé(s)` : '⚠️ ' + (r.error || r.skipped)); loadSrv(); };
+      const loadSrv = async () => { try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'client_mails_status', date: day }); setSrv(r); } catch (e) { setSrv({ ok: false, error: e.message }); } };
+      const cancel = async () => {
+        if (!confirm('Annuler tous les mails clients NON ENCORE ENVOYÉS de ce jour ?')) return;
+        try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'client_mails_cancel', date: day }); showToast(r && r.ok !== false ? `${r.cancelled || 0} mail(s) annulé(s)` : '⚠️ ' + ((r && r.error) || 'erreur')); await storage.setDoc(`day_${day}_prep`, 'cmails', { sig: 'cancelled', cancelledAt: new Date().toISOString(), cancelledBy: session.name }); loadSrv(); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const preview = async () => {
+        const data = await kbClientMailsLoad(day);
+        const list = kbClientMailsClients(day, data);
+        if (!list.length) { showToast('Aucune commande ce jour'); return; }
+        setPrev({ list, data, i: 0, kind: 'cloture' });
+      };
+      if (!cfg) return <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Chargement…</p></div>;
+      const cm = st && st.cm;
+      const pill = (m, lb, col) => <button key={m} onClick={() => setMode(m)} className={cfg.mode === m ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '8px 12px', ...(cfg.mode === m ? { background: col, borderColor: col } : {}) }}>{lb}</button>;
+      let pv = null;
+      if (prev) {
+        const c = prev.list[prev.i]; const lieu = prev.data.lieux.sites[c.site]; const hours = (c.site === 'DOM' && kbSlotParse(c.slot)) || kbLieuHours(prev.data.lieux, c.site, day);
+        pv = { c, html: kbMailHtml(prev.kind, day, c, lieu, hours) };
+      }
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '12px 14px' }}>
+            <strong style={{ fontSize: 15 }}>📧 Mails clients</strong>
+            <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0 8px' }}>À la clôture de la prépa : récap de commande (casiers en gros, hors casier, ruptures, dernière minute probable). Le jour J, <b>60 min avant l'ouverture</b> du lieu : rappel avec horaires et résultat du ND dernière minute. Horaires : Pilotage › 📍 Lieux &amp; horaires.</p>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {pill('off', '⏸️ Désactivé', '#777')}
+              {pill('test', `🧪 Test (${KB_CM_TEST_N} clients → ${KB_RECAP_TO})`, '#ef6c00')}
+              {pill('live', '✅ Réel (clients)', '#2e7d32')}
+            </div>
+          </div>
+          <div className="card" style={{ padding: '12px 14px' }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ fontSize: 13, fontWeight: 700 }}>Distribution du</label>
+              <input type="date" value={day} onChange={e => { setDay(e.target.value); setSrv(null); }} style={{ padding: 6, borderRadius: 8, border: '1px solid var(--line)' }} />
+              <span style={{ fontSize: 13 }}>{st && st.meta && st.meta.closed ? '🔒 prépa clôturée' : '⏳ prépa non clôturée'}</span>
+            </div>
+            {cm && <div style={{ fontSize: 13, marginTop: 8, lineHeight: 1.5 }}>
+              {cm.at && <div>Dernier dépôt : <b>{new Date(cm.at).toLocaleString('fr-FR')}</b> ({cm.mode}) · {cm.cloture || 0} récap · {cm.rappel || 0} rappel(s) · {cm.clients || 0} clients</div>}
+              {(cm.noEmail || []).length > 0 && <div style={{ color: 'var(--danger)' }}>Sans e-mail : {(cm.noEmail || []).join(', ')}</div>}
+              {(cm.noHours || []).length > 0 && <div style={{ color: '#ef6c00' }}>Pas d'horaires → pas de rappel : {(cm.noHours || []).join(', ')} (Pilotage › Lieux &amp; horaires)</div>}
+              {cm.err && <div style={{ color: 'var(--danger)' }}>⚠️ Dernière erreur : {cm.err}</div>}
+              {cm.cancelledAt && <div>Annulé par {cm.cancelledBy} le {new Date(cm.cancelledAt).toLocaleString('fr-FR')}</div>}
+            </div>}
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
+              <button className="btn-secondary" onClick={preview}>👁️ Aperçu</button>
+              <button className="btn-primary" disabled={busy} onClick={stageNow}>{busy ? 'Dépôt…' : '✉️ Déposer / mettre à jour'}</button>
+              <button className="btn-secondary" onClick={loadSrv}>🔄 État serveur</button>
+              <button className="btn-secondary" onClick={cancel}>🛑 Annuler les envois en attente</button>
+            </div>
+            {srv && <div style={{ fontSize: 13, marginTop: 10 }}>
+              {srv.ok === false ? <span style={{ color: 'var(--danger)' }}>⚠️ {srv.error}</span> : <>
+                <div>Serveur : <b>{srv.sent || 0}</b> envoyé(s) · <b>{srv.pending || 0}</b> en attente · {srv.failed || 0} échec(s) · {srv.cancelled || 0} annulé(s)</div>
+                <div style={{ maxHeight: 260, overflow: 'auto', marginTop: 6 }}>
+                  {(srv.rows || []).map((r, i) => <div key={i} style={{ borderBottom: '1px solid var(--line)', padding: '3px 0' }}>{r.status === 'sent' ? '✅' : r.status === 'pending' ? '⏳' : r.status === 'failed' ? '❌' : '⏹️'} {r.type} · {r.site} · {r.client} · {r.status === 'sent' ? 'envoyé ' + new Date(r.sentAt).toLocaleString('fr-FR') : 'prévu ' + new Date(r.sendAt).toLocaleString('fr-FR')}{r.error ? ' · ' + r.error : ''}</div>)}
+                </div>
+              </>}
+            </div>}
+          </div>
+          {pv && <KbSheet title={`Aperçu · ${pv.c.site} · ${pv.c.name}`} onClose={() => setPrev(null)}>
+            <div style={{ display: 'flex', gap: 6, padding: '8px 12px', flexWrap: 'wrap', alignItems: 'center' }}>
+              <button className={prev.kind === 'cloture' ? 'btn-primary' : 'btn-secondary'} onClick={() => setPrev(p => ({ ...p, kind: 'cloture' }))}>Récap clôture</button>
+              <button className={prev.kind === 'rappel' ? 'btn-primary' : 'btn-secondary'} onClick={() => setPrev(p => ({ ...p, kind: 'rappel' }))}>Rappel J-60 min</button>
+              <button className="btn-secondary" disabled={prev.i <= 0} onClick={() => setPrev(p => ({ ...p, i: p.i - 1 }))}>←</button>
+              <span style={{ fontSize: 12 }}>{prev.i + 1}/{prev.list.length}</span>
+              <button className="btn-secondary" disabled={prev.i >= prev.list.length - 1} onClick={() => setPrev(p => ({ ...p, i: p.i + 1 }))}>→</button>
+            </div>
+            <iframe title="aperçu" srcDoc={pv.html} style={{ width: '100%', height: '70vh', border: 'none' }} />
+          </KbSheet>}
+          <div className="card" style={{ padding: '12px 14px', fontSize: 12, color: 'var(--ink-mute)' }}>
+            Envoi serveur : script <b>KBG_ClientMails.gs</b> dans le projet Apps Script <b>KBG STOCK PROXY</b> (actions client_mails_stage / status / cancel + déclencheur toutes les 5 min). Sans lui, « Déposer » affiche une erreur.
+          </div>
+        </div>
+      );
+    }
+
     // V9.67 — noms de fromages (repli quand la catégorie du catalogue manque, ex. nouveau site)
     const KB_CHEESE_RX = /\b(fromage|comte|tomme|brie|camembert|chevre|reblochon|roquefort|bleu d|bleu de|emmental|raclette|munster|morbier|cantal|saint[- ]nectaire|st[- ]nectaire|ossau|feta|mozzarella|parmesan|parmigiano|beaufort|abondance|mimolette|gouda|coulommiers|chaource|epoisses|maroilles|pont[- ]l.eveque|langres|salers|laguiole|fourme|crottin|pelardon|picodon|rocamadour|valencay|selles sur cher|sainte[- ]maure|bethmale|tomette|faisselle|fromage blanc|cancoillotte|mont d.or|vacherin|gruyere|ricotta|burrata|halloumi|manchego|pecorino|cheddar)\b/;
     function PrepaDuJourPage({ session }) {
@@ -10756,6 +11179,7 @@
       const [prodQ, setProdQ] = React.useState('');
       const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert
       const [reserved, setReserved] = React.useState({}); // V9.74 — casiers JSON par client (site||client → ['1','2'])
+      const [listDoneOpen, setListDoneOpen] = React.useState(false); // V9.75 — produits terminés dépliés
       const [doneOpen, setDoneOpen] = React.useState({}); // V9.73 — section « Dispatch fait » dépliée
       const [recent, setRecent] = React.useState({});    // V9.73 — déposés à l'instant (restent visibles ~1 s)
       const [casPick, setCasPick] = React.useState(null); // V9.73 — choix du n° de nouveau casier { site, client }
@@ -11021,6 +11445,12 @@
             showToast(lg.ok ? `✉️ Fichier Dromy envoyé (${lg.count} clients, ${lg.cartons} cartons)` : (lg.skipped ? 'Pas de livraison à domicile : rien envoyé à Dromy' : '⚠️ Envoi Dromy échoué : ' + lg.error + ' — renvoyer depuis Pilotage › Dromy'));
           }
         } catch (e) { showToast('⚠️ Envoi Dromy : ' + e.message); }
+        // V9.75 — mails clients (récap maintenant + rappel J-60 min), selon Pilotage › Mails clients
+        try {
+          const cm = await kbStageClientMails(day, user, { force: true });
+          if (cm.ok) showToast(`✉️ Mails clients déposés : ${cm.cloture || 0} récap + ${cm.rappel || 0} rappel(s)${cm.mode === 'test' ? ' (mode TEST)' : ''}`);
+          else if (cm.error) showToast('⚠️ Mails clients non déposés : ' + cm.error + ' — Pilotage › Mails clients');
+        } catch (e) { showToast('⚠️ Mails clients : ' + e.message); }
         // V9.61 — 🎆 + ruptures ancien site envoyées automatiquement à hg@ (cohabitation)
         kbCelebrate({ title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`, sub: `${rows.length} lignes préparées · merci l'équipe 💚` });
         if (KB_COHABITATION) {
@@ -11173,8 +11603,10 @@
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
         const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
+          // V9.75 — « Suivant » : prochain produit NON terminé (après celui-ci, sinon depuis le début)
+          const todoP = prods.filter(p => p !== openProd && !prodStat(p).fin);
           const i = prods.indexOf(openProd);
-          const next = i>=0 && i<prods.length-1 ? prods[i+1] : null;
+          const next = todoP.find(p => prods.indexOf(p) > i) || todoP[0] || null;
           const ps = prodStat(openProd);
           body = (
             <div className="pdj-detail">
@@ -11224,11 +11656,16 @@
                   {prodQ && <button className="pdj-fx" onClick={()=>setProdQ('')} aria-label="Effacer">✕</button>}
                 </div>
               </div>
-              {prods.length ? (
-                <div className="pdj-plist">
-                  <div className="pdj-phead"><span>Produit{prodSite ? ' · ' + prodSite : ' · toutes les boutiques'}</span><span>Progrès</span></div>
-                  {prods.map(p => {
-                    const x = prodStat(p);
+              {prods.length ? (() => {
+                // V9.75 — produits terminés masqués → « ✅ Dispatch fait »
+                const stats = {}; prods.forEach(p => { stats[p] = prodStat(p); });
+                const todo = prods.filter(p => !stats[p].fin), fini = prods.filter(p => stats[p].fin);
+                return (<>
+                {todo.length === 0 && <div className="pdj-alldone" style={{marginBottom:10}}>✅ Tous les produits sont faits</div>}
+                {todo.length > 0 && <div className="pdj-plist">
+                  <div className="pdj-phead"><span>Produit{prodSite ? ' · ' + prodSite : ' · toutes les boutiques'} · {todo.length} à faire</span><span>Progrès</span></div>
+                  {todo.map(p => {
+                    const x = stats[p];
                     const pct = x.tot ? Math.round(x.dn / x.tot * 100) : 0;
                     const anyND = x.ss.some(si=>ndOn(PK(si,p))), anyLM = x.ss.some(si=>prep.lm[PK(si,p)]);
                     return (
@@ -11252,8 +11689,24 @@
                       </button>
                     );
                   })}
-                </div>
-              ) : <div className="pdj-no">{rsAll.length ? 'Aucun produit ne correspond.' : 'Aucune commande.'}</div>}
+                </div>}
+                {fini.length > 0 && <button className={"pdj-donebar"+(listDoneOpen?" on":"")} style={{marginTop:10}} onClick={()=>setListDoneOpen(v=>!v)}>
+                  ✅ Dispatch fait ({fini.length} produit{fini.length>1?'s':''}) <span>{listDoneOpen ? '▲ masquer' : '▼ voir / corriger'}</span>
+                </button>}
+                {listDoneOpen && fini.length > 0 && <div className="pdj-plist" style={{marginTop:6}}>
+                  {fini.map(p => { const x = stats[p]; const pct = x.tot ? Math.round(x.dn / x.tot * 100) : 0; return (
+                    <button key={p} className="pdj-prow fin" onClick={()=>setOpenProd(p)}>
+                      <span className="pdj-pinfo">
+                        <span className="pdj-pn">{p}{x.rp>0 && <span className="pdj-badge rp">🚫 {x.rp}</span>}</span>
+                        <span className="pdj-pp">{x.po[0].producer || '—'}</span>
+                        {!prodSite && <span className="pdj-psites">{x.ss.join(' · ')}</span>}
+                      </span>
+                      <span className="pdj-pprog"><span className="n">{x.dn} / {x.tot}</span><span className="b"><span style={{width:pct+'%'}} /></span></span>
+                      <span className="pdj-pfin">✅</span>
+                    </button>); })}
+                </div>}
+                </>);
+              })() : <div className="pdj-no">{rsAll.length ? 'Aucun produit ne correspond.' : 'Aucune commande.'}</div>}
             </div>
           );
         }
@@ -14253,6 +14706,8 @@
         { k: 'temp',  label: 'Température',    icon: '🌡️' },
         { k: 'codes', label: 'Codes-barres',  icon: '🏷️' },
         { k: 'dromy', label: 'Dromy',         icon: '🚚' },
+        { k: 'lieux', label: 'Lieux & horaires', icon: '📍' },
+        { k: 'cmails', label: 'Mails clients', icon: '📧' },
         { k: 'ancien', label: 'Ancien site',  icon: '🔁' },
         { k: 'histo', label: 'Historique',    icon: '📜' },
       ];
@@ -14275,6 +14730,8 @@
           {sub === 'temp'  && <TempMasterPage session={session} />}
           {sub === 'codes' && <BarcodesManagerPage session={session} />}
           {sub === 'dromy' && <DromyPilotagePage session={session} />}
+          {sub === 'lieux' && <KbLieuxPage session={session} />}
+          {sub === 'cmails' && <KbClientMailsPage session={session} />}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
@@ -19174,6 +19631,18 @@
         const run = () => { if (!stop) psAutoSync(session.name).catch(() => {}); };
         const t0 = setTimeout(run, 8000);
         const t = setInterval(run, 60000);
+        return () => { stop = true; clearTimeout(t0); clearInterval(t); };
+      }, [session && session.name, session && session.role]);
+
+      // V9.75 — Mails clients : re-dépôt auto (postes Master/Prépa, toutes les 2 min) si le contenu change
+      //   (ex. dispatch dernière minute du matin → rappel J-60 min à jour). Rien si prépa non clôturée.
+      React.useEffect(() => {
+        if (!session) return;
+        if (!(session.role === 'master' || session.isMaster || session.role === 'prep')) return;
+        let stop = false;
+        const run = () => { if (!stop) kbStageClientMails(activeDay(), session.name).catch(() => {}); };
+        const t0 = setTimeout(run, 15000);
+        const t = setInterval(run, 120000);
         return () => { stop = true; clearTimeout(t0); clearInterval(t); };
       }, [session && session.name, session && session.role]);
 
