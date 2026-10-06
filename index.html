@@ -627,7 +627,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.60';
+    const APP_VERSION = 'V9.62';
+    // V9.62 — PRÉPA sur la bonne date : la prépa se cale automatiquement sur la PROCHAINE distribution
+    //   ayant des commandes (J+1… J+7), re-vérifie toutes les 5 min / au retour sur l'appli ; bandeau avec
+    //   choix de la date (pastilles date · nb commandes) ; changement de date sans recharger l'appli.
+    // V9.61 — Cohabitation ancien / nouveau site : ruptures prépa des commandes ANCIEN SITE (par client,
+    //   par produit, + remises prépa et rajouts distrib) envoyées à hg@probon.fr à la clôture de la prépa ;
+    //   récap distrib (manquants retirés / remises / rajouts) envoyé à hg@ à la clôture de chaque local ;
+    //   tout consultable / renvoyable dans Master › Pilotage › 🔁 Ancien site (copier, PDF, CSV, mail).
+    //   🎆 Feu d'artifice + citation à la clôture de la prépa et de la distribution.
     // V9.60 — Distrib › Suivi › Non récupérés : fiche façon distribution (ancien casier en gros, 🥬 ND à
     //   ajouter, 🍞 pain, frais déjà en casier), consigne « rien dans les rolls », date de récup prévue,
     //   🖨️ feuille A4 à mettre dans le casier (NOM + date), bouton « 📦 Rangé en casier ».
@@ -2175,6 +2183,21 @@
       const d = new Date(dayKey + 'T12:00:00');
       d.setDate(d.getDate() + n);
       return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    // V9.62 — PRÉPA = distribution SUIVANTE. Cherche les prochaines dates (J+1 … J+7) qui ont
+    // des commandes chargées (day_<J>_orders). La prépa ne travaille jamais sur aujourd'hui par défaut.
+    async function kbUpcomingDays(maxDays) {
+      const out = [];
+      const t = todayKey();
+      const days = []; for (let i = 0; i <= (maxDays || 7); i++) days.push(addDays(t, i));
+      const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+      days.forEach((d, i) => { const n = (docs[i] && docs[i].orders && docs[i].orders.length) || 0; if (n || i <= 1) out.push({ day: d, count: n, today: i === 0 }); });
+      return out;
+    }
+    async function kbFindPrepDay() {
+      const list = await kbUpcomingDays(7);
+      const f = list.find(x => !x.today && x.count > 0);
+      return f ? f.day : null;
     }
     function formatDateFR(d = new Date()) {
       if (typeof d === 'string') d = new Date(d);
@@ -7654,6 +7677,476 @@
       );
     }
 
+
+    // ============================================================
+    // V9.61 — COHABITATION ancien site / nouveau site
+    //  • Ruptures prépa des commandes ANCIEN SITE (Mongo, sans _ps) → à reporter à la main
+    //    sur l'ancien site de prépa. Mail auto à la clôture de la prépa + Master › Pilotage › Ancien site.
+    //  • Récap distrib (remises / retraits / rajouts faits par le distributeur) → mail auto à la
+    //    clôture de chaque local + Master › Pilotage › Ancien site.
+    //  • 🎆 Feu d'artifice + citation à la clôture de la prépa et de la distribution.
+    // ============================================================
+    const KB_RECAP_TO = 'hg@probon.fr';
+    const KB_COHABITATION = true; // passer à false quand l'ancien site est arrêté (plus de mails auto)
+    const kbIsPsOrder = (o) => !!(o && (o._ps || /^PST?_/.test(String(o.orderId || ''))));
+    const kbEsc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const kbCasCmpRow = (a, b) => (a.site || '').localeCompare(b.site || '') || casCmp(a.casier, b.casier) || (a.client || '').localeCompare(b.client || '') || (a.produit || '').localeCompare(b.produit || '');
+
+    // ---------- Ruptures prépa (ancien site) ----------
+    async function kbAncienRuptures(day) {
+      const [od, prepArr, fixArr] = await Promise.all([
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        storage.getAll(`day_${day}_prep`).catch(() => []),
+        storage.getAll(`day_${day}_distribfix`).catch(() => []),
+      ]);
+      const prep = parsePrepDocs(prepArr);
+      const fix = parseDistribFix(fixArr);
+      const meta = (prepArr || []).find(d => d.id === 'meta') || null;
+      const sentDoc = (prepArr || []).find(d => d.id === 'ancien') || null;
+      const lines = [], remises = [];
+      let psRupt = 0, nAncien = 0, nPs = 0;
+      for (const o of ((od && od.orders) || [])) {
+        const ps = kbIsPsOrder(o);
+        if (ps) nPs++; else nAncien++;
+        const site = String(o.site || '').toUpperCase();
+        const client = o.name || '(client)';
+        const cas = [...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String);
+        for (const it of (o.items || [])) {
+          const produit = it.produit || '(produit)';
+          const k = site + '||' + client + '||' + produit;
+          const base = { site, client, email: o.email || '', casier: cas[0] || '', orderId: o.orderId || '', produit, producteur: it.producteur || '', qty: it.qty || 1, prix: it.consumer_price || 0 };
+          if (prep.status[k] === 'rupture') {
+            if (ps) { psRupt++; continue; }
+            lines.push({ ...base, restored: !!fix[k] });
+            continue;
+          }
+          if (ps) continue;
+          const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
+          if (rc && rc.pct) remises.push({ ...base, pct: rc.pct, reason: rc.reason || '' });
+        }
+      }
+      lines.sort(kbCasCmpRow); remises.sort(kbCasCmpRow);
+      return { day, lines, remises, psRupt, nAncien, nPs, closed: !!(meta && meta.closed), closedBy: (meta && meta.closedBy) || '', closedAt: (meta && meta.closedAt) || '', sent: (sentDoc && sentDoc.sent) || null };
+    }
+    function kbRupturesByProduct(lines) {
+      const m = {};
+      for (const l of lines) {
+        if (l.restored) continue;
+        const k = l.producteur + '||' + l.produit;
+        if (!m[k]) m[k] = { produit: l.produit, producteur: l.producteur, qty: 0, clients: [] };
+        m[k].qty += l.qty; m[k].clients.push(l);
+      }
+      return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit));
+    }
+    function kbRupturesText(d) {
+      const act = d.lines.filter(l => !l.restored);
+      const out = [`RUPTURES PRÉPA — ANCIEN SITE — ${formatDateShort(d.day)}`, `${act.length} ligne(s) à passer en rupture sur l'ancien site`, ''];
+      let cur = '';
+      for (const l of act) {
+        if (l.site !== cur) { cur = l.site; out.push(`== ${siteLabel(l.site)} (${l.site}) ==`); }
+        out.push(`Casier ${l.casier || '?'} · ${l.client} — ${l.produit}${l.producteur ? ' (' + l.producteur + ')' : ''} ×${l.qty}`);
+      }
+      const rest = d.lines.filter(l => l.restored);
+      if (rest.length) { out.push('', 'RAJOUTÉS EN DISTRIB (rupture annulée, NE PAS enlever) :'); rest.forEach(l => out.push(`${l.site} · ${l.client} — ${l.produit} ×${l.qty}`)); }
+      if (d.remises.length) { out.push('', 'REMISES PRÉPA :'); d.remises.forEach(r => out.push(`${r.site} · Casier ${r.casier || '?'} · ${r.client} — ${r.produit} ×${r.qty} : -${r.pct}% (${r.reason})`)); }
+      return out.join('\n');
+    }
+    function kbRupturesCsv(d) {
+      const head = ['Type', 'Local', 'Casier', 'Client', 'Email', 'Produit', 'Producteur', 'Quantite', 'Prix unitaire', 'Remise %', 'Motif'];
+      const rows = [head.join(';')];
+      const eur = (c) => ((c || 0) / 100).toFixed(2).replace('.', ',');
+      const cell = (v) => { const s = String(v == null ? '' : v); return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      d.lines.forEach(l => rows.push([l.restored ? 'Rajouté distrib (ne pas enlever)' : 'Rupture', l.site, l.casier, l.client, l.email, l.produit, l.producteur, l.qty, eur(l.prix), '', ''].map(cell).join(';')));
+      d.remises.forEach(r => rows.push(['Remise prépa', r.site, r.casier, r.client, r.email, r.produit, r.producteur, r.qty, eur(r.prix), r.pct, r.reason].map(cell).join(';')));
+      return '﻿' + rows.join('\r\n') + '\r\n';
+    }
+    function kbRupturesHtml(d) {
+      const act = d.lines.filter(l => !l.restored);
+      const td = 'padding:4px 8px;border-bottom:1px solid #eee;font-size:13px';
+      const th = 'padding:4px 8px;text-align:left;background:#f1f5ee;font-size:12px';
+      let html = `<div style="font-family:Arial,sans-serif;color:#222;max-width:720px">`
+        + `<h2 style="margin:0 0 4px">🚫 Ruptures prépa — ancien site — ${kbEsc(formatDateShort(d.day))}</h2>`
+        + `<p style="margin:0 0 12px;color:#666;font-size:13px"><b>${act.length}</b> ligne(s) à passer en rupture sur l'ancien site de prépa · commandes ancien site : ${d.nAncien} · nouveau site : ${d.nPs} (${d.psRupt} rupture(s) nouveau site, non listées)${d.closedBy ? ' · prépa clôturée par ' + kbEsc(d.closedBy) : ''}</p>`;
+      if (!act.length) html += `<p style="color:#2e7d32"><b>Aucune rupture sur les commandes de l'ancien site.</b></p>`;
+      else {
+        html += `<h3 style="margin:10px 0 4px;font-size:15px">Par client</h3><table style="border-collapse:collapse;width:100%"><tr><th style="${th}">Local</th><th style="${th}">Casier</th><th style="${th}">Client</th><th style="${th}">Produit</th><th style="${th}">Qté</th></tr>`
+          + act.map(l => `<tr><td style="${td}">${kbEsc(l.site)}</td><td style="${td}"><b>${kbEsc(l.casier)}</b></td><td style="${td}">${kbEsc(l.client)}</td><td style="${td}">${kbEsc(l.produit)}<br><span style="color:#888;font-size:11px">${kbEsc(l.producteur)}</span></td><td style="${td};text-align:right"><b>${l.qty}</b></td></tr>`).join('')
+          + `</table>`;
+        html += `<h3 style="margin:14px 0 4px;font-size:15px">Par produit</h3><table style="border-collapse:collapse;width:100%"><tr><th style="${th}">Produit</th><th style="${th}">Qté</th><th style="${th}">Clients</th></tr>`
+          + kbRupturesByProduct(d.lines).map(p => `<tr><td style="${td}"><b>${kbEsc(p.produit)}</b><br><span style="color:#888;font-size:11px">${kbEsc(p.producteur)}</span></td><td style="${td};text-align:right"><b>${p.qty}</b></td><td style="${td}">${p.clients.map(c => kbEsc(c.site + ' · ' + c.client + (c.qty > 1 ? ' ×' + c.qty : ''))).join('<br>')}</td></tr>`).join('')
+          + `</table>`;
+      }
+      const rest = d.lines.filter(l => l.restored);
+      if (rest.length) html += `<h3 style="margin:14px 0 4px;font-size:15px;color:#2e7d32">➕ Rajoutés en distrib (rupture annulée — NE PAS enlever)</h3><ul style="font-size:13px">${rest.map(l => `<li>${kbEsc(l.site)} · ${kbEsc(l.client)} — ${kbEsc(l.produit)} ×${l.qty}</li>`).join('')}</ul>`;
+      if (d.remises.length) html += `<h3 style="margin:14px 0 4px;font-size:15px;color:#a3125b">🏷️ Remises prépa (ancien site)</h3><table style="border-collapse:collapse;width:100%">${d.remises.map(r => `<tr><td style="${td}">${kbEsc(r.site)} · casier ${kbEsc(r.casier)}</td><td style="${td}">${kbEsc(r.client)}</td><td style="${td}">${kbEsc(r.produit)} ×${r.qty}</td><td style="${td}"><b>-${r.pct}%</b> ${kbEsc(r.reason)}</td></tr>`).join('')}</table>`;
+      return html + `<p style="color:#999;font-size:11px;margin-top:16px">Appli Kelbongoo ${APP_VERSION} · export automatique (cohabitation ancien / nouveau site)</p></div>`;
+    }
+    async function kbSendRuptures(day, by, opts) {
+      const d = await kbAncienRuptures(day);
+      const act = d.lines.filter(l => !l.restored);
+      const csv = kbRupturesCsv(d);
+      const subject = `[Ancien site] Ruptures prépa du ${formatDateShort(day)} — ${act.length} ligne(s)${d.remises.length ? ' + ' + d.remises.length + ' remise(s)' : ''}`;
+      let r;
+      try {
+        r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_RECAP_TO, subject, body: kbRupturesText(d), htmlBody: kbRupturesHtml(d),
+          attachment: { dataB64: btoa(unescape(encodeURIComponent(csv))), mimeType: 'text/csv', name: `ruptures_ancien_site_${day}.csv` } });
+      } catch (e) { r = { ok: false, error: e.message }; }
+      const log = { at: new Date().toISOString(), by: by || '—', to: KB_RECAP_TO, count: act.length, remises: d.remises.length, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue'), auto: !!(opts && opts.auto) };
+      try { await storage.setDoc(`day_${day}_prep`, 'ancien', { sent: log }, { replace: true }); } catch (_) {}
+      return log;
+    }
+
+    // ---------- Récap distrib (remises / retraits / rajouts du distributeur) ----------
+    async function kbDistribRecap(day, site) {
+      const S = site ? String(site).toUpperCase() : '';
+      const [od, refArr, fixArr, cloArr] = await Promise.all([
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        storage.getAll(`day_${day}_refunds`).catch(() => []),
+        storage.getAll(`day_${day}_distribfix`).catch(() => []),
+        storage.getAll(`day_${day}_closure`).catch(() => []),
+      ]);
+      const orders = (od && od.orders) || [];
+      const byId = {}; orders.forEach(o => { byId[o.orderId] = o; });
+      const byClient = {}; orders.forEach(o => { byClient[String(o.site || '').toUpperCase() + '||' + (o.name || '')] = o; });
+      const refunds = (refArr || []).filter(r => r && r.orderId && (!S || String(r.site || '').toUpperCase() === S)).map(r => {
+        const o = byId[r.orderId] || null;
+        const cas = o ? [...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String)[0] || '' : '';
+        return { site: String(r.site || '').toUpperCase(), client: r.client || '', email: r.email || '', casier: cas, orderId: r.orderId, produit: r.produit || '', producteur: r.producteur || '',
+          qty: r.qty || 1, pct: r.pct || 0, cents: r.refundCents || 0, lineCents: r.lineCents || 0, detail: r.detail || '', mode: r.mode || '', by: r.createdBy || '', at: r.createdAt || '',
+          retrait: (r.pct || 0) >= 100, ps: /^PST?_/.test(String(r.orderId)) || kbIsPsOrder(o) };
+      });
+      const restores = [];
+      for (const d of (fixArr || [])) {
+        const id = d.id || ''; const bar = id.indexOf('|'); if (bar < 0 || !d.restore) continue;
+        const key = decodeURIComponent(id.slice(bar + 1)); const p = key.split('||');
+        const st = String(p[0] || '').toUpperCase(); if (S && st !== S) continue;
+        const o = byClient[st + '||' + (p[1] || '')] || null;
+        const it = o ? (o.removed || []).concat(o.items || []).find(x => x.produit === p[2]) : null;
+        restores.push({ site: st, client: p[1] || '', produit: d.produit || p[2] || '', qty: (it && it.qty) || 1, by: d.by || '', at: d.at || '', ps: kbIsPsOrder(o) });
+      }
+      refunds.sort(kbCasCmpRow); restores.sort(kbCasCmpRow);
+      const closures = (cloArr || []).filter(c => c && c.site && (!S || c.site === S));
+      return { day, site: S, refunds, restores, closures };
+    }
+    function kbDistribRecapText(d) {
+      const lbl = d.site ? `${siteLabel(d.site)} (${d.site})` : 'tous les locaux';
+      const out = [`RÉCAP DISTRIB — ${lbl} — ${formatDateShort(d.day)}`, ''];
+      const block = (title, arr) => { if (!arr.length) return; out.push(title); arr.forEach(x => out.push(x)); out.push(''); };
+      const anc = d.refunds.filter(r => !r.ps), ps = d.refunds.filter(r => r.ps);
+      block('ANCIEN SITE — MANQUANTS À ENLEVER (retrait total) :', anc.filter(r => r.retrait).map(r => `${r.site} · Casier ${r.casier || '?'} · ${r.client} — ${r.produit} ×${r.qty} (${fmtEuro(r.cents)})`));
+      block('ANCIEN SITE — REMISES :', anc.filter(r => !r.retrait).map(r => `${r.site} · Casier ${r.casier || '?'} · ${r.client} — ${r.produit} ×${r.qty} : -${r.pct}% = ${fmtEuro(r.cents)} (${r.detail})`));
+      block('ANCIEN SITE — RAJOUTÉS (rupture prépa annulée, à remettre) :', d.restores.filter(r => !r.ps).map(r => `${r.site} · ${r.client} — ${r.produit} ×${r.qty}`));
+      block('NOUVEAU SITE (pour info) :', ps.map(r => `${r.site} · ${r.client} — ${r.produit} ×${r.qty} : ${r.retrait ? 'retrait total' : '-' + r.pct + '%'} = ${fmtEuro(r.cents)}`).concat(d.restores.filter(r => r.ps).map(r => `${r.site} · ${r.client} — ${r.produit} : rajouté`)));
+      if (out.length <= 2) out.push('Aucune remise, aucun manquant, aucun rajout.');
+      return out.join('\n');
+    }
+    function kbDistribRecapCsv(d) {
+      const cell = (v) => { const s = String(v == null ? '' : v); return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const eur = (c) => ((c || 0) / 100).toFixed(2).replace('.', ',');
+      const rows = [['Site', 'Type', 'Local', 'Casier', 'Client', 'Email', 'Produit', 'Producteur', 'Quantite', 'Remise %', 'Montant', 'Detail', 'Par'].join(';')];
+      d.refunds.forEach(r => rows.push([r.ps ? 'Nouveau' : 'Ancien', r.retrait ? 'Manquant (retrait total)' : 'Remise', r.site, r.casier, r.client, r.email, r.produit, r.producteur, r.qty, r.pct, eur(r.cents), r.detail, r.by].map(cell).join(';')));
+      d.restores.forEach(r => rows.push([r.ps ? 'Nouveau' : 'Ancien', 'Rajouté (rupture annulée)', r.site, '', r.client, '', r.produit, '', r.qty, '', '', '', r.by].map(cell).join(';')));
+      return '﻿' + rows.join('\r\n') + '\r\n';
+    }
+    function kbDistribRecapHtml(d) {
+      const lbl = d.site ? `${kbEsc(siteLabel(d.site))} (${kbEsc(d.site)})` : 'tous les locaux';
+      const td = 'padding:4px 8px;border-bottom:1px solid #eee;font-size:13px';
+      const anc = d.refunds.filter(r => !r.ps), ps = d.refunds.filter(r => r.ps);
+      const tbl = (title, color, arr, fn) => arr.length ? `<h3 style="margin:14px 0 4px;font-size:15px;color:${color}">${title} (${arr.length})</h3><table style="border-collapse:collapse;width:100%">${arr.map(fn).join('')}</table>` : '';
+      const rowR = r => `<tr><td style="${td}">${kbEsc(r.site)} · casier <b>${kbEsc(r.casier || '?')}</b></td><td style="${td}">${kbEsc(r.client)}</td><td style="${td}">${kbEsc(r.produit)} ×${r.qty}<br><span style="color:#888;font-size:11px">${kbEsc(r.producteur)}</span></td><td style="${td};white-space:nowrap">${r.retrait ? '<b>retrait total</b>' : '<b>-' + r.pct + '%</b>'} · ${kbEsc(fmtEuro(r.cents))}<br><span style="color:#888;font-size:11px">${kbEsc(r.detail)}${r.by ? ' · ' + kbEsc(r.by) : ''}</span></td></tr>`;
+      const rowF = r => `<tr><td style="${td}">${kbEsc(r.site)}</td><td style="${td}">${kbEsc(r.client)}</td><td style="${td}">${kbEsc(r.produit)} ×${r.qty}</td><td style="${td}">${kbEsc(r.by)}</td></tr>`;
+      const total = anc.reduce((s, r) => s + r.cents, 0);
+      let html = `<div style="font-family:Arial,sans-serif;color:#222;max-width:720px">`
+        + `<h2 style="margin:0 0 4px">🧾 Récap distrib — ${lbl} — ${kbEsc(formatDateShort(d.day))}</h2>`
+        + `<p style="margin:0 0 8px;color:#666;font-size:13px">À reporter à la main sur l'ancien site · total ancien site : <b>${kbEsc(fmtEuro(total))}</b>${d.closures.length ? ' · clôturé par ' + d.closures.map(c => kbEsc(c.site + ' ' + (c.closedBy || ''))).join(', ') : ''}</p>`
+        + tbl('🗑️ Ancien site — manquants à enlever (retrait total)', '#b23b3b', anc.filter(r => r.retrait), rowR)
+        + tbl('🏷️ Ancien site — remises', '#a3125b', anc.filter(r => !r.retrait), rowR)
+        + tbl('➕ Ancien site — rajoutés (rupture prépa annulée, à remettre)', '#2e7d32', d.restores.filter(r => !r.ps), rowF)
+        + tbl('🛒 Nouveau site (pour info)', '#555', ps, rowR)
+        + tbl('🛒 Nouveau site — rajoutés (pour info)', '#555', d.restores.filter(r => r.ps), rowF);
+      if (!d.refunds.length && !d.restores.length) html += `<p style="color:#2e7d32"><b>Aucune remise, aucun manquant, aucun rajout.</b></p>`;
+      return html + `<p style="color:#999;font-size:11px;margin-top:16px">Appli Kelbongoo ${APP_VERSION} · export automatique (cohabitation ancien / nouveau site)</p></div>`;
+    }
+    async function kbSendDistribRecap(day, site, by, opts) {
+      const d = await kbDistribRecap(day, site);
+      const anc = d.refunds.filter(r => !r.ps);
+      const subject = `[Ancien site] Récap distrib ${site || 'tous locaux'} du ${formatDateShort(day)} — ${anc.filter(r => r.retrait).length} manquant(s), ${anc.filter(r => !r.retrait).length} remise(s), ${d.restores.filter(r => !r.ps).length} rajout(s)`;
+      const csv = kbDistribRecapCsv(d);
+      let r;
+      try {
+        r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_RECAP_TO, subject, body: kbDistribRecapText(d), htmlBody: kbDistribRecapHtml(d),
+          attachment: { dataB64: btoa(unescape(encodeURIComponent(csv))), mimeType: 'text/csv', name: `recap_distrib_${site || 'TOUS'}_${day}.csv` } });
+      } catch (e) { r = { ok: false, error: e.message }; }
+      const log = { at: new Date().toISOString(), by: by || '—', to: KB_RECAP_TO, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue'), auto: !!(opts && opts.auto), n: d.refunds.length + d.restores.length };
+      if (site) { try { await storage.setDoc(`day_${day}_closure`, site, { recapSent: log }); } catch (_) {} }
+      return log;
+    }
+    function kbRecapPdf(title, sub, head, body, fileName) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      doc.setFontSize(15); doc.setFont(undefined, 'bold'); doc.text(kbPdfTxt(title), 12, 14);
+      doc.setFontSize(10); doc.setFont(undefined, 'normal'); doc.text(kbPdfTxt(sub), 12, 20);
+      doc.autoTable({ startY: 25, head: [head.map(kbPdfTxt)], body: body.map(r => r.map(kbPdfTxt)), styles: { fontSize: 9, cellPadding: 1.6 }, headStyles: { fillColor: [74, 124, 59] }, margin: { left: 10, right: 10 } });
+      kbOpenPdf(doc, fileName);
+    }
+    function kbCopyText(text, showToast) {
+      const done = () => showToast && showToast('📋 Copié');
+      try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(done, () => fallback()); return; } } catch (e) {}
+      fallback();
+      function fallback() { try { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); done(); } catch (e) { showToast && showToast('Copie impossible'); } }
+    }
+    const kbSentLine = (s) => s ? `${s.ok ? '✉️ Envoyé' : '⚠️ Échec envoi'} à ${s.to || KB_RECAP_TO} ${s.auto ? '(auto) ' : ''}le ${new Date(s.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}${s.by ? ' · ' + s.by : ''}${s.ok ? '' : ' — ' + (s.error || '')}` : '';
+    const kbBtnRow = { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 };
+    const kbBtnSm = { fontSize: 13, padding: '8px 12px' };
+
+    function AncienRupturesPanel({ day, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [d, setD] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [view, setView] = React.useState('client');
+      const [busy, setBusy] = React.useState(false);
+      const load = React.useCallback(() => { setErr(''); kbAncienRuptures(day).then(setD).catch(e => setErr(e.message)); }, [day]);
+      React.useEffect(() => { setD(null); load(); }, [load]);
+      if (err) return <div className="alert-red">Erreur : {err} <button className="btn-ghost" onClick={load}>Réessayer</button></div>;
+      if (!d) return <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement…</div>;
+      const act = d.lines.filter(l => !l.restored);
+      const rest = d.lines.filter(l => l.restored);
+      const send = async () => { setBusy(true); try { const lg = await kbSendRuptures(day, (session && session.name) || '—'); showToast(lg.ok ? `✉️ Envoyé à ${KB_RECAP_TO}` : '⚠️ ' + lg.error); load(); } finally { setBusy(false); } };
+      const pdf = () => {
+        try {
+          kbRecapPdf(`Ruptures prepa - ancien site - ${formatDateShort(day)}`, `${act.length} ligne(s) a passer en rupture · ${d.remises.length} remise(s) prepa`,
+            ['Local', 'Casier', 'Client', 'Produit', 'Qte', 'Info'],
+            act.map(l => [l.site, l.casier, l.client, l.produit + (l.producteur ? ' (' + l.producteur + ')' : ''), String(l.qty), 'RUPTURE'])
+              .concat(rest.map(l => [l.site, l.casier, l.client, l.produit, String(l.qty), 'Rajoute distrib - ne pas enlever']))
+              .concat(d.remises.map(r => [r.site, r.casier, r.client, r.produit, String(r.qty), `Remise -${r.pct}% ${r.reason}`])),
+            `ruptures_ancien_site_${day}.pdf`);
+        } catch (e) { showToast('PDF : ' + e.message); }
+      };
+      const byProd = kbRupturesByProduct(d.lines);
+      const line = { display: 'flex', justifyContent: 'space-between', gap: 8, padding: '7px 0', borderBottom: '1px solid var(--line)', fontSize: 13 };
+      let curSite = '';
+      return (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>
+            <b style={{ fontSize: 22, color: act.length ? 'var(--warn)' : 'var(--accent)' }}>{act.length}</b> ligne(s) à passer en rupture sur l'ancien site
+            {d.remises.length > 0 && <> · <b>{d.remises.length}</b> remise(s) prépa</>}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>
+            Commandes ancien site : {d.nAncien} · nouveau site : {d.nPs}{d.psRupt ? ` (${d.psRupt} rupture(s) nouveau site, non listées)` : ''} · {d.closed ? `🔒 prépa clôturée${d.closedBy ? ' par ' + d.closedBy : ''}` : '⏳ prépa en cours (liste provisoire)'}
+          </div>
+          {d.sent && <div style={{ fontSize: 12, marginTop: 4, color: d.sent.ok ? 'var(--accent-dark,#2e7d32)' : 'var(--warn)' }}>{kbSentLine(d.sent)}</div>}
+          <div style={kbBtnRow}>
+            <button className={view === 'client' ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setView('client')}>👤 Par client</button>
+            <button className={view === 'produit' ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setView('produit')}>🧺 Par produit</button>
+            <button className="btn-ghost" style={kbBtnSm} onClick={load}>🔄</button>
+          </div>
+          <div style={{ maxHeight: '48vh', overflowY: 'auto', marginTop: 8 }}>
+            {!act.length && <div className="alert-info" style={{ fontSize: 13 }}>✅ Aucune rupture sur les commandes de l'ancien site.</div>}
+            {view === 'client' && act.map((l, i) => {
+              const hdr = l.site !== curSite ? (curSite = l.site, <div key={'h' + i} style={{ fontWeight: 800, fontSize: 13, marginTop: 8, color: 'var(--ink)' }}>📍 {siteLabel(l.site)} ({l.site})</div>) : null;
+              return <React.Fragment key={i}>{hdr}<div style={line}><span><b>Casier {l.casier || '?'}</b> · {l.client}<br /><span style={{ color: 'var(--ink-soft)' }}>{l.produit}</span> <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{l.producteur}</span></span><b style={{ whiteSpace: 'nowrap' }}>×{l.qty}</b></div></React.Fragment>;
+            })}
+            {view === 'produit' && byProd.map((p, i) => (
+              <div key={i} style={{ ...line, flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}><b>{p.produit} <span style={{ fontWeight: 400, color: 'var(--ink-mute)', fontSize: 11 }}>{p.producteur}</span></b><b>×{p.qty}</b></div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{p.clients.map(c => `${c.site} · cas. ${c.casier || '?'} · ${c.client}${c.qty > 1 ? ' ×' + c.qty : ''}`).join(' — ')}</div>
+              </div>
+            ))}
+            {rest.length > 0 && <>
+              <div style={{ fontWeight: 800, fontSize: 13, marginTop: 12, color: '#2e7d32' }}>➕ Rajoutés en distrib (rupture annulée — NE PAS enlever)</div>
+              {rest.map((l, i) => <div key={'r' + i} style={line}><span>{l.site} · {l.client} — {l.produit}</span><b>×{l.qty}</b></div>)}
+            </>}
+            {d.remises.length > 0 && <>
+              <div style={{ fontWeight: 800, fontSize: 13, marginTop: 12, color: '#a3125b' }}>🏷️ Remises prépa (ancien site)</div>
+              {d.remises.map((r, i) => <div key={'m' + i} style={line}><span>{r.site} · cas. {r.casier || '?'} · {r.client}<br /><span style={{ color: 'var(--ink-soft)' }}>{r.produit} ×{r.qty}</span></span><b style={{ whiteSpace: 'nowrap' }}>-{r.pct}% <span style={{ fontWeight: 400, fontSize: 11 }}>{r.reason}</span></b></div>)}
+            </>}
+          </div>
+          <div style={kbBtnRow}>
+            <button className="btn-secondary" style={kbBtnSm} onClick={() => kbCopyText(kbRupturesText(d), showToast)}>📋 Copier</button>
+            <button className="btn-secondary" style={kbBtnSm} onClick={pdf}>🖨️ PDF</button>
+            <button className="btn-secondary" style={kbBtnSm} onClick={() => kbDownloadText(kbRupturesCsv(d), `ruptures_ancien_site_${day}.csv`)}>⬇️ CSV</button>
+            <button className="btn-primary" style={kbBtnSm} disabled={busy} onClick={send}>{busy ? 'Envoi…' : `✉️ Envoyer à ${KB_RECAP_TO}`}</button>
+          </div>
+        </div>
+      );
+    }
+
+    function AncienDistribPanel({ day, site, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [d, setD] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const load = React.useCallback(() => { setErr(''); kbDistribRecap(day, site).then(setD).catch(e => setErr(e.message)); }, [day, site]);
+      React.useEffect(() => { setD(null); load(); }, [load]);
+      if (err) return <div className="alert-red">Erreur : {err} <button className="btn-ghost" onClick={load}>Réessayer</button></div>;
+      if (!d) return <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Chargement…</div>;
+      const anc = d.refunds.filter(r => !r.ps), ps = d.refunds.filter(r => r.ps);
+      const ret = anc.filter(r => r.retrait), rem = anc.filter(r => !r.retrait);
+      const resA = d.restores.filter(r => !r.ps), resP = d.restores.filter(r => r.ps);
+      const sent = site ? ((d.closures.find(c => c.site === site) || {}).recapSent || null) : null;
+      const send = async () => { setBusy(true); try { const lg = await kbSendDistribRecap(day, site, (session && session.name) || '—'); showToast(lg.ok ? `✉️ Envoyé à ${KB_RECAP_TO}` : '⚠️ ' + lg.error); load(); } finally { setBusy(false); } };
+      const pdf = () => {
+        try {
+          const rowR = (lbl) => r => [r.site, r.casier || '', r.client, r.produit + ' x' + r.qty, r.retrait ? 'retrait total' : `-${r.pct}%`, fmtEuro(r.cents), lbl];
+          kbRecapPdf(`Recap distrib ${site || 'tous locaux'} - ${formatDateShort(day)}`, `Ancien site : ${ret.length} manquant(s), ${rem.length} remise(s), ${resA.length} rajout(s)`,
+            ['Local', 'Casier', 'Client', 'Produit', 'Action', 'Montant', 'Site'],
+            ret.map(rowR('Ancien')).concat(rem.map(rowR('Ancien'))).concat(resA.map(r => [r.site, '', r.client, r.produit + ' x' + r.qty, 'RAJOUTE', '', 'Ancien']))
+              .concat(ps.map(rowR('Nouveau'))).concat(resP.map(r => [r.site, '', r.client, r.produit, 'RAJOUTE', '', 'Nouveau'])),
+            `recap_distrib_${site || 'TOUS'}_${day}.pdf`);
+        } catch (e) { showToast('PDF : ' + e.message); }
+      };
+      const line = { display: 'flex', justifyContent: 'space-between', gap: 8, padding: '7px 0', borderBottom: '1px solid var(--line)', fontSize: 13 };
+      const R = (r, i) => <div key={i} style={line}><span>{r.site} · <b>cas. {r.casier || '?'}</b> · {r.client}<br /><span style={{ color: 'var(--ink-soft)' }}>{r.produit} ×{r.qty}</span> <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{r.detail}{r.by ? ' · ' + r.by : ''}</span></span><b style={{ whiteSpace: 'nowrap', textAlign: 'right' }}>{r.retrait ? 'retrait' : `-${r.pct}%`}<br /><span style={{ fontWeight: 400 }}>{fmtEuro(r.cents)}</span></b></div>;
+      const F = (r, i) => <div key={i} style={line}><span>{r.site} · {r.client} — {r.produit}</span><b>×{r.qty}</b></div>;
+      const H = (t, c) => <div style={{ fontWeight: 800, fontSize: 13, marginTop: 10, color: c }}>{t}</div>;
+      return (
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>
+            Ancien site : <b>{ret.length}</b> manquant(s) à enlever · <b>{rem.length}</b> remise(s) · <b>{resA.length}</b> rajout(s)
+            {(ps.length + resP.length) > 0 && <span style={{ color: 'var(--ink-mute)' }}> · nouveau site : {ps.length + resP.length}</span>}
+          </div>
+          {site && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>{d.closures.length ? '🔒 Local clôturé' : '⏳ Local pas encore clôturé (liste provisoire)'}</div>}
+          {sent && <div style={{ fontSize: 12, marginTop: 4, color: sent.ok ? 'var(--accent-dark,#2e7d32)' : 'var(--warn)' }}>{kbSentLine(sent)}</div>}
+          <div style={{ maxHeight: '48vh', overflowY: 'auto', marginTop: 6 }}>
+            {!d.refunds.length && !d.restores.length && <div className="alert-info" style={{ fontSize: 13, marginTop: 6 }}>✅ Aucune remise, aucun manquant, aucun rajout.</div>}
+            {ret.length > 0 && <>{H('🗑️ Ancien site — manquants à enlever', '#b23b3b')}{ret.map(R)}</>}
+            {rem.length > 0 && <>{H('🏷️ Ancien site — remises', '#a3125b')}{rem.map(R)}</>}
+            {resA.length > 0 && <>{H('➕ Ancien site — rajoutés (à remettre)', '#2e7d32')}{resA.map(F)}</>}
+            {(ps.length + resP.length) > 0 && <>{H('🛒 Nouveau site (pour info)', 'var(--ink-mute)')}{ps.map(R)}{resP.map(F)}</>}
+          </div>
+          <div style={kbBtnRow}>
+            <button className="btn-secondary" style={kbBtnSm} onClick={() => kbCopyText(kbDistribRecapText(d), showToast)}>📋 Copier</button>
+            <button className="btn-secondary" style={kbBtnSm} onClick={pdf}>🖨️ PDF</button>
+            <button className="btn-secondary" style={kbBtnSm} onClick={() => kbDownloadText(kbDistribRecapCsv(d), `recap_distrib_${site || 'TOUS'}_${day}.csv`)}>⬇️ CSV</button>
+            <button className="btn-ghost" style={kbBtnSm} onClick={load}>🔄</button>
+            <button className="btn-primary" style={kbBtnSm} disabled={busy} onClick={send}>{busy ? 'Envoi…' : `✉️ Envoyer à ${KB_RECAP_TO}`}</button>
+          </div>
+        </div>
+      );
+    }
+
+    function KbSheet({ title, onClose, children }) {
+      return (
+        <div className="modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }} style={{ zIndex: 1000 }}>
+          <div className="modal" style={{ maxWidth: 560, width: 'calc(100% - 24px)' }}>
+            <div className="modal-header"><h2 style={{ fontSize: 16 }}>{title}</h2><button className="modal-close" onClick={onClose}>×</button></div>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    // Master › Pilotage › Ancien site
+    function AncienSitePilotagePage({ session }) {
+      const [day, setDay] = React.useState(activeDay());
+      const [site, setSite] = React.useState('');
+      const [sites, setSites] = React.useState([]);
+      React.useEffect(() => {
+        let stop = false;
+        storage.getDoc(`day_${day}_orders`, 'data').then(od => { if (!stop) setSites([...new Set(((od && od.orders) || []).map(o => String(o.site || '').toUpperCase()).filter(Boolean))].sort()); }).catch(() => { if (!stop) setSites([]); });
+        return () => { stop = true; };
+      }, [day]);
+      return (
+        <div className="stack">
+          <div className="alert-info" style={{ fontSize: 13 }}>
+            🔁 <b>Cohabitation ancien / nouveau site.</b> Ces récaps sont envoyés automatiquement à <b>{KB_RECAP_TO}</b> : ruptures à la clôture de la prépa, remises & manquants à la clôture de chaque local. Ils restent consultables et renvoyables ici.
+          </div>
+          <div className="card" style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 13, fontWeight: 700 }}>Distribution du</label>
+            <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ fontSize: 15, padding: '6px 8px' }} />
+            <button className="btn-ghost" style={kbBtnSm} onClick={() => setDay(activeDay())}>Jour actif</button>
+          </div>
+          <div className="card">
+            <h3 style={{ marginBottom: 6 }}>🚫 Ruptures prépa — à reporter sur l'ancien site</h3>
+            <AncienRupturesPanel key={'r' + day} day={day} session={session} />
+          </div>
+          <div className="card">
+            <h3 style={{ marginBottom: 6 }}>🧾 Récap distrib — remises & manquants enlevés par les distributeurs</h3>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+              <button className={!site ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => setSite('')}>Tous</button>
+              {sites.map(s => <button key={s} className={site === s ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => setSite(s)}>{s}</button>)}
+            </div>
+            <AncienDistribPanel key={'d' + day + site} day={day} site={site} session={session} />
+          </div>
+        </div>
+      );
+    }
+
+    // ---------- 🎆 Feu d'artifice + citation ----------
+    function kbCelebrate(opts) {
+      try {
+        const o = opts || {};
+        const q = KBG_QUOTES[Math.floor(Math.random() * KBG_QUOTES.length)];
+        const prev = document.getElementById('kb-celebrate'); if (prev && prev.__close) prev.__close();
+        if (!document.getElementById('kb-celebrate-css')) {
+          const st = document.createElement('style'); st.id = 'kb-celebrate-css';
+          st.textContent = '@keyframes kbPop{0%{transform:scale(.6);opacity:0}70%{transform:scale(1.05);opacity:1}100%{transform:scale(1)}}@keyframes kbFadeIn{from{opacity:0}to{opacity:1}}';
+          document.head.appendChild(st);
+        }
+        const wrap = document.createElement('div'); wrap.id = 'kb-celebrate';
+        wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:radial-gradient(ellipse at center,rgba(20,45,30,.88),rgba(5,12,8,.95));display:flex;align-items:center;justify-content:center;cursor:pointer;animation:kbFadeIn .3s ease-out';
+        const cv = document.createElement('canvas'); cv.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none';
+        wrap.appendChild(cv);
+        const card = document.createElement('div');
+        card.style.cssText = 'position:relative;max-width:340px;margin:16px;padding:22px 20px 16px;background:rgba(255,255,255,.96);border-radius:18px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.45);animation:kbPop .55s ease-out';
+        card.innerHTML = '<div style="font-size:46px;line-height:1">🎆</div>'
+          + '<div style="font-weight:800;font-size:20px;color:#1a4d2e;margin-top:6px">' + kbEsc(o.title || 'Bravo !') + '</div>'
+          + (o.sub ? '<div style="font-size:13px;color:#2e7d32;margin-top:4px">' + kbEsc(o.sub) + '</div>' : '')
+          + '<div style="margin-top:14px;font-style:italic;color:#33691e;font-size:15px;line-height:1.35;border-top:1px dashed #a5d6a7;padding-top:12px">« ' + kbEsc(q) + ' »</div>'
+          + '<div style="margin-top:12px;font-size:11px;color:#999">Touche pour fermer</div>';
+        wrap.appendChild(card);
+        document.body.appendChild(wrap);
+        try { navigator.vibrate && navigator.vibrate([60, 40, 60, 40, 120]); } catch (e) {}
+        const ctx = cv.getContext('2d');
+        let W = 0, H = 0;
+        const resize = () => { const dpr = Math.min(2, window.devicePixelRatio || 1); W = window.innerWidth; H = window.innerHeight; cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); };
+        resize(); window.addEventListener('resize', resize);
+        const reduce = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        const COLORS = ['#ff5252', '#ffd740', '#69f0ae', '#40c4ff', '#e040fb', '#ffab40', '#b2ff59', '#ffffff', '#18ffff'];
+        const rockets = [], parts = [];
+        const t0 = performance.now(); const LAUNCH_MS = 5200;
+        let nextLaunch = 0, raf = 0, closed = false;
+        const launch = () => {
+          const x = W * (0.12 + Math.random() * 0.76);
+          const ty = H * (0.12 + Math.random() * 0.33);
+          const g = 0.09; const vy = -Math.sqrt(2 * g * Math.max(60, H - ty));
+          rockets.push({ x, y: H, vx: (Math.random() - 0.5) * 1.2, vy, g, color: COLORS[(Math.random() * COLORS.length) | 0] });
+        };
+        const explode = (x, y, color) => {
+          const n = 70 + ((Math.random() * 40) | 0); const ring = Math.random() < 0.3; const c2 = COLORS[(Math.random() * COLORS.length) | 0];
+          for (let i = 0; i < n; i++) {
+            const a = (Math.PI * 2 * i) / n + Math.random() * 0.1; const sp = ring ? 4.2 : 1 + Math.random() * 4.6;
+            parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0, max: 55 + Math.random() * 45, color: i % 3 === 0 ? c2 : color, size: 1.4 + Math.random() * 1.6 });
+          }
+        };
+        const frame = (now) => {
+          if (closed) return;
+          const el = now - t0;
+          if (el < LAUNCH_MS && now >= nextLaunch) { launch(); if (Math.random() < 0.35) launch(); nextLaunch = now + 260 + Math.random() * 380; }
+          ctx.globalCompositeOperation = 'destination-out'; ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fillRect(0, 0, W, H);
+          ctx.globalCompositeOperation = 'lighter';
+          for (let i = rockets.length - 1; i >= 0; i--) {
+            const r = rockets[i]; r.x += r.vx; r.y += r.vy; r.vy += r.g;
+            ctx.fillStyle = r.color; ctx.beginPath(); ctx.arc(r.x, r.y, 2.2, 0, Math.PI * 2); ctx.fill();
+            if (r.vy >= -0.4) { explode(r.x, r.y, r.color); rockets.splice(i, 1); }
+          }
+          for (let i = parts.length - 1; i >= 0; i--) {
+            const p = parts[i]; p.vx *= 0.975; p.vy = p.vy * 0.975 + 0.05; p.x += p.vx; p.y += p.vy; p.life++;
+            const a = 1 - p.life / p.max; if (a <= 0) { parts.splice(i, 1); continue; }
+            ctx.globalAlpha = a; ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+          if (el < LAUNCH_MS || rockets.length || parts.length) raf = requestAnimationFrame(frame);
+          else ctx.clearRect(0, 0, W, H);
+        };
+        if (!reduce) { for (let i = 0; i < 3; i++) launch(); raf = requestAnimationFrame(frame); }
+        const close = () => { if (closed) return; closed = true; cancelAnimationFrame(raf); window.removeEventListener('resize', resize); wrap.remove(); };
+        wrap.__close = close;
+        wrap.addEventListener('click', close);
+        setTimeout(close, o.duration || 12000);
+      } catch (e) { console.warn('kbCelebrate', e); }
+    }
+
     function ClosurePage({ session, currentSite, orders, consumersByEmail, isClosed, onReopen }) {
       const showToast = React.useContext(ToastContext);
       const [statuses, setStatuses] = React.useState([]);
@@ -7662,6 +8155,7 @@
       const [progress, setProgress] = React.useState({ done: 0, total: 0 });
       const [reopenPwd, setReopenPwd] = React.useState('');
       const [askReopen, setAskReopen] = React.useState(false);
+      const [showRecap, setShowRecap] = React.useState(false); // V9.61 — récap ancien site
       // Distributions passées non clôturées sur ce site (master seulement)
       const [pastUnclosed, setPastUnclosed] = React.useState([]);
 
@@ -7732,6 +8226,8 @@
           });
           setPastUnclosed(curr => curr.filter(p => p.day !== day));
           showToast(`✓ Distribution du ${formatDateShort(day)} clôturée`);
+          // V9.61 — récap remises & manquants (ancien site) → hg@
+          if (KB_COHABITATION) kbSendDistribRecap(day, currentSite, session.name, { auto: true }).then(lg => { if (!lg.ok) showToast('⚠️ Récap non envoyé : ' + lg.error + ' — renvoyer depuis Pilotage › Ancien site'); });
         } catch (e) {
           showToast('Erreur : ' + e.message);
         }
@@ -7776,6 +8272,13 @@
           });
           setConfirming(false);
           showToast(`✓ Journée clôturée pour ${currentSite}`);
+          // V9.61 — 🎆 + récap remises & manquants (ancien site) envoyé automatiquement à hg@
+          kbCelebrate({ title: `Bravo${session.name ? ' ' + String(session.name).split(' ')[0] : ''}, distribution bouclée !`, sub: `${siteLabel(currentSite)} · ${passed.length} client(s) servi(s) 💚` });
+          if (KB_COHABITATION) {
+            kbSendDistribRecap(activeDay(), currentSite, session.name, { auto: true })
+              .then(lg => showToast(lg.ok ? `✉️ Récap remises & manquants envoyé (${KB_RECAP_TO})` : '⚠️ Récap non envoyé : ' + lg.error + ' — bouton « Récap ancien site »'))
+              .catch(() => {});
+          }
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setClosing(false); }
       };
@@ -7824,6 +8327,16 @@
                 🔒 <strong>Cette journée est déjà clôturée pour {currentSite}.</strong>
               </div>
               <DopamineClose session={session} />
+              {KB_COHABITATION && (
+                <button className="btn-secondary btn-block" onClick={() => setShowRecap(true)}>
+                  🧾 Récap remises & manquants (ancien site)
+                </button>
+              )}
+              {showRecap && (
+                <KbSheet title={`Récap distrib · ${currentSite} · ${formatDateShort(activeDay())}`} onClose={() => setShowRecap(false)}>
+                  <AncienDistribPanel day={activeDay()} site={currentSite} session={session} />
+                </KbSheet>
+              )}
               {session.isMaster && (
                 !askReopen ? (
                   <button className="btn-secondary" onClick={() => setAskReopen(true)}>
@@ -10068,6 +10581,7 @@
       const [remAllOpen, setRemAllOpen] = React.useState({});
       const [remCliOpen, setRemCliOpen] = React.useState({});
       const [openClient, setOpenClient] = React.useState(null);
+      const [ancienOpen, setAncienOpen] = React.useState(false); // V9.61 — ruptures ancien site
 
       // ---- helpers (scopés) ----
       const K = (r) => r.site + '||' + r.client + '||' + r.product;
@@ -10214,6 +10728,14 @@
             showToast(lg.ok ? `✉️ Fichier Dromy envoyé (${lg.count} clients, ${lg.cartons} cartons)` : (lg.skipped ? 'Pas de livraison à domicile : rien envoyé à Dromy' : '⚠️ Envoi Dromy échoué : ' + lg.error + ' — renvoyer depuis Pilotage › Dromy'));
           }
         } catch (e) { showToast('⚠️ Envoi Dromy : ' + e.message); }
+        // V9.61 — 🎆 + ruptures ancien site envoyées automatiquement à hg@ (cohabitation)
+        kbCelebrate({ title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`, sub: `${rows.length} lignes préparées · merci l'équipe 💚` });
+        if (KB_COHABITATION) {
+          try {
+            const lg = await kbSendRuptures(day, user, { auto:true });
+            showToast(lg.ok ? `✉️ Ruptures ancien site envoyées (${lg.count} ligne(s)) à ${KB_RECAP_TO}` : '⚠️ Ruptures ancien site non envoyées : ' + lg.error + ' — Pilotage › Ancien site');
+          } catch (e) { showToast('⚠️ Ruptures ancien site : ' + e.message); }
+        }
       };
 
       // ---- rendu d'une carte produit ----
@@ -10315,7 +10837,10 @@
               <p className="pdj-cnums">{done} déposés · {rupt} ruptures · {rows.length} lignes</p>
               <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>La prépa n'est plus modifiable. Toute correction passe désormais par <b>Manquants &amp; ND</b> (infos, raisons) ou <b>Dispatch dernière minute</b>.</p>
               <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>🏷️ Étiquettes livraison et 🍞 dispatch pain : onglet <b>Suivi &amp; impression</b>.</p>
+              {KB_COHABITATION && <button className="pdj-close" style={{marginTop:12}} onClick={()=>setAncienOpen(true)}>🚫 Ruptures ancien site</button>}
             </div>
+            <div style={{maxWidth:520,margin:'12px auto'}}><DopamineClose session={session} /></div>
+            {ancienOpen && <KbSheet title={`Ruptures ancien site · ${formatDateShort(day)}`} onClose={()=>setAncienOpen(false)}><AncienRupturesPanel day={day} session={session} /></KbSheet>}
           </div>
         );
       }
@@ -10436,6 +10961,7 @@
             <div className="pdj-gprog"><span className="t">Progression {globalProg.d}/{globalProg.t} · {globalProg.pct}%</span><span className="bar"><span className="fill" style={{width:globalProg.pct+'%'}} /></span></div>
             <div className="pdj-tools">
               {prep.closed && <span className="pdj-closedtag">🔒 Prépa clôturée par {prep.closedBy}</span>}
+              {KB_COHABITATION && <button className="pdj-btn" onClick={()=>setAncienOpen(true)} title="Ruptures à reporter sur l'ancien site">🚫 Ruptures ancien site</button>}
               <span style={{flex:1}} />
               <button className={"pdj-close"+(globalProg.allDone?"":" off")} onClick={closeDay}>
                 {globalProg.allDone ? '✅ Clôturer la prépa du jour' : `🔒 Clôture (${globalProg.d}/${globalProg.t})`}
@@ -10443,6 +10969,7 @@
             </div>
           </div>
           <div className="pdj-main">{body}</div>
+          {ancienOpen && <KbSheet title={`Ruptures ancien site · ${formatDateShort(day)}`} onClose={()=>setAncienOpen(false)}><AncienRupturesPanel day={day} session={session} /></KbSheet>}
         </div>
       );
     }
@@ -13182,6 +13709,7 @@
         { k: 'temp',  label: 'Température',    icon: '🌡️' },
         { k: 'codes', label: 'Codes-barres',  icon: '🏷️' },
         { k: 'dromy', label: 'Dromy',         icon: '🚚' },
+        { k: 'ancien', label: 'Ancien site',  icon: '🔁' },
         { k: 'histo', label: 'Historique',    icon: '📜' },
       ];
       const [sub, setSub] = React.useState(() => { try { return localStorage.getItem('kbg_suivi_sub') || 'ca'; } catch (e) { return 'ca'; } });
@@ -13203,6 +13731,7 @@
           {sub === 'temp'  && <TempMasterPage session={session} />}
           {sub === 'codes' && <BarcodesManagerPage session={session} />}
           {sub === 'dromy' && <DromyPilotagePage session={session} />}
+          {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
       );
@@ -17446,18 +17975,49 @@
 
     // Bandeau d'alerte quand le jour affiché n'est pas aujourd'hui (ex. fichier d'une
     // autre date chargé). Permet de revenir à aujourd'hui en un tap (utile sur mobile).
+    // V9.62 — Bandeau prépa : date de la distribution préparée + choix de la date (dates avec commandes)
+    function PrepDayBanner() {
+      const ad = activeDay();
+      const today = todayKey();
+      const [list, setList] = React.useState(null);
+      const [, force] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        const load = () => kbUpcomingDays(7).then(l => { if (!stop) setList(l); }).catch(() => { if (!stop) setList([]); });
+        load();
+        const h = () => { force(x => x + 1); load(); };
+        window.addEventListener('active-day-change', h);
+        const t = setInterval(load, 5 * 60000);
+        return () => { stop = true; clearInterval(t); window.removeEventListener('active-day-change', h); };
+      }, []);
+      const lbl = (d) => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return d; } };
+      const short = (d) => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit' }); } catch (e) { return d; } };
+      const cur = (list || []).find(x => x.day === ad);
+      const isToday = ad === today;
+      const hasFuture = (list || []).some(x => !x.today && x.count > 0);
+      return (
+        <div style={{margin:'8px 0',padding:'8px 12px',borderRadius:8,background:isToday?'#fff4e5':'#eaf1e6',border:'1px solid '+(isToday?'#f0b866':'#cfe0c4'),fontSize:13,color:isToday?'#8a4b00':'#2f5326'}}>
+          <div>🗓️ Prépa pour la distribution du <strong style={{textTransform:'capitalize'}}>{lbl(ad)}</strong>{cur ? ` · ${cur.count} commande${cur.count>1?'s':''}` : ''}{isToday ? ' — ⚠️ c\'est AUJOURD\'HUI' : ''}</div>
+          {isToday && list && !hasFuture && <div style={{fontSize:12,marginTop:3}}>Aucune commande chargée pour les prochains jours : l'appli basculera seule sur demain dès que les commandes seront chargées.</div>}
+          {list && list.length > 0 && (
+            <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:6}}>
+              {list.map(x => (
+                <button key={x.day} onClick={() => { if (x.day !== ad) setActiveDay(x.day); }}
+                  style={{fontSize:12,padding:'5px 10px',borderRadius:16,cursor:'pointer',fontWeight:x.day===ad?800:500,
+                    border:x.day===ad?'2px solid #2f5326':'1px solid #cfe0c4',background:x.day===ad?'#2f5326':'#fff',color:x.day===ad?'#fff':'#2f5326',textTransform:'capitalize'}}>
+                  {x.today ? 'Auj. ' : ''}{short(x.day)} · {x.count}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
     function ActiveDayBanner({ mode } = {}) {
       const ad = activeDay();
       const today = todayKey();
       const label = (d) => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return d; } };
-      if (mode === 'prep') {
-        if (!ad) return null;
-        return (
-          <div style={{margin:'8px 0',padding:'8px 12px',borderRadius:8,background:'#eaf1e6',border:'1px solid #cfe0c4',fontSize:13,color:'#2f5326'}}>
-            🗓️ Prépa pour la distribution du <strong style={{textTransform:'capitalize'}}>{label(ad)}</strong>{ad === today ? '' : ' (préparée à l\'avance — normal)'}.
-          </div>
-        );
-      }
+      if (mode === 'prep') return <PrepDayBanner />;
       if (ad === today) return null;
       const back = () => { setActiveDay(null); location.reload(); };
       const future = ad > today;
@@ -17902,6 +18462,33 @@
       const [tab, setTab] = React.useState('clients');
       // Vue empruntée par le master (sans se reconnecter) : null | 'prep' | 'distrib'
       const [viewAs, setViewAs] = React.useState(null);
+      // V9.62 — changement de jour actif → ré-abonnement des pages (sans recharger l'appli)
+      const [dayRev, setDayRev] = React.useState(0);
+      React.useEffect(() => {
+        const h = () => setDayRev(r => r + 1);
+        window.addEventListener('active-day-change', h);
+        return () => window.removeEventListener('active-day-change', h);
+      }, []);
+      // V9.62 — PRÉPA : se cale automatiquement sur la prochaine distribution ayant des commandes
+      // (demain en général). Ne touche pas un choix manuel déjà sur une date future.
+      const prepMode = !!(session && (session.role === 'prep' || (session.isMaster && viewAs === 'prep')));
+      React.useEffect(() => {
+        if (!prepMode) return;
+        let stop = false;
+        const check = () => {
+          if (stop || activeDay() > todayKey()) return;
+          kbFindPrepDay().then(d => { if (!stop && d && activeDay() <= todayKey()) setActiveDay(d); }).catch(() => {});
+        };
+        check();
+        const t = setInterval(check, 5 * 60000);
+        const v = () => { if (document.visibilityState === 'visible') check(); };
+        document.addEventListener('visibilitychange', v);
+        return () => { stop = true; clearInterval(t); document.removeEventListener('visibilitychange', v); };
+      }, [prepMode]);
+      // V9.62 — un vrai distributeur est toujours sur AUJOURD'HUI (téléphone utilisé avant en prépa)
+      React.useEffect(() => {
+        if (session && session.role === 'distrib' && !session.isMaster && activeDay() !== todayKey()) setActiveDay(null);
+      }, [session && session.role, session && session.isMaster]);
       const [currentSite, setCurrentSite] = React.useState(null);
 
       const [rawOrders, setRawOrders] = React.useState([]);
@@ -18075,7 +18662,7 @@
         const u10 = storage.subscribe('push_messages', setPushMessages);
         const u11 = storage.subscribe('followups', setFollowUpsAll);
         return () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); u9(); u10(); u11(); };
-      }, [session]);
+      }, [session, dayRev]);
 
       const handleLogin = (s) => {
         const sess = { ...s, lastSeen: new Date().toISOString(), confirmedAt: new Date().toISOString() };
@@ -18298,6 +18885,7 @@
               </div>
             </div>
             <ActiveDayBanner mode="prep" />
+            <React.Fragment key={'prepday-' + activeDay() + '-' + dayRev}>
             {tab === 'prep' && <PrepPage session={effSession} setSession={setSession} products={products} dispatchData={dispatchData} />}
             {tab === 'prepajour' && <PrepaDuJourPage session={effSession} />}
             {tab === 'mudujour' && <MuDuJourPage session={effSession} setTab={setTab} />}
@@ -18313,6 +18901,7 @@
             {tab === 'muload' && <MuOrdersLoadPage session={effSession} setTab={setTab} />}
             {tab === 'inventory' && <InventoryPage session={effSession} />}
             {tab === 'admin' && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
+            </React.Fragment>
             <div className="tab-bar">
               <button className={tab==='prepajour'?'active':''} onClick={()=>setTab('prepajour')}>
                 <span className="tab-icon">🥬</span>Prépa du jour
