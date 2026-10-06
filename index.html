@@ -627,7 +627,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.69b';
+    const APP_VERSION = 'V9.70';
+    // V9.70 — Récap ruptures ancien site (Pilotage, prépa, mail, PDF) par PRODUIT façon ancien admin :
+    //   « ⏱ Tout en rupture — cocher l'horloge » (commandé = rupture, tous lieux) vs « ✋ Partiel — cocher
+    //   ces casiers » (BIC 6, TOL 12…) avec commandé / rupture.
     // V9.69 — MU : (1) commandes captées par un ID SITE KBG posé sur une ligne NON ACTIVE du Sheet (ex. Pomme
     //   Akane : ID sur « Pomme Akane Bio » inactif, ligne active « Pomme Akane 750g Bio » sans ID) → reportées
     //   sur la ligne active + alerte ; (2) chargement : affichage immédiat du dernier chargement (cache local),
@@ -7730,6 +7733,7 @@
       const meta = (prepArr || []).find(d => d.id === 'meta') || null;
       const sentDoc = (prepArr || []).find(d => d.id === 'ancien') || null;
       const lines = [], remises = [];
+      const ordered = {}; // V9.70 — total commandé ancien site par produit (pour « tout en rupture » vs partiel)
       let psRupt = 0, nAncien = 0, nPs = 0;
       for (const o of ((od && od.orders) || [])) {
         const ps = kbIsPsOrder(o);
@@ -7741,6 +7745,7 @@
           const produit = it.produit || '(produit)';
           const k = site + '||' + client + '||' + produit;
           const base = { site, client, email: o.email || '', casier: cas[0] || '', orderId: o.orderId || '', produit, producteur: it.producteur || '', qty: it.qty || 1, prix: it.consumer_price || 0 };
+          if (!ps && !o._test) { const pk = (it.producteur || '') + '||' + produit; ordered[pk] = (ordered[pk] || 0) + (it.qty || 1); }
           if (prep.status[k] === 'rupture') {
             if (ps) { psRupt++; continue; }
             lines.push({ ...base, restored: !!fix[k] });
@@ -7752,21 +7757,28 @@
         }
       }
       lines.sort(kbCasCmpRow); remises.sort(kbCasCmpRow);
-      return { day, lines, remises, psRupt, nAncien, nPs, closed: !!(meta && meta.closed), closedBy: (meta && meta.closedBy) || '', closedAt: (meta && meta.closedAt) || '', sent: (sentDoc && sentDoc.sent) || null };
+      return { day, lines, remises, ordered, psRupt, nAncien, nPs, closed: !!(meta && meta.closed), closedBy: (meta && meta.closedBy) || '', closedAt: (meta && meta.closedAt) || '', sent: (sentDoc && sentDoc.sent) || null };
     }
-    function kbRupturesByProduct(lines) {
+    // V9.70 — par produit : commandé (ancien site, tous lieux) vs rupture → « tout » (cocher l'horloge) ou partiel (casiers)
+    function kbRupturesByProduct(lines, ordered) {
       const m = {};
       for (const l of lines) {
         if (l.restored) continue;
         const k = l.producteur + '||' + l.produit;
-        if (!m[k]) m[k] = { produit: l.produit, producteur: l.producteur, qty: 0, clients: [] };
+        if (!m[k]) m[k] = { produit: l.produit, producteur: l.producteur, qty: 0, clients: [], ordered: (ordered && ordered[k]) || 0 };
         m[k].qty += l.qty; m[k].clients.push(l);
       }
-      return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit));
+      return Object.values(m).map(p => { p.clients.sort(kbCasCmpRow); p.full = !p.ordered || p.qty >= p.ordered; return p; })
+        .sort((a, b) => (a.full === b.full ? 0 : a.full ? -1 : 1) || a.produit.localeCompare(b.produit));
     }
     function kbRupturesText(d) {
       const act = d.lines.filter(l => !l.restored);
       const out = [`RUPTURES PRÉPA — ANCIEN SITE — ${formatDateShort(d.day)}`, `${act.length} ligne(s) à passer en rupture sur l'ancien site`, ''];
+      const bp = kbRupturesByProduct(d.lines, d.ordered);
+      const full = bp.filter(p => p.full), part = bp.filter(p => !p.full);
+      if (full.length) { out.push('⏱ TOUT EN RUPTURE — cocher l\'horloge du produit :'); full.forEach(p => out.push(`  ${p.produit} (${p.producteur}) — commandé ${p.ordered || p.qty} · rupture ${p.qty}`)); out.push(''); }
+      if (part.length) { out.push('✋ RUPTURE PARTIELLE — entrer dans le produit et cocher ces casiers :'); part.forEach(p => out.push(`  ${p.produit} (${p.producteur}) — commandé ${p.ordered} · rupture ${p.qty} → ${p.clients.map(c => c.site + ' ' + (c.casier || '?') + (c.qty > 1 ? ' ×' + c.qty : '')).join(', ')}`)); out.push(''); }
+      out.push('DÉTAIL PAR CLIENT :');
       let cur = '';
       for (const l of act) {
         if (l.site !== cur) { cur = l.site; out.push(`== ${siteLabel(l.site)} (${l.site}) ==`); }
@@ -7798,9 +7810,13 @@
         html += `<h3 style="margin:10px 0 4px;font-size:15px">Par client</h3><table style="border-collapse:collapse;width:100%"><tr><th style="${th}">Local</th><th style="${th}">Casier</th><th style="${th}">Client</th><th style="${th}">Produit</th><th style="${th}">Qté</th></tr>`
           + act.map(l => `<tr><td style="${td}">${kbEsc(l.site)}</td><td style="${td}"><b>${kbEsc(l.casier)}</b></td><td style="${td}">${kbEsc(l.client)}</td><td style="${td}">${kbEsc(l.produit)}<br><span style="color:#888;font-size:11px">${kbEsc(l.producteur)}</span></td><td style="${td};text-align:right"><b>${l.qty}</b></td></tr>`).join('')
           + `</table>`;
-        html += `<h3 style="margin:14px 0 4px;font-size:15px">Par produit</h3><table style="border-collapse:collapse;width:100%"><tr><th style="${th}">Produit</th><th style="${th}">Qté</th><th style="${th}">Clients</th></tr>`
-          + kbRupturesByProduct(d.lines).map(p => `<tr><td style="${td}"><b>${kbEsc(p.produit)}</b><br><span style="color:#888;font-size:11px">${kbEsc(p.producteur)}</span></td><td style="${td};text-align:right"><b>${p.qty}</b></td><td style="${td}">${p.clients.map(c => kbEsc(c.site + ' · ' + c.client + (c.qty > 1 ? ' ×' + c.qty : ''))).join('<br>')}</td></tr>`).join('')
-          + `</table>`;
+        const bp = kbRupturesByProduct(d.lines, d.ordered);
+        const full = bp.filter(p => p.full), part = bp.filter(p => !p.full);
+        const pre = `<h3 style="margin:0 0 4px;font-size:15px">`;
+        html = html.replace('<h3 style="margin:10px 0 4px;font-size:15px">Par client</h3>',
+          (full.length ? `${pre}⏱ Tout en rupture — cocher l'horloge du produit (${full.length})</h3><table style="border-collapse:collapse;width:100%;margin-bottom:12px">${full.map(p => `<tr><td style="${td}"><b>${kbEsc(p.produit)}</b> <span style="color:#888;font-size:11px">${kbEsc(p.producteur)}</span></td><td style="${td};white-space:nowrap">commandé <b>${p.ordered || p.qty}</b> · rupture <b style="color:#b23b3b">${p.qty}</b></td></tr>`).join('')}</table>` : '')
+          + (part.length ? `${pre}✋ Rupture partielle — entrer dans le produit, cocher ces casiers (${part.length})</h3><table style="border-collapse:collapse;width:100%;margin-bottom:12px">${part.map(p => `<tr><td style="${td}"><b>${kbEsc(p.produit)}</b> <span style="color:#888;font-size:11px">${kbEsc(p.producteur)}</span><br>commandé <b>${p.ordered}</b> · rupture <b style="color:#b23b3b">${p.qty}</b></td><td style="${td}">${p.clients.map(c => `<b>${kbEsc(c.site)} ${kbEsc(c.casier || '?')}</b>${c.qty > 1 ? ' ×' + c.qty : ''}`).join(' · ')}</td></tr>`).join('')}</table>` : '')
+          + '<h3 style="margin:10px 0 4px;font-size:15px">Détail par client</h3>');
       }
       const rest = d.lines.filter(l => l.restored);
       if (rest.length) html += `<h3 style="margin:14px 0 4px;font-size:15px;color:#2e7d32">➕ Rajoutés en distrib (rupture annulée — NE PAS enlever)</h3><ul style="font-size:13px">${rest.map(l => `<li>${kbEsc(l.site)} · ${kbEsc(l.client)} — ${kbEsc(l.produit)} ×${l.qty}</li>`).join('')}</ul>`;
@@ -7929,7 +7945,7 @@
       const showToast = React.useContext(ToastContext);
       const [d, setD] = React.useState(null);
       const [err, setErr] = React.useState('');
-      const [view, setView] = React.useState('client');
+      const [view, setView] = React.useState('produit');
       const [busy, setBusy] = React.useState(false);
       const load = React.useCallback(() => { setErr(''); kbAncienRuptures(day).then(setD).catch(e => setErr(e.message)); }, [day]);
       React.useEffect(() => { setD(null); load(); }, [load]);
@@ -7942,13 +7958,16 @@
         try {
           kbRecapPdf(`Ruptures prepa - ancien site - ${formatDateShort(day)}`, `${act.length} ligne(s) a passer en rupture · ${d.remises.length} remise(s) prepa`,
             ['Local', 'Casier', 'Client', 'Produit', 'Qte', 'Info'],
-            act.map(l => [l.site, l.casier, l.client, l.produit + (l.producteur ? ' (' + l.producteur + ')' : ''), String(l.qty), 'RUPTURE'])
+            bpFull.map(p => ['TOUS', '', 'TOUT EN RUPTURE (horloge)', p.produit + ' (' + p.producteur + ')', String(p.qty) + '/' + String(p.ordered || p.qty), 'Cocher l\'horloge'])
+              .concat(bpPart.map(p => ['', '', 'PARTIEL : ' + p.clients.map(c => c.site + ' ' + (c.casier || '?')).join(', '), p.produit + ' (' + p.producteur + ')', String(p.qty) + '/' + String(p.ordered), 'Cocher ces casiers']))
+              .concat(act.map(l => [l.site, l.casier, l.client, l.produit + (l.producteur ? ' (' + l.producteur + ')' : ''), String(l.qty), 'RUPTURE']))
               .concat(rest.map(l => [l.site, l.casier, l.client, l.produit, String(l.qty), 'Rajoute distrib - ne pas enlever']))
               .concat(d.remises.map(r => [r.site, r.casier, r.client, r.produit, String(r.qty), `Remise -${r.pct}% ${r.reason}`])),
             `ruptures_ancien_site_${day}.pdf`);
         } catch (e) { showToast('PDF : ' + e.message); }
       };
-      const byProd = kbRupturesByProduct(d.lines);
+      const byProd = kbRupturesByProduct(d.lines, d.ordered);
+      const bpFull = byProd.filter(p => p.full), bpPart = byProd.filter(p => !p.full);
       const line = { display: 'flex', justifyContent: 'space-between', gap: 8, padding: '7px 0', borderBottom: '1px solid var(--line)', fontSize: 13 };
       let curSite = '';
       return (
@@ -7972,12 +7991,24 @@
               const hdr = l.site !== curSite ? (curSite = l.site, <div key={'h' + i} style={{ fontWeight: 800, fontSize: 13, marginTop: 8, color: 'var(--ink)' }}>📍 {siteLabel(l.site)} ({l.site})</div>) : null;
               return <React.Fragment key={i}>{hdr}<div style={line}><span><b>Casier {l.casier || '?'}</b> · {l.client}<br /><span style={{ color: 'var(--ink-soft)' }}>{l.produit}</span> <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{l.producteur}</span></span><b style={{ whiteSpace: 'nowrap' }}>×{l.qty}</b></div></React.Fragment>;
             })}
-            {view === 'produit' && byProd.map((p, i) => (
-              <div key={i} style={{ ...line, flexDirection: 'column', gap: 2 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}><b>{p.produit} <span style={{ fontWeight: 400, color: 'var(--ink-mute)', fontSize: 11 }}>{p.producteur}</span></b><b>×{p.qty}</b></div>
-                <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{p.clients.map(c => `${c.site} · cas. ${c.casier || '?'} · ${c.client}${c.qty > 1 ? ' ×' + c.qty : ''}`).join(' — ')}</div>
-              </div>
-            ))}
+            {view === 'produit' && bpFull.length > 0 && <>
+              <div style={{ fontWeight: 800, fontSize: 14, marginTop: 6, color: '#b23b3b' }}>⏱ Tout en rupture — cocher l'horloge du produit ({bpFull.length})</div>
+              {bpFull.map((p, i) => (
+                <div key={'f' + i} style={line}>
+                  <span><b>{p.produit}</b> <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{p.producteur}</span></span>
+                  <span style={{ whiteSpace: 'nowrap', fontSize: 13 }}>commandé <b>{p.ordered || p.qty}</b> · rupture <b style={{ color: '#b23b3b' }}>{p.qty}</b></span>
+                </div>
+              ))}
+            </>}
+            {view === 'produit' && bpPart.length > 0 && <>
+              <div style={{ fontWeight: 800, fontSize: 14, marginTop: 12, color: '#8a4b00' }}>✋ Rupture partielle — entrer dans le produit, cocher ces casiers ({bpPart.length})</div>
+              {bpPart.map((p, i) => (
+                <div key={'p' + i} style={{ ...line, flexDirection: 'column', gap: 4 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><span><b>{p.produit}</b> <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{p.producteur}</span></span><span style={{ whiteSpace: 'nowrap' }}>commandé <b>{p.ordered}</b> · rupture <b style={{ color: '#b23b3b' }}>{p.qty}</b></span></div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>{p.clients.map((c, j) => <span key={j} style={{ background: '#e8f5e9', border: '1px solid #a5d6a7', borderRadius: 6, padding: '2px 8px', fontWeight: 800, fontSize: 13 }}>{c.site} {c.casier || '?'}{c.qty > 1 ? ' ×' + c.qty : ''}</span>)}</div>
+                </div>
+              ))}
+            </>}
             {rest.length > 0 && <>
               <div style={{ fontWeight: 800, fontSize: 13, marginTop: 12, color: '#2e7d32' }}>➕ Rajoutés en distrib (rupture annulée — NE PAS enlever)</div>
               {rest.map((l, i) => <div key={'r' + i} style={line}><span>{l.site} · {l.client} — {l.produit}</span><b>×{l.qty}</b></div>)}
