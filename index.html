@@ -627,7 +627,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.62';
+    const APP_VERSION = 'V9.63';
+    // V9.63 — MU : (1) bouton « 📄 Reprendre le stock du Sheet » (MU en cours + MU réelle) — la colonne
+    //   STOCK MU du Sheet remplace le stock calculé et les corrections du jour, annulable ; (2) la MU vise la
+    //   distribution préparée (jour prépa, sinon J+1), affichée en bandeau ; (3) commandes de l'appli prises
+    //   en compte dès qu'il est 10h passé, même si elles ont été chargées avant 10h.
     // V9.62 — PRÉPA sur la bonne date : la prépa se cale automatiquement sur la PROCHAINE distribution
     //   ayant des commandes (J+1… J+7), re-vérifie toutes les 5 min / au retour sur l'appli ; bandeau avec
     //   choix de la date (pastilles date · nb commandes) ; changement de date sans recharger l'appli.
@@ -8919,7 +8923,15 @@
     //   Seule correction possible : « Corriger le stock PDP » (MU réelle). L'inventaire du soir
     //   ne sert plus de source : c'est l'appli qui y écrit le stock MU (colonne STOCK MU du Sheet).
     //   Point de départ si aucun calcul antérieur (≤ 14 j) : colonne STOCK MU du Sheet.
-    async function muComputeStartStock(dateKey, flIdx){
+    // V9.63 — jour de distribution servi par la MU de dateKey = jour prépa (activeDay) s'il est futur, sinon J+1
+    function muTargetDay(dateKey){
+      const ad = activeDay();
+      return (ad && ad > dateKey) ? ad : muShiftDate(dateKey, 1);
+    }
+    function muSheetStock(flIdx){ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return stock; }
+    async function muComputeStartStock(dateKey, flIdx, snapToday){
+      // V9.63 — « Reprendre le stock du Sheet » : la colonne STOCK MU fait foi pour ce jour (puis le calcul repart de là)
+      if(snapToday && snapToday.startFromSheet) return { stock: muSheetStock(flIdx), source:'sheet', fromDate:null, forced:true, forcedBy: snapToday.startFromSheet.by||'', forcedAt: snapToday.startFromSheet.at||0 };
       const LOOKBACK = 14;
       const dates = []; for(let i=1;i<=LOOKBACK;i++) dates.push(muShiftDate(dateKey,-i)); // récent → ancien
       const snaps = await Promise.all(dates.map(d=>storage.getDoc('mu_'+d, MU_REEL_DOC).catch(()=>null)));
@@ -8940,18 +8952,23 @@
       const flIdx = React.useMemo(()=>muFlIndex(flRows), [flRows]);
       const [start,setStart] = React.useState(null);
       const ready = items!==null && flRows!==null;
+      const snapToday = entries ? entries[MU_REEL_DOC] : null;
+      const sheetFlag = snapToday && snapToday.startFromSheet ? String(snapToday.startFromSheet.at||1) : '';
       React.useEffect(()=>{
         if(!ready) return;
         let stop=false;
-        muComputeStartStock(dateKey, flIdx).then(r=>{ if(!stop) setStart(r); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null}); });
+        muComputeStartStock(dateKey, flIdx, snapToday).then(r=>{ if(!stop) setStart(r); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null}); });
         return ()=>{ stop=true; };
-      },[ready, dateKey, flIdx]);
-      const snapToday = entries ? entries[MU_REEL_DOC] : null;
+      },[ready, dateKey, flIdx, sheetFlag]);
       const faitToday = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
       // V9.59 — commandes exactes : chargement manuel (prépa, 10h) prioritaire ; sinon commandes de la
       // distribution suivante déjà présentes dans l'appli (PrestaShop / export Mongo) chargées après 10h.
-      const nextDay = muShiftDate(dateKey, 1);
+      const nextDay = muTargetDay(dateKey);
       const [nextOrders, setNextOrders] = React.useState(null);
+      // V9.63 — après 10h (clôture des commandes), les commandes présentes dans l'appli font foi,
+      // même si elles ont été chargées avant 10h (on regarde l'HEURE ACTUELLE, plus l'heure de chargement).
+      const [after10, setAfter10] = React.useState(()=> Date.now() >= new Date(dateKey+'T10:00:00').getTime());
+      React.useEffect(()=>{ if(after10) return; const t=setInterval(()=>{ if(Date.now() >= new Date(dateKey+'T10:00:00').getTime()) setAfter10(true); }, 30000); return ()=>clearInterval(t); },[after10, dateKey]);
       React.useEffect(()=>{
         const u = storage.subscribe(`day_${nextDay}_orders`, arr=>{ const d=(arr||[]).find(x=>x.id==='data') || null; setNextOrders(d); });
         return u;
@@ -8959,14 +8976,13 @@
       React.useEffect(()=>{
         if(!ready || !nextOrders || !Object.keys(flIdx).length) return;
         if(snapToday && snapToday.exactSource==='manuel') return;            // le chargement manuel fait foi
-        const at = nextOrders.psLoadedAt || nextOrders.uploadedAt || '';
-        if(!at || new Date(at).getTime() < new Date(dateKey+'T10:00:00').getTime()) return; // avant la clôture des commandes
+        if(!after10) return; // avant la clôture des commandes (10h)
         const res = muExactFromLines(muLinesFromOrders(nextOrders.orders), flIdx);
         if(!res.matched) return;
         const json = JSON.stringify(res.exact);
         if(snapToday && snapToday.exactJson===json) return;
         storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: json, exactFor: nextDay, exactSource:'auto', exactFile:'commandes de l’appli ('+(nextOrders.source||'?')+')', exactAt: Date.now(), exactBy:'auto', exactLines: res.matched, exactUnmatched: res.unmatched }).catch(()=>{});
-      },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, dateKey, nextDay]);
+      },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, dateKey, nextDay, after10]);
       const exact = muExactOf(snapToday);
       const rows = React.useMemo(()=>{
         const out = [];
@@ -9003,7 +9019,39 @@
       const cmdInfo = exact
         ? { exact:true, source: snapToday.exactSource, file: snapToday.exactFile||'', at: snapToday.exactAt, by: snapToday.exactBy, forDay: snapToday.exactFor }
         : { exact:false };
-      return { rows, byKey, start, ready: !!start, setOverride, cmdInfo, flIdx };
+      // V9.63 — repartir de la colonne STOCK MU du Sheet (efface les corrections manuelles du jour)
+      const resetFromSheet = async (by) => {
+        const ovs = {}; Object.keys((snapToday && snapToday.overrides) || {}).forEach(k => { ovs[k] = null; });
+        await storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { startFromSheet: { by: by||'—', at: Date.now() }, overrides: ovs });
+      };
+      const cancelSheet = async () => { await storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { startFromSheet: null }); };
+      return { rows, byKey, start, ready: !!start, setOverride, cmdInfo, flIdx, nextDay, resetFromSheet, cancelSheet, nextOrdersCount: (nextOrders && nextOrders.orders ? nextOrders.orders.length : 0), after10 };
+    }
+    // V9.63 — bandeau MU : distribution visée + source du stock PDP + « Reprendre le stock du Sheet »
+    function MuDayStockBar({ reel, operator, onReload }) {
+      const [busy, setBusy] = React.useState(false);
+      const lbl = (d) => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return d; } };
+      const src = reel.start;
+      const srcTxt = !src ? 'calcul…'
+        : src.forced ? `colonne STOCK MU du Sheet (repris${src.forcedBy ? ' par ' + src.forcedBy : ''}${src.forcedAt ? ' à ' + new Date(src.forcedAt).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}) : ''})`
+        : src.source==='calc' ? `reste calculé de la MU du ${formatDateShort(src.fromDate)}`
+        : src.source==='sheet' ? 'colonne STOCK MU du Sheet' : 'indisponible (compté à 0)';
+      const go = async () => {
+        if (!confirm('Reprendre le stock PDP depuis la colonne STOCK MU du Sheet ?\n\nLe stock calculé et les corrections manuelles du jour sont remplacés par les valeurs du Sheet.')) return;
+        setBusy(true);
+        try { onReload && await onReload(); await reel.resetFromSheet(operator); } finally { setBusy(false); }
+      };
+      const undo = async () => { setBusy(true); try { await reel.cancelSheet(); } finally { setBusy(false); } };
+      return (
+        <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
+          <div style={{fontSize:13}}>🗓️ MU pour la distribution du <b style={{textTransform:'capitalize'}}>{lbl(reel.nextDay)}</b>{reel.nextOrdersCount ? ` · ${reel.nextOrdersCount} commande(s) dans l'appli` : ' · aucune commande chargée pour ce jour'}{reel.nextOrdersCount && !reel.after10 ? ' (prises en compte à 10h)' : ''}</div>
+          <div style={{marginTop:3}}>📦 Stock PDP = <b>{srcTxt}</b></div>
+          <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:6}}>
+            <button className="btn-secondary" style={{fontSize:12,padding:'5px 10px'}} disabled={busy} onClick={go}>📄 Reprendre le stock du Sheet</button>
+            {src && src.forced && <button className="btn-ghost" style={{fontSize:12,padding:'5px 10px'}} disabled={busy} onClick={undo}>↺ Revenir au stock calculé</button>}
+          </div>
+        </div>
+      );
     }
 
     // V9.59 — bandeau « commandes estimées / exactes » (MU en cours + MU réelle)
@@ -9212,6 +9260,7 @@
             <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Préparateur</div><div style={{fontSize:20,fontWeight:900,color:'#ef6c00'}}>{operator}</div></div>
             <div style={{textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>Tes sachets : <b style={{color:'#ef6c00'}}>{totals.mine}</b><br/>Total du jour : <b>{totals.all}</b></div>
           </div>
+          <MuDayStockBar reel={reel} operator={operator} onReload={loadFl} />
           <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
           {flErr && <div style={{background:'#fff3e0',border:'1px solid #ffcc80',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#bf6000'}}>⚠️ {flErr} — stock PDP et commandes non fiables.</div>}
 
@@ -9391,7 +9440,7 @@
       const srcLabel = !src ? 'Calcul du stock PDP…'
         : src.source==='calc' ? `Stock PDP = reste calculé de la MU du ${formatDateShort(src.fromDate)} (stock + fait − commandes ${src.exact?'exactes':'estimées'})`
         : src.source==='inventaire' ? `Stock PDP = inventaire du ${formatDateShort(src.fromDate)}`
-        : src.source==='sheet' ? 'Stock PDP = colonne STOCK MU du Sheet (point de départ, aucun calcul antérieur)'
+        : src.source==='sheet' ? (src.forced ? 'Stock PDP = colonne STOCK MU du Sheet (repris manuellement aujourd\'hui)' : 'Stock PDP = colonne STOCK MU du Sheet (point de départ, aucun calcul antérieur)')
         : 'Stock PDP indisponible (erreur de lecture) — compté à 0';
 
       const saveEdit = (r)=>{ const v=Math.max(0,parseInt(editVal,10)||0); reel.setOverride(r.key, v, operator); setEditKey(null); setEditVal(''); };
@@ -9413,6 +9462,7 @@
               </button>
             )}
           </div>
+          <MuDayStockBar reel={reel} operator={operator} onReload={load} />
           <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
             <div style={{fontWeight:700,marginBottom:4}}>{srcLabel}</div>
             <div style={{color:'var(--ink-mute)'}}>À faire = Commandes − Stock PDP · Reste ce soir = Stock PDP + MU réalisée − Commandes → écrit automatiquement dans l'inventaire du soir (STOCK MU) et devient le stock PDP du prochain jour de MU.</div>
@@ -10266,7 +10316,7 @@
     function MuOrdersLoadPage({ session, setTab }) {
       const showToast = React.useContext(ToastContext);
       const dateKey = todayKey();
-      const [forDay, setForDay] = React.useState(() => addDays(todayKey(), 1));
+      const [forDay, setForDay] = React.useState(() => muTargetDay(todayKey()));
       const [flRows, setFlRows] = React.useState(null);
       const [flErr, setFlErr] = React.useState('');
       const [snap, setSnap] = React.useState(null);
