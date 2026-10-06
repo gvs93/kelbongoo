@@ -627,7 +627,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.76';
+    const APP_VERSION = 'V9.78';
+    // V9.78 — Prépa clôturée : bouton « 🚚 Envoyer à Rungis » (même popup, envoie seulement le mail, sans re-clôturer).
+    //   Sert à tester sur une prépa déjà clôturée et à renvoyer en cas d'erreur (rolls / dollies / lieux).
+    // V9.77 — Prépa : 🎨 une couleur vive par lieu (puce casier, bandeau de lieu, onglets, cagettes ND, liste produits).
+    //   ⚖️ Fourchette de poids (Sheet FL, « Unité de vente » / colonne poids) affichée sur la fiche produit et la liste.
+    //   Barre de progression en RÉFÉRENCES (produits terminés), plus en unités.
+    //   Clôture : popup « Prépa clôturée » → cocher les lieux livrés par Probon Rungis + nb de dollies ;
+    //   rolls = casiers du lieu ÷ 16 (8 étages × 2 casiers), arrondi au-dessus, ajustable ±.
+    //   Mail auto « Rolls Kelbongoo prêts » à fl@ / st@ / rr@pribon.org (rolls + dollies par lieu).
     // V9.76 — Prépa : un produit en « 🟣 Dispatch dernière minute » compte comme TRAITÉ (comme un manquant) :
     //   il ne bloque plus la clôture, sort de la liste « à faire » (→ Dispatch fait). À la clôture, il part dans
     //   Manquants & ND (comme les ruptures, note « Dispatch dernière minute ») pour être dispatché le jour J.
@@ -8648,6 +8656,85 @@
     const PDJ_SITE_LABELS = { ROB:"Montreuil Robespierre", DOM:"Livraison domicile", PDP:"Porte de Pantin", PDC:"Place de Clichy", NCC:"Noisy-le-Sec Charly Chaplin", LIL:"Lila Marché", CES:"Mairie de Montreuil", BOR:"Borrego", TPM:"TEST PROGMAG" };
     const PDJ_REM_PRESETS = [10, 20, 30, 50];
     const PDJ_REM_MOTIFS = ['DLC courte', 'Abîmé / écrasé', 'Geste co', 'Autre'];
+    // V9.77 — 🎨 couleur par lieu (vives, texte blanc lisible). Lieu inconnu → couleur stable tirée de la palette.
+    const KB_SITE_COLORS = {
+      BIC:'#FF1F8E', BOR:'#FF6D00', STB:'#00B060', PDP:'#7C3AED', TOL:'#0A84FF', ROB:'#E11D48', PDC:'#00A8B5',
+      NCC:'#D946EF', LIL:'#9333EA', CES:'#16A34A', BAR:'#F43F5E', CHA:'#2563EB', NCA:'#0D9488', ROM:'#EA580C',
+      FOR:'#B45309', PAD:'#DB2777', DOM:'#475569', TPM:'#6B7280'
+    };
+    const KB_SITE_PALETTE = ['#FF1F8E','#FF6D00','#00B060','#7C3AED','#0A84FF','#E11D48','#00A8B5','#D946EF','#16A34A','#EA580C','#2563EB','#DB2777'];
+    function kbSiteColor(code) {
+      const c = String(code || '').toUpperCase();
+      if (KB_SITE_COLORS[c]) return KB_SITE_COLORS[c];
+      let h = 0; for (let i = 0; i < c.length; i++) h = (h * 31 + c.charCodeAt(i)) >>> 0;
+      return KB_SITE_PALETTE[h % KB_SITE_PALETTE.length];
+    }
+    // style « lieu » pour les éléments de la prépa : --sc = couleur pleine, --ss = fond doux
+    const kbSiteVars = (code) => { const c = kbSiteColor(code); return { '--sc': c, '--ss': c + '1F' }; };
+    // V9.77 — ⚖️ fourchette de poids par produit : Sheet FL (colonne poids/fourchette, sinon « Unité de vente »)
+    //   + liste MU. Seules les valeurs contenant un poids (g / kg) sont retenues.
+    const KB_W_RX = /\d\s*(g|gr|kg)\b/i;
+    function kbPdjWeightIdx(flRows, muList) {
+      const byId = {}, byName = {}, names = {};
+      const put = (id, name, w) => {
+        w = String(w == null ? '' : w).trim(); if (!w || !KB_W_RX.test(w)) return;
+        id = String(id || '').trim(); if (id && !byId[id]) byId[id] = w;
+        const k = muKey(name); if (k && !byName[k]) { byName[k] = w; names[k] = { name: String(name || '').trim() }; }
+      };
+      if (flRows && flRows.length) {
+        const H = flRows[0].map(h => normalizeText(String(h || '')).trim());
+        const f = (ps) => { for (const pr of ps) { const i = H.findIndex(pr); if (i >= 0) return i; } return -1; };
+        const iProd = f([h => h === 'designation site kelbongoo', h => h.includes('designation'), h => h === 'produit']);
+        const iId = f([h => h.includes('id site'), h => h === 'id kbg']);
+        const iW = f([h => h.includes('fourchette'), h => h.includes('poids')]);
+        const iUv = f([h => h === 'unite de vente', h => h.includes('unite de vente'), h => h === 'uv']);
+        for (let r = 1; r < flRows.length; r++) {
+          const row = flRows[r]; if (!row) continue;
+          const wCol = iW >= 0 ? String(row[iW] || '') : '';
+          put(iId >= 0 ? row[iId] : '', iProd >= 0 ? row[iProd] : '', KB_W_RX.test(wCol) ? wCol : (iUv >= 0 ? row[iUv] : ''));
+        }
+      }
+      (muList || []).forEach(it => { if (it) put('', muName(it), it.uv); });
+      return { byId, byName, names };
+    }
+    // V9.77 — Rolls Rungis : 1 roll = 8 étages × 2 casiers
+    const KB_CASIERS_PAR_ROLL = 16;
+    const KB_RUNGIS_TO = 'fl@pribon.org, st@pribon.org, rr@pribon.org';
+    function kbRungisHtml(day, list, by) {
+      const tr = list.reduce((a, x) => a + x.rolls, 0), td = list.reduce((a, x) => a + x.dolly, 0);
+      const pl = (n, w) => `${n} ${w}${n > 1 ? 's' : ''}`;
+      const box = (lbl, n) => `<td style="width:50%;padding:6px"><div style="background:#f4f1ea;border-radius:12px;padding:14px 16px"><div style="font-size:13px;color:#6f6a62">${lbl}</div><div style="font-size:40px;font-weight:900;color:#1b1b1b;line-height:1.1">${n}</div></div></td>`;
+      const rowsHtml = list.map(x => {
+        const c = kbSiteColor(x.site);
+        return `<tr><td style="padding:6px 0"><table role="presentation" width="100%" style="border-collapse:collapse;border-left:10px solid ${c};background:${c}14;border-radius:0">`
+          + `<tr><td style="padding:14px 16px"><span style="display:inline-block;background:${c};color:#fff;font-weight:900;font-size:20px;padding:4px 12px;border-radius:8px">${kbEsc(x.site)}</span>`
+          + ` <span style="font-size:18px;font-weight:700;color:#1b1b1b">${kbEsc(siteLabel(x.site))}</span></td>`
+          + `<td style="padding:14px 16px;text-align:right;white-space:nowrap"><span style="font-size:30px;font-weight:900;color:${c}">${pl(x.rolls, 'roll')}</span>`
+          + (x.dolly > 0 ? `<br><span style="font-size:20px;font-weight:800;color:#1b1b1b">+ ${pl(x.dolly, 'dolly').replace('dollys', 'dollies')}</span>` : '')
+          + `</td></tr></table></td></tr>`;
+      }).join('');
+      return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;color:#1b1b1b">`
+        + `<p style="font-size:17px;margin:0 0 6px">Bonjour,</p>`
+        + `<p style="font-size:17px;margin:0 0 14px">Voici le nombre de rolls par lieu de distribution pour la distribution du <b>${kbEsc(formatDateShort(day))}</b> :</p>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-bottom:8px"><tr>${box('Total rolls', tr)}${box('Total dollies', td)}</tr></table>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse">${rowsHtml}</table>`
+        + `<p style="color:#999;font-size:12px;margin-top:18px">Prépa clôturée${by ? ' par ' + kbEsc(by) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
+    }
+    function kbRungisText(day, list, by) {
+      const tr = list.reduce((a, x) => a + x.rolls, 0), td = list.reduce((a, x) => a + x.dolly, 0);
+      const out = ['Bonjour,', '', `Voici le nombre de rolls par lieu de distribution pour la distribution du ${formatDateShort(day)} :`, ''];
+      list.forEach(x => out.push(`${x.site} - ${siteLabel(x.site)} : ${x.rolls} roll${x.rolls > 1 ? 's' : ''}${x.dolly > 0 ? ' + ' + x.dolly + ' dolly' + (x.dolly > 1 ? 'ies' : '') : ''}`.replace('dollyies', 'dollies')));
+      out.push('', `TOTAL : ${tr} roll${tr > 1 ? 's' : ''} + ${td} dolly${td > 1 ? 'ies' : ''}`.replace('dollyies', 'dollies'), '', `Prépa clôturée${by ? ' par ' + by : ''}`);
+      return out.join('\n');
+    }
+    async function kbSendRungis(day, by, list) {
+      let r;
+      try { r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_RUNGIS_TO, subject: 'Rolls Kelbongoo prêts', body: kbRungisText(day, list, by), htmlBody: kbRungisHtml(day, list, by) }); }
+      catch (e) { r = { ok: false, error: e.message }; }
+      const log = { at: new Date().toISOString(), by: by || '—', to: KB_RUNGIS_TO, list, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue') };
+      try { await storage.setDoc(`day_${day}_prep`, 'rungis', log, { replace: true }); } catch (_) {}
+      return log;
+    }
 
     /* ============================================================
        MU DU JOUR — Mise en unité des Fruits & Légumes (sachets)
@@ -11189,6 +11276,24 @@
       const [casNum, setCasNum] = React.useState('');
       const [casErr, setCasErr] = React.useState('');
       const [prodSite, setProdSite] = React.useState(''); // V9.65 — '' = toutes les boutiques
+      // V9.77 — popup de clôture (lieux livrés par Probon Rungis)
+      const [rg, setRg] = React.useState(null); // { sel:{site:true}, rolls:{site:n}, dolly:{site:n} }
+      const [rgBusy, setRgBusy] = React.useState(false);
+      // V9.77 — ⚖️ fourchette de poids (Sheet FL + liste MU), cache local puis rafraîchi
+      const [wIdx, setWIdx] = React.useState(() => kbPdjWeightIdx(kbMuCacheGet('fl'), kbMuCacheGet('list')));
+      React.useEffect(() => { let stop = false;
+        flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }).then(d => {
+          if (stop || !d || d.ok === false || !d.rows) return; kbMuCacheSet('fl', d.rows); setWIdx(kbPdjWeightIdx(d.rows, kbMuCacheGet('list')));
+        }).catch(() => {});
+        return () => { stop = true; }; }, []);
+      const weightOf = (r) => {
+        if (!r) return '';
+        if (r.id && wIdx.byId[String(r.id)]) return wIdx.byId[String(r.id)];
+        const nm = String(r.product || '').replace(/^\[TEST\]\s*/, '');
+        const k = muKey(nm); if (wIdx.byName[k]) return wIdx.byName[k];
+        const fk = muFuzzyKey(nm, wIdx.names); if (fk && wIdx.byName[fk]) return wIdx.byName[fk];
+        return KB_W_RX.test(r.type || '') && /[-–]/.test(r.type || '') ? r.type : '';
+      };
       // V9.67 — catalogue (catégorie / famille) pour le filtre « 🧀 Tous les fromages »
       const [catalog, setCatalog] = React.useState(null);
       React.useEffect(() => { let stop = false; readCache('products').then(d => { if (!stop) setCatalog(d || {}); }).catch(() => { if (!stop) setCatalog({}); }); return () => { stop = true; }; }, []);
@@ -11205,7 +11310,7 @@
       const K = (r) => r.site + '||' + r.client + '||' + r.product;
       const PK = (s, p) => s + '||' + p;
       const CK = (s, c) => s + '||' + c;
-      const siteLabel = (s) => PDJ_SITE_LABELS[s] || s;
+      const siteLabel = (s) => PDJ_SITE_LABELS[s] || (typeof SITE_NAMES !== 'undefined' && SITE_NAMES[s]) || s; // V9.77 — noms complets (BIC → Bichat)
       const encId = (s) => encodeURIComponent(s);
 
       // ---- chargement commandes du jour ----
@@ -11293,8 +11398,19 @@
       const ndOn = (pk) => !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
       const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
-      const siteProgress = (s) => { const rs=rows.filter(r=>r.site===s); const done=rs.filter(handled).length; return { done, total: rs.length }; };
-      const globalProg = React.useMemo(() => { let d=0,t=0; sites.forEach(s=>{const p=siteProgress(s);d+=p.done;t+=p.total;}); return { d, t, pct: t?Math.round(d/t*100):0, allDone: t>0 && d===t }; }, [rows, prep, sites]);
+      // V9.77 — progression en RÉFÉRENCES : une référence est faite quand toutes ses lignes sont traitées
+      const refProg = React.useMemo(() => {
+        const bySite = {}, glob = {};
+        rows.forEach(r => { const h = handled(r);
+          const sk = r.site + '||' + r.product; bySite[sk] = (bySite[sk] === undefined ? true : bySite[sk]) && h;
+          glob[r.product] = (glob[r.product] === undefined ? true : glob[r.product]) && h; });
+        const site = {};
+        Object.entries(bySite).forEach(([k, ok]) => { const s = k.split('||')[0]; if (!site[s]) site[s] = { done: 0, total: 0 }; site[s].total++; if (ok) site[s].done++; });
+        const t = Object.keys(glob).length, d = Object.values(glob).filter(Boolean).length;
+        return { site, d, t };
+      }, [rows, prep]);
+      const siteProgress = (s) => refProg.site[s] || { done: 0, total: 0 };
+      const globalProg = { d: refProg.d, t: refProg.t, pct: refProg.t ? Math.round(refProg.d / refProg.t * 100) : 0, allDone: refProg.t > 0 && refProg.d === refProg.t };
 
       // ---- actions ----
       const toggleDone = (r) => {
@@ -11423,10 +11539,41 @@
       );
 
       // clôture → manquants (motif pré-rempli)
-      const closeDay = async () => {
-        if (!globalProg.allDone) { showToast(`Termine toutes les prépas d'abord (${globalProg.d}/${globalProg.t})`); return; }
-        if (!confirm('Clôturer la prépa du jour ?\n\nUne fois clôturée, on ne revient plus sur la prépa. Les modifications se feront uniquement via « Manquants & ND » et « Dispatch dernière minute ». Les ruptures et les produits « dernière minute » partiront dans Manquants & ND (motif pré-rempli).')) return;
-        if (!confirm('Confirmer DÉFINITIVEMENT la clôture de la prépa du jour ?')) return;
+      // V9.77 — casiers par lieu (tous les casiers des clients ayant au moins un produit en casier) → rolls
+      const rollSites = React.useMemo(() => {
+        const out = {};
+        sites.filter(s => s !== 'DOM').forEach(s => {
+          const cl = [...new Set(rows.filter(r => r.site === s && !ndOn(PK(s, r.product))).map(r => r.client))];
+          const n = cl.reduce((a, c) => a + Math.max(1, getCasiers(s, c).filter(x => x && x !== '?').length), 0);
+          out[s] = { casiers: n, rolls: Math.ceil(n / KB_CASIERS_PAR_ROLL) };
+        });
+        return out;
+      }, [rows, prep, reserved, sites]);
+      const openRungis = () => {
+        const rolls = {}; Object.entries(rollSites).forEach(([s, v]) => { rolls[s] = v.rolls; });
+        setRg({ sel: {}, rolls, dolly: {} });
+      };
+      const closeDay = () => {
+        if (!globalProg.allDone) { showToast(`Termine toutes les références d'abord (${globalProg.d}/${globalProg.t})`); return; }
+        const rolls = {}; Object.entries(rollSites).forEach(([s, v]) => { rolls[s] = v.rolls; });
+        setRg({ sel: {}, rolls, dolly: {} });
+      };
+      const confirmClose = async () => {
+        if (!rg || rgBusy) return;
+        const list = Object.keys(rg.sel).filter(s => rg.sel[s]).sort().map(s => ({ site: s, rolls: Math.max(0, rg.rolls[s] || 0), dolly: Math.max(0, parseInt(rg.dolly[s], 10) || 0) }));
+        if (!confirm(prep.closed ? `Envoyer le mail à Probon Rungis ?\n\n${list.map(x => `${x.site} : ${x.rolls} roll(s) + ${x.dolly} dolly`).join('\n')}` : list.length ? `Clôturer la prépa et prévenir Probon Rungis ?\n\n${list.map(x => `${x.site} : ${x.rolls} roll(s) + ${x.dolly} dolly`).join('\n')}` : 'Clôturer la prépa ?\n\nAucun lieu coché : pas de mail à Rungis.')) return;
+        setRgBusy(true);
+        try {
+          if (prep.closed) {
+            // V9.78 — prépa déjà clôturée : envoi Rungis seul
+            if (!list.length) { showToast('Coche au moins un lieu'); return; }
+            const lg = await kbSendRungis(day, user, list);
+            try { await storage.setDoc(`day_${day}_prep`, 'meta', { rungis: list }); } catch (_) {}
+            showToast(lg.ok ? `🚚 Mail Rungis envoyé : ${list.reduce((a,x)=>a+x.rolls,0)} roll(s) · ${list.reduce((a,x)=>a+x.dolly,0)} dolly` : '⚠️ Mail Rungis non envoyé : ' + lg.error);
+          } else await doCloseDay(list);
+        } finally { setRgBusy(false); setRg(null); }
+      };
+      const doCloseDay = async (rungisList) => {
         const agg = {};
         rows.forEach(r => { const lmR = isLmRow(r); if (prep.status[K(r)] !== 'rupture' && !lmR) return;
           const p=r.product; if(!agg[p]) agg[p]={ produit:p, producteur:r.producer, qty:0, clients:0, bySite:{}, lm:false };
@@ -11442,8 +11589,15 @@
             status:'rupture', source:'prepa', uploadedBy:user, uploadedAt:new Date().toISOString(),
           });
         }
-        await storage.setDoc(`day_${day}_prep`, 'meta', { closed:true, closedBy:user, closedAt:new Date().toISOString() });
+        await storage.setDoc(`day_${day}_prep`, 'meta', { closed:true, closedBy:user, closedAt:new Date().toISOString(), rungis: rungisList || [] });
         showToast(`✅ Prépa clôturée · ${Object.keys(agg).length} produit(s) → Manquants & ND`);
+        // V9.77 — mail « Rolls Kelbongoo prêts » à Probon Rungis (lieux cochés)
+        if (rungisList && rungisList.length) {
+          try {
+            const lg = await kbSendRungis(day, user, rungisList);
+            showToast(lg.ok ? `🚚 Mail Rungis envoyé : ${rungisList.reduce((a,x)=>a+x.rolls,0)} roll(s) · ${rungisList.reduce((a,x)=>a+x.dolly,0)} dolly` : '⚠️ Mail Rungis non envoyé : ' + lg.error);
+          } catch (e) { showToast('⚠️ Mail Rungis : ' + e.message); }
+        }
         // V9.59 — Livraison à domicile : fichier Dromy envoyé automatiquement si activé (Pilotage › Dromy)
         try {
           const cfgD = await storage.getDoc('app_config', 'dromy');
@@ -11477,13 +11631,13 @@
         const nd = ndOn(pk) ? ndData(pk) : null, lm = prep.lm[pk], ra = prep.remiseAll[pk];
         const allDone = po.every(handled);
         return (
-          <div key={pk} className={"pdj-card" + (allDone?" done":"") + (nd?" nd":"") + (lm?" lm":"")}>
+          <div key={pk} style={kbSiteVars(site)} className={"pdj-card sc" + (allDone?" done":"") + (nd?" nd":"") + (lm?" lm":"")}>
             <div className="pdj-pname">{product}
               {nd && <span className="pdj-badge nd">ND</span>}
               {lm && <span className="pdj-badge lm">Dispatch dern.min.</span>}
               {ra && <span className="pdj-badge rem">🏷️ -{ra.pct}% {ra.reason}</span>}
             </div>
-            <div className="pdj-psub">{po[0].producer} · {po[0].type || '—'} · <b>{total} u · {po.length} client{po.length>1?'s':''}</b></div>
+            <div className="pdj-psub">{po[0].producer} · {po[0].type || '—'} · <b>{total} u · {po.length} client{po.length>1?'s':''}</b>{weightOf(po[0]) && <span className="pdj-pw">⚖️ {weightOf(po[0])}</span>}</div>
 
             {nd ? (
               <div className="pdj-panel nd">
@@ -11516,7 +11670,7 @@
                       {firstDone && <div className="pdj-donehint">Toucher un casier pour annuler le dépôt (erreur)</div>}
                       <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
                         <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
-                          <span className="pdj-csite">{site}</span>
+                          <span className="pdj-csite" style={{background:kbSiteColor(site)}}>{site}</span>
                           <span className="pdj-cnum">{clientCasier(site,r.client)}</span>
                           <span className="pdj-cname">{r.client.split(' ')[0]}</span>
                           {rc && <span className="pdj-tag rem">🏷️-{rc.pct}%</span>}
@@ -11568,6 +11722,43 @@
       // ---- rendu principal ----
       if (!day) return <div className="card" style={{margin:16}}>Aucune distribution active. L'admin doit charger les commandes.</div>;
 
+      const rgPopup = rg && (() => {
+            const ss = Object.keys(rollSites).sort();
+            const chosen = ss.filter(s => rg.sel[s]);
+            const tr = chosen.reduce((a, s) => a + (rg.rolls[s] || 0), 0), td = chosen.reduce((a, s) => a + (parseInt(rg.dolly[s], 10) || 0), 0);
+            const setK = (k, s, v) => setRg(o => ({ ...o, [k]: { ...o[k], [s]: v } }));
+            return (
+              <KbSheet title={prep.closed ? "🚚 Envoi à Probon Rungis" : "🎉 Prépa clôturée — livraison Rungis"} onClose={() => { if (!rgBusy) setRg(null); }}>
+                <div className="pdj-rg">
+                  <div className="pdj-rgq">Quels lieux seront livrés par <b>Probon Rungis</b> ?</div>
+                  <div className="pdj-hint" style={{marginBottom:10}}>Coche les lieux, vérifie les rolls et indique les dollies (cagettes vertes à roulettes). Un mail part à fl@, st@ et rr@pribon.org.</div>
+                  {ss.map(s => { const on = !!rg.sel[s], c = kbSiteColor(s); return (
+                    <div key={s} className={"pdj-rgl" + (on ? " on" : "")} style={{ '--sc': c, '--ss': c + '1F' }}>
+                      <button className="pdj-rgchk" onClick={() => setK('sel', s, !on)}>
+                        <span className="box">{on ? '✓' : ''}</span>
+                        <span className="code">{s}</span>
+                        <span className="nm">{siteLabel(s)}</span>
+                      </button>
+                      {on && <div className="pdj-rgctl">
+                        <div className="pdj-rgf"><span>🛒 Rolls</span>
+                          <button onClick={() => setK('rolls', s, Math.max(0, (rg.rolls[s] || 0) - 1))}>−</button>
+                          <b>{rg.rolls[s] || 0}</b>
+                          <button onClick={() => setK('rolls', s, (rg.rolls[s] || 0) + 1)}>+</button></div>
+                        <div className="pdj-rgf"><span>🟩 Dollies</span>
+                          <button onClick={() => setK('dolly', s, Math.max(0, (parseInt(rg.dolly[s], 10) || 0) - 1))}>−</button>
+                          <b>{parseInt(rg.dolly[s], 10) || 0}</b>
+                          <button onClick={() => setK('dolly', s, (parseInt(rg.dolly[s], 10) || 0) + 1)}>+</button></div>
+                      </div>}
+                    </div>); })}
+                  <div className="pdj-rgtot">{chosen.length ? <>🚚 Rungis : <b>{tr}</b> roll{tr > 1 ? 's' : ''} · <b>{td}</b> dolly{td > 1 ? 'ies' : ''} · {chosen.length} lieu{chosen.length > 1 ? 'x' : ''}</> : 'Aucun lieu coché → pas de mail Rungis'}</div>
+                  <button className="pdj-close" style={{ width: '100%', minHeight: 64, fontSize: 20 }} disabled={rgBusy} onClick={confirmClose}>
+                    {rgBusy ? 'Envoi en cours…' : prep.closed ? '🚚 Envoyer à Rungis' : (chosen.length ? '✅ Clôturer + envoyer à Rungis' : '✅ Clôturer la prépa')}
+                  </button>
+                  {!prep.closed && <div className="pdj-hint" style={{marginTop:8}}>Une fois clôturée, la prépa n'est plus modifiable (corrections via « Manquants &amp; ND »).</div>}
+                </div>
+              </KbSheet>
+            );
+          })();
       if (prep.closed) {
         let done=0, rupt=0; rows.forEach(r=>{ const x=prep.status[K(r)]; if(x==='rupture')rupt++; else if(x==='done')done++; });
         return (
@@ -11579,8 +11770,10 @@
               <p className="pdj-cnums">{done} déposés · {rupt} ruptures · {rows.length} lignes</p>
               <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>La prépa n'est plus modifiable. Toute correction passe désormais par <b>Manquants &amp; ND</b> (infos, raisons) ou <b>Dispatch dernière minute</b>.</p>
               <p className="pdj-hint" style={{maxWidth:340,margin:'8px auto 0'}}>🏷️ Étiquettes livraison et 🍞 dispatch pain : onglet <b>Suivi &amp; impression</b>.</p>
+              <button className="pdj-close" style={{marginTop:12,marginRight:8}} onClick={openRungis}>🚚 Envoyer à Rungis</button>
               {KB_COHABITATION && <button className="pdj-close" style={{marginTop:12}} onClick={()=>setAncienOpen(true)}>🚫 Ruptures ancien site</button>}
             </div>
+            {rgPopup}
             <div style={{maxWidth:520,margin:'12px auto'}}><DopamineClose session={session} /></div>
             {ancienOpen && <KbSheet title={`Ruptures ancien site · ${formatDateShort(day)}`} onClose={()=>setAncienOpen(false)}><AncienRupturesPanel day={day} session={session} /></KbSheet>}
           </div>
@@ -11596,7 +11789,7 @@
           sites.forEach(s => {
             const rs = rows.filter(r => r.site===s && r.product.toLowerCase().includes(q));
             const prods = [...new Set(rs.map(r=>r.product))].sort();
-            if (prods.length) blocks.push(<div key={s}><div className="pdj-shdr">📍 {siteLabel(s)}</div>{prods.map(p=>renderProduct(s,p,rs.filter(r=>r.product===p)))}</div>);
+            if (prods.length) blocks.push(<div key={s}><div className="pdj-shdr" style={{background:kbSiteColor(s)}}>📍 {s} · {siteLabel(s)}</div>{prods.map(p=>renderProduct(s,p,rs.filter(r=>r.product===p)))}</div>);
           });
           body = blocks.length ? blocks : <div className="pdj-no">Aucun résultat pour « {searchQ} ».</div>;
         }
@@ -11622,6 +11815,7 @@
                 <div style={{minWidth:0,flex:1}}>
                   <div className="pdj-dname">{openProd}</div>
                   <div className="pdj-dprod">{ps.po[0].producer}{ps.po[0].type ? ' · '+ps.po[0].type : ''}</div>
+                  {weightOf(ps.po[0]) && <div className="pdj-wrange">⚖️ Fourchette : <b>{weightOf(ps.po[0])}</b></div>}
                   {othersOn(openProd).length>0 && <div className="pdj-pres">👥 Aussi sur ce produit : {othersOn(openProd).join(', ')}</div>}
                 </div>
                 <div className={"pdj-dcount"+(ps.fin?" ok":"")}>{ps.dn}<span>/{ps.tot}</span></div>
@@ -11629,7 +11823,7 @@
               {ps.po.some(r=>(r.qty||1)>1) && <div className="pdj-multihint">👆 Quantité ×2 ou plus : toucher le casier <b>une fois par article posé</b> (1/2 → 2/2 ✓).</div>}
               {ps.ss.map(site => (
                 <div key={site} className="pdj-dblock">
-                  <div className="pdj-dsite"><span>{site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span></div>
+                  <div className="pdj-dsite" style={kbSiteVars(site)}><span>📍 {site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span></div>
                   {renderProduct(site, openProd, ps.po.filter(r=>r.site===site))}
                 </div>
               ))}
@@ -11651,7 +11845,7 @@
                   </select>
                   {prodFilter && <button className="pdj-fx" onClick={()=>setProdFilter('')} aria-label="Tous les producteurs">✕</button>}
                 </div>
-                <div className="pdj-fbox">
+                <div className="pdj-fbox" style={prodSite ? {boxShadow:'inset 0 0 0 4px '+kbSiteColor(prodSite), borderRadius:14} : null}>
                   <select className="pdj-fsel" value={prodSite} onChange={e=>{ const v=e.target.value; setProdSite(v); if(v) setCurSite(v); }}>
                     <option value="">Toutes les boutiques ({sites.length})</option>
                     {sites.map(x=>{ const pg=siteProgress(x); return <option key={x} value={x}>{x}{siteLabel(x)!==x?' · '+siteLabel(x):''} — {pg.done}/{pg.total}</option>; })}
@@ -11670,7 +11864,7 @@
                 return (<>
                 {todo.length === 0 && <div className="pdj-alldone" style={{marginBottom:10}}>✅ Tous les produits sont faits</div>}
                 {todo.length > 0 && <div className="pdj-plist">
-                  <div className="pdj-phead"><span>Produit{prodSite ? ' · ' + prodSite : ' · toutes les boutiques'} · {todo.length} à faire</span><span>Progrès</span></div>
+                  <div className="pdj-phead"><span>Produit{prodSite ? <> · <i className="pdj-sitepill" style={{background:kbSiteColor(prodSite)}}>{prodSite}</i></> : ' · toutes les boutiques'} · {todo.length} à faire</span><span>Progrès</span></div>
                   {todo.map(p => {
                     const x = stats[p];
                     const pct = x.tot ? Math.round(x.dn / x.tot * 100) : 0;
@@ -11685,7 +11879,8 @@
                           </span>
                           <span className="pdj-pp">{x.po[0].producer || '—'}</span>
                           {x.po[0].type && <span className="pdj-pt">{x.po[0].type}</span>}
-                          {!prodSite && <span className="pdj-psites">{x.ss.join(' · ')}</span>}
+                          {weightOf(x.po[0]) && <span className="pdj-pw">⚖️ {weightOf(x.po[0])}</span>}
+                          {!prodSite && <span className="pdj-psites">{x.ss.map(si => <i key={si} style={{background:kbSiteColor(si)}}>{si}</i>)}</span>}
                           {othersOn(p).length>0 && <span className="pdj-pres">👤 {othersOn(p).join(', ')} dessus</span>}
                         </span>
                         <span className="pdj-pprog">
@@ -11706,7 +11901,7 @@
                       <span className="pdj-pinfo">
                         <span className="pdj-pn">{p}{x.rp>0 && <span className="pdj-badge rp">🚫 {x.rp}</span>}</span>
                         <span className="pdj-pp">{x.po[0].producer || '—'}</span>
-                        {!prodSite && <span className="pdj-psites">{x.ss.join(' · ')}</span>}
+                        {!prodSite && <span className="pdj-psites">{x.ss.map(si => <i key={si} style={{background:kbSiteColor(si)}}>{si}</i>)}</span>}
                       </span>
                       <span className="pdj-pprog"><span className="n">{x.dn} / {x.tot}</span><span className="b"><span style={{width:pct+'%'}} /></span></span>
                       <span className="pdj-pfin">✅</span>
@@ -11725,8 +11920,8 @@
           if (!prods.length) return null;
           const art = rs.reduce((a,r)=>a+r.qty,0);
           return (
-            <div key={site} className="pdj-ndsite">
-              <div className="pdj-ndh"><span>🔴 Cagette ND · {site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span><span>{prods.length} produit{prods.length>1?'s':''} · {art} art.</span></div>
+            <div key={site} className="pdj-ndsite" style={{borderColor:kbSiteColor(site)}}>
+              <div className="pdj-ndh" style={{background:kbSiteColor(site)}}><span>🔴 Cagette ND · {site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span><span>{prods.length} produit{prods.length>1?'s':''} · {art} art.</span></div>
               {prods.map(p => {
                 const pk = PK(site,p), po = rs.filter(r=>r.product===p), tot = po.reduce((a,r)=>a+r.qty,0), d = ndData(pk);
                 const ok = d.placed!=null;
@@ -11764,9 +11959,9 @@
               const done = ords.filter(handled).length;
               const open = openClient===c;
               return (
-                <div key={c} className="pdj-crow">
+                <div key={c} className="pdj-crow" style={{borderLeft:'8px solid '+kbSiteColor(curSite)}}>
                   <div className="pdj-chead" onClick={()=>setOpenClient(open?null:c)}>
-                    <span className="pdj-cas">Casier {clientCasier(curSite,c)}</span>
+                    <span className="pdj-cas" style={{background:kbSiteColor(curSite),color:'#fff'}}>{curSite} · Casier {clientCasier(curSite,c)}</span>
                     <span className="pdj-chn">{c}</span>
                     <span className="pdj-cm">{done}/{ords.length} {open?'▲':'▼'}</span>
                   </div>
@@ -11814,7 +12009,7 @@
               const done=ords.filter(handled).length;
               const art=ords.reduce((a,r)=>a+r.qty,0);
               return (
-                <div key={c} className="pdj-crow">
+                <div key={c} className="pdj-crow" style={{borderLeft:'8px solid '+kbSiteColor(curSite)}}>
                   <div className="pdj-cn">{c}</div><div className="pdj-cm">{done}/{ords.length} déposés · {art} articles</div>
                   <div className="pdj-cb">
                     {nums.map((n,i)=> nums.length<=1
@@ -11859,6 +12054,7 @@
               </KbSheet>
             );
           })()}
+          {rgPopup}
           <div className="pdj-topbar">
             <div className="pdj-modebar">
               <button className={mode==='produits'&&!searchOpen?'active':''} onClick={()=>{setMode('produits');setSearchOpen(false);setOpenProd(null);}}>🥕 Par produit</button>
@@ -11870,21 +12066,21 @@
             {searchOpen && <div className="pdj-searchbar"><input autoFocus type="search" placeholder="Rechercher un produit sur tous les sites…" value={searchQ} onChange={e=>setSearchQ(e.target.value)} /></div>}
             {!searchOpen && mode!=='produits' && mode!=='nd' && <div className="pdj-subbar">
               {sites.map(s => { const p=siteProgress(s); const ok=p.done===p.total&&p.total>0;
-                return <button key={s} className={"pdj-sbtn"+(s===curSite?" active":"")} onClick={()=>setCurSite(s)}>📍 {siteLabel(s)}<span className={"p"+(ok?" ok":"")}>{p.done}/{p.total}{ok?' ✓':''}</span></button>; })}
+                return <button key={s} style={kbSiteVars(s)} className={"pdj-sbtn sc"+(s===curSite?" active":"")} onClick={()=>setCurSite(s)}>📍 {siteLabel(s)}<span className={"p"+(ok?" ok":"")}>{p.done}/{p.total}{ok?' ✓':''}</span></button>; })}
             </div>}
             {!searchOpen && <div className="pdj-stats">
               <span className="pdj-stat"><b>{nc}</b> clients</span>
-              <span className="pdj-stat"><b>{sp.done}/{sp.total}</b> déposés</span>
+              <span className="pdj-stat"><b>{sp.done}/{sp.total}</b> réf. faites</span>
               {nr>0 && <span className="pdj-stat r"><b>{nr}</b> rupture{nr>1?'s':''}</span>}
             </div>}
-            <div className="pdj-gprog"><span className="t">Progression {globalProg.d}/{globalProg.t} · {globalProg.pct}%</span><span className="bar"><span className="fill" style={{width:globalProg.pct+'%'}} /></span></div>
+            <div className="pdj-gprog"><span className="t">Références <b>{globalProg.d}/{globalProg.t}</b> · {globalProg.pct}%</span><span className="bar"><span className="fill" style={{width:globalProg.pct+'%'}} /></span></div>
             <div className="pdj-tools">
               {prep.closed && <span className="pdj-closedtag">🔒 Prépa clôturée par {prep.closedBy}</span>}
               {KB_COHABITATION && <button className="pdj-btn" onClick={()=>setAncienOpen(true)} title="Ruptures à reporter sur l'ancien site">🚫 Ruptures ancien site</button>}
               {activeOthers.length>0 && <span className="pdj-live">🟢 En prépa aussi : {activeOthers.map(u=>u.split(' ')[0]).join(', ')}</span>}
               <span style={{flex:1}} />
               <button className={"pdj-close"+(globalProg.allDone?"":" off")} onClick={closeDay}>
-                {globalProg.allDone ? '✅ Clôturer la prépa du jour' : `🔒 Clôture (${globalProg.d}/${globalProg.t})`}
+                {globalProg.allDone ? '✅ Clôturer la prépa du jour' : `🔒 Clôture (${globalProg.d}/${globalProg.t} réf.)`}
               </button>
             </div>
           </div>
@@ -11905,6 +12101,30 @@
 .pdj-subbar{display:flex;gap:8px;overflow-x:auto;padding:8px 10px}
 .pdj-sbtn{flex:0 0 auto;min-height:52px;padding:8px 16px;border-radius:26px;border:2px solid #cfc8bb;background:#fcfaf6;font-size:18px;font-weight:700;color:#4a463f;cursor:pointer;white-space:nowrap}
 .pdj-sbtn.active{background:var(--acc);border-color:var(--acc);color:#fff}
+.pdj-sbtn.sc{border-color:var(--sc);background:var(--ss);color:#222;border-width:3px}
+.pdj-sbtn.sc.active{background:var(--sc);color:#fff}
+.pdj-card.sc{border-left:10px solid var(--sc)!important}
+.pdj-card.sc .pdj-chip{border-color:var(--sc);background:var(--ss)}
+.pdj-card.sc .pdj-chip.done{background:#e3f2e1;border-color:#2e7d32}
+.pdj-card.sc .pdj-chip.rupt{background:#fdecec;border-color:#c62828}
+.pdj-psites i,.pdj-sitepill{display:inline-block;font-style:normal;color:#fff;font-weight:900;font-size:14px;padding:2px 8px;border-radius:6px;margin:2px 4px 0 0}
+.pdj-pw{display:inline-block;background:#fff3cd;color:#7a4b00;border:2px solid #f0b429;font-weight:800;font-size:15px;padding:2px 8px;border-radius:8px;margin:3px 0 0 6px}
+.pdj-wrange{display:inline-block;margin-top:6px;background:#fff3cd;color:#7a4b00;border:2px solid #f0b429;font-size:20px;font-weight:700;padding:4px 12px;border-radius:10px}
+.pdj-rg{padding:4px 2px 8px}
+.pdj-rgq{font-size:20px;font-weight:800;margin-bottom:4px}
+.pdj-rgl{border:3px solid var(--sc);border-radius:14px;margin-bottom:10px;overflow:hidden;background:#fff}
+.pdj-rgl.on{background:var(--ss)}
+.pdj-rgchk{display:flex;align-items:center;gap:12px;width:100%;min-height:64px;padding:10px 12px;border:none;background:none;cursor:pointer;text-align:left}
+.pdj-rgchk .box{flex:0 0 36px;height:36px;border-radius:8px;border:3px solid var(--sc);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900;color:#fff}
+.pdj-rgl.on .pdj-rgchk .box{background:var(--sc)}
+.pdj-rgchk .code{background:var(--sc);color:#fff;font-weight:900;font-size:20px;padding:4px 10px;border-radius:8px}
+.pdj-rgchk .nm{font-size:18px;font-weight:700;color:#222}
+.pdj-rgctl{display:flex;gap:10px;flex-wrap:wrap;padding:0 12px 12px}
+.pdj-rgf{flex:1 1 150px;display:flex;align-items:center;gap:8px;background:#fff;border-radius:12px;padding:6px 8px;font-size:16px;font-weight:700}
+.pdj-rgf span{flex:1}
+.pdj-rgf button{width:48px;height:48px;border-radius:10px;border:2px solid var(--sc);background:#fff;color:var(--sc);font-size:26px;font-weight:900;cursor:pointer}
+.pdj-rgf b{min-width:34px;text-align:center;font-size:26px}
+.pdj-rgtot{margin:6px 0 12px;padding:12px;border-radius:12px;background:#f4f1ea;font-size:18px;text-align:center}
 .pdj-sbtn .p{font-size:15px;opacity:.9;margin-left:6px}.pdj-sbtn .p.ok{color:#c8f5b5}
 .pdj-stats{display:flex;gap:8px;flex-wrap:wrap;padding:6px 10px 2px}
 .pdj-stat{background:#fcfaf6;border:1px solid #e8e3da;border-radius:10px;padding:5px 12px;font-size:16px;color:#4a463f}.pdj-stat b{color:var(--accd)}.pdj-stat.r b{color:var(--warn)}
@@ -11916,6 +12136,7 @@
 .pdj-main{padding:10px 10px 60px}
 .pdj-no{padding:30px;text-align:center;color:#6f6a62;font-size:19px}
 .pdj-shdr{font-weight:800;color:var(--accd);margin:14px 2px 8px;font-size:19px}
+.pdj-shdr[style]{color:#fff;padding:8px 12px;border-radius:10px}
 /* filtres producteur / produit */
 .pdj-filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .pdj-fbox{flex:1 1 260px;display:flex;align-items:stretch;border:2px solid var(--blue);border-radius:12px;overflow:hidden;background:#fff}
@@ -11949,6 +12170,7 @@
 .pdj-dcount{flex:0 0 auto;font-size:34px;font-weight:900;color:#ef6c00}.pdj-dcount span{font-size:22px;color:#777}.pdj-dcount.ok{color:var(--acc)}
 .pdj-dsite{margin:12px 0 -4px;border-top:4px solid var(--acc);position:relative;height:0}
 .pdj-dsite span{position:absolute;top:-17px;left:12px;background:var(--acc);color:#fff;font-weight:900;font-size:18px;padding:3px 12px;border-radius:8px}
+.pdj-dsite[style]{border-top:6px solid var(--sc)}.pdj-dsite[style] span{background:var(--sc);font-size:20px;padding:4px 14px;top:-19px}
 .pdj-detail .pdj-card{border:none;box-shadow:none;padding:16px 0 0;background:transparent}
 .pdj-detail .pdj-card.done{opacity:1}
 .pdj-detail .pdj-card>.pdj-pname,.pdj-detail .pdj-card>.pdj-psub{display:none}
