@@ -627,7 +627,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.73';
+    const APP_VERSION = 'V9.74';
+    // V9.74 — Casiers : chaque client démarre avec TOUS ses casiers du JSON (ex. Henry = 1 et 2) ; la puce affiche
+    //   « 1·2 ». On peut supprimer un casier inutilisé (✕, s'il en reste au moins un) → son n° redevient attribuable.
+    //   Unicité par lieu = casiers en cours de chaque client (JSON ou modifiés dans l'appli). Plus de « 📌 ancien site ».
+    //   Distrib (étiquettes / suivi) : même règle (tous les casiers JSON tant que la prépa ne les a pas modifiés).
     // V9.73 — Prépa : un casier déposé DISPARAÎT de la fiche produit (et de la fiche casier) pour ne pas
     //   submerger le préparateur ; il reste visible ~1 s en vert puis passe dans « ✅ Dispatch fait (N) »
     //   (repliable) où on peut l'annuler en cas d'erreur (confirmation). Les ruptures restent affichées.
@@ -9858,8 +9862,9 @@
     function kbClientCasiers(prep, site, client, order) {
       const k = site + '||' + client;
       if (prep.casiers[k] && prep.casiers[k].length) return prep.casiers[k].map(String);
-      const c = (order.casiersFrais && order.casiersFrais[0]) || (order.casiersSec && order.casiersSec[0]);
-      return (c != null && c !== '') ? [String(c)] : [];
+      // V9.74 — tous les casiers du JSON (frais, sinon sec), comme la prépa
+      const l = ((order.casiersFrais && order.casiersFrais.length) ? order.casiersFrais : (order.casiersSec || [])).map(x => String(x).trim()).filter(Boolean);
+      return [...new Set(l)];
     }
     // Lignes « livraison à domicile » (1 par client, regroupement par nom comme la prépa)
     function kbDomRows(data, opts) {
@@ -10750,8 +10755,7 @@
       const [prodFilter, setProdFilter] = React.useState('');
       const [prodQ, setProdQ] = React.useState('');
       const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert
-      const [reserved, setReserved] = React.useState({}); // V9.73 — casiers ancien site par client (site||client → ['1','2'])
-      const [reservedAll, setReservedAll] = React.useState({}); // V9.73 — frais + sec (blocage unicité)
+      const [reserved, setReserved] = React.useState({}); // V9.74 — casiers JSON par client (site||client → ['1','2'])
       const [doneOpen, setDoneOpen] = React.useState({}); // V9.73 — section « Dispatch fait » dépliée
       const [recent, setRecent] = React.useState({});    // V9.73 — déposés à l'instant (restent visibles ~1 s)
       const [casPick, setCasPick] = React.useState(null); // V9.73 — choix du n° de nouveau casier { site, client }
@@ -10783,17 +10787,14 @@
         const unsub = storage.subscribe(`day_${day}_orders`, (arr) => {
           const data = (arr || []).find(d => d.id === 'data') || (arr || [])[0];
           const orders = (data && data.orders) || [];
-          const rws = [], resv = {}, resvAll = {};
+          const rws = [], resv = {};
           orders.forEach(o => {
             const site = (o.site || '').toUpperCase();
             const client = o.name || '(client)';
             const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || '?';
-            // V9.73 — tous les casiers attribués par l'ancien site (frais + sec), ex. Henry = 1 et 2
-            //   proposés au client = bacs frais (sinon sec) ; bloqués pour les autres = frais + sec
-            const rk = site + '||' + client; if (!resv[rk]) resv[rk] = []; if (!resvAll[rk]) resvAll[rk] = [];
-            const add = (arr, list) => (list || []).forEach(n => { const v = String(n).trim(); if (v && !arr.includes(v)) arr.push(v); });
-            add(resv[rk], (o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : o.casiersSec);
-            add(resvAll[rk], [...(o.casiersFrais || []), ...(o.casiersSec || [])]);
+            // V9.74 — casiers du client dans le JSON (frais, sinon sec), ex. Henry = 1 et 2
+            const rk = site + '||' + client; if (!resv[rk]) resv[rk] = [];
+            ((o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : (o.casiersSec || [])).forEach(n => { const v = String(n).trim(); if (v && !resv[rk].includes(v)) resv[rk].push(v); });
             (o.items || []).forEach(it => rws.push({
               site, client, casier: String(casier),
               id: it.id || '', product: it.produit || '(produit)', producer: it.producteur || '',
@@ -10802,7 +10803,7 @@
             }));
           });
           Object.values(resv).forEach(a => a.sort(casCmp));
-          setRows(rws); setReserved(resv); setReservedAll(resvAll);
+          setRows(rws); setReserved(resv);
         });
         return unsub;
       }, [day]);
@@ -10849,9 +10850,11 @@
       // ---- dérivés ----
       const sites = React.useMemo(() => [...new Set(rows.map(r => r.site))].sort(), [rows]);
       React.useEffect(() => { if (!curSite && sites.length) setCurSite(sites[0]); }, [sites]);
-      const seedCounter = React.useMemo(() => { const m={}; rows.forEach(r => { const n=parseInt(r.casier,10); if(!isNaN(n)) m[r.site]=Math.max(m[r.site]||0,n); }); Object.entries(reservedAll).forEach(([k,a]) => { const s=k.split('||')[0]; a.forEach(v => { const n=parseInt(v,10); if(!isNaN(n)) m[s]=Math.max(m[s]||0,n); }); }); return m; }, [rows, reservedAll]);
-      const getCasiers = (s, c) => prep.casiers[CK(s,c)] || [ (rows.find(r => r.site===s && r.client===c) || {}).casier || '?' ];
-      const clientCasier = (s, c) => { const a=getCasiers(s,c); return a[a.length-1]; };
+      const seedCounter = React.useMemo(() => { const m={}; rows.forEach(r => { const n=parseInt(r.casier,10); if(!isNaN(n)) m[r.site]=Math.max(m[r.site]||0,n); }); Object.entries(reserved).forEach(([k,a]) => { const s=k.split('||')[0]; a.forEach(v => { const n=parseInt(v,10); if(!isNaN(n)) m[s]=Math.max(m[s]||0,n); }); }); return m; }, [rows, reserved]);
+      const getCasiers = (s, c) => prep.casiers[CK(s,c)] || ((reserved[CK(s,c)] || []).length ? reserved[CK(s,c)] : [ (rows.find(r => r.site===s && r.client===c) || {}).casier || '?' ]);
+      // V9.74 — affichage : tous les casiers du client (« 1·2 ») ; tri sur le 1er
+      const clientCasier = (s, c) => getCasiers(s,c).join('·');
+      const casFirst = (s, c) => getCasiers(s,c)[0];
       const basket = (s, c) => rows.filter(r => r.site===s && r.client===c).reduce((a,r)=>a+r.qty,0);
       const weighable = (t) => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
       const st = (r) => prep.status[K(r)] || 'todo';
@@ -10940,14 +10943,13 @@
         wND(PK(site,product), { placed, alloc, shortage });
         showToast(`ND : ${placed}/${total} attribués, ${shortage.length} en rupture`);
       };
-      // V9.73 — n° de casier : unique par lieu. Occupés = casiers en cours (appli) + casiers ancien site (frais+sec) de chaque client.
+      // V9.74 — n° de casier : unique par lieu. Occupés = casiers en cours de chaque client (JSON ou modifiés). Un casier supprimé redevient libre.
       const casOwners = (site) => {
         const own = {};
         const put = (n, c) => { const v = String(n).trim(); if (v && v !== '?' && !own[v]) own[v] = c; };
         const clients = new Set(rows.filter(r => r.site === site).map(r => r.client));
         Object.keys(prep.casiers || {}).forEach(k => { const [s, c] = k.split('||'); if (s === site) clients.add(c); });
         clients.forEach(c => getCasiers(site, c).forEach(n => put(n, c)));
-        clients.forEach(c => (reservedAll[CK(site, c)] || []).forEach(n => put(n, c)));
         return own;
       };
       const nextFree = (site) => {
@@ -10957,7 +10959,6 @@
         n++; while (own[String(n)]) n++;
         return n;
       };
-      const freeReserved = (site, client) => { const cur = getCasiers(site, client).map(String); return (reserved[CK(site, client)] || []).filter(v => !cur.includes(v)); };
       const giveCasier = (site, client, num) => {
         const v = String(num).trim();
         if (!/^\d{1,4}$/.test(v) || parseInt(v, 10) < 1) { setCasErr('Numéro invalide.'); return false; }
@@ -10974,7 +10975,9 @@
       };
       const addCasierFor = (site, client) => { setCasPick({ site, client }); setCasNum(''); setCasErr(''); };
       const addCasier = (client) => addCasierFor(curSite, client);
-      const removeCasier = (client, idx) => { if(idx<=0) return; const arr=[...getCasiers(curSite,client)]; const n=arr[idx]; if(!confirm(`Supprimer le Casier ${n} de ${client.split(' ')[0]} ?`)) return; arr.splice(idx,1); wCas(CK(curSite,client), arr); showToast(`Casier ${n} retiré`); };
+      // V9.74 — supprimer un casier inutilisé (JSON ou ajouté) : il en reste au moins un ; le n° redevient attribuable
+      const removeCasierFor = (site, client, idx) => { const arr=[...getCasiers(site,client)].map(String); if(arr.length<=1) { showToast('Il faut garder au moins un casier'); return; } const n=arr[idx]; if(!confirm(`Supprimer le Casier ${n} de ${client.split(' ')[0]} ?\nLe n° ${n} redevient libre pour un autre client.`)) return; arr.splice(idx,1); wCas(CK(site,client), arr); showToast(`Casier ${n} retiré — n° ${n} libre`); };
+      const removeCasier = (client, idx) => removeCasierFor(curSite, client, idx);
 
       // remise
       const openRemAll = (pk) => setRemAllOpen(o => o[pk] ? {...o,[pk]:undefined} : {...o,[pk]:{ reason:(prep.remiseAll[pk]&&prep.remiseAll[pk].reason)||'DLC courte', pct:(prep.remiseAll[pk]&&prep.remiseAll[pk].pct)||10 }});
@@ -11029,7 +11032,7 @@
       };
 
       // ---- rendu d'une carte produit ----
-      const casSort = (site) => (a, b) => casCmp(clientCasier(site, a.client), clientCasier(site, b.client)) || a.client.localeCompare(b.client);
+      const casSort = (site) => (a, b) => casCmp(casFirst(site, a.client), casFirst(site, b.client)) || a.client.localeCompare(b.client);
       const renderProduct = (site, product, po0) => {
         const po = [...po0].sort(casSort(site)); // V9.64 — casiers dans l'ordre croissant
         const pk = PK(site, product);
@@ -11290,7 +11293,7 @@
           </div>
         );
       } else if (mode === 'casier') {
-        let clients = [...new Set(rows.filter(r=>r.site===curSite).map(r=>r.client))].sort((a,b)=>casCmp(clientCasier(curSite,a),clientCasier(curSite,b))||a.localeCompare(b));
+        let clients = [...new Set(rows.filter(r=>r.site===curSite).map(r=>r.client))].sort((a,b)=>casCmp(casFirst(curSite,a),casFirst(curSite,b))||a.localeCompare(b));
         const q = clientFilter.trim().toLowerCase();
         if (q) clients = clients.filter(c => c.toLowerCase().includes(q) || getCasiers(curSite,c).some(n=>String(n).includes(q)));
         body = (
@@ -11354,9 +11357,9 @@
                 <div key={c} className="pdj-crow">
                   <div className="pdj-cn">{c}</div><div className="pdj-cm">{done}/{ords.length} déposés · {art} articles</div>
                   <div className="pdj-cb">
-                    {nums.map((n,i)=> i===0
+                    {nums.map((n,i)=> nums.length<=1
                       ? <span key={i} className="pdj-cas">Casier {n}</span>
-                      : <span key={i} className="pdj-cas add">Casier {n}<button className="pdj-rmcas" title="Retirer" onClick={()=>removeCasier(c,i)}>✕</button></span>)}
+                      : <span key={i} className={"pdj-cas"+(i>0?" add":"")}>Casier {n}<button className="pdj-rmcas" title="Supprimer ce casier" onClick={()=>removeCasier(c,i)}>✕</button></span>)}
                     <button className="pdj-addcas" onClick={()=>addCasier(c)}>📦 Casier plein → +1</button>
                   </div>
                 </div>
@@ -11376,24 +11379,22 @@
           {casPick && (() => {
             const { site, client } = casPick;
             const cur = getCasiers(site, client);
-            const resv = freeReserved(site, client);
-            const auto = resv.length ? resv[0] : String(nextFree(site));
+            const auto = String(nextFree(site));
             return (
               <KbSheet title={`📦 Nouveau casier · ${client} · ${site}`} onClose={()=>{ setCasPick(null); setCasErr(''); }}>
                 <div className="pdj-cpick">
-                  <div className="pdj-cpcur">Casier(s) actuel(s) : <b>{cur.join(' · ')}</b></div>
-                  {resv.map(v => (
-                    <button key={v} className="pdj-cpbtn resv" onClick={()=>giveCasier(site, client, v)}>📌 Casier {v}<small>prévu par l'ancien site pour ce client</small></button>
-                  ))}
-                  {!resv.length && <button className="pdj-cpbtn" onClick={()=>giveCasier(site, client, auto)}>⚡ Automatique → Casier {auto}<small>prochain numéro libre à {site}</small></button>}
-                  {resv.length > 0 && <button className="pdj-cpbtn alt" onClick={()=>giveCasier(site, client, String(nextFree(site)))}>⚡ Nouveau n° libre → Casier {nextFree(site)}</button>}
+                  <div className="pdj-cpcur">Casier(s) actuel(s) :</div>
+                  <div className="pdj-cb">{cur.map((n,i)=>(
+                    <span key={n} className="pdj-cas">Casier {n}{cur.length>1 && <button className="pdj-rmcas" title="Supprimer ce casier" onClick={()=>removeCasierFor(site, client, i)}>✕</button>}</span>
+                  ))}</div>
+                  <button className="pdj-cpbtn" onClick={()=>giveCasier(site, client, auto)}>⚡ Automatique → Casier {auto}<small>prochain numéro libre à {site}</small></button>
                   <div className="pdj-cplbl">✍️ Ou choisir le numéro :</div>
                   <div className="pdj-row">
                     <input className="pdj-num" style={{flex:1,width:'auto'}} type="number" inputMode="numeric" min="1" placeholder="N°" value={casNum} onChange={e=>{ setCasNum(e.target.value); setCasErr(''); }} onKeyDown={e=>{ if(e.key==='Enter') giveCasier(site, client, casNum); }} />
                     <button className="pdj-go" style={{background:'var(--accd)'}} disabled={!casNum} onClick={()=>giveCasier(site, client, casNum)}>Valider</button>
                   </div>
                   {casErr && <div className="pdj-cperr">⛔ {casErr}</div>}
-                  <div className="pdj-hint" style={{marginTop:8}}>Un numéro = un seul client par lieu (casiers de l'ancien site compris).</div>
+                  <div className="pdj-hint" style={{marginTop:8}}>Un numéro = un seul client par lieu. Casier pas utilisé ? ✕ pour le supprimer : son n° redevient libre.</div>
                 </div>
               </KbSheet>
             );
