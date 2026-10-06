@@ -627,7 +627,19 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.66';
+    const APP_VERSION = 'V9.69b';
+    // V9.69 — MU : (1) commandes captées par un ID SITE KBG posé sur une ligne NON ACTIVE du Sheet (ex. Pomme
+    //   Akane : ID sur « Pomme Akane Bio » inactif, ligne active « Pomme Akane 750g Bio » sans ID) → reportées
+    //   sur la ligne active + alerte ; (2) chargement : affichage immédiat du dernier chargement (cache local),
+    //   mise à jour en arrière-plan avec compteur de secondes, alerte « lent » à 15 s, délai max 60 s + Relancer.
+    // V9.68 — MU EXACTE dès le chargement du JSON du matin (ou de toute commande dans l'appli pour la
+    //   distribution visée), sans attendre 10h ni le PDF Totaux ; recalcul à chaque nouveau chargement
+    //   (ex. PrestaShop après 10h) ; un PDF chargé à la main ne fait foi que s'il est plus récent.
+    // V9.67 — Prépa à plusieurs en live : présence (qui est sur quel produit, 🟢 en prépa aussi), nom du
+    //   collègue sur un casier déposé, confirmation avant de défaire le dépôt d'un collègue.
+    // V9.67 — Prépa : TOUJOURS les commandes du lendemain (plus jamais « aujourd'hui », pastilles = jours à
+    //   venir seulement) ; bouton ⛶ Plein écran ; mise en page compacte petits écrans (Zebra MC2200, 4" 800×480) ;
+    //   filtre « 🧀 Tous les fromages » (catégorie/famille du catalogue, repli sur le nom) dans le filtre producteurs.
     // V9.66 — Prépa ND : les produits de type ND (catalogue, cat 'nd') partent AUTOMATIQUEMENT en cagette ND
     //   (plus affichés « casier ») ; nouvel onglet « 🔴 Cagettes ND » (une cagette par boutique, ✅ En cagette,
     //   quantité partielle → rupture des plus petits paniers) ; bouton « ✅ Les N sont dans la cagette » sur la
@@ -2205,7 +2217,7 @@
       const t = todayKey();
       const days = []; for (let i = 0; i <= (maxDays || 7); i++) days.push(addDays(t, i));
       const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
-      days.forEach((d, i) => { const n = (docs[i] && docs[i].orders && docs[i].orders.length) || 0; if (n || i <= 1) out.push({ day: d, count: n, today: i === 0 }); });
+      days.forEach((d, i) => { if (i === 0) return; const n = (docs[i] && docs[i].orders && docs[i].orders.length) || 0; if (n || i === 1) out.push({ day: d, count: n, today: false }); }); // V9.67 — jamais aujourd'hui
       return out;
     }
     async function kbFindPrepDay() {
@@ -8805,12 +8817,22 @@
     //   { <nom normalisé du fichier> : <clé produit Sheet FL> | '__ignore__' (pas un produit MU) }
     //   Stockées dans l'appli UNIQUEMENT — le Sheet FL n'est jamais modifié.
     function muExactFromLines(lines, flIdx, alias){
-      const byId = {}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.id) byId[v.id]=k; });
+      // V9.69 — un ID SITE KBG porté par une ligne NON ACTIVE du Sheet (ex. ancien « Pomme Akane Bio »)
+      // ne doit pas capter les commandes : on les redirige vers la ligne ACTIVE équivalente (nom).
+      const act = {}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v && v.actif!==false) act[k]=v; });
+      const byId = {}, byIdOff = {};
+      Object.entries(flIdx||{}).forEach(([k,v])=>{ if(!v.id) return; if(v.actif!==false) byId[v.id]=k; else if(!byIdOff[v.id]) byIdOff[v.id]=k; });
+      const redirected = {};
       const exact = {}; let matched = 0, unmatched = 0, ignored = 0; const unmatchedNames = {}; const fuzzy = {}; const aliased = {};
       (lines||[]).forEach(l=>{
         const q = Number(l.qty)||0; if(q<=0) return;
         let k = (l.id && byId[String(l.id).trim()]) || null;
         const nm = String(l.name||'').replace(/^\[TEST\]\s*/,'');
+        if(!k && l.id && byIdOff[String(l.id).trim()]){
+          const off = byIdOff[String(l.id).trim()];
+          const k2 = (act[muKey(nm)] ? muKey(nm) : null) || muFuzzyKey(nm, act) || muFuzzyKey((flIdx[off]||{}).name||off, act);
+          if(k2){ k = k2; redirected[k2] = (flIdx[off]||{}).name || off; } else k = off;
+        }
         const al = (!k && alias && nm) ? alias[_flNorm(nm)] : null;
         if(al === '__ignore__'){ ignored++; return; }
         if(al && flIdx[al]){ k = al; aliased[k] = nm; }
@@ -8826,7 +8848,7 @@
       const likely = Object.keys(unmatchedNames).filter(n=>{ const A=_flSig(n); if(!A.length) return false;
         if(A.length<=2 && heads.has(A[0])) return true;                                   // ex. « Carotte Rainbow Bio »
         return flSigs.some(S=>S.filter(t=>A.includes(t)).length>=2); }).map(n=>({ name:n, qty:unmatchedNames[n] }));
-      return { exact, matched, unmatched, unmatchedNames, unmatchedMeta: meta, fuzzy, likely, ignored, aliased };
+      return { exact, matched, unmatched, unmatchedNames, unmatchedMeta: meta, fuzzy, likely, ignored, aliased, redirected };
     }
     // V9.59e — PDF « Totaux » de l'ancien site (totals-AAAA-MM-JJ.pdf) : tableau produit × lieu.
     // pages = [[{text, x, top, w}]] (mots PDF.js). Colonnes = codes lieux de l'en-tête « Totaux » ;
@@ -8985,14 +9007,19 @@
       },[nextDay]);
       React.useEffect(()=>{
         if(!ready || !nextOrders || !Object.keys(flIdx).length) return;
-        if(snapToday && snapToday.exactSource==='manuel') return;            // le chargement manuel fait foi
-        if(!after10) return; // avant la clôture des commandes (10h)
+        // V9.68 — dès que des commandes sont chargées dans l'appli pour la distribution visée (JSON ancien site
+        // du matin, PrestaShop…), la MU devient EXACTE, sans attendre 10h ni le PDF. Le chargement manuel (PDF)
+        // ne fait foi que s'il est plus récent que le dernier chargement de commandes.
+        const loadedAt = Math.max(new Date(nextOrders.uploadedAt||0).getTime()||0, new Date(nextOrders.psLoadedAt||0).getTime()||0);
+        if(snapToday && snapToday.exactSource==='manuel' && (snapToday.exactAt||0) >= loadedAt) return;
+        if(!(nextOrders.orders||[]).length) return;
         const res = muExactFromLines(muLinesFromOrders(nextOrders.orders), flIdx);
         if(!res.matched) return;
         const json = JSON.stringify(res.exact);
-        if(snapToday && snapToday.exactJson===json) return;
-        storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: json, exactFor: nextDay, exactSource:'auto', exactFile:'commandes de l’appli ('+(nextOrders.source||'?')+')', exactAt: Date.now(), exactBy:'auto', exactLines: res.matched, exactUnmatched: res.unmatched }).catch(()=>{});
-      },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, dateKey, nextDay, after10]);
+        if(snapToday && snapToday.exactJson===json && snapToday.exactSource==='auto' && snapToday.exactRedirected) return;
+        const nPs = (nextOrders.orders||[]).filter(o=>o && o._ps && !o._test).length, nOld = (nextOrders.orders||[]).filter(o=>o && !o._ps).length;
+        storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: json, exactFor: nextDay, exactSource:'auto', exactFile:`commandes de l’appli : ancien site ${nOld}${nPs ? ' + nouveau site '+nPs : ' · nouveau site : pas encore chargé'}`, exactAt: Date.now(), exactBy:'auto', exactLines: res.matched, exactUnmatched: res.unmatched, exactRedirected: res.redirected || {} }).catch(()=>{});
+      },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, snapToday && snapToday.exactAt, dateKey, nextDay]);
       const exact = muExactOf(snapToday);
       const rows = React.useMemo(()=>{
         const out = [];
@@ -9027,7 +9054,7 @@
       },[start, ready, rows, dateKey, snapToday]);
       const setOverride = (k, v, by) => storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { overrides:{ [k]: v }, overriddenBy:{ [k]: v==null?null:{ by:by||'—', at:Date.now() } } });
       const cmdInfo = exact
-        ? { exact:true, source: snapToday.exactSource, file: snapToday.exactFile||'', at: snapToday.exactAt, by: snapToday.exactBy, forDay: snapToday.exactFor }
+        ? { exact:true, source: snapToday.exactSource, file: snapToday.exactFile||'', at: snapToday.exactAt, by: snapToday.exactBy, forDay: snapToday.exactFor, redirected: snapToday.exactRedirected || {} }
         : { exact:false };
       // V9.63 — repartir de la colonne STOCK MU du Sheet (efface les corrections manuelles du jour)
       const resetFromSheet = async (by) => {
@@ -9054,7 +9081,7 @@
       const undo = async () => { setBusy(true); try { await reel.cancelSheet(); } finally { setBusy(false); } };
       return (
         <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
-          <div style={{fontSize:13}}>🗓️ MU pour la distribution du <b style={{textTransform:'capitalize'}}>{lbl(reel.nextDay)}</b>{reel.nextOrdersCount ? ` · ${reel.nextOrdersCount} commande(s) dans l'appli` : ' · aucune commande chargée pour ce jour'}{reel.nextOrdersCount && !reel.after10 ? ' (prises en compte à 10h)' : ''}</div>
+          <div style={{fontSize:13}}>🗓️ MU pour la distribution du <b style={{textTransform:'capitalize'}}>{lbl(reel.nextDay)}</b>{reel.nextOrdersCount ? ` · ${reel.nextOrdersCount} commande(s) dans l'appli → MU exacte` : ' · aucune commande chargée pour ce jour → MU estimée'}</div>
           <div style={{marginTop:3}}>📦 Stock PDP = <b>{srcTxt}</b></div>
           <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:6}}>
             <button className="btn-secondary" style={{fontSize:12,padding:'5px 10px'}} disabled={busy} onClick={go}>📄 Reprendre le stock du Sheet</button>
@@ -9070,11 +9097,12 @@
       if(info.exact) return (
         <div style={{background:'#e8f5e9',border:'1px solid #a5d6a7',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#1b5e20'}}>
           ✅ <b>MU exacte</b> : commandes réelles de la distribution du {info.forDay ? formatDateShort(info.forDay) : '?'} ({info.source==='auto'?'chargées automatiquement':'chargées'}{info.by && info.by!=='auto' ? ' par '+info.by : ''}{info.at ? ' à '+muTime(info.at) : ''}{info.file ? ' · '+info.file : ''}).
+          {info.redirected && Object.keys(info.redirected).length>0 && <div style={{marginTop:4,color:'#8a4b00'}}>ℹ️ Commandes rattachées par le nom à la ligne active (l'ID trouvé était sur une ligne non active) : {Object.entries(info.redirected).map(([k,off])=>`« ${off} » → ${k}`).join(' · ')}.</div>}
         </div>
       );
       return (
         <div style={{background:'#fff8e1',border:'1px solid #ffe082',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#8d6e00',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-          <span>⏳ <b>MU estimée</b> : colonne ESTIMATION MU du Sheet (commandes de 6h, +15-20 % déjà compris). À 10h, charge les commandes à préparer pour avoir la MU exacte.</span>
+          <span>⏳ <b>MU estimée</b> : colonne ESTIMATION MU du Sheet (commandes de 6h, +15-20 % déjà compris). Dès que le JSON des commandes (ancien site) est chargé, la MU passe en EXACTE toute seule.</span>
           {setTab && <button className="btn-secondary" style={{fontSize:12,padding:'5px 10px'}} onClick={()=>setTab('muload')}>📥 Charger les commandes</button>}
         </div>
       );
@@ -9095,10 +9123,32 @@
       );
     }
 
+    // V9.69 — cache local de la liste MU et du Sheet FL : affichage immédiat, mise à jour en arrière-plan
+    function kbMuCacheGet(k){ try{ const o = JSON.parse(localStorage.getItem('kb_mu_cache_'+k)||'null'); return o && Array.isArray(o.v) ? o.v : null; }catch(e){ return null; } }
+    function kbMuCacheAt(k){ try{ const o = JSON.parse(localStorage.getItem('kb_mu_cache_'+k)||'null'); return o ? o.at : 0; }catch(e){ return 0; } }
+    function kbMuCacheSet(k, v){ try{ localStorage.setItem('kb_mu_cache_'+k, JSON.stringify({ at: Date.now(), v })); }catch(e){} }
+    function kbWithTimeout(p, ms, label){ return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error((label||'Chargement')+' : pas de réponse après '+Math.round(ms/1000)+' s')), ms))]); }
+    function MuLoadBar({ busy, onRetry }){
+      const on = busy && (busy.list || busy.fl);
+      const [, tick] = React.useState(0);
+      React.useEffect(()=>{ if(!on) return; const t=setInterval(()=>tick(x=>x+1), 1000); return ()=>clearInterval(t); },[on]);
+      if(!on) return null;
+      const sec = Math.max(0, Math.round((Date.now() - (busy.t0||Date.now()))/1000));
+      const slow = sec >= 15;
+      return (
+        <div style={{background:slow?'#fff3e0':'#eef4fb',border:'1px solid '+(slow?'#ffcc80':'#c9d9ef'),borderRadius:10,padding:'8px 12px',fontSize:13,color:slow?'#8a4b00':'#2c4a8c',display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+          <span className="kb-spin" style={{display:'inline-block',width:16,height:16,border:'3px solid currentColor',borderRightColor:'transparent',borderRadius:'50%',animation:'kbspin .8s linear infinite'}} />
+          <style>{'@keyframes kbspin{to{transform:rotate(360deg)}}'}</style>
+          <span style={{flex:1}}>Mise à jour depuis le Sheet… <b>{sec} s</b> · {busy.list?'liste MU ⏳':'liste MU ✓'} · {busy.fl?'Sheet FL ⏳':'Sheet FL ✓'}{slow ? ' — Google répond lentement (normal jusqu\'à ~30 s le matin). Les chiffres affichés sont ceux du dernier chargement.' : ''}</span>
+          {slow && onRetry && <button className="btn-secondary" style={{fontSize:12,padding:'4px 10px'}} onClick={onRetry}>↻ Relancer</button>}
+        </div>
+      );
+    }
     function MuDuJourPage({ session, setTab }) {
       const operator = session.name;
       const dateKey = todayKey();
-      const [items,setItems]=React.useState(null);
+      const [items,setItems]=React.useState(()=>kbMuCacheGet('list'));
+      const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [error,setError]=React.useState('');
       const [search,setSearch]=React.useState('');
       const [entries,setEntries]=React.useState({});
@@ -9106,30 +9156,32 @@
       const [showRecap,setShowRecap]=React.useState(false);
       const [mailing,setMailing]=React.useState(false);
       // Autres produits commandés du jour (pièce / barquette / botte…), non ensachés
-      const [flRows,setFlRows]=React.useState(null);
+      const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
       const [flErr,setFlErr]=React.useState('');
       const [showAprep,setShowAprep]=React.useState(true);
       const loadFl = React.useCallback(async ()=>{
-        setFlErr('');
+        setFlErr(''); setBusy(b=>({ ...b, fl:true, t0: b.list ? b.t0 : Date.now() }));
         try{
-          const data = await flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }); // V9.59 : vrai nom d'onglet (MU_TAB n'existe plus dans le classeur)
+          const data = await kbWithTimeout(flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }), 60000, 'Sheet FL'); // V9.59 : vrai nom d'onglet
           if(!data || data.ok===false) throw new Error((data&&data.error)||'lecture impossible');
-          setFlRows(data.rows||[]);
-        }catch(e){ setFlRows([]); setFlErr('Produits commandés indisponibles : '+e.message); }
+          setFlRows(data.rows||[]); kbMuCacheSet('fl', data.rows||[]);
+        }catch(e){ setFlRows(r=> r || []); setFlErr('Sheet FL non mis à jour : '+e.message+(kbMuCacheGet('fl')?' (chiffres du dernier chargement)':'')); }
+        finally{ setBusy(b=>({ ...b, fl:false })); }
       },[]);
       React.useEffect(()=>{ loadFl(); },[loadFl]);
 
       const loadList = React.useCallback(async ()=>{
-        setError(''); setItems(null);
+        setError(''); setBusy(b=>({ ...b, list:true, t0: b.fl ? b.t0 : Date.now() }));
         try{
           // V9.55 — via kbgProxy (GET côté serveur, secret ajouté par le serveur)
-          const data = await flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET');
+          const data = await kbWithTimeout(flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'), 60000, 'Liste MU');
           if(!data) throw new Error('réponse illisible');
           if(data.success===false) throw new Error(data.error||'Lecture de la feuille impossible');
           const list = data.items||[];
-          setItems(list);
+          setItems(list); kbMuCacheSet('list', list);
           if(list.length===0) setError('Aucun FL actif de type MU trouvé dans la feuille.'+(data.headers?(' Colonnes détectées : '+data.headers.join(' | ')):''));
-        }catch(e){ setItems([]); setError('Impossible de charger la liste : '+e.message); }
+        }catch(e){ setItems(it=> it || []); setError('Liste MU non mise à jour : '+e.message+(kbMuCacheGet('list')?' — affichage du dernier chargement.':'')); }
+        finally{ setBusy(b=>({ ...b, list:false })); }
       },[]);
       React.useEffect(()=>{ loadList(); },[loadList]);
       React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; arr.forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
@@ -9270,6 +9322,7 @@
             <div><div style={{fontSize:11,color:'var(--ink-mute)'}}>Préparateur</div><div style={{fontSize:20,fontWeight:900,color:'#ef6c00'}}>{operator}</div></div>
             <div style={{textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>Tes sachets : <b style={{color:'#ef6c00'}}>{totals.mine}</b><br/>Total du jour : <b>{totals.all}</b></div>
           </div>
+          <MuLoadBar busy={busy} onRetry={()=>{loadList();loadFl();}} />
           <MuDayStockBar reel={reel} operator={operator} onReload={loadFl} />
           <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
           {flErr && <div style={{background:'#fff3e0',border:'1px solid #ffcc80',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#bf6000'}}>⚠️ {flErr} — stock PDP et commandes non fiables.</div>}
@@ -9305,7 +9358,8 @@
             </div>
           )}
 
-          {items===null && <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste MU…</p></div>}
+          {items===null && !busy.list && <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement de la liste MU…</p></div>}
+          {items===null && busy.list && <div className="card"><p style={{fontSize:13,color:'var(--ink-mute)',margin:0}}>Premier chargement de la liste MU (Google Sheet) — les fois suivantes l'affichage sera immédiat.</p></div>}
           {error && <div className="card" style={{background:'#fff3e0',border:'1px solid #ffcc80'}}><p style={{fontSize:13,color:'#bf6000',margin:0}}>{error}</p></div>}
 
           {items!==null && filtered.length>0 && (
@@ -9411,8 +9465,9 @@
     function MuReelPage({ session, setTab }) {
       const operator = (session && session.name) || '—';
       const dateKey = todayKey();
-      const [items,setItems]=React.useState(null);
-      const [flRows,setFlRows]=React.useState(null);
+      const [items,setItems]=React.useState(()=>kbMuCacheGet('list'));
+      const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
+      const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [err,setErr]=React.useState('');
       const [entries,setEntries]=React.useState({});
       const [search,setSearch]=React.useState('');
@@ -9420,17 +9475,18 @@
       const [editKey,setEditKey]=React.useState(null);
       const [editVal,setEditVal]=React.useState('');
       const load = React.useCallback(async ()=>{
-        setErr(''); setItems(null); setFlRows(null);
+        setErr(''); setBusy({ list:true, fl:true, t0:Date.now() });
         try{
           const [mu, fl] = await Promise.all([
-            flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'),
-            flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }).catch(e=>({ ok:false, error:e.message })),
+            kbWithTimeout(flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'), 60000, 'Liste MU').finally(()=>setBusy(b=>({...b,list:false}))),
+            kbWithTimeout(flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }), 60000, 'Sheet FL').catch(e=>({ ok:false, error:e.message })).finally(()=>setBusy(b=>({...b,fl:false}))),
           ]);
           if(!mu || mu.success===false) throw new Error((mu&&mu.error)||'liste MU illisible');
-          setItems(mu.items||[]);
-          if(!fl || fl.ok===false){ setFlRows([]); setErr('Sheet FL indisponible ('+((fl&&fl.error)||'?')+') — commandes = estimation MU.'); }
-          else setFlRows(fl.rows||[]);
-        }catch(e){ setItems([]); setFlRows([]); setErr('Chargement impossible : '+e.message); }
+          setItems(mu.items||[]); kbMuCacheSet('list', mu.items||[]);
+          if(!fl || fl.ok===false){ setFlRows(r=>r||[]); setErr('Sheet FL non mis à jour ('+((fl&&fl.error)||'?')+')'+(kbMuCacheGet('fl')?' — chiffres du dernier chargement.':' — commandes = estimation MU.')); }
+          else { setFlRows(fl.rows||[]); kbMuCacheSet('fl', fl.rows||[]); }
+        }catch(e){ setItems(it=>it||[]); setFlRows(r=>r||[]); setErr('Chargement impossible : '+e.message); }
+        finally{ setBusy(b=>({ ...b, list:false, fl:false })); }
       },[]);
       React.useEffect(()=>{ load(); },[load]);
       React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; (arr||[]).forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
@@ -9472,6 +9528,7 @@
               </button>
             )}
           </div>
+          <MuLoadBar busy={busy} onRetry={load} />
           <MuDayStockBar reel={reel} operator={operator} onReload={load} />
           <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
             <div style={{fontWeight:700,marginBottom:4}}>{srcLabel}</div>
@@ -10626,6 +10683,8 @@
       );
     }
 
+    // V9.67 — noms de fromages (repli quand la catégorie du catalogue manque, ex. nouveau site)
+    const KB_CHEESE_RX = /\b(fromage|comte|tomme|brie|camembert|chevre|reblochon|roquefort|bleu d|bleu de|emmental|raclette|munster|morbier|cantal|saint[- ]nectaire|st[- ]nectaire|ossau|feta|mozzarella|parmesan|parmigiano|beaufort|abondance|mimolette|gouda|coulommiers|chaource|epoisses|maroilles|pont[- ]l.eveque|langres|salers|laguiole|fourme|crottin|pelardon|picodon|rocamadour|valencay|selles sur cher|sainte[- ]maure|bethmale|tomette|faisselle|fromage blanc|cancoillotte|mont d.or|vacherin|gruyere|ricotta|burrata|halloumi|manchego|pecorino|cheddar)\b/;
     function PrepaDuJourPage({ session }) {
       const showToast = React.useContext(ToastContext);
       const day = activeDay();
@@ -10647,6 +10706,16 @@
       const [prodQ, setProdQ] = React.useState('');
       const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert
       const [prodSite, setProdSite] = React.useState(''); // V9.65 — '' = toutes les boutiques
+      // V9.67 — catalogue (catégorie / famille) pour le filtre « 🧀 Tous les fromages »
+      const [catalog, setCatalog] = React.useState(null);
+      React.useEffect(() => { let stop = false; readCache('products').then(d => { if (!stop) setCatalog(d || {}); }).catch(() => { if (!stop) setCatalog({}); }); return () => { stop = true; }; }, []);
+      const catByName = React.useMemo(() => { const m = {}; Object.values(catalog || {}).forEach(p => { if (p && p.name) m[muStrip(String(p.name).toLowerCase()).replace(/[^a-z0-9]+/g,' ').trim()] = p; }); return m; }, [catalog]);
+      const isCheese = React.useCallback((r) => {
+        const p = (catalog && r.id && catalog[r.id]) || catByName[muStrip(String(r.product).replace(/^\[TEST\]\s*/,'').toLowerCase()).replace(/[^a-z0-9]+/g,' ').trim()];
+        const txt = muStrip(((p && (p.category + ' ' + p.family)) || '').toLowerCase());
+        if (/fromage|cremerie/.test(txt)) return true;
+        return KB_CHEESE_RX.test(muStrip(String(r.product).toLowerCase()));
+      }, [catalog, catByName]);
       React.useEffect(() => { try { window.scrollTo(0, 0); } catch (e) {} }, [openProd]);
 
       // ---- helpers (scopés) ----
@@ -10669,7 +10738,7 @@
             const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || '?';
             (o.items || []).forEach(it => rws.push({
               site, client, casier: String(casier),
-              product: it.produit || '(produit)', producer: it.producteur || '',
+              id: it.id || '', product: it.produit || '(produit)', producer: it.producteur || '',
               type: it.type || it.format || '', qty: it.qty || 1, price: it.consumer_price || 0,
               cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' // V9.66 — 'nd' = cagette ND (remis à la main en distrib)
             }));
@@ -10683,14 +10752,15 @@
       React.useEffect(() => {
         if (!day) return;
         const unsub = storage.subscribe(`day_${day}_prep`, (arr) => {
-          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}, nx={}; let counters={}, closed=false, closedBy='';
+          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}, nx={}, sb={}, pr={}; let counters={}, closed=false, closedBy='';
           (arr || []).forEach(d => {
             const id = d.id;
             if (id === 'counters') { Object.keys(d).forEach(k => { if (k !== 'id' && k !== '_ts') counters[k] = d[k]; }); return; }
             if (id === 'meta') { closed = !!d.closed; closedBy = d.closedBy || ''; return; }
             const bar = id.indexOf('|'); if (bar < 0) return;
             const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
-            if (pfx === 'st') st[key] = d.v;
+            if (pfx === 'st') { st[key] = d.v; sb[key] = d.by || ''; }
+            else if (pfx === 'pr') { if (d.at && Date.now() - d.at < 180000) pr[key] = d; } // V9.67 — présence live
             else if (pfx === 'pd') pd[key] = d.v;
             else if (pfx === 'rc') rc[key] = { pct: d.pct, reason: d.reason };
             else if (pfx === 'ra') ra[key] = { pct: d.pct, reason: d.reason };
@@ -10699,7 +10769,7 @@
             else if (pfx === 'cs') cs[key] = d.nums || [];
             else if (pfx === 'nx') nx[key] = true; // V9.66 — produit ND repassé en casier à la main
           });
-          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy, ndOff:nx });
+          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy, ndOff:nx, statusBy:sb, presence:pr });
         });
         return unsub;
       }, [day]);
@@ -10733,7 +10803,23 @@
       const globalProg = React.useMemo(() => { let d=0,t=0; sites.forEach(s=>{const p=siteProgress(s);d+=p.done;t+=p.total;}); return { d, t, pct: t?Math.round(d/t*100):0, allDone: t>0 && d===t }; }, [rows, prep, sites]);
 
       // ---- actions ----
-      const toggleDone = (r) => wStatus(K(r), st(r)==='done' ? null : 'done');
+      const toggleDone = (r) => {
+        const k = K(r), cur = st(r), by = (prep.statusBy || {})[k];
+        // V9.67 — plusieurs préparateurs en même temps : ne pas défaire sans le vouloir le travail d'un collègue
+        if (cur === 'done' && by && by !== user && !window.confirm(`Déjà déposé par ${by}.\nAnnuler ce dépôt ?`)) return;
+        wStatus(k, cur==='done' ? null : 'done');
+      };
+      // V9.67 — présence : qui est sur quel produit (rafraîchie toutes les 60 s, expire après 3 min)
+      const presKey = 'pr|' + encId(user);
+      React.useEffect(() => {
+        if (!day || prep.closed) return;
+        const write = () => storage.setDoc(`day_${day}_prep`, presKey, { product: openProd || '', mode, at: Date.now() }, { replace:true }).catch(()=>{});
+        write();
+        const t = setInterval(write, 60000);
+        return () => clearInterval(t);
+      }, [day, openProd, mode, prep.closed]);
+      const othersOn = (product) => Object.entries(prep.presence || {}).filter(([u, d]) => u !== user && d.product === product).map(([u]) => u.split(' ')[0]);
+      const activeOthers = Object.keys(prep.presence || {}).filter(u => u !== user);
       const toggleRuptCli = (r) => wStatus(K(r), st(r)==='rupture' ? null : 'rupture');
       const ruptAll = (site, product) => { const po=rows.filter(r=>r.site===site&&r.product===product); const all=po.every(r=>st(r)==='rupture'); po.forEach(r=>wStatus(K(r), all?null:'rupture')); };
       const setPoids1 = (r) => { const cur=prep.poids[K(r)]||''; const v=prompt('Poids réel constaté ? (ex : 320g)', cur); if(v!==null) wPoids(K(r), v.trim()||null); };
@@ -10866,6 +10952,7 @@
                           {rc && <span className="pdj-tag rem">🏷️-{rc.pct}%</span>}
                           {pv && <span className="pdj-tag w">⚖️{pv}</span>}
                           <span className="pdj-cqty">×{r.qty}{x==='done'?' ✓':x==='rupture'?' 🚫':''}</span>
+                          {x!=='todo' && (prep.statusBy||{})[k] && (prep.statusBy||{})[k]!==user && <span className="pdj-by">{String((prep.statusBy||{})[k]).split(' ')[0]}</span>}
                         </div>
                         <button className="pdj-xr rup" title="Rupture ce client" onClick={()=>toggleRuptCli(r)}>🚫</button>
                         <button className="pdj-xr" title="Poids" onClick={()=>setPoids1(r)}>⚖️</button>
@@ -10945,7 +11032,8 @@
         const rsAll = rows.filter(r => !prodSite || r.site===prodSite);
         const producers = [...new Set(rsAll.map(r=>r.producer||'—'))].sort((a,b)=>a.localeCompare(b));
         const pq = muStrip(prodQ.trim().toLowerCase());
-        const rs = rsAll.filter(r => (!prodFilter || (r.producer||'—')===prodFilter) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
+        const nCheeseProd = new Set(rsAll.filter(isCheese).map(r=>r.producer||'—')).size;
+        const rs = rsAll.filter(r => (!prodFilter || (prodFilter==='__fromage' ? isCheese(r) : (r.producer||'—')===prodFilter)) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
         const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.filter(r=>st(r)==='done').reduce((a,r)=>a+r.qty,0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
@@ -10959,6 +11047,7 @@
                 <div style={{minWidth:0,flex:1}}>
                   <div className="pdj-dname">{openProd}</div>
                   <div className="pdj-dprod">{ps.po[0].producer}{ps.po[0].type ? ' · '+ps.po[0].type : ''}</div>
+                  {othersOn(openProd).length>0 && <div className="pdj-pres">👥 Aussi sur ce produit : {othersOn(openProd).join(', ')}</div>}
                 </div>
                 <div className={"pdj-dcount"+(ps.fin?" ok":"")}>{ps.dn}<span>/{ps.tot}</span></div>
               </div>
@@ -10981,6 +11070,7 @@
                 <div className="pdj-fbox">
                   <select className="pdj-fsel" value={prodFilter} onChange={e=>setProdFilter(e.target.value)}>
                     <option value="">Tous les producteurs ({producers.length})</option>
+                    {nCheeseProd>0 && <option value="__fromage">🧀 Tous les fromages ({nCheeseProd} producteur{nCheeseProd>1?'s':''})</option>}
                     {producers.map(x=><option key={x} value={x}>{x}</option>)}
                   </select>
                   {prodFilter && <button className="pdj-fx" onClick={()=>setProdFilter('')} aria-label="Tous les producteurs">✕</button>}
@@ -11015,6 +11105,7 @@
                           <span className="pdj-pp">{x.po[0].producer || '—'}</span>
                           {x.po[0].type && <span className="pdj-pt">{x.po[0].type}</span>}
                           {!prodSite && <span className="pdj-psites">{x.ss.join(' · ')}</span>}
+                          {othersOn(p).length>0 && <span className="pdj-pres">👤 {othersOn(p).join(', ')} dessus</span>}
                         </span>
                         <span className="pdj-pprog">
                           <span className="n">{x.dn} / {x.tot}</span>
@@ -11142,7 +11233,7 @@
       const nr = curSite ? rows.filter(r=>r.site===curSite && prep.status[K(r)]==='rupture').length : 0;
 
       return (
-        <div className="pdj-wrap">
+        <div className={"pdj-wrap"+(mode==='produits'&&openProd?' focus':'')}>
           <PdjStyle />
           <div className="pdj-topbar">
             <div className="pdj-modebar">
@@ -11153,7 +11244,7 @@
               <button className={searchOpen?'active':''} onClick={()=>setSearchOpen(v=>!v)}>🔍</button>
             </div>
             {searchOpen && <div className="pdj-searchbar"><input autoFocus type="search" placeholder="Rechercher un produit sur tous les sites…" value={searchQ} onChange={e=>setSearchQ(e.target.value)} /></div>}
-            {!searchOpen && mode!=='produits' && <div className="pdj-subbar">
+            {!searchOpen && mode!=='produits' && mode!=='nd' && <div className="pdj-subbar">
               {sites.map(s => { const p=siteProgress(s); const ok=p.done===p.total&&p.total>0;
                 return <button key={s} className={"pdj-sbtn"+(s===curSite?" active":"")} onClick={()=>setCurSite(s)}>📍 {siteLabel(s)}<span className={"p"+(ok?" ok":"")}>{p.done}/{p.total}{ok?' ✓':''}</span></button>; })}
             </div>}
@@ -11166,6 +11257,7 @@
             <div className="pdj-tools">
               {prep.closed && <span className="pdj-closedtag">🔒 Prépa clôturée par {prep.closedBy}</span>}
               {KB_COHABITATION && <button className="pdj-btn" onClick={()=>setAncienOpen(true)} title="Ruptures à reporter sur l'ancien site">🚫 Ruptures ancien site</button>}
+              {activeOthers.length>0 && <span className="pdj-live">🟢 En prépa aussi : {activeOthers.map(u=>u.split(' ')[0]).join(', ')}</span>}
               <span style={{flex:1}} />
               <button className={"pdj-close"+(globalProg.allDone?"":" off")} onClick={closeDay}>
                 {globalProg.allDone ? '✅ Clôturer la prépa du jour' : `🔒 Clôture (${globalProg.d}/${globalProg.t})`}
@@ -11216,6 +11308,9 @@
 .pdj-pp{font-size:18px;font-style:italic;color:#333}
 .pdj-pt{font-size:16px;font-style:italic;color:#777}
 .pdj-psites{font-size:16px;font-weight:800;color:var(--acc)}
+.pdj-pres{display:inline-block;font-size:15px;font-weight:800;color:#1f5f80;background:#e3eef4;border-radius:8px;padding:2px 8px;margin-top:3px}
+.pdj-live{font-size:15px;font-weight:700;color:var(--accd)}
+.pdj-by{font-size:13px;font-weight:800;color:#1f5f80;background:#e3eef4;border-radius:6px;padding:1px 6px;white-space:nowrap}
 .pdj-dblock{margin-top:22px}
 .pdj-pprog{flex:0 0 130px;display:flex;flex-direction:column;align-items:center;gap:6px}
 .pdj-pprog .n{font-size:22px;font-weight:800}
@@ -11299,6 +11394,25 @@
 .pdj-closedbox{max-width:480px;margin:40px auto;text-align:center;background:#fff;border:2px solid #e8e3da;border-radius:16px;padding:26px 20px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
 .pdj-closedbox h2{color:#2f5326;font-size:26px}.pdj-closedbox p{font-size:18px;color:#4a463f;margin-top:8px}
 .pdj-cnums{font-weight:800;color:#2f5326 !important;margin-top:12px !important}
+@media (max-width:400px), (max-height:640px){
+.pdj-wrap{font-size:16px}
+.pdj-topbar{position:static}
+.pdj-modebar button{min-height:44px;font-size:14px;padding:4px 2px;flex:1 1 34%;border-bottom-width:3px}
+.pdj-modebar button:last-child{flex:0 0 44px}
+.pdj-stats{display:none}
+.pdj-gprog{padding:2px 8px 2px}.pdj-gprog .t{font-size:13px}
+.pdj-tools{padding:2px 8px 6px;flex-wrap:nowrap;overflow-x:auto;gap:6px}.pdj-tools .pdj-btn{min-height:40px;font-size:13px;padding:4px 8px;white-space:nowrap}.pdj-close{min-height:40px;font-size:14px;padding:4px 10px;white-space:nowrap}
+.pdj-live{font-size:13px;white-space:nowrap}
+.pdj-wrap.focus .pdj-tools,.pdj-wrap.focus .pdj-gprog{display:none}
+.pdj-filters{gap:6px;margin-bottom:8px}.pdj-fbox{flex-basis:100%}
+.pdj-main{padding:8px 6px 50px}
+.pdj-fsel,.pdj-fin{min-height:48px;font-size:17px;padding:6px 10px}.pdj-fx{width:48px}
+.pdj-prow{min-height:78px;padding:10px;gap:8px}.pdj-pn{font-size:19px}.pdj-pp{font-size:16px}.pdj-pt{font-size:14px}
+.pdj-pprog{flex-basis:78px}.pdj-pprog .n{font-size:18px}.pdj-pfin{flex-basis:26px;font-size:24px}
+.pdj-dhead{padding:8px;gap:8px}.pdj-back{flex-basis:54px;height:54px;font-size:28px}.pdj-dname{font-size:21px}.pdj-dprod{font-size:16px}.pdj-dcount{font-size:28px}
+.pdj-chip{min-height:72px;padding:8px}.pdj-cnum{font-size:32px}.pdj-cname{font-size:18px}.pdj-cqty{font-size:24px}.pdj-csite{font-size:16px}
+.pdj-ndh{font-size:18px;padding:10px 12px}.pdj-ndl{flex-wrap:wrap}.pdj-ndn{flex-basis:100%}.pdj-ndbtn{flex:1;min-width:0}
+}
 @media (max-width:560px){.pdj-pprog{flex-basis:92px}.pdj-pprog .n{font-size:20px}.pdj-cnum{font-size:32px}.pdj-xr{width:50px;height:50px}.pdj-chip{flex-wrap:wrap}.pdj-cbody{flex-basis:100%}.pdj-modebar button{font-size:16px}}
 `}</style>;
     }
@@ -18228,6 +18342,16 @@
     // Bandeau d'alerte quand le jour affiché n'est pas aujourd'hui (ex. fichier d'une
     // autre date chargé). Permet de revenir à aujourd'hui en un tap (utile sur mobile).
     // V9.62 — Bandeau prépa : date de la distribution préparée + choix de la date (dates avec commandes)
+    // V9.67 — plein écran (terminaux Zebra MC2200 / téléphones) : masque barres du navigateur
+    function kbToggleFullscreen() {
+      try {
+        const d = document, el = d.documentElement;
+        if (d.fullscreenElement || d.webkitFullscreenElement) { (d.exitFullscreen || d.webkitExitFullscreen).call(d); return; }
+        const req = el.requestFullscreen || el.webkitRequestFullscreen;
+        if (req) { const r = req.call(el, { navigationUI: 'hide' }); if (r && r.catch) r.catch(() => {}); }
+        try { screen.orientation && screen.orientation.lock && screen.orientation.lock('portrait').catch(() => {}); } catch (e) {}
+      } catch (e) {}
+    }
     function PrepDayBanner() {
       const ad = activeDay();
       const today = todayKey();
@@ -18249,15 +18373,16 @@
       const hasFuture = (list || []).some(x => !x.today && x.count > 0);
       return (
         <div style={{margin:'8px 0',padding:'8px 12px',borderRadius:8,background:isToday?'#fff4e5':'#eaf1e6',border:'1px solid '+(isToday?'#f0b866':'#cfe0c4'),fontSize:13,color:isToday?'#8a4b00':'#2f5326'}}>
-          <div>🗓️ Prépa pour la distribution du <strong style={{textTransform:'capitalize'}}>{lbl(ad)}</strong>{cur ? ` · ${cur.count} commande${cur.count>1?'s':''}` : ''}{isToday ? ' — ⚠️ c\'est AUJOURD\'HUI' : ''}</div>
-          {isToday && list && !hasFuture && <div style={{fontSize:12,marginTop:3}}>Aucune commande chargée pour les prochains jours : l'appli basculera seule sur demain dès que les commandes seront chargées.</div>}
+          <div style={{display:'flex',justifyContent:'space-between',gap:8,alignItems:'flex-start'}}><div>🗓️ Prépa pour la distribution du <strong style={{textTransform:'capitalize'}}>{lbl(ad)}</strong>{cur ? ` · ${cur.count} commande${cur.count>1?'s':''}` : ''}{isToday ? ' — ⚠️ c\'est AUJOURD\'HUI' : ''}</div>
+            <button onClick={kbToggleFullscreen} title="Plein écran" style={{flex:'0 0 auto',minHeight:40,padding:'4px 10px',borderRadius:10,border:'1px solid #cfe0c4',background:'#fff',fontSize:14,fontWeight:700,cursor:'pointer'}}>⛶ Plein écran</button></div>
+          {!isToday && cur && !cur.count && <div style={{fontSize:12,marginTop:3}}>Aucune commande chargée pour l'instant : elles apparaîtront ici dès leur chargement (nouveau site : automatique).</div>}
           {list && list.length > 0 && (
             <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:6}}>
               {list.map(x => (
                 <button key={x.day} onClick={() => { if (x.day !== ad) setActiveDay(x.day); }}
                   style={{fontSize:12,padding:'5px 10px',borderRadius:16,cursor:'pointer',fontWeight:x.day===ad?800:500,
                     border:x.day===ad?'2px solid #2f5326':'1px solid #cfe0c4',background:x.day===ad?'#2f5326':'#fff',color:x.day===ad?'#fff':'#2f5326',textTransform:'capitalize'}}>
-                  {x.today ? 'Auj. ' : ''}{short(x.day)} · {x.count}
+                  {short(x.day)} · {x.count}
                 </button>
               ))}
             </div>
@@ -18729,7 +18854,8 @@
         let stop = false;
         const check = () => {
           if (stop || activeDay() > todayKey()) return;
-          kbFindPrepDay().then(d => { if (!stop && d && activeDay() <= todayKey()) setActiveDay(d); }).catch(() => {});
+          // V9.67 — la prépa prépare TOUJOURS les commandes du lendemain
+          if (activeDay() <= todayKey()) setActiveDay(addDays(todayKey(), 1));
         };
         check();
         const t = setInterval(check, 5 * 60000);
