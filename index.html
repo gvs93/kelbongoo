@@ -627,7 +627,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.70';
+    const APP_VERSION = 'V9.72';
+    // V9.72 — Push « 🥕 Équipe prépa (MU / prépa) » : plein écran sur l'appli prépa, validation par
+    //   initiales, accusé PAR PERSONNE (nom du code perso) → ne revient plus pour celui qui a validé ;
+    //   historique master : qui a validé, initiales, heure. Les push boutiques ne s'affichent plus en prépa.
+    //   Destinataires : toute l'équipe ou des personnes choisies (liste = préparateurs déjà connectés, nom du
+    //   code perso, 🟢 connecté < 3 min) ; présence dans app_config/prep_presence (battement 60 s).
+    // V9.71 — Prépa anti-erreur : clics ignorés 0,65 s après un changement d'écran/produit, 0,8 s au retour
+    //   sur l'appli et pendant un défilement ; quantité > 1 = un toucher par article (1/2 → 2/2 ✓, compteur
+    //   partagé pc|) ; annuler un dépôt demande toujours une confirmation.
     // V9.70 — Récap ruptures ancien site (Pilotage, prépa, mail, PDF) par PRODUIT façon ancien admin :
     //   « ⏱ Tout en rupture — cocher l'horloge » (commandé = rupture, tous lieux) vs « ✋ Partiel — cocher
     //   ces casiers » (BIC 6, TOL 12…) avec commandé / rupture.
@@ -10783,7 +10791,7 @@
       React.useEffect(() => {
         if (!day) return;
         const unsub = storage.subscribe(`day_${day}_prep`, (arr) => {
-          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}, nx={}, sb={}, pr={}; let counters={}, closed=false, closedBy='';
+          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}, nx={}, sb={}, pr={}, pc={}; let counters={}, closed=false, closedBy='';
           (arr || []).forEach(d => {
             const id = d.id;
             if (id === 'counters') { Object.keys(d).forEach(k => { if (k !== 'id' && k !== '_ts') counters[k] = d[k]; }); return; }
@@ -10791,6 +10799,7 @@
             const bar = id.indexOf('|'); if (bar < 0) return;
             const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
             if (pfx === 'st') { st[key] = d.v; sb[key] = d.by || ''; }
+            else if (pfx === 'pc') pc[key] = d.n || 0; // V9.71 — articles déjà posés (qté > 1)
             else if (pfx === 'pr') { if (d.at && Date.now() - d.at < 180000) pr[key] = d; } // V9.67 — présence live
             else if (pfx === 'pd') pd[key] = d.v;
             else if (pfx === 'rc') rc[key] = { pct: d.pct, reason: d.reason };
@@ -10800,7 +10809,7 @@
             else if (pfx === 'cs') cs[key] = d.nums || [];
             else if (pfx === 'nx') nx[key] = true; // V9.66 — produit ND repassé en casier à la main
           });
-          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy, ndOff:nx, statusBy:sb, presence:pr });
+          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy, ndOff:nx, statusBy:sb, presence:pr, count:pc });
         });
         return unsub;
       }, [day]);
@@ -10812,6 +10821,7 @@
       const wRemAll = (pk, o)  => o ? storage.setDoc(`day_${day}_prep`, 'ra|' + encId(pk), { pct:o.pct, reason:o.reason, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'ra|' + encId(pk));
       const wND     = (pk, o)  => o ? storage.setDoc(`day_${day}_prep`, 'nd|' + encId(pk), { placed:o.placed, alloc:o.alloc, shortage:o.shortage, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'nd|' + encId(pk));
       const wLM     = (pk, on) => on ? storage.setDoc(`day_${day}_prep`, 'lm|' + encId(pk), { on:true, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'lm|' + encId(pk));
+      const wCount  = (key, n) => n ? storage.setDoc(`day_${day}_prep`, 'pc|' + encId(key), { n, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'pc|' + encId(key)).catch(()=>{});
       const wNdOff  = (pk, on) => on ? storage.setDoc(`day_${day}_prep`, 'nx|' + encId(pk), { on:true, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'nx|' + encId(pk));
       const wCas    = (ck, nums) => storage.setDoc(`day_${day}_prep`, 'cs|' + encId(ck), { nums }, { replace:true });
       const wCounter = (site, n) => storage.setDoc(`day_${day}_prep`, 'counters', { [site]: n });
@@ -10836,10 +10846,38 @@
       // ---- actions ----
       const toggleDone = (r) => {
         const k = K(r), cur = st(r), by = (prep.statusBy || {})[k];
-        // V9.67 — plusieurs préparateurs en même temps : ne pas défaire sans le vouloir le travail d'un collègue
-        if (cur === 'done' && by && by !== user && !window.confirm(`Déjà déposé par ${by}.\nAnnuler ce dépôt ?`)) return;
-        wStatus(k, cur==='done' ? null : 'done');
+        // V9.71 — défaire un dépôt demande TOUJOURS une confirmation (clics accidentels)
+        if (cur === 'done') {
+          if (!window.confirm(`Annuler le dépôt ?\n${r.product} — casier ${clientCasier(r.site, r.client)}${by && by !== user ? `\n(déposé par ${by})` : ''}`)) return;
+          wStatus(k, null); wCount(k, null); return;
+        }
+        // V9.71 — quantité > 1 : un toucher PAR article (1/2 → 2/2 = déposé)
+        const q = Math.max(1, r.qty || 1);
+        const n = ((prep.count || {})[k] || 0) + 1;
+        if (n >= q) { wStatus(k, 'done'); wCount(k, null); }
+        else { if (cur === 'rupture') wStatus(k, null); wCount(k, n); }
       };
+      const posed = (r) => st(r) === 'done' ? (r.qty || 1) : ((prep.count || {})[K(r)] || 0);
+      const qtyLabel = (r, x) => {
+        const q = r.qty || 1;
+        if (x === 'done') return `×${q} ✓`;
+        if (x === 'rupture') return `×${q} 🚫`;
+        if (q > 1) return `${(prep.count || {})[K(r)] || 0}/${q}`;
+        return `×${q}`;
+      };
+      // V9.71 — anti-clic accidentel : clics ignorés juste après un changement d'écran / de produit,
+      // au retour sur l'appli et pendant un défilement (le doigt qui « traverse » sur la page suivante).
+      const guardUntil = React.useRef(Date.now() + 800);
+      const armGuard = (ms) => { guardUntil.current = Math.max(guardUntil.current, Date.now() + ms); };
+      React.useEffect(() => { armGuard(650); }, [mode, openProd, curSite, prodSite, searchOpen]);
+      React.useEffect(() => {
+        const onScroll = () => armGuard(250);
+        const onVis = () => { if (document.visibilityState === 'visible') armGuard(800); };
+        window.addEventListener('scroll', onScroll, { passive: true });
+        document.addEventListener('visibilitychange', onVis);
+        return () => { window.removeEventListener('scroll', onScroll); document.removeEventListener('visibilitychange', onVis); };
+      }, []);
+      const guardClick = (e) => { if (Date.now() < guardUntil.current) { e.stopPropagation(); e.preventDefault(); } };
       // V9.67 — présence : qui est sur quel produit (rafraîchie toutes les 60 s, expire après 3 min)
       const presKey = 'pr|' + encId(user);
       React.useEffect(() => {
@@ -10975,14 +11013,14 @@
                   const k=K(r), x=st(r), rc=prep.remiseCli[k]||prep.remiseAll[pk], pv=prep.poids[k];
                   return (
                     <div key={k}>
-                      <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":"")}>
+                      <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
                         <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                           <span className="pdj-csite">{site}</span>
                           <span className="pdj-cnum">{clientCasier(site,r.client)}</span>
                           <span className="pdj-cname">{r.client.split(' ')[0]}</span>
                           {rc && <span className="pdj-tag rem">🏷️-{rc.pct}%</span>}
                           {pv && <span className="pdj-tag w">⚖️{pv}</span>}
-                          <span className="pdj-cqty">×{r.qty}{x==='done'?' ✓':x==='rupture'?' 🚫':''}</span>
+                          <span className={"pdj-cqty"+((r.qty||1)>1&&x==='todo'?" multi":"")}>{qtyLabel(r,x)}</span>
                           {x!=='todo' && (prep.statusBy||{})[k] && (prep.statusBy||{})[k]!==user && <span className="pdj-by">{String((prep.statusBy||{})[k]).split(' ')[0]}</span>}
                         </div>
                         <button className="pdj-xr rup" title="Rupture ce client" onClick={()=>toggleRuptCli(r)}>🚫</button>
@@ -11066,7 +11104,7 @@
         const nCheeseProd = new Set(rsAll.filter(isCheese).map(r=>r.producer||'—')).size;
         const rs = rsAll.filter(r => (!prodFilter || (prodFilter==='__fromage' ? isCheese(r) : (r.producer||'—')===prodFilter)) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
-        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.filter(r=>st(r)==='done').reduce((a,r)=>a+r.qty,0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
+        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
           const i = prods.indexOf(openProd);
           const next = i>=0 && i<prods.length-1 ? prods[i+1] : null;
@@ -11082,6 +11120,7 @@
                 </div>
                 <div className={"pdj-dcount"+(ps.fin?" ok":"")}>{ps.dn}<span>/{ps.tot}</span></div>
               </div>
+              {ps.po.some(r=>(r.qty||1)>1) && <div className="pdj-multihint">👆 Quantité ×2 ou plus : toucher le casier <b>une fois par article posé</b> (1/2 → 2/2 ✓).</div>}
               {ps.ss.map(site => (
                 <div key={site} className="pdj-dblock">
                   <div className="pdj-dsite"><span>{site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span></div>
@@ -11209,13 +11248,13 @@
                       const k=K(r), x=st(r), pk=PK(r.site,r.product), rc=prep.remiseCli[k]||prep.remiseAll[pk], pv=prep.poids[k];
                       return (
                         <div key={k}>
-                          <div className={"pdj-chip"+(x==='done'?" done":x==='rupture'?" rupt":"")}>
+                          <div className={"pdj-chip"+(x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
                             <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                               <span className="pdj-cname">{r.product}</span>
                               {ndOn(pk) && <span className="pdj-tag nd">🔴 cagette ND</span>}
                               {rc && <span className="pdj-tag rem">🏷️-{rc.pct}%</span>}
                               {pv && <span className="pdj-tag w">⚖️{pv}</span>}
-                              <span className="pdj-cqty">×{r.qty}{x==='done'?' ✓':x==='rupture'?' 🚫':''}</span>
+                              <span className={"pdj-cqty"+((r.qty||1)>1&&x==='todo'?" multi":"")}>{qtyLabel(r,x)}</span>
                             </div>
                             <button className="pdj-xr rup" title="Rupture" onClick={()=>toggleRuptCli(r)}>🚫</button>
                             <button className="pdj-xr" title="Poids" onClick={()=>setPoids1(r)}>⚖️</button>
@@ -11295,7 +11334,7 @@
               </button>
             </div>
           </div>
-          <div className="pdj-main">{body}</div>
+          <div className="pdj-main" onClickCapture={guardClick}>{body}</div>
           {ancienOpen && <KbSheet title={`Ruptures ancien site · ${formatDateShort(day)}`} onClose={()=>setAncienOpen(false)}><AncienRupturesPanel day={day} session={session} /></KbSheet>}
         </div>
       );
@@ -11386,6 +11425,8 @@
 .pdj-ndbtn{min-height:60px;min-width:120px;border-radius:12px;border:2px solid var(--nd);background:#fff;color:var(--nd);font-size:18px;font-weight:800;cursor:pointer;padding:6px 12px}
 .pdj-ndbtn.go{background:var(--nd);color:#fff}.pdj-tag.rem{background:var(--rem-s);color:var(--rem)}.pdj-tag.w{background:var(--info-s);color:var(--info)}
 .pdj-chip.done{background:var(--acc-s);border-color:var(--acc)}.pdj-chip.done .pdj-cnum,.pdj-chip.done .pdj-cqty{color:var(--accd)}
+.pdj-chip.part{background:#fff4e5;border-color:#ef6c00}.pdj-cqty.multi{background:#ef6c00;color:#fff;border-radius:10px;padding:2px 10px}.pdj-chip.part .pdj-cqty.multi{background:#ef6c00}
+.pdj-multihint{margin:10px 0 0;background:#fff4e5;border:2px solid #ffb74d;border-radius:12px;padding:8px 12px;font-size:17px;color:#8a4b00}
 .pdj-chip.rupt{background:var(--warn-s);border-color:var(--warn)}.pdj-chip.rupt .pdj-cbody{text-decoration:line-through;opacity:.8}
 .pdj-xr{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:2px solid #e0dbd2;background:#fff;font-size:24px;cursor:pointer}
 .pdj-xr.rem.on{background:var(--rem);color:#fff;border-color:var(--rem)}
@@ -18639,7 +18680,16 @@
       const [title, setTitle] = React.useState('');
       const [body, setBody] = React.useState('');
       const [icon, setIcon] = React.useState('📣');
-      const [target, setTarget] = React.useState('all'); // 'all' | 'some'
+      const [target, setTarget] = React.useState('all'); // 'all' | 'some' | 'prep' (V9.72 — équipe prépa / MU)
+      // V9.72 — destinataires prépa : tous, ou des personnes choisies (connectées en vert)
+      const [prepTo, setPrepTo] = React.useState([]); // [] = toute l'équipe
+      const [prepPres, setPrepPres] = React.useState({});
+      const [, tickPres] = React.useState(0);
+      React.useEffect(() => { const t = setInterval(() => tickPres(x => x + 1), 30000); return () => clearInterval(t); }, []);
+      React.useEffect(() => { const u = storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'prep_presence'); setPrepPres((d && d.users) || {}); }); return () => { u && u(); }; }, []);
+      const prepPeople = (() => Object.entries(prepPres || {}).filter(([n, v]) => n && v && v.at).map(([n, v]) => ({ name: n, at: v.at, online: Date.now() - v.at < 180000, page: v.page || '' }))
+        .sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name)))();
+      const togglePrepTo = (n) => setPrepTo(prev => prev.includes(n) ? prev.filter(x => x !== n) : [...prev, n]);
       const [sites, setSites] = React.useState([]);
       const [busy, setBusy] = React.useState(false);
       const [channel, setChannel] = React.useState('push'); // 'push' | 'mail'
@@ -18667,6 +18717,7 @@
       const send = async () => {
         if (!body.trim()) { showToast('Écris le message.'); return; }
         if (target === 'some' && sites.length === 0) { showToast('Choisis au moins un site.'); return; }
+        if (target === 'prep' && !confirm(`Envoyer ce message à ${prepTo.length ? prepTo.join(', ') : 'toute l\'équipe prépa (MU / prépa)'} ?\nChaque personne devra le valider avec ses initiales.`)) return;
         setBusy(true);
         try {
           const id = 'push_' + Date.now();
@@ -18675,15 +18726,16 @@
             title: title.trim() || 'Information',
             body: body.trim(),
             icon,
-            target: target === 'all' ? 'all' : 'some',
-            sites: target === 'all' ? [] : sites,
+            target: target === 'all' ? 'all' : target === 'prep' ? 'prep' : 'some',
+            sites: target === 'some' ? sites : [],
+            to: target === 'prep' ? prepTo : [],
             acks: {},
             cancelled: false,
             createdBy: session.name,
             createdAt: new Date().toISOString(),
           });
-          showToast('✓ Message envoyé aux boutiques');
-          setTitle(''); setBody(''); setSites([]); setTarget('all'); setIcon('📣');
+          showToast(target === 'prep' ? '✓ Message envoyé à l\'équipe prépa' : '✓ Message envoyé aux boutiques');
+          setTitle(''); setBody(''); setSites([]); setTarget('all'); setIcon('📣'); setPrepTo([]);
         } catch(e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
       };
@@ -18701,6 +18753,7 @@
 
       const ackSummary = (m) => {
         const acks = m.acks || {};
+        if (m.target === 'prep') { const ppl = Object.keys(acks).filter(k => k.startsWith('u:')); return { seen: ppl, total: null, list: [], prep: true }; }
         const targetSites = (m.target === 'all') ? sitesList : (m.sites || []);
         const seen = Object.keys(acks);
         return { seen, total: targetSites.length, list: targetSites };
@@ -18751,7 +18804,27 @@
               <div className="filter-row">
                 <div className={`chip ${target==='all'?'selected':''}`} onClick={()=>setTarget('all')}>Toutes les boutiques</div>
                 <div className={`chip ${target==='some'?'selected':''}`} onClick={()=>setTarget('some')}>Choisir des sites</div>
+                <div className={`chip ${target==='prep'?'selected':''}`} onClick={()=>setTarget('prep')}>🥕 Équipe prépa (MU / prépa)</div>
               </div>
+              {target === 'prep' && (
+                <div style={{marginTop:8}}>
+                  {(() => { const on = prepPeople.filter(p => p.online); return (
+                    <div style={{background:'#e8f5e9',border:'1px solid #a5d6a7',borderRadius:10,padding:'8px 12px',fontSize:13,marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                      <span>🟢 <b>Actuellement connectés sur la prépa :</b> {on.length ? on.map(p => p.name).join(', ') : 'personne'}</span>
+                      {on.length > 0 && <button className="btn-secondary" style={{fontSize:12,padding:'4px 10px'}} onClick={() => setPrepTo(on.map(p => p.name))}>Cibler les connectés ({on.length})</button>}
+                    </div>); })()}
+                  <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                    <div className={`chip ${prepTo.length===0?'selected':''}`} onClick={()=>setPrepTo([])}>👥 Toute l'équipe prépa</div>
+                    {prepPeople.map(p => (
+                      <div key={p.name} className={`chip ${prepTo.includes(p.name)?'selected':''}`} onClick={()=>togglePrepTo(p.name)} title={p.online ? 'connecté' : 'vu le ' + new Date(p.at).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}>
+                        {p.online ? '🟢' : '⚪'} {p.name}
+                      </div>
+                    ))}
+                  </div>
+                  {prepPeople.length === 0 && <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>Personne ne s'est encore connecté en prépa depuis cette version : la liste se remplit toute seule (nom du code perso) dès qu'un préparateur ouvre l'appli.</div>}
+                  <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:6}}>🟢 = connecté maintenant · ⚪ = déjà venu (le message l'attendra à sa prochaine connexion). Plein écran, validation par initiales ; une fois validé il ne revient plus pour cette personne.</div>
+                </div>
+              )}
               {target === 'some' && (
                 <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:8}}>
                   {sitesList.map(s => (
@@ -18783,7 +18856,7 @@
                         <div style={{fontSize:13,color:'var(--ink-soft)',whiteSpace:'pre-wrap',marginTop:2}}>{m.body}</div>
                         <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>
                           {m.createdBy} · {m.createdAt ? formatDateShort(m.createdAt.slice(0,10)) : ''} ·
-                          {m.target === 'all' ? ' toutes' : ' ' + (m.sites||[]).join(', ')}
+                          {m.target === 'all' ? ' toutes' : m.target === 'prep' ? (' 🥕 ' + ((m.to||[]).length ? (m.to||[]).join(', ') : 'toute l\'équipe prépa')) : ' ' + (m.sites||[]).join(', ')}
                         </div>
                       </div>
                       {!m.cancelled && (
@@ -18791,7 +18864,9 @@
                       )}
                     </div>
                     <div style={{fontSize:12}}>
-                      <span style={{color:'var(--accent-dark)',fontWeight:600}}>✓ Lu par {seen.length}/{total}</span>
+                      {m.target === 'prep'
+                        ? <span style={{color:'var(--accent-dark)',fontWeight:600}}>✓ Validé par {seen.length}{(m.to||[]).length ? '/' + m.to.length : ''} personne(s){seen.length ? ' : ' + seen.map(k => { const a = (m.acks||{})[k] || {}; return `${a.name || k.slice(2)} (${a.initials || '—'} · ${a.at ? new Date(a.at).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : ''})`; }).join(', ') : ''}{(m.to||[]).length && m.to.some(n => !(m.acks||{})['u:'+n]) ? ' · ⏳ en attente : ' + m.to.filter(n => !(m.acks||{})['u:'+n]).join(', ') : ''}</span>
+                        : <span style={{color:'var(--accent-dark)',fontWeight:600}}>✓ Lu par {seen.length}/{total}</span>}
                       {list.length > 0 && (
                         <div style={{marginTop:4,display:'flex',gap:8,flexWrap:'wrap'}}>
                           {list.map(s => {
@@ -18894,6 +18969,16 @@
         document.addEventListener('visibilitychange', v);
         return () => { stop = true; clearInterval(t); document.removeEventListener('visibilitychange', v); };
       }, [prepMode]);
+      // V9.72 — présence équipe prépa (pour cibler un push) : nom du code perso, toutes les 60 s
+      React.useEffect(() => {
+        if (!session || session.role !== 'prep' || !session.name) return;
+        const beat = () => storage.setDoc('app_config', 'prep_presence', { users: { [session.name]: { at: Date.now(), page: 'prepa' } } }).catch(() => {});
+        beat();
+        const t = setInterval(beat, 60000);
+        const v = () => { if (document.visibilityState === 'visible') beat(); };
+        document.addEventListener('visibilitychange', v);
+        return () => { clearInterval(t); document.removeEventListener('visibilitychange', v); };
+      }, [session && session.name, session && session.role]);
       // V9.62 — un vrai distributeur est toujours sur AUJOURD'HUI (téléphone utilisé avant en prépa)
       React.useEffect(() => {
         if (session && session.role === 'distrib' && !session.isMaster && activeDay() !== todayKey()) setActiveDay(null);
@@ -19163,8 +19248,18 @@
       const pendingPush = React.useMemo(() => {
         if (!session || session.isMaster) return [];
         const site = currentSite;
+        // V9.72 — équipe prépa : messages « prépa » validés PAR PERSONNE (nom du code perso)
+        if (session.role === 'prep') {
+          const me = 'u:' + (session.name || '');
+          return (pushMessages || [])
+            .filter(m => !m.cancelled && m.target === 'prep')
+            .filter(m => !(m.to && m.to.length) || m.to.includes(session.name))
+            .filter(m => !(m.expiresAt && Date.now() > new Date(m.expiresAt).getTime()))
+            .filter(m => !(m.acks || {})[me])
+            .sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
+        }
         return (pushMessages || [])
-          .filter(m => !m.cancelled)
+          .filter(m => !m.cancelled && m.target !== 'prep')
           .filter(m => {
             // cible : 'all' ou liste de sites contenant le site courant
             if (m.target && m.target !== 'all') {
@@ -19181,6 +19276,11 @@
       }, [pushMessages, session, currentSite]);
 
       const ackPush = async (m, initials) => {
+        if (m.target === 'prep') { // V9.72 — accusé personnel (fusion, sans écraser ceux des collègues)
+          const key = 'u:' + (session.name || '');
+          await storage.setDoc('push_messages', m.id, { acks: { [key]: { by: initials || session.name, initials: initials || '', name: session.name, at: new Date().toISOString() } } });
+          return;
+        }
         const acks = { ...(m.acks || {}) };
         acks[currentSite] = { by: initials || session.name, initials: initials || '', name: session.name, at: new Date().toISOString() };
         await storage.setDoc('push_messages', m.id, { ...m, acks });
