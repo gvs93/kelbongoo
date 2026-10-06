@@ -627,7 +627,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.72';
+    const APP_VERSION = 'V9.73';
+    // V9.73 — Prépa : un casier déposé DISPARAÎT de la fiche produit (et de la fiche casier) pour ne pas
+    //   submerger le préparateur ; il reste visible ~1 s en vert puis passe dans « ✅ Dispatch fait (N) »
+    //   (repliable) où on peut l'annuler en cas d'erreur (confirmation). Les ruptures restent affichées.
+    //   Casiers : « ➕ / Casier plein » ouvre un choix — casier prévu par l'ancien site (bacs 2, 3…),
+    //   automatique (prochain n° libre) ou n° choisi à la main. Un n° = un seul client par lieu
+    //   (casiers ancien site frais + sec de tous les clients compris) ; refus si déjà pris.
     // V9.72 — Push « 🥕 Équipe prépa (MU / prépa) » : plein écran sur l'appli prépa, validation par
     //   initiales, accusé PAR PERSONNE (nom du code perso) → ne revient plus pour celui qui a validé ;
     //   historique master : qui a validé, initiales, heure. Les push boutiques ne s'affichent plus en prépa.
@@ -10744,6 +10750,13 @@
       const [prodFilter, setProdFilter] = React.useState('');
       const [prodQ, setProdQ] = React.useState('');
       const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert
+      const [reserved, setReserved] = React.useState({}); // V9.73 — casiers ancien site par client (site||client → ['1','2'])
+      const [reservedAll, setReservedAll] = React.useState({}); // V9.73 — frais + sec (blocage unicité)
+      const [doneOpen, setDoneOpen] = React.useState({}); // V9.73 — section « Dispatch fait » dépliée
+      const [recent, setRecent] = React.useState({});    // V9.73 — déposés à l'instant (restent visibles ~1 s)
+      const [casPick, setCasPick] = React.useState(null); // V9.73 — choix du n° de nouveau casier { site, client }
+      const [casNum, setCasNum] = React.useState('');
+      const [casErr, setCasErr] = React.useState('');
       const [prodSite, setProdSite] = React.useState(''); // V9.65 — '' = toutes les boutiques
       // V9.67 — catalogue (catégorie / famille) pour le filtre « 🧀 Tous les fromages »
       const [catalog, setCatalog] = React.useState(null);
@@ -10770,11 +10783,17 @@
         const unsub = storage.subscribe(`day_${day}_orders`, (arr) => {
           const data = (arr || []).find(d => d.id === 'data') || (arr || [])[0];
           const orders = (data && data.orders) || [];
-          const rws = [];
+          const rws = [], resv = {}, resvAll = {};
           orders.forEach(o => {
             const site = (o.site || '').toUpperCase();
             const client = o.name || '(client)';
             const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || '?';
+            // V9.73 — tous les casiers attribués par l'ancien site (frais + sec), ex. Henry = 1 et 2
+            //   proposés au client = bacs frais (sinon sec) ; bloqués pour les autres = frais + sec
+            const rk = site + '||' + client; if (!resv[rk]) resv[rk] = []; if (!resvAll[rk]) resvAll[rk] = [];
+            const add = (arr, list) => (list || []).forEach(n => { const v = String(n).trim(); if (v && !arr.includes(v)) arr.push(v); });
+            add(resv[rk], (o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : o.casiersSec);
+            add(resvAll[rk], [...(o.casiersFrais || []), ...(o.casiersSec || [])]);
             (o.items || []).forEach(it => rws.push({
               site, client, casier: String(casier),
               id: it.id || '', product: it.produit || '(produit)', producer: it.producteur || '',
@@ -10782,7 +10801,8 @@
               cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' // V9.66 — 'nd' = cagette ND (remis à la main en distrib)
             }));
           });
-          setRows(rws);
+          Object.values(resv).forEach(a => a.sort(casCmp));
+          setRows(rws); setReserved(resv); setReservedAll(resvAll);
         });
         return unsub;
       }, [day]);
@@ -10829,7 +10849,7 @@
       // ---- dérivés ----
       const sites = React.useMemo(() => [...new Set(rows.map(r => r.site))].sort(), [rows]);
       React.useEffect(() => { if (!curSite && sites.length) setCurSite(sites[0]); }, [sites]);
-      const seedCounter = React.useMemo(() => { const m={}; rows.forEach(r => { const n=parseInt(r.casier,10); if(!isNaN(n)) m[r.site]=Math.max(m[r.site]||0,n); }); return m; }, [rows]);
+      const seedCounter = React.useMemo(() => { const m={}; rows.forEach(r => { const n=parseInt(r.casier,10); if(!isNaN(n)) m[r.site]=Math.max(m[r.site]||0,n); }); Object.entries(reservedAll).forEach(([k,a]) => { const s=k.split('||')[0]; a.forEach(v => { const n=parseInt(v,10); if(!isNaN(n)) m[s]=Math.max(m[s]||0,n); }); }); return m; }, [rows, reservedAll]);
       const getCasiers = (s, c) => prep.casiers[CK(s,c)] || [ (rows.find(r => r.site===s && r.client===c) || {}).casier || '?' ];
       const clientCasier = (s, c) => { const a=getCasiers(s,c); return a[a.length-1]; };
       const basket = (s, c) => rows.filter(r => r.site===s && r.client===c).reduce((a,r)=>a+r.qty,0);
@@ -10854,9 +10874,15 @@
         // V9.71 — quantité > 1 : un toucher PAR article (1/2 → 2/2 = déposé)
         const q = Math.max(1, r.qty || 1);
         const n = ((prep.count || {})[k] || 0) + 1;
-        if (n >= q) { wStatus(k, 'done'); wCount(k, null); }
+        if (n >= q) { wStatus(k, 'done'); wCount(k, null); markRecent(k); }
         else { if (cur === 'rupture') wStatus(k, null); wCount(k, n); }
       };
+      // V9.73 — le casier déposé reste ~1 s en vert puis disparaît (→ « Dispatch fait »)
+      const markRecent = (k) => {
+        setRecent(m => ({ ...m, [k]: true }));
+        setTimeout(() => { armGuard(450); setRecent(m => { const x = { ...m }; delete x[k]; return x; }); }, 1100);
+      };
+      const isHidden = (r) => st(r) === 'done' && !recent[K(r)];
       const posed = (r) => st(r) === 'done' ? (r.qty || 1) : ((prep.count || {})[K(r)] || 0);
       const qtyLabel = (r, x) => {
         const q = r.qty || 1;
@@ -10914,7 +10940,39 @@
         wND(PK(site,product), { placed, alloc, shortage });
         showToast(`ND : ${placed}/${total} attribués, ${shortage.length} en rupture`);
       };
-      const addCasierFor = (site, client) => { const n=((prep.counters[site] ?? seedCounter[site]) || 0) + 1; wCounter(site, n); wCas(CK(site,client), [...getCasiers(site,client), n]); showToast(`Casier ${n} créé pour ${client.split(' ')[0]}`); };
+      // V9.73 — n° de casier : unique par lieu. Occupés = casiers en cours (appli) + casiers ancien site (frais+sec) de chaque client.
+      const casOwners = (site) => {
+        const own = {};
+        const put = (n, c) => { const v = String(n).trim(); if (v && v !== '?' && !own[v]) own[v] = c; };
+        const clients = new Set(rows.filter(r => r.site === site).map(r => r.client));
+        Object.keys(prep.casiers || {}).forEach(k => { const [s, c] = k.split('||'); if (s === site) clients.add(c); });
+        clients.forEach(c => getCasiers(site, c).forEach(n => put(n, c)));
+        clients.forEach(c => (reservedAll[CK(site, c)] || []).forEach(n => put(n, c)));
+        return own;
+      };
+      const nextFree = (site) => {
+        const own = casOwners(site);
+        let n = Math.max((prep.counters[site] ?? 0) || 0, seedCounter[site] || 0);
+        Object.keys(own).forEach(v => { const x = parseInt(v, 10); if (!isNaN(x)) n = Math.max(n, x); });
+        n++; while (own[String(n)]) n++;
+        return n;
+      };
+      const freeReserved = (site, client) => { const cur = getCasiers(site, client).map(String); return (reserved[CK(site, client)] || []).filter(v => !cur.includes(v)); };
+      const giveCasier = (site, client, num) => {
+        const v = String(num).trim();
+        if (!/^\d{1,4}$/.test(v) || parseInt(v, 10) < 1) { setCasErr('Numéro invalide.'); return false; }
+        const cur = getCasiers(site, client).map(String);
+        if (cur.includes(v)) { setCasErr(`Casier ${v} : déjà à ${client.split(' ')[0]}.`); return false; }
+        const own = casOwners(site)[v];
+        if (own && own !== client) { setCasErr(`Casier ${v} déjà pris par ${own} à ${site}. Choisis un autre numéro.`); return false; }
+        const n = parseInt(v, 10), c = (prep.counters[site] ?? 0) || 0;
+        if (n > c) wCounter(site, n);
+        wCas(CK(site, client), [...cur, v]);
+        showToast(`Casier ${v} attribué à ${client.split(' ')[0]} (${site})`);
+        setCasPick(null); setCasNum(''); setCasErr('');
+        return true;
+      };
+      const addCasierFor = (site, client) => { setCasPick({ site, client }); setCasNum(''); setCasErr(''); };
       const addCasier = (client) => addCasierFor(curSite, client);
       const removeCasier = (client, idx) => { if(idx<=0) return; const arr=[...getCasiers(curSite,client)]; const n=arr[idx]; if(!confirm(`Supprimer le Casier ${n} de ${client.split(' ')[0]} ?`)) return; arr.splice(idx,1); wCas(CK(curSite,client), arr); showToast(`Casier ${n} retiré`); };
 
@@ -11009,10 +11067,13 @@
               </div>
             ) : (
               <div className="pdj-chips">
-                {po.map(r => {
+                {po.filter(r=>!isHidden(r)).length===0 && <div className="pdj-alldone">✅ Tout est dans les casiers</div>}
+                {[...po.filter(r=>!isHidden(r)), ...(doneOpen[pk] ? po.filter(isHidden) : [])].map((r, ix, arr) => {
                   const k=K(r), x=st(r), rc=prep.remiseCli[k]||prep.remiseAll[pk], pv=prep.poids[k];
+                  const firstDone = doneOpen[pk] && isHidden(r) && (ix===0 || !isHidden(arr[ix-1]));
                   return (
                     <div key={k}>
+                      {firstDone && <div className="pdj-donehint">Toucher un casier pour annuler le dépôt (erreur)</div>}
                       <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
                         <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                           <span className="pdj-csite">{site}</span>
@@ -11037,6 +11098,9 @@
                     </div>
                   );
                 })}
+                {po.some(isHidden) && <button className={"pdj-donebar"+(doneOpen[pk]?" on":"")} onClick={()=>setDoneOpen(m=>({...m,[pk]:!m[pk]}))}>
+                  ✅ Dispatch fait ({po.filter(isHidden).length}) <span>{doneOpen[pk] ? '▲ masquer' : '▼ voir / corriger'}</span>
+                </button>}
               </div>
             )}
 
@@ -11244,7 +11308,8 @@
                     <span className="pdj-cm">{done}/{ords.length} {open?'▲':'▼'}</span>
                   </div>
                   {open && <div className="pdj-clines">
-                    {ords.map(r => {
+                    {ords.filter(r=>!isHidden(r)).length===0 && <div className="pdj-alldone">✅ Tout est dans le casier</div>}
+                    {[...ords.filter(r=>!isHidden(r)), ...(doneOpen['c|'+c] ? ords.filter(isHidden) : [])].map(r => {
                       const k=K(r), x=st(r), pk=PK(r.site,r.product), rc=prep.remiseCli[k]||prep.remiseAll[pk], pv=prep.poids[k];
                       return (
                         <div key={k}>
@@ -11265,6 +11330,9 @@
                         </div>
                       );
                     })}
+                    {ords.some(isHidden) && <button className={"pdj-donebar"+(doneOpen['c|'+c]?" on":"")} onClick={()=>setDoneOpen(m=>({...m,['c|'+c]:!m['c|'+c]}))}>
+                      ✅ Dispatch fait ({ords.filter(isHidden).length}) <span>{doneOpen['c|'+c] ? '▲ masquer' : '▼ voir / corriger'}</span>
+                    </button>}
                   </div>}
                 </div>
               );
@@ -11305,6 +11373,31 @@
       return (
         <div className={"pdj-wrap"+(mode==='produits'&&openProd?' focus':'')}>
           <PdjStyle />
+          {casPick && (() => {
+            const { site, client } = casPick;
+            const cur = getCasiers(site, client);
+            const resv = freeReserved(site, client);
+            const auto = resv.length ? resv[0] : String(nextFree(site));
+            return (
+              <KbSheet title={`📦 Nouveau casier · ${client} · ${site}`} onClose={()=>{ setCasPick(null); setCasErr(''); }}>
+                <div className="pdj-cpick">
+                  <div className="pdj-cpcur">Casier(s) actuel(s) : <b>{cur.join(' · ')}</b></div>
+                  {resv.map(v => (
+                    <button key={v} className="pdj-cpbtn resv" onClick={()=>giveCasier(site, client, v)}>📌 Casier {v}<small>prévu par l'ancien site pour ce client</small></button>
+                  ))}
+                  {!resv.length && <button className="pdj-cpbtn" onClick={()=>giveCasier(site, client, auto)}>⚡ Automatique → Casier {auto}<small>prochain numéro libre à {site}</small></button>}
+                  {resv.length > 0 && <button className="pdj-cpbtn alt" onClick={()=>giveCasier(site, client, String(nextFree(site)))}>⚡ Nouveau n° libre → Casier {nextFree(site)}</button>}
+                  <div className="pdj-cplbl">✍️ Ou choisir le numéro :</div>
+                  <div className="pdj-row">
+                    <input className="pdj-num" style={{flex:1,width:'auto'}} type="number" inputMode="numeric" min="1" placeholder="N°" value={casNum} onChange={e=>{ setCasNum(e.target.value); setCasErr(''); }} onKeyDown={e=>{ if(e.key==='Enter') giveCasier(site, client, casNum); }} />
+                    <button className="pdj-go" style={{background:'var(--accd)'}} disabled={!casNum} onClick={()=>giveCasier(site, client, casNum)}>Valider</button>
+                  </div>
+                  {casErr && <div className="pdj-cperr">⛔ {casErr}</div>}
+                  <div className="pdj-hint" style={{marginTop:8}}>Un numéro = un seul client par lieu (casiers de l'ancien site compris).</div>
+                </div>
+              </KbSheet>
+            );
+          })()}
           <div className="pdj-topbar">
             <div className="pdj-modebar">
               <button className={mode==='produits'&&!searchOpen?'active':''} onClick={()=>{setMode('produits');setSearchOpen(false);setOpenProd(null);}}>🥕 Par produit</button>
@@ -11427,6 +11520,18 @@
 .pdj-chip.done{background:var(--acc-s);border-color:var(--acc)}.pdj-chip.done .pdj-cnum,.pdj-chip.done .pdj-cqty{color:var(--accd)}
 .pdj-chip.part{background:#fff4e5;border-color:#ef6c00}.pdj-cqty.multi{background:#ef6c00;color:#fff;border-radius:10px;padding:2px 10px}.pdj-chip.part .pdj-cqty.multi{background:#ef6c00}
 .pdj-multihint{margin:10px 0 0;background:#fff4e5;border:2px solid #ffb74d;border-radius:12px;padding:8px 12px;font-size:17px;color:#8a4b00}
+.pdj-donebar{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;min-height:62px;margin-top:6px;padding:10px 16px;border-radius:14px;border:2px dashed var(--acc);background:var(--acc-s);color:var(--accd);font-size:19px;font-weight:800;cursor:pointer}
+.pdj-donebar span{font-size:15px;font-weight:700}.pdj-donebar.on{border-style:solid}
+.pdj-donehint{margin:8px 2px 4px;font-size:15px;font-weight:700;color:var(--accd)}
+.pdj-alldone{padding:14px;border-radius:14px;background:var(--acc-s);color:var(--accd);font-size:21px;font-weight:900;text-align:center}
+.pdj-cpick{padding:14px 16px 18px;display:flex;flex-direction:column;gap:10px}
+.pdj-cpcur{font-size:17px}
+.pdj-cpbtn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;min-height:72px;padding:10px 16px;border-radius:14px;border:2px solid var(--blue);background:var(--blue);color:#fff;font-size:22px;font-weight:900;cursor:pointer;text-align:left}
+.pdj-cpbtn small{font-size:14px;font-weight:600;opacity:.9}
+.pdj-cpbtn.resv{background:var(--accd);border-color:var(--accd)}
+.pdj-cpbtn.alt{background:#fff;color:var(--blue);min-height:60px;font-size:19px}
+.pdj-cplbl{font-size:17px;font-weight:800;margin-top:4px}
+.pdj-cperr{padding:10px 12px;border-radius:12px;background:var(--warn-s);border:2px solid var(--warn);font-size:17px;font-weight:800}
 .pdj-chip.rupt{background:var(--warn-s);border-color:var(--warn)}.pdj-chip.rupt .pdj-cbody{text-decoration:line-through;opacity:.8}
 .pdj-xr{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:2px solid #e0dbd2;background:#fff;font-size:24px;cursor:pointer}
 .pdj-xr.rem.on{background:var(--rem);color:#fff;border-color:var(--rem)}
