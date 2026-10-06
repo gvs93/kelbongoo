@@ -627,7 +627,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.64';
+    const APP_VERSION = 'V9.66';
+    // V9.66 — Prépa ND : les produits de type ND (catalogue, cat 'nd') partent AUTOMATIQUEMENT en cagette ND
+    //   (plus affichés « casier ») ; nouvel onglet « 🔴 Cagettes ND » (une cagette par boutique, ✅ En cagette,
+    //   quantité partielle → rupture des plus petits paniers) ; bouton « ✅ Les N sont dans la cagette » sur la
+    //   fiche ; ND repassable en casier à la main (nx|) ; tag « 🔴 cagette ND » en prépa par casier ; 🥕 Par produit.
+    // V9.65 — Prépa par produit : 2e filtre « Toutes les boutiques » / une boutique (avec avancement) ;
+    //   en « toutes », la liste cumule les boutiques et la fiche produit montre un bloc de casiers par boutique.
     // V9.64 — Prépa par produit façon ancien site : filtre producteur + recherche produit, liste produits
     //   (producteur, conditionnement, progrès x/y) → tap = fiche produit avec la liste des casiers en GROS
     //   (local + n° de casier, ordre croissant), « Suivant → » ; casiers croissants partout (prépa par casier
@@ -7945,7 +7951,7 @@
           {d.sent && <div style={{ fontSize: 12, marginTop: 4, color: d.sent.ok ? 'var(--accent-dark,#2e7d32)' : 'var(--warn)' }}>{kbSentLine(d.sent)}</div>}
           <div style={kbBtnRow}>
             <button className={view === 'client' ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setView('client')}>👤 Par client</button>
-            <button className={view === 'produit' ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setView('produit')}>🧺 Par produit</button>
+            <button className={view === 'produit' ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setView('produit')}>🥕 Par produit</button>
             <button className="btn-ghost" style={kbBtnSm} onClick={load}>🔄</button>
           </div>
           <div style={{ maxHeight: '48vh', overflowY: 'auto', marginTop: 8 }}>
@@ -10625,7 +10631,7 @@
       const day = activeDay();
       const user = (session && session.name) || '—';
       const [rows, setRows] = React.useState([]);
-      const [prep, setPrep] = React.useState({ status:{}, poids:{}, remiseCli:{}, remiseAll:{}, nd:{}, lm:{}, casiers:{}, counters:{}, closed:false, closedBy:'' });
+      const [prep, setPrep] = React.useState({ status:{}, poids:{}, remiseCli:{}, remiseAll:{}, nd:{}, lm:{}, casiers:{}, counters:{}, closed:false, closedBy:'', ndOff:{} });
       const [mode, setMode] = React.useState('produits');
       const [curSite, setCurSite] = React.useState(null);
       const [searchOpen, setSearchOpen] = React.useState(false);
@@ -10639,8 +10645,8 @@
       // V9.64 — prépa par produit façon ancien site : filtre producteur + recherche, liste → fiche produit (casiers)
       const [prodFilter, setProdFilter] = React.useState('');
       const [prodQ, setProdQ] = React.useState('');
-      const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert (site courant)
-      React.useEffect(() => { setOpenProd(null); }, [curSite]);
+      const [openProd, setOpenProd] = React.useState(null); // nom du produit ouvert
+      const [prodSite, setProdSite] = React.useState(''); // V9.65 — '' = toutes les boutiques
       React.useEffect(() => { try { window.scrollTo(0, 0); } catch (e) {} }, [openProd]);
 
       // ---- helpers (scopés) ----
@@ -10664,7 +10670,8 @@
             (o.items || []).forEach(it => rws.push({
               site, client, casier: String(casier),
               product: it.produit || '(produit)', producer: it.producteur || '',
-              type: it.type || it.format || '', qty: it.qty || 1, price: it.consumer_price || 0
+              type: it.type || it.format || '', qty: it.qty || 1, price: it.consumer_price || 0,
+              cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' // V9.66 — 'nd' = cagette ND (remis à la main en distrib)
             }));
           });
           setRows(rws);
@@ -10676,7 +10683,7 @@
       React.useEffect(() => {
         if (!day) return;
         const unsub = storage.subscribe(`day_${day}_prep`, (arr) => {
-          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}; let counters={}, closed=false, closedBy='';
+          const st={}, pd={}, rc={}, ra={}, nd={}, lm={}, cs={}, nx={}; let counters={}, closed=false, closedBy='';
           (arr || []).forEach(d => {
             const id = d.id;
             if (id === 'counters') { Object.keys(d).forEach(k => { if (k !== 'id' && k !== '_ts') counters[k] = d[k]; }); return; }
@@ -10690,8 +10697,9 @@
             else if (pfx === 'nd') nd[key] = { placed: d.placed, alloc: d.alloc || [], shortage: d.shortage || [] };
             else if (pfx === 'lm') lm[key] = true;
             else if (pfx === 'cs') cs[key] = d.nums || [];
+            else if (pfx === 'nx') nx[key] = true; // V9.66 — produit ND repassé en casier à la main
           });
-          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy });
+          setPrep({ status:st, poids:pd, remiseCli:rc, remiseAll:ra, nd, lm, casiers:cs, counters, closed, closedBy, ndOff:nx });
         });
         return unsub;
       }, [day]);
@@ -10703,6 +10711,7 @@
       const wRemAll = (pk, o)  => o ? storage.setDoc(`day_${day}_prep`, 'ra|' + encId(pk), { pct:o.pct, reason:o.reason, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'ra|' + encId(pk));
       const wND     = (pk, o)  => o ? storage.setDoc(`day_${day}_prep`, 'nd|' + encId(pk), { placed:o.placed, alloc:o.alloc, shortage:o.shortage, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'nd|' + encId(pk));
       const wLM     = (pk, on) => on ? storage.setDoc(`day_${day}_prep`, 'lm|' + encId(pk), { on:true, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'lm|' + encId(pk));
+      const wNdOff  = (pk, on) => on ? storage.setDoc(`day_${day}_prep`, 'nx|' + encId(pk), { on:true, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'nx|' + encId(pk));
       const wCas    = (ck, nums) => storage.setDoc(`day_${day}_prep`, 'cs|' + encId(ck), { nums }, { replace:true });
       const wCounter = (site, n) => storage.setDoc(`day_${day}_prep`, 'counters', { [site]: n });
 
@@ -10715,6 +10724,10 @@
       const basket = (s, c) => rows.filter(r => r.site===s && r.client===c).reduce((a,r)=>a+r.qty,0);
       const weighable = (t) => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
       const st = (r) => prep.status[K(r)] || 'todo';
+      // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
+      const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
+      const ndOn = (pk) => !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
+      const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
       const siteProgress = (s) => { const rs=rows.filter(r=>r.site===s); const done=rs.filter(r=>{const x=prep.status[K(r)];return x==='done'||x==='rupture';}).length; return { done, total: rs.length }; };
       const globalProg = React.useMemo(() => { let d=0,t=0; sites.forEach(s=>{const p=siteProgress(s);d+=p.done;t+=p.total;}); return { d, t, pct: t?Math.round(d/t*100):0, allDone: t>0 && d===t }; }, [rows, prep, sites]);
@@ -10725,7 +10738,11 @@
       const ruptAll = (site, product) => { const po=rows.filter(r=>r.site===site&&r.product===product); const all=po.every(r=>st(r)==='rupture'); po.forEach(r=>wStatus(K(r), all?null:'rupture')); };
       const setPoids1 = (r) => { const cur=prep.poids[K(r)]||''; const v=prompt('Poids réel constaté ? (ex : 320g)', cur); if(v!==null) wPoids(K(r), v.trim()||null); };
       const setPoidsProd = (site, product) => { const v=prompt('Poids réel (s\'applique à ce produit) — ex : 320g',''); if(v && v.trim()) rows.filter(r=>r.site===site&&r.product===product).forEach(r=>wPoids(K(r), v.trim())); };
-      const toggleND = (pk) => { if(prep.nd[pk]) wND(pk, null); else { wND(pk, { placed:null, alloc:[], shortage:[] }); wLM(pk, false); } setMoreOpen(m=>({...m,[pk]:false})); };
+      const toggleND = (pk) => {
+        if (ndOn(pk)) { if (prep.nd[pk]) wND(pk, null); if (ndAuto.has(pk)) wNdOff(pk, true); }
+        else { wNdOff(pk, false); wND(pk, { placed:null, alloc:[], shortage:[] }); wLM(pk, false); }
+        setMoreOpen(m=>({...m,[pk]:false}));
+      };
       const toggleLM = (pk) => { if(prep.lm[pk]) wLM(pk, false); else { wLM(pk, true); wND(pk, null); } setMoreOpen(m=>({...m,[pk]:false})); };
       const saveND = (site, product, val) => {
         const po = rows.filter(r=>r.site===site&&r.product===product);
@@ -10804,7 +10821,7 @@
         const po = [...po0].sort(casSort(site)); // V9.64 — casiers dans l'ordre croissant
         const pk = PK(site, product);
         const total = po.reduce((s,r)=>s+r.qty,0);
-        const nd = prep.nd[pk], lm = prep.lm[pk], ra = prep.remiseAll[pk];
+        const nd = ndOn(pk) ? ndData(pk) : null, lm = prep.lm[pk], ra = prep.remiseAll[pk];
         const allDone = po.every(r => { const x=st(r); return x==='done'||x==='rupture'; });
         return (
           <div key={pk} className={"pdj-card" + (allDone?" done":"") + (nd?" nd":"") + (lm?" lm":"")}>
@@ -10817,8 +10834,10 @@
 
             {nd ? (
               <div className="pdj-panel nd">
-                <div className="pdj-big">Mettre <span className="q">{total}×</span> dans la cagette ND</div>
-                <div className="pdj-loc">Lieu <b>{siteLabel(site)}</b> — quantité réelle disponible :</div>
+                <div className="pdj-big">🔴 Mettre <span className="q">{total}×</span> dans la cagette ND · <b>{site}</b></div>
+                <div className="pdj-hint" style={{color:'#7a3a12'}}>Pas en casier : le distributeur le remet à la main au client.{ndAuto.has(pk) ? ' (produit ND du catalogue)' : ''}</div>
+                {nd.placed==null && <button className="pdj-go" style={{width:'100%',margin:'10px 0 4px',minHeight:64,fontSize:21}} onClick={()=>saveND(site,product,total)}>✅ Les {total} sont dans la cagette</button>}
+                <div className="pdj-loc">Pas tout reçu ? Quantité réelle mise en cagette :</div>
                 <div className="pdj-row">
                   <input className="pdj-num" type="number" min="0" max={total} defaultValue={nd.placed==null?total:nd.placed} id={"ndq_"+encId(pk)} />
                   <button className="pdj-go" onClick={()=>saveND(site,product,document.getElementById("ndq_"+encId(pk)).value)}>Valider</button>
@@ -10922,12 +10941,13 @@
           body = blocks.length ? blocks : <div className="pdj-no">Aucun résultat pour « {searchQ} ».</div>;
         }
       } else if (mode === 'produits') {
-        const rsAll = rows.filter(r => r.site===curSite);
+        // V9.65 — filtres : producteur · boutique (toutes ou une) · recherche
+        const rsAll = rows.filter(r => !prodSite || r.site===prodSite);
         const producers = [...new Set(rsAll.map(r=>r.producer||'—'))].sort((a,b)=>a.localeCompare(b));
         const pq = muStrip(prodQ.trim().toLowerCase());
         const rs = rsAll.filter(r => (!prodFilter || (r.producer||'—')===prodFilter) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
-        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.filter(r=>st(r)==='done').reduce((a,r)=>a+r.qty,0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); return { po, tot, dn, rp, fin }; };
+        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.filter(r=>st(r)==='done').reduce((a,r)=>a+r.qty,0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
           const i = prods.indexOf(openProd);
           const next = i>=0 && i<prods.length-1 ? prods[i+1] : null;
@@ -10942,8 +10962,12 @@
                 </div>
                 <div className={"pdj-dcount"+(ps.fin?" ok":"")}>{ps.dn}<span>/{ps.tot}</span></div>
               </div>
-              <div className="pdj-dsite"><span>{siteLabel(curSite)}</span></div>
-              {renderProduct(curSite, openProd, ps.po)}
+              {ps.ss.map(site => (
+                <div key={site} className="pdj-dblock">
+                  <div className="pdj-dsite"><span>{site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span></div>
+                  {renderProduct(site, openProd, ps.po.filter(r=>r.site===site))}
+                </div>
+              ))}
               <div className="pdj-dnav">
                 <button className="pdj-navbtn" onClick={()=>setOpenProd(null)}>← Liste</button>
                 {next && <button className="pdj-navbtn go" onClick={()=>setOpenProd(next)}>Suivant : {next} →</button>}
@@ -10962,26 +10986,35 @@
                   {prodFilter && <button className="pdj-fx" onClick={()=>setProdFilter('')} aria-label="Tous les producteurs">✕</button>}
                 </div>
                 <div className="pdj-fbox">
+                  <select className="pdj-fsel" value={prodSite} onChange={e=>{ const v=e.target.value; setProdSite(v); if(v) setCurSite(v); }}>
+                    <option value="">Toutes les boutiques ({sites.length})</option>
+                    {sites.map(x=>{ const pg=siteProgress(x); return <option key={x} value={x}>{x}{siteLabel(x)!==x?' · '+siteLabel(x):''} — {pg.done}/{pg.total}</option>; })}
+                  </select>
+                  {prodSite && <button className="pdj-fx" onClick={()=>setProdSite('')} aria-label="Toutes les boutiques">✕</button>}
+                </div>
+                <div className="pdj-fbox">
                   <input className="pdj-fin" type="search" placeholder="Chercher un produit" value={prodQ} onChange={e=>setProdQ(e.target.value)} />
                   {prodQ && <button className="pdj-fx" onClick={()=>setProdQ('')} aria-label="Effacer">✕</button>}
                 </div>
               </div>
               {prods.length ? (
                 <div className="pdj-plist">
-                  <div className="pdj-phead"><span>Produit</span><span>Progrès</span></div>
+                  <div className="pdj-phead"><span>Produit{prodSite ? ' · ' + prodSite : ' · toutes les boutiques'}</span><span>Progrès</span></div>
                   {prods.map(p => {
-                    const x = prodStat(p); const pk = PK(curSite,p);
+                    const x = prodStat(p);
                     const pct = x.tot ? Math.round(x.dn / x.tot * 100) : 0;
+                    const anyND = x.ss.some(si=>ndOn(PK(si,p))), anyLM = x.ss.some(si=>prep.lm[PK(si,p)]);
                     return (
                       <button key={p} className={"pdj-prow"+(x.fin?" fin":"")} onClick={()=>setOpenProd(p)}>
                         <span className="pdj-pinfo">
                           <span className="pdj-pn">{p}
-                            {prep.nd[pk] && <span className="pdj-badge nd">ND</span>}
-                            {prep.lm[pk] && <span className="pdj-badge lm">Dern. min.</span>}
+                            {anyND && <span className="pdj-badge nd">ND</span>}
+                            {anyLM && <span className="pdj-badge lm">Dern. min.</span>}
                             {x.rp>0 && <span className="pdj-badge rp">🚫 {x.rp}</span>}
                           </span>
                           <span className="pdj-pp">{x.po[0].producer || '—'}</span>
                           {x.po[0].type && <span className="pdj-pt">{x.po[0].type}</span>}
+                          {!prodSite && <span className="pdj-psites">{x.ss.join(' · ')}</span>}
                         </span>
                         <span className="pdj-pprog">
                           <span className="n">{x.dn} / {x.tot}</span>
@@ -10992,10 +11025,45 @@
                     );
                   })}
                 </div>
-              ) : <div className="pdj-no">{rsAll.length ? 'Aucun produit ne correspond.' : 'Aucune commande pour ce site.'}</div>}
+              ) : <div className="pdj-no">{rsAll.length ? 'Aucun produit ne correspond.' : 'Aucune commande.'}</div>}
             </div>
           );
         }
+      } else if (mode === 'nd') {
+        // V9.66 — Cagettes ND : par boutique, les produits à mettre en cagette (remis à la main au client en distrib)
+        const blocks = sites.map(site => {
+          const rs = rows.filter(r => r.site===site && ndOn(PK(site, r.product)));
+          const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
+          if (!prods.length) return null;
+          const art = rs.reduce((a,r)=>a+r.qty,0);
+          return (
+            <div key={site} className="pdj-ndsite">
+              <div className="pdj-ndh"><span>🔴 Cagette ND · {site}{siteLabel(site)!==site?' · '+siteLabel(site):''}</span><span>{prods.length} produit{prods.length>1?'s':''} · {art} art.</span></div>
+              {prods.map(p => {
+                const pk = PK(site,p), po = rs.filter(r=>r.product===p), tot = po.reduce((a,r)=>a+r.qty,0), d = ndData(pk);
+                const ok = d.placed!=null;
+                return (
+                  <div key={p} className={"pdj-ndl"+(ok?" ok":"")}>
+                    <div className="pdj-ndn"><b>{p}</b><i>{po[0].producer}{po[0].type?' · '+po[0].type:''} · {po.length} client{po.length>1?'s':''}</i>
+                      {ok && (d.shortage||[]).length>0 && <span className="pdj-tag rem" style={{display:'inline-block',marginTop:4}}>manque {(d.shortage||[]).reduce((a,x)=>a+x.need,0)} → rupture</span>}
+                    </div>
+                    <div className="pdj-ndq">{ok ? <span style={{color:'var(--accd)'}}>{d.placed}/{tot} ✓</span> : <>×{tot}</>}</div>
+                    {!ok
+                      ? <button className="pdj-ndbtn go" onClick={()=>saveND(site,p,tot)}>✅ En cagette</button>
+                      : <button className="pdj-ndbtn" onClick={()=>{ wND(pk,{placed:null,alloc:[],shortage:[]}); po.forEach(r=>wStatus(K(r),null)); }}>↺ Annuler</button>}
+                    <button className="pdj-ndbtn" style={{minWidth:64}} title="Quantité partielle / détail" onClick={()=>{ setMode('produits'); setProdSite(''); setOpenProd(p); }}>⋯</button>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        }).filter(Boolean);
+        body = (
+          <div>
+            <div className="pdj-hint" style={{fontSize:17,marginBottom:12}}>Une cagette ND par boutique. Les produits ND ne vont <b>pas</b> en casier : le distributeur les remet à la main au client (fiche client « Non-dispatch »). Pas tout reçu → « ⋯ » pour saisir la quantité réelle (priorité aux plus gros paniers, le reste en rupture).</div>
+            {blocks.length ? blocks : <div className="pdj-no">Aucun produit ND aujourd'hui.<br/>Un produit peut être passé en ND depuis sa fiche (🔴 Cagette ND).</div>}
+          </div>
+        );
       } else if (mode === 'casier') {
         let clients = [...new Set(rows.filter(r=>r.site===curSite).map(r=>r.client))].sort((a,b)=>casCmp(clientCasier(curSite,a),clientCasier(curSite,b))||a.localeCompare(b));
         const q = clientFilter.trim().toLowerCase();
@@ -11022,6 +11090,7 @@
                           <div className={"pdj-chip"+(x==='done'?" done":x==='rupture'?" rupt":"")}>
                             <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                               <span className="pdj-cname">{r.product}</span>
+                              {ndOn(pk) && <span className="pdj-tag nd">🔴 cagette ND</span>}
                               {rc && <span className="pdj-tag rem">🏷️-{rc.pct}%</span>}
                               {pv && <span className="pdj-tag w">⚖️{pv}</span>}
                               <span className="pdj-cqty">×{r.qty}{x==='done'?' ✓':x==='rupture'?' 🚫':''}</span>
@@ -11077,13 +11146,14 @@
           <PdjStyle />
           <div className="pdj-topbar">
             <div className="pdj-modebar">
-              <button className={mode==='produits'&&!searchOpen?'active':''} onClick={()=>{setMode('produits');setSearchOpen(false);setOpenProd(null);}}>🧺 Par produit</button>
+              <button className={mode==='produits'&&!searchOpen?'active':''} onClick={()=>{setMode('produits');setSearchOpen(false);setOpenProd(null);}}>🥕 Par produit</button>
+              <button className={mode==='nd'&&!searchOpen?'active':''} onClick={()=>{setMode('nd');setSearchOpen(false);}}>🔴 Cagettes ND</button>
               <button className={mode==='casier'&&!searchOpen?'active':''} onClick={()=>{setMode('casier');setSearchOpen(false);}}>📦 Par casier</button>
               <button className={mode==='clients'&&!searchOpen?'active':''} onClick={()=>{setMode('clients');setSearchOpen(false);}}>👤 Casiers / clients</button>
               <button className={searchOpen?'active':''} onClick={()=>setSearchOpen(v=>!v)}>🔍</button>
             </div>
             {searchOpen && <div className="pdj-searchbar"><input autoFocus type="search" placeholder="Rechercher un produit sur tous les sites…" value={searchQ} onChange={e=>setSearchQ(e.target.value)} /></div>}
-            {!searchOpen && <div className="pdj-subbar">
+            {!searchOpen && mode!=='produits' && <div className="pdj-subbar">
               {sites.map(s => { const p=siteProgress(s); const ok=p.done===p.total&&p.total>0;
                 return <button key={s} className={"pdj-sbtn"+(s===curSite?" active":"")} onClick={()=>setCurSite(s)}>📍 {siteLabel(s)}<span className={"p"+(ok?" ok":"")}>{p.done}/{p.total}{ok?' ✓':''}</span></button>; })}
             </div>}
@@ -11112,8 +11182,8 @@
       return <style>{`
 .pdj-wrap{--nd:#c2410c;--nd-s:#fdece3;--lm:#7c3aed;--lm-s:#f0e9fd;--rem:#a3125b;--rem-s:#fbe6f0;--info:#1f5f80;--info-s:#e3eef4;--acc:#2e7d32;--acc-s:#e3f2e1;--accd:#1b5e20;--warn:#b8860b;--warn-s:#fbf3df;--blue:#2f8cf0;font-size:18px}
 .pdj-topbar{position:sticky;top:0;z-index:10;background:#fff;border-bottom:2px solid #e8e3da}
-.pdj-modebar{display:flex}
-.pdj-modebar button{flex:1;min-height:58px;padding:10px 6px;border:none;background:none;font-size:18px;font-weight:800;color:#8a857e;cursor:pointer;border-bottom:4px solid transparent}
+.pdj-modebar{display:flex;flex-wrap:wrap}
+.pdj-modebar button{flex:1 1 auto;white-space:nowrap;min-height:58px;padding:10px 6px;border:none;background:none;font-size:18px;font-weight:800;color:#8a857e;cursor:pointer;border-bottom:4px solid transparent}
 .pdj-modebar button.active{color:var(--acc);border-bottom-color:var(--acc)}
 .pdj-searchbar{padding:8px 10px}.pdj-searchbar input,.pdj-cfilter{width:100%;min-height:56px;padding:12px 16px;border:2px solid #cfc8bb;border-radius:14px;font-size:20px;outline:none;background:#fcfaf6;box-sizing:border-box}
 .pdj-subbar{display:flex;gap:8px;overflow-x:auto;padding:8px 10px}
@@ -11132,7 +11202,7 @@
 .pdj-shdr{font-weight:800;color:var(--accd);margin:14px 2px 8px;font-size:19px}
 /* filtres producteur / produit */
 .pdj-filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-.pdj-fbox{flex:1 1 300px;display:flex;align-items:stretch;border:2px solid var(--blue);border-radius:12px;overflow:hidden;background:#fff}
+.pdj-fbox{flex:1 1 260px;display:flex;align-items:stretch;border:2px solid var(--blue);border-radius:12px;overflow:hidden;background:#fff}
 .pdj-fsel,.pdj-fin{flex:1;min-height:58px;border:none;padding:10px 14px;font-size:20px;background:#fff;outline:none;min-width:0;color:#222}
 .pdj-fx{width:58px;border:none;border-left:2px solid var(--blue);background:#fff;color:var(--blue);font-size:24px;font-weight:900;cursor:pointer}
 /* liste produits (façon ancien site) */
@@ -11145,6 +11215,8 @@
 .pdj-pn{font-size:22px;font-weight:800;line-height:1.2;color:#111}
 .pdj-pp{font-size:18px;font-style:italic;color:#333}
 .pdj-pt{font-size:16px;font-style:italic;color:#777}
+.pdj-psites{font-size:16px;font-weight:800;color:var(--acc)}
+.pdj-dblock{margin-top:22px}
 .pdj-pprog{flex:0 0 130px;display:flex;flex-direction:column;align-items:center;gap:6px}
 .pdj-pprog .n{font-size:22px;font-weight:800}
 .pdj-pprog .b{display:block;width:100%;height:12px;background:#e6e9ee;border-radius:6px;overflow:hidden}.pdj-pprog .b span{display:block;height:12px;background:var(--acc)}
@@ -11178,7 +11250,15 @@
 .pdj-cnum{font-weight:900;font-size:36px;color:#111;white-space:nowrap;min-width:56px}
 .pdj-cname{flex:1;font-weight:700;font-size:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#333}
 .pdj-cqty{font-weight:900;font-size:26px;color:#111;white-space:nowrap}
-.pdj-tag{font-size:15px;font-weight:800;padding:2px 8px;border-radius:8px}.pdj-tag.rem{background:var(--rem-s);color:var(--rem)}.pdj-tag.w{background:var(--info-s);color:var(--info)}
+.pdj-tag{font-size:15px;font-weight:800;padding:2px 8px;border-radius:8px}.pdj-tag.nd{background:var(--nd-s);color:var(--nd);white-space:nowrap}
+.pdj-ndsite{background:#fff;border:3px solid var(--nd);border-radius:16px;margin-bottom:16px;overflow:hidden}
+.pdj-ndh{background:var(--nd);color:#fff;padding:12px 16px;font-size:22px;font-weight:900;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.pdj-ndl{display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1.5px solid var(--nd-s);min-height:84px}
+.pdj-ndl.ok{background:var(--acc-s)}
+.pdj-ndn{flex:1;min-width:0}.pdj-ndn b{display:block;font-size:21px;line-height:1.2}.pdj-ndn i{font-size:17px;color:#555}
+.pdj-ndq{font-size:30px;font-weight:900;white-space:nowrap}
+.pdj-ndbtn{min-height:60px;min-width:120px;border-radius:12px;border:2px solid var(--nd);background:#fff;color:var(--nd);font-size:18px;font-weight:800;cursor:pointer;padding:6px 12px}
+.pdj-ndbtn.go{background:var(--nd);color:#fff}.pdj-tag.rem{background:var(--rem-s);color:var(--rem)}.pdj-tag.w{background:var(--info-s);color:var(--info)}
 .pdj-chip.done{background:var(--acc-s);border-color:var(--acc)}.pdj-chip.done .pdj-cnum,.pdj-chip.done .pdj-cqty{color:var(--accd)}
 .pdj-chip.rupt{background:var(--warn-s);border-color:var(--warn)}.pdj-chip.rupt .pdj-cbody{text-decoration:line-through;opacity:.8}
 .pdj-xr{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:2px solid #e0dbd2;background:#fff;font-size:24px;cursor:pointer}
