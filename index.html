@@ -627,7 +627,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.75';
+    const APP_VERSION = 'V9.76';
+    // V9.76 — Prépa : un produit en « 🟣 Dispatch dernière minute » compte comme TRAITÉ (comme un manquant) :
+    //   il ne bloque plus la clôture, sort de la liste « à faire » (→ Dispatch fait). À la clôture, il part dans
+    //   Manquants & ND (comme les ruptures, note « Dispatch dernière minute ») pour être dispatché le jour J.
     // V9.75 — Prépa › Par produit : un produit TERMINÉ (tout déposé / rupture) disparaît de la liste → « ✅ Dispatch fait
     //   (N produits) » repliable en bas (rouvrir pour corriger). « Suivant » saute les produits terminés.
     //   Mails clients : récap à la clôture de la prépa (casiers en gros, hors casier, ruptures, dernière minute probable)
@@ -11282,12 +11285,15 @@
       const basket = (s, c) => rows.filter(r => r.site===s && r.client===c).reduce((a,r)=>a+r.qty,0);
       const weighable = (t) => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
       const st = (r) => prep.status[K(r)] || 'todo';
+      // V9.76 — traité = déposé, rupture, ou produit passé en dispatch dernière minute (= manquant)
+      const isLmRow = (r) => !!prep.lm[PK(r.site, r.product)];
+      const handled = (r) => { const x = prep.status[K(r)]; return x === 'done' || x === 'rupture' || isLmRow(r); };
       // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
       const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
       const ndOn = (pk) => !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
       const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
-      const siteProgress = (s) => { const rs=rows.filter(r=>r.site===s); const done=rs.filter(r=>{const x=prep.status[K(r)];return x==='done'||x==='rupture';}).length; return { done, total: rs.length }; };
+      const siteProgress = (s) => { const rs=rows.filter(r=>r.site===s); const done=rs.filter(handled).length; return { done, total: rs.length }; };
       const globalProg = React.useMemo(() => { let d=0,t=0; sites.forEach(s=>{const p=siteProgress(s);d+=p.done;t+=p.total;}); return { d, t, pct: t?Math.round(d/t*100):0, allDone: t>0 && d===t }; }, [rows, prep, sites]);
 
       // ---- actions ----
@@ -11419,11 +11425,12 @@
       // clôture → manquants (motif pré-rempli)
       const closeDay = async () => {
         if (!globalProg.allDone) { showToast(`Termine toutes les prépas d'abord (${globalProg.d}/${globalProg.t})`); return; }
-        if (!confirm('Clôturer la prépa du jour ?\n\nUne fois clôturée, on ne revient plus sur la prépa. Les modifications se feront uniquement via « Manquants & ND » et « Dispatch dernière minute ». Les ruptures partiront dans Manquants & ND (motif pré-rempli).')) return;
+        if (!confirm('Clôturer la prépa du jour ?\n\nUne fois clôturée, on ne revient plus sur la prépa. Les modifications se feront uniquement via « Manquants & ND » et « Dispatch dernière minute ». Les ruptures et les produits « dernière minute » partiront dans Manquants & ND (motif pré-rempli).')) return;
         if (!confirm('Confirmer DÉFINITIVEMENT la clôture de la prépa du jour ?')) return;
         const agg = {};
-        rows.forEach(r => { if (prep.status[K(r)] !== 'rupture') return;
-          const p=r.product; if(!agg[p]) agg[p]={ produit:p, producteur:r.producer, qty:0, clients:0, bySite:{} };
+        rows.forEach(r => { const lmR = isLmRow(r); if (prep.status[K(r)] !== 'rupture' && !lmR) return;
+          const p=r.product; if(!agg[p]) agg[p]={ produit:p, producteur:r.producer, qty:0, clients:0, bySite:{}, lm:false };
+          if (lmR) agg[p].lm = true;
           agg[p].qty+=r.qty; agg[p].clients++; agg[p].bySite[r.site]=(agg[p].bySite[r.site]||0)+r.qty;
         });
         for (const m of Object.values(agg)) {
@@ -11431,7 +11438,7 @@
           await storage.setDoc(`day_${day}_manquants`, id, {
             produit:m.produit, producteur:m.producteur, cond:'',
             fini:0, total:m.qty, manque:m.qty, clients:m.clients, bySite:m.bySite,
-            reason:'rupture_appro', reasonNote:`Signalé en prépa par ${user}`,
+            reason:'rupture_appro', reasonNote: m.lm ? `Dispatch dernière minute (prépa, ${user})` : `Signalé en prépa par ${user}`, lastMinute: !!m.lm,
             status:'rupture', source:'prepa', uploadedBy:user, uploadedAt:new Date().toISOString(),
           });
         }
@@ -11468,7 +11475,7 @@
         const pk = PK(site, product);
         const total = po.reduce((s,r)=>s+r.qty,0);
         const nd = ndOn(pk) ? ndData(pk) : null, lm = prep.lm[pk], ra = prep.remiseAll[pk];
-        const allDone = po.every(r => { const x=st(r); return x==='done'||x==='rupture'; });
+        const allDone = po.every(handled);
         return (
           <div key={pk} className={"pdj-card" + (allDone?" done":"") + (nd?" nd":"") + (lm?" lm":"")}>
             <div className="pdj-pname">{product}
@@ -11601,7 +11608,7 @@
         const nCheeseProd = new Set(rsAll.filter(isCheese).map(r=>r.producer||'—')).size;
         const rs = rsAll.filter(r => (!prodFilter || (prodFilter==='__fromage' ? isCheese(r) : (r.producer||'—')===prodFilter)) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
-        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(r=>{const x=st(r);return x==='done'||x==='rupture';}); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
+        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(handled); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
           // V9.75 — « Suivant » : prochain produit NON terminé (après celui-ci, sinon depuis le début)
           const todoP = prods.filter(p => p !== openProd && !prodStat(p).fin);
@@ -11754,7 +11761,7 @@
             <input className="pdj-cfilter" type="search" placeholder="Chercher un client ou un n° de casier…" value={clientFilter} onChange={e=>setClientFilter(e.target.value)} />
             {clients.length ? clients.map(c => {
               const ords = rows.filter(r=>r.site===curSite&&r.client===c);
-              const done = ords.filter(r=>{const x=prep.status[K(r)];return x==='done'||x==='rupture';}).length;
+              const done = ords.filter(handled).length;
               const open = openClient===c;
               return (
                 <div key={c} className="pdj-crow">
@@ -11804,7 +11811,7 @@
             <input className="pdj-cfilter" type="search" placeholder="Chercher un client ou un n° de casier…" value={clientFilter} onChange={e=>setClientFilter(e.target.value)} />
             {clients.length ? clients.map(c => {
               const nums=getCasiers(curSite,c), ords=rows.filter(r=>r.site===curSite&&r.client===c);
-              const done=ords.filter(r=>{const x=prep.status[K(r)];return x==='done'||x==='rupture';}).length;
+              const done=ords.filter(handled).length;
               const art=ords.reduce((a,r)=>a+r.qty,0);
               return (
                 <div key={c} className="pdj-crow">
