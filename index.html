@@ -627,7 +627,14 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.78';
+    const APP_VERSION = 'V9.80';
+    // V9.80 — URGENT : la distrib affichait les casiers du JSON au lieu de ceux créés / ajoutés / supprimés en prépa.
+    //   Les casiers de la prépa (day_X_prep cs|site||client) priment désormais partout côté distrib (liste clients, recherche,
+    //   clôture/non-récupérés, dispatch). Le JSON d'origine reste dans o.casiersJson (ruptures ancien site inchangées).
+    // V9.79 — Prépa : RUPTURE PARTIELLE. Qté > 1 déjà entamée (ex. 1/2) + 🚫 → « 1/2 ✓ · manque 1 » : les posés sont livrés,
+    //   seul le reste part en manquant (distrib, mails clients, ruptures ancien site, clôture). Re-🚫 → rupture totale ; re-🚫 → annulé.
+    //   Suivi CA › Bilan : « 🧠 Compte rendu de la période » (tendance, écarts vs période précédente, manquants principaux,
+    //   lieux, journées atypiques), explications de l'équipe (app_config/ca_notes), exports PDF / CSV / texte pour Claude.
     // V9.78 — Prépa clôturée : bouton « 🚚 Envoyer à Rungis » (même popup, envoie seulement le mail, sans re-clôturer).
     //   Sert à tester sur une prépa déjà clôturée et à renvoyer en cas d'erreur (rolls / dollies / lieux).
     // V9.77 — Prépa : 🎨 une couleur vive par lieu (puce casier, bandeau de lieu, onglets, cagettes ND, liste produits).
@@ -2348,16 +2355,23 @@
 
     // Reconstruit l'état prépa (day_X_prep, écriture par clé) en maps status/remiseAll/remiseCli.
     function parsePrepDocs(arr) {
-      const status = {}, remiseAll = {}, remiseCli = {};
+      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {};
       for (const d of (arr || [])) {
         const id = d.id; if (!id || id === 'counters' || id === 'meta') continue;
         const bar = id.indexOf('|'); if (bar < 0) continue;
         const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
-        if (pfx === 'st') status[key] = d.v;
+        if (pfx === 'st') { status[key] = d.v; if (d.v === 'partiel') posedN[key] = d.n || 0; }
+        else if (pfx === 'cs') casiers[key] = (d.nums || []).map(String).filter(Boolean); // V9.80 — casiers créés/modifiés en prépa
         else if (pfx === 'rc') remiseCli[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'ra') remiseAll[key] = { pct: d.pct, reason: d.reason };
       }
-      return { status, remiseAll, remiseCli };
+      return { status, remiseAll, remiseCli, posedN, casiers };
+    }
+    // V9.79 — rupture PARTIELLE : quantité manquante d'une ligne (0 si pas en partiel)
+    function kbPartMiss(prep, k, qty) {
+      if (!prep || !prep.status || prep.status[k] !== 'partiel') return 0;
+      const q = qty || 1, n = Math.min(q, Math.max(0, (prep.posedN && prep.posedN[k]) || 0));
+      return q - n;
     }
     // Annulations distrib : day_X_distribfix — un produit rupturé en prépa mais finalement présent,
     // rajouté à la main côté distrib. Clé = site||client||produit.
@@ -2368,16 +2382,39 @@
     }
     // Applique les décisions de prépa à UNE commande : rupture prépa → l'article passe en
     // « removed » (non livré, retiré du montant réel) ; remise prépa → ajoutée en « reduced ».
+    // V9.80 — remplace les casiers du JSON par ceux de la prépa (même règle que Prépa du jour : liste frais, sinon sec)
+    function kbApplyPrepCasiers(orders, cas) {
+      if (!cas || !Object.keys(cas).length || !Array.isArray(orders)) return orders;
+      return orders.map(o => {
+        const site = String(o.site || '').toUpperCase(); if (site === 'DOM') return o;
+        const pc = cas[site + '||' + (o.name || '(client)')]; if (!pc || !pc.length) return o;
+        const hasF = (o.casiersFrais || []).length, hasS = (o.casiersSec || []).length;
+        return (hasF || !hasS) ? { ...o, casiersFrais: [...pc], casiersJson: o.casiersJson || o.casiersFrais || [] } : { ...o, casiersSec: [...pc], casiersJson: o.casiersJson || o.casiersSec || [] };
+      });
+    }
     function applyPrepToOrder(o, prep) {
       if (!prep || !o) return o;
       const site = o.site, client = o.name;
+      // V9.80 — les casiers de la PRÉPA (créés / ajoutés / supprimés dans l'appli) priment sur ceux du JSON
+      const pc = prep.casiers && prep.casiers[String(site || '').toUpperCase() + '||' + (client || '(client)')];
+      if (pc && pc.length && String(site || '').toUpperCase() !== 'DOM') {
+        const hasF = (o.casiersFrais || []).length, hasS = (o.casiersSec || []).length;
+        o = (hasF || !hasS) ? { ...o, casiersFrais: [...pc], casiersJson: o.casiersFrais || [] } : { ...o, casiersSec: [...pc], casiersJson: o.casiersSec || [] };
+      }
       const hasStatus = prep.status && Object.keys(prep.status).length;
       const hasRem = (prep.remiseCli && Object.keys(prep.remiseCli).length) || (prep.remiseAll && Object.keys(prep.remiseAll).length);
       if (!hasStatus && !hasRem) return o;
       const items = [], removed = [...(o.removed || [])], reduced = [...(o.reduced || [])];
-      for (const it of (o.items || [])) {
+      for (let it of (o.items || [])) {
         const k = site + '||' + client + '||' + it.produit;
         if (prep.status && prep.status[k] === 'rupture' && !(prep.overrides && prep.overrides[k])) { removed.push({ ...it, reason: 'rupture_prepa' }); continue; }
+        // V9.79 — rupture partielle : on livre ce qui a été posé, le reste part en manquant
+        const miss = (prep.overrides && prep.overrides[k]) ? 0 : kbPartMiss(prep, k, it.qty || 1);
+        if (miss > 0) {
+          removed.push({ ...it, qty: miss, quantity: miss, reason: 'rupture_prepa_partielle' });
+          if ((it.qty || 1) - miss <= 0) continue;
+          it = { ...it, qty: (it.qty || 1) - miss, quantity: (it.qty || 1) - miss };
+        }
         const rc = (prep.remiseCli && prep.remiseCli[k]) || (prep.remiseAll && prep.remiseAll[site + '||' + it.produit]);
         if (rc && rc.pct) reduced.push({ ...it, percentage: rc.pct });
         items.push(it);
@@ -4022,7 +4059,7 @@
                   {o.removed.map((r, i) => (
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 13, padding: '3px 0', borderBottom: '1px dashed var(--border)', color: 'var(--ink-soft)' }}>
                       <span style={{ minWidth: 0 }}>{r.produit}{r.producteur ? ` · ${r.producteur}` : ''}</span>
-                      <span style={{ whiteSpace: 'nowrap', display:'flex', alignItems:'center', gap:8 }}><strong>×{r.qty}</strong> <span style={{ color: 'var(--ink-mute)' }}>{lineEuro(r)}</span>{r.reason === 'rupture_prepa' && <button className="btn-secondary" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => restoreItem(r)}>➕ Rajouter</button>}</span>
+                      <span style={{ whiteSpace: 'nowrap', display:'flex', alignItems:'center', gap:8 }}><strong>×{r.qty}</strong> <span style={{ color: 'var(--ink-mute)' }}>{lineEuro(r)}</span>{(r.reason === 'rupture_prepa' || r.reason === 'rupture_prepa_partielle') && <button className="btn-secondary" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => restoreItem(r)}>➕ Rajouter</button>}</span>
                     </div>
                   ))}
                 </div>
@@ -4569,7 +4606,7 @@
             const byId = {};
             (data.orders || []).forEach(o => {
               const site = String(o.site || '').toUpperCase(), client = o.name || '(client)';
-              const cas = [...new Set([...kbClientCasiers(data.prep, site, client, o), ...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String))].sort(casCmp);
+              const cas = [...new Set(kbClientCasiers(data.prep, site, client, o).map(String))].sort(casCmp); // V9.80 — casiers prépa prioritaires
               byId[o.orderId] = { order: o, casiers: cas };
             });
             setDayInfo(m => ({ ...m, [d]: byId }));
@@ -7786,6 +7823,11 @@
             lines.push({ ...base, restored: !!fix[k] });
             continue;
           }
+          const pmiss = kbPartMiss(prep, k, it.qty || 1); // V9.79 — partiel : seule la quantité manquante
+          if (pmiss > 0) {
+            if (ps) psRupt++;
+            else lines.push({ ...base, qty: pmiss, partiel: true, restored: !!fix[k] });
+          }
           if (ps) continue;
           const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
           if (rc && rc.pct) remises.push({ ...base, pct: rc.pct, reason: rc.reason || '' });
@@ -10953,14 +10995,14 @@
 
     // Lecture de l'état prépa (mêmes règles que « Prépa du jour »)
     function kbParsePrepDocs(arr) {
-      const P = { status: {}, nd: {}, lm: {}, casiers: {}, remCli: {}, remAll: {}, ndOff: {}, meta: null, cmails: null };
+      const P = { status: {}, posedN: {}, nd: {}, lm: {}, casiers: {}, remCli: {}, remAll: {}, ndOff: {}, meta: null, cmails: null };
       (arr || []).forEach(d => {
         const id = d.id;
         if (id === 'meta') { P.meta = d; return; }
         if (id === 'cmails') { P.cmails = d; return; }
         const bar = id.indexOf('|'); if (bar < 0) return;
         const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
-        if (pfx === 'st') P.status[key] = d.v;
+        if (pfx === 'st') { P.status[key] = d.v; if (d.v === 'partiel') P.posedN[key] = d.n || 0; }
         else if (pfx === 'nd') P.nd[key] = d;
         else if (pfx === 'lm') P.lm[key] = true;
         else if (pfx === 'cs') P.casiers[key] = (d.nums || []).map(String);
@@ -11021,6 +11063,11 @@
             out.lm.push({ ...line, lmState, lmQty });
           }
           else if (prep.status[K] === 'rupture') out.rupt.push(line);
+          else if (kbPartMiss(prep, K, it.qty) > 0) { // V9.79 — rupture partielle : posé + manquant
+            const mq = kbPartMiss(prep, K, it.qty), ok = (it.qty || 1) - mq;
+            out.rupt.push({ ...line, qty: mq });
+            if (ok > 0) (ndOn ? out.hors : out.casier).push({ ...line, qty: ok });
+          }
           else if (ndOn) out.hors.push(line);
           else out.casier.push(line);
         });
@@ -11351,7 +11398,7 @@
             if (id === 'meta') { closed = !!d.closed; closedBy = d.closedBy || ''; return; }
             const bar = id.indexOf('|'); if (bar < 0) return;
             const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
-            if (pfx === 'st') { st[key] = d.v; sb[key] = d.by || ''; }
+            if (pfx === 'st') { st[key] = d.v; sb[key] = d.by || ''; if (d.v === 'partiel') pc[key] = d.n || pc[key] || 0; }
             else if (pfx === 'pc') pc[key] = d.n || 0; // V9.71 — articles déjà posés (qté > 1)
             else if (pfx === 'pr') { if (d.at && Date.now() - d.at < 180000) pr[key] = d; } // V9.67 — présence live
             else if (pfx === 'pd') pd[key] = d.v;
@@ -11368,7 +11415,7 @@
       }, [day]);
 
       // ---- writes ----
-      const wStatus = (key, v) => v ? storage.setDoc(`day_${day}_prep`, 'st|' + encId(key), { v, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'st|' + encId(key));
+      const wStatus = (key, v, extra) => v ? storage.setDoc(`day_${day}_prep`, 'st|' + encId(key), { v, by:user, ...(extra || {}) }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'st|' + encId(key));
       const wPoids  = (key, v) => v ? storage.setDoc(`day_${day}_prep`, 'pd|' + encId(key), { v, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'pd|' + encId(key));
       const wRemCli = (key, o) => o ? storage.setDoc(`day_${day}_prep`, 'rc|' + encId(key), { pct:o.pct, reason:o.reason, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'rc|' + encId(key));
       const wRemAll = (pk, o)  => o ? storage.setDoc(`day_${day}_prep`, 'ra|' + encId(pk), { pct:o.pct, reason:o.reason, by:user }, { replace:true }) : storage.deleteDoc(`day_${day}_prep`, 'ra|' + encId(pk));
@@ -11392,7 +11439,9 @@
       const st = (r) => prep.status[K(r)] || 'todo';
       // V9.76 — traité = déposé, rupture, ou produit passé en dispatch dernière minute (= manquant)
       const isLmRow = (r) => !!prep.lm[PK(r.site, r.product)];
-      const handled = (r) => { const x = prep.status[K(r)]; return x === 'done' || x === 'rupture' || isLmRow(r); };
+      const handled = (r) => { const x = prep.status[K(r)]; return x === 'done' || x === 'rupture' || x === 'partiel' || isLmRow(r); };
+      // V9.79 — quantité manquante d'une ligne (rupture totale = qté, partielle = qté − posés)
+      const missOf = (r) => { const x = prep.status[K(r)], q = r.qty || 1; if (x === 'rupture') return q; if (x === 'partiel') return Math.max(0, q - Math.min(q, (prep.count || {})[K(r)] || 0)); return 0; };
       // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
       const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
       const ndOn = (pk) => !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
@@ -11422,9 +11471,9 @@
         }
         // V9.71 — quantité > 1 : un toucher PAR article (1/2 → 2/2 = déposé)
         const q = Math.max(1, r.qty || 1);
-        const n = ((prep.count || {})[k] || 0) + 1;
+        const n = (cur === 'rupture' ? 0 : ((prep.count || {})[k] || 0)) + 1;
         if (n >= q) { wStatus(k, 'done'); wCount(k, null); markRecent(k); }
-        else { if (cur === 'rupture') wStatus(k, null); wCount(k, n); }
+        else { if (cur === 'rupture' || cur === 'partiel') wStatus(k, null); wCount(k, n); }
       };
       // V9.73 — le casier déposé reste ~1 s en vert puis disparaît (→ « Dispatch fait »)
       const markRecent = (k) => {
@@ -11437,6 +11486,7 @@
         const q = r.qty || 1;
         if (x === 'done') return `×${q} ✓`;
         if (x === 'rupture') return `×${q} 🚫`;
+        if (x === 'partiel') { const n = Math.min(q, (prep.count || {})[K(r)] || 0); return `${n}/${q} ✓ · manque ${q - n}`; }
         if (q > 1) return `${(prep.count || {})[K(r)] || 0}/${q}`;
         return `×${q}`;
       };
@@ -11464,7 +11514,15 @@
       }, [day, openProd, mode, prep.closed]);
       const othersOn = (product) => Object.entries(prep.presence || {}).filter(([u, d]) => u !== user && d.product === product).map(([u]) => u.split(' ')[0]);
       const activeOthers = Object.keys(prep.presence || {}).filter(u => u !== user);
-      const toggleRuptCli = (r) => wStatus(K(r), st(r)==='rupture' ? null : 'rupture');
+      // V9.79 — 🚫 sur une ligne déjà entamée (ex. 1/2) = RUPTURE PARTIELLE : on valide les posés, le reste part en manquant.
+      //         Re-toucher 🚫 sur une partielle → rupture totale ; encore → annulé (retour au comptage).
+      const toggleRuptCli = (r) => {
+        const k = K(r), x = st(r), q = r.qty || 1, n = Math.min(q, (prep.count || {})[k] || 0);
+        if (x === 'rupture') { wStatus(k, null); return; }
+        if (x === 'partiel') { wStatus(k, 'rupture'); return; }
+        if (x === 'todo' && q > 1 && n > 0 && n < q) { wStatus(k, 'partiel', { n }); showToast(`⚠️ Rupture partielle : ${n} posé${n>1?'s':''} · manque ${q - n}`); return; }
+        wStatus(k, 'rupture');
+      };
       const ruptAll = (site, product) => { const po=rows.filter(r=>r.site===site&&r.product===product); const all=po.every(r=>st(r)==='rupture'); po.forEach(r=>wStatus(K(r), all?null:'rupture')); };
       const setPoids1 = (r) => { const cur=prep.poids[K(r)]||''; const v=prompt('Poids réel constaté ? (ex : 320g)', cur); if(v!==null) wPoids(K(r), v.trim()||null); };
       const setPoidsProd = (site, product) => { const v=prompt('Poids réel (s\'applique à ce produit) — ex : 320g',''); if(v && v.trim()) rows.filter(r=>r.site===site&&r.product===product).forEach(r=>wPoids(K(r), v.trim())); };
@@ -11575,10 +11633,10 @@
       };
       const doCloseDay = async (rungisList) => {
         const agg = {};
-        rows.forEach(r => { const lmR = isLmRow(r); if (prep.status[K(r)] !== 'rupture' && !lmR) return;
+        rows.forEach(r => { const lmR = isLmRow(r), mq = lmR ? r.qty : missOf(r); if (!mq) return;
           const p=r.product; if(!agg[p]) agg[p]={ produit:p, producteur:r.producer, qty:0, clients:0, bySite:{}, lm:false };
           if (lmR) agg[p].lm = true;
-          agg[p].qty+=r.qty; agg[p].clients++; agg[p].bySite[r.site]=(agg[p].bySite[r.site]||0)+r.qty;
+          agg[p].qty+=mq; agg[p].clients++; agg[p].bySite[r.site]=(agg[p].bySite[r.site]||0)+mq;
         });
         for (const m of Object.values(agg)) {
           const id = dispatchNorm(m.producteur + '|' + m.produit) || ('m_' + m.produit).slice(0,80);
@@ -11668,7 +11726,7 @@
                   return (
                     <div key={k}>
                       {firstDone && <div className="pdj-donehint">Toucher un casier pour annuler le dépôt (erreur)</div>}
-                      <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
+                      <div className={"pdj-chip" + (x==='done'?" done":x==='rupture'?" rupt":x==='partiel'?" prt":((prep.count||{})[k]?" part":""))}>
                         <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                           <span className="pdj-csite" style={{background:kbSiteColor(site)}}>{site}</span>
                           <span className="pdj-cnum">{clientCasier(site,r.client)}</span>
@@ -11760,7 +11818,7 @@
             );
           })();
       if (prep.closed) {
-        let done=0, rupt=0; rows.forEach(r=>{ const x=prep.status[K(r)]; if(x==='rupture')rupt++; else if(x==='done')done++; });
+        let done=0, rupt=0; rows.forEach(r=>{ const x=prep.status[K(r)]; if(x==='rupture'||x==='partiel')rupt++; else if(x==='done')done++; });
         return (
           <div className="pdj-wrap"><PdjStyle />
             <div className="pdj-closedbox">
@@ -11801,7 +11859,7 @@
         const nCheeseProd = new Set(rsAll.filter(isCheese).map(r=>r.producer||'—')).size;
         const rs = rsAll.filter(r => (!prodFilter || (prodFilter==='__fromage' ? isCheese(r) : (r.producer||'—')===prodFilter)) && (!pq || muStrip(r.product.toLowerCase()).includes(pq) || muStrip((r.producer||'').toLowerCase()).includes(pq)));
         const prods = [...new Set(rs.map(r=>r.product))].sort((a,b)=>a.localeCompare(b));
-        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture').length; const fin=po.every(handled); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
+        const prodStat = (p) => { const po=rsAll.filter(r=>r.product===p); const tot=po.reduce((a,r)=>a+r.qty,0); const dn=po.reduce((a,r)=>a+posed(r),0); const rp=po.filter(r=>st(r)==='rupture'||st(r)==='partiel').length; const fin=po.every(handled); const ss=[...new Set(po.map(r=>r.site))].sort(); return { po, tot, dn, rp, fin, ss }; };
         if (openProd && rsAll.some(r=>r.product===openProd)) {
           // V9.75 — « Suivant » : prochain produit NON terminé (après celui-ci, sinon depuis le début)
           const todoP = prods.filter(p => p !== openProd && !prodStat(p).fin);
@@ -11971,7 +12029,7 @@
                       const k=K(r), x=st(r), pk=PK(r.site,r.product), rc=prep.remiseCli[k]||prep.remiseAll[pk], pv=prep.poids[k];
                       return (
                         <div key={k}>
-                          <div className={"pdj-chip"+(x==='done'?" done":x==='rupture'?" rupt":((prep.count||{})[k]?" part":""))}>
+                          <div className={"pdj-chip"+(x==='done'?" done":x==='rupture'?" rupt":x==='partiel'?" prt":((prep.count||{})[k]?" part":""))}>
                             <div className="pdj-cbody" onClick={()=>toggleDone(r)}>
                               <span className="pdj-cname">{r.product}</span>
                               {ndOn(pk) && <span className="pdj-tag nd">🔴 cagette ND</span>}
@@ -12026,7 +12084,7 @@
 
       const nc = curSite ? new Set(rows.filter(r=>r.site===curSite).map(r=>r.client)).size : 0;
       const sp = curSite ? siteProgress(curSite) : { done:0, total:0 };
-      const nr = curSite ? rows.filter(r=>r.site===curSite && prep.status[K(r)]==='rupture').length : 0;
+      const nr = curSite ? rows.filter(r=>r.site===curSite && (prep.status[K(r)]==='rupture'||prep.status[K(r)]==='partiel')).length : 0;
 
       return (
         <div className={"pdj-wrap"+(mode==='produits'&&openProd?' focus':'')}>
@@ -12215,6 +12273,7 @@
 .pdj-cpbtn.alt{background:#fff;color:var(--blue);min-height:60px;font-size:19px}
 .pdj-cplbl{font-size:17px;font-weight:800;margin-top:4px}
 .pdj-cperr{padding:10px 12px;border-radius:12px;background:var(--warn-s);border:2px solid var(--warn);font-size:17px;font-weight:800}
+.pdj-chip.prt{background:#fff1e0;border-color:#c62828;border-style:dashed}.pdj-chip.prt .pdj-cqty{background:#c62828;color:#fff;border-radius:10px;padding:2px 10px;white-space:nowrap}
 .pdj-chip.rupt{background:var(--warn-s);border-color:var(--warn)}.pdj-chip.rupt .pdj-cbody{text-decoration:line-through;opacity:.8}
 .pdj-xr{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:2px solid #e0dbd2;background:#fff;font-size:24px;cursor:pointer}
 .pdj-xr.rem.on{background:var(--rem);color:#fff;border-color:var(--rem)}
@@ -14507,7 +14566,440 @@
       );
     }
 
-    function CaDashboard() {
+    // ============================================================
+    // V9.79 — ANALYSE CA : compte rendu automatique + explications + exports
+    // Sources : ca_history (CA / commandes / lieux / manquants JSON), day_<J>_manquants
+    // (manquants signalés en prépa, avec motif), app_config/ca_notes (explications de l'équipe).
+    // ============================================================
+    const KB_NOTE_MOTIFS = [
+      { id: 'mauvaise_commande', label: 'Mauvaise commande (appro)' },
+      { id: 'rupture_producteur', label: 'Rupture producteur' },
+      { id: 'non_livre', label: 'Non livré / retard livraison' },
+      { id: 'erreur_prepa', label: 'Erreur prépa' },
+      { id: 'qualite', label: 'Qualité / casse' },
+      { id: 'fin_saison', label: 'Fin de saison' },
+      { id: 'bug_info', label: 'Bug informatique / site' },
+      { id: 'meteo', label: 'Météo' },
+      { id: 'ferie', label: 'Férié / vacances scolaires' },
+      { id: 'evenement', label: 'Événement / animation / promo' },
+      { id: 'fermeture', label: 'Fermeture / travaux / lieu' },
+      { id: 'autre', label: 'Autre' },
+    ];
+    const kbNoteMotifLabel = (id) => (KB_NOTE_MOTIFS.find(m => m.id === id) || {}).label || prepReasonLabel(id) || id || '';
+    const kbNoteScopes = [ ['general', 'Général'], ['jour', 'Une journée'], ['lieu', 'Un lieu'], ['produit', 'Un produit'] ];
+    const kbANorm = (s) => normalizeText(String(s || '')).replace(/[^a-z0-9]+/g, ' ').trim();
+    const kbEur = (c) => Math.round((c || 0) / 100).toLocaleString('fr-FR').replace(/[  ]/g, ' ') + ' €';
+    const kbPct = (a, b) => (b ? ((a - b) / b) * 100 : null);
+    const kbPctTxt = (p, dec) => p == null ? 'n/d' : `${p >= 0 ? '+' : ''}${p.toFixed(dec == null ? 1 : dec).replace('.', ',')} %`;
+    const kbKpiDelta = (k) => k[5] === 'pt' ? `${k[1] - k[2] >= 0 ? '+' : ''}${(k[1] - k[2]).toFixed(1).replace('.', ',')} pt` : kbPctTxt(kbPct(k[1], k[2]));
+    const kbShiftKey = (k, n) => { const d = new Date(k + 'T12:00:00'); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); };
+    const kbDaysBetween = (a, b) => Math.round((new Date(b + 'T12:00:00') - new Date(a + 'T12:00:00')) / 86400000);
+    const kbDowLong = (k) => { try { return new Date(k + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long' }); } catch (e) { return ''; } };
+
+    // Agrège une liste de jours (ca_history) + manquants prépa (par date) en indicateurs.
+    function kbCaPeriod(docs, prepByDate, priceOf) {
+      const P = { nb: docs.length, reel: 0, manq: 0, rem: 0, orders: 0, prepa: 0, bySite: {}, siteDays: {}, byWeek: {}, days: [], manqProd: {} };
+      for (const d of docs) {
+        const t = d.totals || totalsFromCaBySite(d.caBySite);
+        // Manquants signalés en prépa (dans l'appli) — en plus des manquants déjà dans le JSON
+        const jsonNames = new Set((d.manquantsByProduct || []).map(p => kbANorm(p.produit)));
+        let prepaC = 0; const prepaSite = {};
+        for (const m of ((prepByDate || {})[d.date] || [])) {
+          const nm = kbANorm(m.produit);
+          const add = (m.source === 'prepa' && m.status === 'rupture' && !jsonNames.has(nm)) ? (m.manque || m.total || 0) : 0;
+          const unit = priceOf(d, m.produit);
+          const k = nm || m.id;
+          if (!P.manqProd[k]) P.manqProd[k] = { produit: m.produit, producteur: m.producteur || '', qty: 0, cents: 0, days: new Set(), reasons: {}, sites: {} };
+          const mp = P.manqProd[k];
+          if (m.reason) mp.reasons[m.reason] = (mp.reasons[m.reason] || 0) + 1;
+          if (m.reasonNote && !/^Signalé en prépa|^Dispatch dernière minute/.test(m.reasonNote)) mp.reasons['note:' + m.reasonNote] = 1;
+          if (!add) continue;
+          const c = Math.round(add * unit);
+          prepaC += c; mp.qty += add; mp.cents += c; mp.days.add(d.date);
+          Object.entries(m.bySite || {}).forEach(([s, q]) => { mp.sites[s] = (mp.sites[s] || 0) + q; prepaSite[s] = (prepaSite[s] || 0) + Math.round(q * unit); });
+        }
+        for (const p of (d.manquantsByProduct || [])) {
+          const k = kbANorm(p.produit) || p.id;
+          if (!P.manqProd[k]) P.manqProd[k] = { produit: p.produit, producteur: p.producteur || '', qty: 0, cents: 0, days: new Set(), reasons: {}, sites: {} };
+          const mp = P.manqProd[k]; mp.qty += p.qty || 0; mp.cents += p.ca_cents || 0; mp.days.add(d.date);
+          Object.entries(p.bySite || {}).forEach(([s, q]) => { mp.sites[s] = (mp.sites[s] || 0) + q; });
+        }
+        const reel = (t.reel || 0) - prepaC, manq = (t.manquant || 0) + prepaC, rem = t.remise || 0;
+        P.reel += reel; P.manq += manq; P.rem += rem; P.prepa += prepaC; P.orders += d.ordersCount || 0;
+        const sites = {};
+        for (const [s, v] of Object.entries(d.caBySite || {})) {
+          const r = (v.reel_cents || 0) - (prepaSite[s] || 0);
+          sites[s] = { reel: r, manq: (v.manquant_cents || 0) + (prepaSite[s] || 0), rem: v.remise_cents || 0 };
+          P.bySite[s] = (P.bySite[s] || 0) + r; P.siteDays[s] = (P.siteDays[s] || 0) + 1;
+        }
+        const wk = isoWeekKey(d.date);
+        if (!P.byWeek[wk]) P.byWeek[wk] = { wk, reel: 0, orders: 0, n: 0, manq: 0, prev: 0 };
+        const W = P.byWeek[wk]; W.reel += reel; W.orders += d.ordersCount || 0; W.n++; W.manq += manq; W.prev += reel + manq + rem;
+        P.days.push({ date: d.date, reel, manq, rem, prepa: prepaC, orders: d.ordersCount || 0, sites });
+      }
+      P.prev = P.reel + P.manq + P.rem;
+      P.panier = P.orders ? P.reel / P.orders : 0;
+      P.caMoy = P.nb ? P.reel / P.nb : 0;
+      P.cmdMoy = P.nb ? P.orders / P.nb : 0;
+      P.tauxManq = P.prev ? P.manq / P.prev * 100 : 0;
+      P.tauxRem = P.prev ? P.rem / P.prev * 100 : 0;
+      P.weeks = Object.values(P.byWeek).sort((a, b) => a.wk.localeCompare(b.wk));
+      return P;
+    }
+
+    // Tendance : régression linéaire sur le CA hebdo (semaine incomplète en fin de période exclue)
+    function kbTrend(weeks) {
+      let w = [...weeks];
+      const maxN = Math.max(0, ...w.map(x => x.n));
+      if (w.length >= 3 && w[w.length - 1].n < maxN) w = w.slice(0, -1); // semaine en cours incomplète
+      if (w.length >= 3 && w[0].n < maxN) w = w.slice(1); // 1re semaine incomplète
+      if (w.length < 3) return { ok: false, weeks: w };
+      const ys = w.map(x => x.reel), n = ys.length, mx = (n - 1) / 2, my = ys.reduce((a, b) => a + b, 0) / n;
+      let num = 0, den = 0; ys.forEach((y, i) => { num += (i - mx) * (y - my); den += (i - mx) * (i - mx); });
+      const slope = den ? num / den : 0, pctWk = my ? slope / my * 100 : 0;
+      const half = Math.floor(n / 2), h1 = ys.slice(0, half), h2 = ys.slice(n - half);
+      const avg = (a) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
+      const dir = pctWk >= 1.5 ? 'up' : pctWk <= -1.5 ? 'down' : 'flat';
+      const om = w.map(x => x.orders), oMy = avg(om); let oNum = 0; om.forEach((y, i) => { oNum += (i - mx) * (y - oMy); });
+      return { ok: true, weeks: w, slope, pctWk, dir, firstHalf: avg(h1), secondHalf: avg(h2), ordersPctWk: oMy && den ? (oNum / den) / oMy * 100 : 0,
+        manqFirst: avg(w.slice(0, half).map(x => x.prev ? x.manq / x.prev * 100 : 0)), manqLast: avg(w.slice(n - half).map(x => x.prev ? x.manq / x.prev * 100 : 0)) };
+    }
+
+    // Notes (explications) qui concernent une période / un lieu / un produit
+    function kbNotesFor(notes, f, t, pred) {
+      return (notes || []).filter(n => n && (n.date || '') <= t && (n.dateTo || n.date || '') >= f && (!pred || pred(n)));
+    }
+    const kbNoteMatchProd = (n, produit) => n.scope === 'produit' && n.produit && (kbANorm(produit).includes(kbANorm(n.produit)) || kbANorm(n.produit).includes(kbANorm(produit)));
+
+    // Construit le compte rendu (phrases) à partir des deux périodes
+    function kbCaReport(A, B, notes, f, t, fB, tB) {
+      const out = [], alerts = [], trend = kbTrend(A.weeks);
+      const dCa = kbPct(A.reel, B.reel), dCmd = kbPct(A.orders, B.orders), dPan = kbPct(A.panier, B.panier), dMoy = kbPct(A.caMoy, B.caMoy);
+      if (B.nb) {
+        out.push(`CA réel de ${kbEur(A.reel)} sur ${A.nb} distribution${A.nb > 1 ? 's' : ''}, soit ${kbPctTxt(dCa)} par rapport à la période précédente (${kbEur(B.reel)} sur ${B.nb}).` +
+          (A.nb !== B.nb ? ` À nombre de distributions comparable, le CA moyen par distribution évolue de ${kbPctTxt(dMoy)} (${kbEur(A.caMoy)} contre ${kbEur(B.caMoy)}).` : ''));
+        out.push(`${A.orders.toLocaleString('fr-FR')} commandes (${A.orders - B.orders >= 0 ? '+' : ''}${(A.orders - B.orders).toLocaleString('fr-FR')}, ${kbPctTxt(dCmd)}), panier moyen ${(A.panier / 100).toFixed(2).replace('.', ',')} € (${kbPctTxt(dPan)}).` +
+          (dCa != null && dCmd != null ? (Math.abs(dCmd) > Math.abs(dPan || 0) ? ' La variation vient surtout du nombre de commandes.' : ' La variation vient surtout du panier moyen.') : ''));
+      } else {
+        out.push(`CA réel de ${kbEur(A.reel)} sur ${A.nb} distribution${A.nb > 1 ? 's' : ''}, ${A.orders.toLocaleString('fr-FR')} commandes, panier moyen ${(A.panier / 100).toFixed(2).replace('.', ',')} €. Pas de données sur la période précédente pour comparer.`);
+      }
+      if (trend.ok) {
+        const lab = trend.dir === 'up' ? 'croissante' : trend.dir === 'down' ? 'décroissante' : 'stable';
+        out.push(`Tendance ${lab} sur ${trend.weeks.length} semaines : ${kbPctTxt(trend.pctWk)} par semaine en moyenne (CA hebdo moyen ${kbEur(trend.firstHalf)} en début de période contre ${kbEur(trend.secondHalf)} en fin). Commandes : ${kbPctTxt(trend.ordersPctWk)} par semaine.`);
+      } else out.push('Période trop courte pour dégager une tendance (il faut au moins 3 semaines complètes).');
+      // Manquants
+      const dTx = A.tauxManq - B.tauxManq;
+      const manqTxt = `Manquants : ${kbEur(A.manq)}, soit ${A.tauxManq.toFixed(1).replace('.', ',')} % du CA commandé` +
+        (B.nb ? ` (${B.tauxManq.toFixed(1).replace('.', ',')} % sur la période précédente : ${Math.abs(dTx) < 0.2 ? 'stable' : dTx < 0 ? 'en baisse, c\'est mieux' : 'en hausse'})` : '') +
+        (A.prepa ? `, dont ${kbEur(A.prepa)} signalés en prépa dans l'appli` : '') + '.';
+      out.push(manqTxt);
+      if (trend.ok && Math.abs(trend.manqLast - trend.manqFirst) >= 0.3) out.push(`Sur la période, le taux de manquants passe de ${trend.manqFirst.toFixed(1).replace('.', ',')} % à ${trend.manqLast.toFixed(1).replace('.', ',')} % : ${trend.manqLast < trend.manqFirst ? 'de moins en moins de manquants' : 'les manquants augmentent'}.`);
+      if (A.rem) out.push(`Remises : ${kbEur(A.rem)} (${A.tauxRem.toFixed(1).replace('.', ',')} % du CA commandé).`);
+      // Top manquants
+      const top = Object.values(A.manqProd).filter(p => p.cents > 0 || p.qty > 0).sort((a, b) => b.cents - a.cents || b.qty - a.qty).slice(0, 8).map(p => {
+        const ns = kbNotesFor(notes, f, t, n => kbNoteMatchProd(n, p.produit));
+        const past = ns.length ? [] : (notes || []).filter(n => kbNoteMatchProd(n, p.produit)).sort((a, b) => (b.date || '').localeCompare(a.date || '')).slice(0, 1);
+        const reasons = Object.keys(p.reasons).filter(r => !r.startsWith('note:')).map(prepReasonLabel).filter(Boolean);
+        const free = Object.keys(p.reasons).filter(r => r.startsWith('note:')).map(r => r.slice(5));
+        const prevP = B.manqProd[kbANorm(p.produit)];
+        return { ...p, nDays: p.days.size, notes: ns, past, reasons: [...new Set(reasons)], free, prevCents: prevP ? prevP.cents : 0, isNew: !prevP };
+      });
+      if (top.length) {
+        out.push('Principaux manquants : ' + top.slice(0, 5).map(p => {
+          const why = p.notes.length ? ` → ${p.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' (' + n.note + ')' : '')).join(' ; ')}` : (p.reasons.length ? ` → ${p.reasons.join(', ')}` : ' → non expliqué');
+          return `${p.produit} (${kbEur(p.cents)}, ${p.nDays} jour${p.nDays > 1 ? 's' : ''}${p.isNew && B.nb ? ', nouveau' : ''})${why}`;
+        }).join(' · ') + '.');
+        const unexp = top.filter(p => !p.notes.length && !p.reasons.length);
+        if (unexp.length) alerts.push(`${unexp.length} manquant${unexp.length > 1 ? 's' : ''} important${unexp.length > 1 ? 's' : ''} sans explication : ${unexp.map(p => p.produit).join(', ')}.`);
+        const rec = top.filter(p => p.nDays >= 3);
+        if (rec.length) alerts.push(`Manquants récurrents (3 jours ou plus) : ${rec.map(p => `${p.produit} (${p.nDays} j)`).join(', ')} — à revoir avec l'appro.`);
+      }
+      // Motifs dominants
+      const mot = {}; kbNotesFor(notes, f, t).forEach(n => { if (n.motif) mot[n.motif] = (mot[n.motif] || 0) + 1; });
+      const motS = Object.entries(mot).sort((a, b) => b[1] - a[1]);
+      if (motS.length) out.push(`Explications notées par l'équipe sur la période : ${motS.map(([m, c]) => `${kbNoteMotifLabel(m)} (${c})`).join(', ')}.`);
+      // Lieux
+      const sites = Object.keys({ ...A.bySite, ...B.bySite }).map(s => {
+        const a = A.bySite[s] || 0, b = B.bySite[s] || 0, na = A.siteDays[s] || 0, nb = B.siteDays[s] || 0;
+        const am = na ? a / na : 0, bm = nb ? b / nb : 0;
+        return { site: s, a, b, na, nb, d: kbPct(a, b), dMoy: kbPct(am, bm), notes: kbNotesFor(notes, f, t, n => n.scope === 'lieu' && n.site === s) };
+      }).sort((x, y) => y.a - x.a);
+      if (B.nb) {
+        const sig = sites.filter(s => s.b && s.a && s.d != null && Math.abs(s.d) >= 8 && Math.abs(s.a - s.b) >= 15000);
+        const up = sig.filter(s => s.d > 0).sort((a, b) => b.d - a.d).slice(0, 3), dn = sig.filter(s => s.d < 0).sort((a, b) => a.d - b.d).slice(0, 3);
+        const fmtS = (s) => `${s.site} ${kbPctTxt(s.d, 0)}${s.na !== s.nb ? ` (${s.na} distrib. contre ${s.nb}, soit ${kbPctTxt(s.dMoy, 0)} par distrib.)` : ''}${s.notes.length ? ' → ' + s.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')).join(' ; ') : ''}`;
+        if (up.length) out.push('Lieux en hausse : ' + up.map(fmtS).join(' · ') + '.');
+        if (dn.length) out.push('Lieux en baisse : ' + dn.map(fmtS).join(' · ') + '.');
+        const gone = sites.filter(s => !s.a && s.b), fresh = sites.filter(s => s.a && !s.b);
+        if (gone.length) out.push(`Lieux sans distribution sur la période (actifs avant) : ${gone.map(s => s.site).join(', ')}.`);
+        if (fresh.length) out.push(`Nouveaux lieux sur la période : ${fresh.map(s => s.site).join(', ')}.`);
+        dn.filter(s => !s.notes.length).forEach(s => alerts.push(`Baisse à ${s.site} (${kbPctTxt(s.d, 0)}) sans explication.`));
+      }
+      // Jours atypiques (CA < 70 % ou > 130 % de la moyenne du même jour de semaine)
+      const byDow = {}; A.days.forEach(d => { const w = new Date(d.date + 'T12:00:00').getDay(); (byDow[w] = byDow[w] || []).push(d.reel); });
+      const odd = A.days.filter(d => { const arr = byDow[new Date(d.date + 'T12:00:00').getDay()]; if (arr.length < 3) return false; const m = arr.reduce((a, b) => a + b, 0) / arr.length; return d.reel < m * 0.7 || d.reel > m * 1.3; })
+        .map(d => ({ ...d, notes: kbNotesFor(notes, d.date, d.date, n => n.scope === 'jour' || n.scope === 'general') }));
+      if (odd.length) out.push('Journées atypiques : ' + odd.slice(0, 6).map(d => `${kbDowLong(d.date)} ${formatDateShort(d.date)} (${kbEur(d.reel)})${d.notes.length ? ' → ' + d.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')).join(' ; ') : ''}`).join(' · ') + '.');
+      odd.filter(d => !d.notes.length).slice(0, 4).forEach(d => alerts.push(`Journée atypique sans explication : ${kbDowLong(d.date)} ${formatDateShort(d.date)}.`));
+      const verdict = !B.nb ? '' : (dCa >= 2 ? 'Croissance' : dCa <= -2 ? 'Recul' : 'Stabilité') + ` du CA (${kbPctTxt(dCa)})` + (trend.ok ? `, tendance ${trend.dir === 'up' ? 'croissante' : trend.dir === 'down' ? 'décroissante' : 'stable'}` : '') + `, manquants ${Math.abs(dTx) < 0.2 ? 'stables' : dTx < 0 ? 'en baisse' : 'en hausse'}.`;
+      return { phrases: out, alerts, trend, top, sites, odd, verdict, kpis: [
+        ['CA réel', A.reel, B.reel, kbEur, true], ['CA commandé (prévisionnel)', A.prev, B.prev, kbEur, true],
+        ['Nb distributions', A.nb, B.nb, v => String(v), true], ['CA moyen / distribution', A.caMoy, B.caMoy, kbEur, true],
+        ['Commandes', A.orders, B.orders, v => Math.round(v).toLocaleString('fr-FR').replace(/[  ]/g, ' '), true], ['Panier moyen', A.panier, B.panier, v => (v / 100).toFixed(2).replace('.', ',') + ' €', true],
+        ['Manquants', A.manq, B.manq, kbEur, false], ['Taux de manquants', A.tauxManq, B.tauxManq, v => v.toFixed(1).replace('.', ',') + ' %', false, 'pt'],
+        ['Remises', A.rem, B.rem, kbEur, false],
+      ] };
+    }
+
+    // ---- Exports ----
+    function kbCaCsv(A, R, notes, f, t) {
+      const q = (v) => { const s = String(v == null ? '' : v); return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const e = (c) => ((c || 0) / 100).toFixed(2).replace('.', ',');
+      const L = [['type', 'date', 'jour', 'lieu', 'produit', 'producteur', 'quantite', 'ca_reel_eur', 'manquants_eur', 'remises_eur', 'commandes', 'motif', 'explication'].join(';')];
+      A.days.forEach(d => {
+        L.push(['jour', d.date, kbDowLong(d.date), 'TOUS', '', '', '', e(d.reel), e(d.manq), e(d.rem), d.orders, '', ''].map(q).join(';'));
+        Object.entries(d.sites).sort().forEach(([s, v]) => L.push(['lieu', d.date, kbDowLong(d.date), s, '', '', '', e(v.reel), e(v.manq), e(v.rem), '', '', ''].map(q).join(';')));
+      });
+      Object.values(A.manqProd).filter(p => p.qty).sort((a, b) => b.cents - a.cents).forEach(p => {
+        const ns = kbNotesFor(notes, f, t, n => kbNoteMatchProd(n, p.produit));
+        L.push(['manquant', `${f}..${t}`, '', Object.keys(p.sites).sort().join(' '), p.produit, p.producteur, p.qty, '', e(p.cents), '', '', ns.map(n => kbNoteMotifLabel(n.motif)).join(' | ') || Object.keys(p.reasons).filter(r => !r.startsWith('note:')).map(prepReasonLabel).join(' | '), ns.map(n => n.note).filter(Boolean).join(' | ')].map(q).join(';'));
+      });
+      kbNotesFor(notes, f, t).forEach(n => L.push(['explication', n.date + (n.dateTo && n.dateTo !== n.date ? '..' + n.dateTo : ''), '', n.site || '', n.produit || '', '', '', '', '', '', '', kbNoteMotifLabel(n.motif), (n.note || '') + (n.by ? ' — ' + n.by : '')].map(q).join(';')));
+      return '﻿' + L.join('\n');
+    }
+    function kbCaClaudeText(A, B, R, notes, f, t, fB, tB) {
+      const L = [];
+      L.push(`# Kelbongoo — données de suivi CA du ${formatDateShort(f)} au ${formatDateShort(t)}`);
+      L.push(`Comparaison : période précédente du ${formatDateShort(fB)} au ${formatDateShort(tB)}. Montants TTC. « CA réel » = livré à prix plein, après manquants (JSON + signalés en prépa), avant remises.`);
+      L.push('', '## Compte rendu automatique', ...(R.verdict ? ['**' + R.verdict + '**'] : []), ...R.phrases.map(p => '- ' + p));
+      if (R.alerts.length) L.push('', '## Points à expliquer / surveiller', ...R.alerts.map(a => '- ' + a));
+      L.push('', '## Indicateurs', '| Indicateur | Période | Précédente | Écart |', '|---|---|---|---|');
+      R.kpis.forEach(k => { const [l, a, b, fm] = k; L.push(`| ${l} | ${fm(a)} | ${B.nb ? fm(b) : 'n/d'} | ${B.nb ? kbKpiDelta(k) : ''} |`); });
+      L.push('', '## CA par semaine', '| Semaine | Distrib. | CA réel | Commandes | Taux manquants |', '|---|---|---|---|---|');
+      A.weeks.forEach(w => L.push(`| ${w.wk} | ${w.n} | ${kbEur(w.reel)} | ${w.orders} | ${w.prev ? (w.manq / w.prev * 100).toFixed(1) : '0'} % |`));
+      L.push('', '## CA par lieu', '| Lieu | CA période | Distrib. | CA précédente | Distrib. | Écart | Explication |', '|---|---|---|---|---|---|---|');
+      R.sites.forEach(s => L.push(`| ${s.site} | ${kbEur(s.a)} | ${s.na} | ${kbEur(s.b)} | ${s.nb} | ${s.d == null ? 'n/d' : kbPctTxt(s.d, 0)} | ${s.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')).join(' ; ')} |`));
+      L.push('', '## Principaux manquants', '| Produit | Producteur | Qté | Montant | Jours | Motif / explication |', '|---|---|---|---|---|---|');
+      R.top.forEach(p => L.push(`| ${p.produit} | ${p.producteur} | ${p.qty} | ${kbEur(p.cents)} | ${p.nDays} | ${[...p.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')), ...p.reasons, ...p.free].join(' ; ') || 'non expliqué'} |`));
+      const ns = kbNotesFor(notes, f, t);
+      if (ns.length) { L.push('', '## Explications de l\'équipe'); ns.forEach(n => L.push(`- ${formatDateShort(n.date)}${n.dateTo && n.dateTo !== n.date ? ' → ' + formatDateShort(n.dateTo) : ''} · ${kbNoteScopes.find(x => x[0] === n.scope)?.[1] || ''}${n.site ? ' ' + n.site : ''}${n.produit ? ' ' + n.produit : ''} : ${kbNoteMotifLabel(n.motif)}${n.note ? ' — ' + n.note : ''}${n.by ? ' (' + n.by + ')' : ''}`)); }
+      L.push('', '## Détail par distribution', '| Date | Jour | CA réel | Manquants | Remises | Commandes |', '|---|---|---|---|---|---|');
+      A.days.forEach(d => L.push(`| ${d.date} | ${kbDowLong(d.date)} | ${kbEur(d.reel)} | ${kbEur(d.manq)} | ${kbEur(d.rem)} | ${d.orders} |`));
+      L.push('', 'Merci d\'analyser ces données : tendance, points forts/faibles, causes probables des manquants et actions à proposer.');
+      return L.join('\n');
+    }
+    function kbCaPdf(A, B, R, notes, f, t, fB, tB) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const T = (s) => kbPdfTxt(String(s == null ? '' : s).replace(/€/g, 'EUR').replace(/→/g, '>').replace(/·/g, '-'));
+      const G = [74, 124, 59];
+      doc.setFillColor(...G); doc.rect(0, 0, 210, 26, 'F'); doc.setTextColor(255, 255, 255);
+      doc.setFontSize(16); doc.setFont(undefined, 'bold'); doc.text(T('Kelbongoo - Compte rendu CA'), 12, 12);
+      doc.setFontSize(10); doc.setFont(undefined, 'normal');
+      doc.text(T(`Du ${formatDateShort(f)} au ${formatDateShort(t)} - comparé au ${formatDateShort(fB)} > ${formatDateShort(tB)} - édité le ${new Date().toLocaleDateString('fr-FR')}`), 12, 20);
+      doc.setTextColor(30, 30, 30);
+      let y = 34;
+      const need = (h) => { if (y + h > 282) { doc.addPage(); y = 16; } };
+      const h2 = (s) => { need(12); doc.setFontSize(12); doc.setFont(undefined, 'bold'); doc.setTextColor(...G); doc.text(T(s), 12, y); doc.setTextColor(30, 30, 30); y += 6; };
+      const para = (s, opt) => { doc.setFontSize(opt && opt.size || 9.5); doc.setFont(undefined, opt && opt.bold ? 'bold' : 'normal'); const lines = doc.splitTextToSize(T(s), 182); need(lines.length * 4.4 + 1); doc.text(lines, opt && opt.indent ? 16 : 12, y); y += lines.length * 4.4 + 1.2; };
+      const table = (head, body, extra) => { need(22); doc.autoTable({ showHead: 'everyPage', startY: y, head: [head.map(T)], body: body.map(r => r.map(T)), styles: { fontSize: 8.5, cellPadding: 1.5 }, headStyles: { fillColor: G }, margin: { left: 10, right: 10 }, ...(extra || {}) }); y = doc.lastAutoTable.finalY + 6; };
+      if (R.verdict) { para(R.verdict, { bold: true, size: 11 }); y += 1; }
+      h2('Analyse');
+      R.phrases.forEach(p => para('- ' + p));
+      if (R.alerts.length) { y += 2; h2('Points à expliquer / surveiller'); R.alerts.forEach(a => para('- ' + a)); }
+      y += 2; h2('Indicateurs');
+      table(['Indicateur', 'Période', 'Précédente', 'Écart'], R.kpis.map(k => [k[0], k[3](k[1]), B.nb ? k[3](k[2]) : 'n/d', B.nb ? kbKpiDelta(k) : '']), { columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' }, 3: { halign: 'right' } } });
+      // Graphique CA hebdo (barres)
+      if (A.weeks.length) {
+        h2('CA réel par semaine'); need(48);
+        const x0 = 16, w0 = 178, h0 = 34, max = Math.max(1, ...A.weeks.map(w => w.reel)), bw = Math.min(16, w0 / A.weeks.length - 2);
+        doc.setDrawColor(200); doc.line(x0, y + h0, x0 + w0, y + h0);
+        A.weeks.forEach((w, i) => { const bh = w.reel / max * (h0 - 4), bx = x0 + i * (w0 / A.weeks.length) + 1;
+          doc.setFillColor(...(R.trend.ok && !R.trend.weeks.includes(w) ? [180, 200, 170] : G)); doc.rect(bx, y + h0 - bh, bw, bh, 'F');
+          doc.setFontSize(6.5); doc.text(T(Math.round(w.reel / 100000) + 'k'), bx + bw / 2, y + h0 - bh - 1, { align: 'center' }); doc.text(T(w.wk.split('-')[1]), bx + bw / 2, y + h0 + 3.5, { align: 'center' }); });
+        if (R.trend.ok) { const n = R.trend.weeks.length, my = R.trend.weeks.reduce((a, w) => a + w.reel, 0) / n, step = w0 / A.weeks.length, i0 = A.weeks.indexOf(R.trend.weeks[0]);
+          const yv = (v) => y + h0 - v / max * (h0 - 4); doc.setDrawColor(200, 60, 40); doc.setLineWidth(0.5);
+          doc.line(x0 + i0 * step + 1 + bw / 2, yv(my - R.trend.slope * (n - 1) / 2), x0 + (i0 + n - 1) * step + 1 + bw / 2, yv(my + R.trend.slope * (n - 1) / 2)); doc.setLineWidth(0.2); }
+        y += h0 + 9;
+        table(['Semaine', 'Distrib.', 'CA réel', 'Commandes', 'Taux manquants'], A.weeks.map(w => [w.wk, w.n, kbEur(w.reel), w.orders, (w.prev ? (w.manq / w.prev * 100).toFixed(1) : '0') + ' %']));
+      }
+      h2('CA par lieu');
+      table(['Lieu', 'CA période', 'Distrib.', 'CA précédente', 'Distrib.', 'Écart', 'Explication'], R.sites.map(s => [s.site, kbEur(s.a), s.na, kbEur(s.b), s.nb, s.d == null ? 'n/d' : kbPctTxt(s.d, 0), s.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')).join(' ; ')]), { columnStyles: { 6: { cellWidth: 55 } } });
+      h2('Principaux manquants');
+      table(['Produit', 'Producteur', 'Qté', 'Montant', 'Jours', 'Motif / explication'], R.top.map(p => [p.produit, p.producteur, p.qty, kbEur(p.cents), p.nDays, [...p.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')), ...p.reasons, ...p.free].join(' ; ') || 'non expliqué']), { columnStyles: { 5: { cellWidth: 60 } } });
+      const ns = kbNotesFor(notes, f, t);
+      if (ns.length) { h2("Explications de l'équipe"); table(['Date', 'Portée', 'Motif', 'Commentaire', 'Par'], ns.map(n => [formatDateShort(n.date) + (n.dateTo && n.dateTo !== n.date ? ' > ' + formatDateShort(n.dateTo) : ''), (kbNoteScopes.find(x => x[0] === n.scope) || [, ''])[1] + (n.site ? ' ' + n.site : '') + (n.produit ? ' ' + n.produit : ''), kbNoteMotifLabel(n.motif), n.note || '', n.by || ''])); }
+      h2('Détail par distribution');
+      table(['Date', 'Jour', 'CA réel', 'Manquants', 'Remises', 'Commandes'], A.days.map(d => [formatDateShort(d.date), kbDowLong(d.date), kbEur(d.reel), kbEur(d.manq), kbEur(d.rem), d.orders]));
+      const np = doc.getNumberOfPages();
+      for (let i = 1; i <= np; i++) { doc.setPage(i); doc.setFontSize(7.5); doc.setTextColor(140); doc.text(T(`Kelbongoo ${APP_VERSION} - page ${i}/${np}`), 198, 291, { align: 'right' }); }
+      kbOpenPdf(doc, `Kelbongoo_CompteRendu_CA_${f}_${t}.pdf`);
+    }
+
+    // ---- Composant : carte « Compte rendu » dans Suivi CA › Bilan ----
+    function CaAnalyse({ all, from, to, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [notes, setNotes] = React.useState([]);
+      const [prepBy, setPrepBy] = React.useState({});
+      const [loadingP, setLoadingP] = React.useState(false);
+      const [form, setForm] = React.useState(null);
+      const [showNotes, setShowNotes] = React.useState(false);
+      const len = Math.max(0, kbDaysBetween(from, to));
+      const tB = kbShiftKey(from, -1), fB = kbShiftKey(tB, -len);
+      const docsA = React.useMemo(() => (all || []).filter(d => d.date && d.date >= from && d.date <= to).sort((a, b) => a.date.localeCompare(b.date)), [all, from, to]);
+      const docsB = React.useMemo(() => (all || []).filter(d => d.date && d.date >= fB && d.date <= tB).sort((a, b) => a.date.localeCompare(b.date)), [all, fB, tB]);
+
+      React.useEffect(() => storage.subscribe('app_config', arr => {
+        const d = (arr || []).find(x => x.id === 'ca_notes');
+        setNotes(Object.entries((d && d.notes) || {}).filter(([, v]) => v && v.date).map(([id, v]) => ({ ...v, id })).sort((a, b) => (b.date || '').localeCompare(a.date || '')));
+      }), []);
+      // Manquants signalés en prépa (avec motifs) pour les dates des deux périodes
+      React.useEffect(() => {
+        let alive = true;
+        const dates = [...docsA, ...docsB].map(d => d.date).filter(d => !(d in prepBy)).slice(0, 160);
+        if (!dates.length) return;
+        setLoadingP(true);
+        (async () => {
+          const res = {};
+          for (let i = 0; i < dates.length; i += 8) {
+            const chunk = dates.slice(i, i + 8);
+            const got = await Promise.all(chunk.map(dk => storage.getAll(`day_${dk}_manquants`).catch(() => [])));
+            chunk.forEach((dk, j) => { res[dk] = got[j] || []; });
+          }
+          if (alive) { setPrepBy(p => ({ ...p, ...res })); setLoadingP(false); }
+        })();
+        return () => { alive = false; };
+      }, [docsA, docsB]);
+
+      const priceOf = React.useMemo(() => {
+        const g = {};
+        (all || []).forEach(d => [...(d.salesByProduct || []), ...(d.manquantsByProduct || [])].forEach(p => { if (p.qty && p.ca_cents) g[kbANorm(p.produit)] = p.ca_cents / p.qty; }));
+        return (d, name) => { const k = kbANorm(name); const hit = [...(d.salesByProduct || []), ...(d.manquantsByProduct || [])].find(p => kbANorm(p.produit) === k && p.qty); return hit ? hit.ca_cents / hit.qty : (g[k] || 0); };
+      }, [all]);
+      const A = React.useMemo(() => kbCaPeriod(docsA, prepBy, priceOf), [docsA, prepBy, priceOf]);
+      const B = React.useMemo(() => kbCaPeriod(docsB, prepBy, priceOf), [docsB, prepBy, priceOf]);
+      const R = React.useMemo(() => kbCaReport(A, B, notes, from, to, fB, tB), [A, B, notes, from, to]);
+
+      const openForm = (o) => setForm({ date: to, dateTo: '', scope: 'general', site: '', produit: '', motif: '', note: '', ...(o || {}) });
+      const saveNote = async () => {
+        if (!form.motif) { showToast('Choisis un motif'); return; }
+        if (form.scope === 'lieu' && !form.site) { showToast('Choisis le lieu'); return; }
+        if (form.scope === 'produit' && !form.produit.trim()) { showToast('Indique le produit'); return; }
+        const id = form.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+        const n = { date: form.date, dateTo: form.dateTo && form.dateTo > form.date ? form.dateTo : '', scope: form.scope, site: form.scope === 'lieu' ? form.site : (form.site || ''), produit: form.scope === 'produit' ? form.produit.trim() : '', motif: form.motif, note: (form.note || '').trim(), by: (session && session.name) || '', at: new Date().toISOString() };
+        try {
+          const cur = (await storage.getDoc('app_config', 'ca_notes')) || {};
+          await storage.setDoc('app_config', 'ca_notes', { notes: { ...(cur.notes || {}), [id]: n } }, { replace: true });
+          showToast('💬 Explication enregistrée'); setForm(null);
+        } catch (e) { showToast('⚠️ ' + e.message); }
+      };
+      const delNote = async (id) => {
+        if (!window.confirm('Supprimer cette explication ?')) return;
+        const cur = (await storage.getDoc('app_config', 'ca_notes')) || {};
+        const m = { ...(cur.notes || {}) }; delete m[id];
+        await storage.setDoc('app_config', 'ca_notes', { notes: m }, { replace: true });
+      };
+      const allSites = React.useMemo(() => [...new Set((all || []).flatMap(d => Object.keys(d.caBySite || {})))].sort(), [all]);
+      const notesP = kbNotesFor(notes, from, to);
+      const box = { background: 'var(--bg-soft,#f6f8f4)', borderRadius: 10, padding: '10px 12px', marginTop: 10 };
+      const trendCol = !R.trend.ok ? 'var(--ink-mute)' : R.trend.dir === 'up' ? '#2e7d32' : R.trend.dir === 'down' ? 'var(--danger,#c62828)' : '#8a6d00';
+
+      if (!docsA.length) return null;
+      return (
+        <div className="card" style={{ borderLeft: '4px solid #4a7c3b' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <h3 style={{ margin: 0 }}>🧠 Compte rendu de la période</h3>
+            {R.trend.ok && <span style={{ fontWeight: 800, color: trendCol, fontSize: 13 }}>{R.trend.dir === 'up' ? '📈 Tendance croissante' : R.trend.dir === 'down' ? '📉 Tendance décroissante' : '➡️ Tendance stable'} ({kbPctTxt(R.trend.pctWk)}/sem.)</span>}
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--ink-mute)', margin: '4px 0 0' }}>Comparé à la période précédente de même durée : {formatDateShort(fB)} → {formatDateShort(tB)} ({B.nb} distrib.).{loadingP ? ' Chargement des manquants prépa…' : ''}</p>
+          {R.verdict && <div style={{ fontWeight: 800, fontSize: 15, marginTop: 10 }}>{R.verdict}</div>}
+          <ul style={{ margin: '8px 0 0', paddingLeft: 18, fontSize: 13.5, lineHeight: 1.5 }}>
+            {R.phrases.map((p, i) => <li key={i} style={{ marginBottom: 4 }}>{p}</li>)}
+          </ul>
+          {R.alerts.length > 0 && <div style={{ ...box, background: '#fff6e5', borderLeft: '3px solid #ef6c00' }}>
+            <div style={{ fontWeight: 800, fontSize: 13, color: '#a64b00', marginBottom: 4 }}>⚠️ À expliquer / surveiller</div>
+            {R.alerts.map((a, i) => <div key={i} style={{ fontSize: 13, marginBottom: 2 }}>• {a}</div>)}
+          </div>}
+
+          {R.top.length > 0 && <div style={box}>
+            <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6 }}>Principaux manquants — explique-les en un clic</div>
+            {R.top.map((p, i) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderTop: i ? '1px solid var(--line)' : 'none' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{p.produit} <span style={{ fontWeight: 400, color: 'var(--ink-mute)', fontSize: 11 }}>· {p.producteur}</span></div>
+                  <div style={{ fontSize: 11.5, color: 'var(--ink-soft)' }}>{p.qty} u · {kbEur(p.cents)} · {p.nDays} jour{p.nDays > 1 ? 's' : ''}{p.isNew && B.nb ? ' · nouveau' : ''}
+                    {p.notes.length ? <b style={{ color: '#2e7d32' }}> · {p.notes.map(n => kbNoteMotifLabel(n.motif) + (n.note ? ' : ' + n.note : '')).join(' ; ')}</b>
+                      : p.reasons.length ? <span> · motif prépa : {p.reasons.join(', ')}</span> : <b style={{ color: '#c62828' }}> · non expliqué</b>}
+                  </div>
+                  {p.past.length > 0 && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>Déjà noté le {formatDateShort(p.past[0].date)} : {kbNoteMotifLabel(p.past[0].motif)}{p.past[0].note ? ' — ' + p.past[0].note : ''}</div>}
+                </div>
+                {p.past.length > 0 && !p.notes.length && <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 8px' }} onClick={() => openForm({ scope: 'produit', produit: p.produit, date: from, dateTo: to, motif: p.past[0].motif, note: p.past[0].note })}>↻ Même motif</button>}
+                <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => openForm({ scope: 'produit', produit: p.produit, date: from, dateTo: to })}>💬</button>
+              </div>
+            ))}
+          </div>}
+
+          {R.sites.length > 0 && B.nb > 0 && <div style={box}>
+            <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 6 }}>Lieux vs période précédente</div>
+            {R.sites.map(s => (
+              <div key={s.site} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', fontSize: 13 }}>
+                <b style={{ flex: '0 0 46px' }}>{s.site}</b>
+                <span style={{ flex: 1 }}>{kbEur(s.a)} <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>({s.na} distrib. · avant {kbEur(s.b)})</span>{s.notes.length > 0 && <span style={{ color: '#2e7d32', fontSize: 11 }}> · {s.notes.map(n => kbNoteMotifLabel(n.motif)).join(', ')}</span>}</span>
+                <span style={{ fontWeight: 700, color: s.d == null ? 'var(--ink-mute)' : s.d >= 0 ? '#2e7d32' : '#c62828' }}>{s.d == null ? '—' : kbPctTxt(s.d, 0)}</span>
+                <button className="btn-secondary" style={{ fontSize: 12, padding: '4px 8px' }} onClick={() => openForm({ scope: 'lieu', site: s.site, date: from, dateTo: to })}>💬</button>
+              </div>
+            ))}
+          </div>}
+
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>
+            <button className="btn-primary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => openForm()}>💬 Ajouter une explication</button>
+            <button className="btn-secondary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => setShowNotes(v => !v)}>📝 Explications ({notesP.length})</button>
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+            <button className="btn-secondary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => { try { kbCaPdf(A, B, R, notes, from, to, fB, tB); } catch (e) { showToast('⚠️ PDF : ' + e.message); } }}>📄 PDF de la période</button>
+            <button className="btn-secondary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => kbDownloadText(kbCaCsv(A, R, notes, from, to), `Kelbongoo_CA_${from}_${to}.csv`)}>📊 Données CSV</button>
+            <button className="btn-secondary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => kbCopyText(kbCaClaudeText(A, B, R, notes, from, to, fB, tB), showToast)}>🤖 Copier pour Claude</button>
+            <button className="btn-secondary" style={{ fontSize: 13, padding: '9px 12px' }} onClick={() => kbDownloadText(kbCaClaudeText(A, B, R, notes, from, to, fB, tB), `Kelbongoo_CA_${from}_${to}.md`, 'text/markdown;charset=utf-8')}>⬇️ Fichier pour Claude</button>
+          </div>
+
+          {showNotes && <div style={box}>
+            {notesP.length ? notesP.map(n => (
+              <div key={n.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', padding: '6px 0', borderTop: '1px solid var(--line)', fontSize: 13 }}>
+                <div style={{ flex: 1 }}>
+                  <b>{formatDateShort(n.date)}{n.dateTo && n.dateTo !== n.date ? ' → ' + formatDateShort(n.dateTo) : ''}</b> · {(kbNoteScopes.find(x => x[0] === n.scope) || [, ''])[1]}{n.site ? ' ' + n.site : ''}{n.produit ? ' · ' + n.produit : ''}
+                  <div><span style={{ fontWeight: 700, color: '#2e7d32' }}>{kbNoteMotifLabel(n.motif)}</span>{n.note ? ' — ' + n.note : ''} <span style={{ color: 'var(--ink-mute)', fontSize: 11 }}>{n.by}</span></div>
+                </div>
+                <button className="btn-secondary" style={{ fontSize: 12, padding: '4px 8px' }} onClick={() => openForm({ ...n })}>✏️</button>
+                <button className="btn-secondary" style={{ fontSize: 12, padding: '4px 8px' }} onClick={() => delNote(n.id)}>🗑</button>
+              </div>
+            )) : <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucune explication sur cette période.</div>}
+          </div>}
+
+          {form && <div style={{ ...box, background: '#eef6ea', border: '1px solid #b9d7ad' }}>
+            <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 8 }}>💬 Explication</div>
+            <div className="chip-group" style={{ marginBottom: 8 }}>
+              {kbNoteScopes.map(([k, l]) => <div key={k} className={`chip ${form.scope === k ? 'selected' : ''}`} onClick={() => setForm(o => ({ ...o, scope: k }))}>{l}</div>)}
+            </div>
+            <div className="date-range">
+              <div style={{ flex: 1 }}><label>{form.scope === 'jour' ? 'Date' : 'Du'}</label><input type="date" value={form.date} onChange={e => setForm(o => ({ ...o, date: e.target.value }))} /></div>
+              {form.scope !== 'jour' && <div style={{ flex: 1 }}><label>Au (facultatif)</label><input type="date" value={form.dateTo} onChange={e => setForm(o => ({ ...o, dateTo: e.target.value }))} /></div>}
+            </div>
+            {form.scope === 'lieu' && <div className="chip-group" style={{ marginTop: 8 }}>{allSites.map(s => <div key={s} className={`chip ${form.site === s ? 'selected' : ''}`} onClick={() => setForm(o => ({ ...o, site: s }))}>{s}</div>)}</div>}
+            {form.scope === 'produit' && <input style={{ width: '100%', marginTop: 8 }} placeholder="Produit (ex. Poireaux)" value={form.produit} onChange={e => setForm(o => ({ ...o, produit: e.target.value }))} />}
+            <div style={{ fontSize: 12, fontWeight: 700, margin: '10px 0 4px' }}>Motif</div>
+            <div className="chip-group">{KB_NOTE_MOTIFS.map(m => <div key={m.id} className={`chip ${form.motif === m.id ? 'selected' : ''}`} onClick={() => setForm(o => ({ ...o, motif: m.id }))}>{m.label}</div>)}</div>
+            <textarea style={{ width: '100%', marginTop: 8, minHeight: 60 }} placeholder="Commentaire (ex. le producteur n'a livré que la moitié, commande passée trop tard…)" value={form.note} onChange={e => setForm(o => ({ ...o, note: e.target.value }))} />
+            <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+              <button className="btn-primary" onClick={saveNote}>Enregistrer</button>
+              <button className="btn-secondary" onClick={() => setForm(null)}>Annuler</button>
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>L'explication est gardée : elle réapparaît dans le compte rendu, le PDF et l'export pour Claude, et elle est proposée la prochaine fois que ce produit manque.</p>
+          </div>}
+        </div>
+      );
+    }
+
+    function CaDashboard({ session }) {
       const [all, setAll] = React.useState(null); // null = chargement
       const [from, setFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
       const [to, setTo] = React.useState(() => new Date().toISOString().slice(0,10));
@@ -14611,6 +15103,9 @@
               )}
             </div>
           </div>
+
+          {/* V9.79 — compte rendu automatique + explications + exports */}
+          <CaAnalyse all={all} from={from} to={to} session={session} />
 
           {/* Comparaison A vs B */}
           {compare && (
@@ -15011,7 +15506,7 @@
         return (
           <div className="stack">
             <Header />
-            <CaDashboard />
+            <CaDashboard session={session} />
           </div>
         );
       }
@@ -19792,7 +20287,9 @@
       const [pushMessages, setPushMessages] = React.useState([]); // infos push master → boutiques
       const [followUpsAll, setFollowUpsAll] = React.useState([]); // pour le blocage 3j
 
-      const orders = React.useMemo(() => enrichOrders(rawOrders, consumersByEmail), [rawOrders, consumersByEmail]);
+      // V9.80 — casiers de la PRÉPA (day_X_prep cs|site||client) appliqués à toutes les vues distrib
+      const [prepCas, setPrepCas] = React.useState({});
+      const orders = React.useMemo(() => enrichOrders(kbApplyPrepCasiers(rawOrders, prepCas), consumersByEmail), [rawOrders, prepCas, consumersByEmail]);
 
       // Sites présents dans les commandes du jour (sinon liste complète historique)
       const sitesOfDay = React.useMemo(() => {
@@ -19888,6 +20385,10 @@
         // Un vrai distributeur travaille TOUJOURS sur la distribution du jour : on ignore
         // tout override de jour (préparation du lendemain) pour ne pas lui montrer demain.
         const dayScope = (session.role === 'distrib') ? todayKey() : activeDay();
+        const uCas = storage.subscribe(`day_${dayScope}_prep`, (arr) => {
+          const m = {}; (arr || []).forEach(d => { const id = String(d.id || ''); if (id.startsWith('cs|')) { const v = (d.nums || []).map(String).filter(Boolean); if (v.length) m[decodeURIComponent(id.slice(3))] = v; } });
+          setPrepCas(prev => JSON.stringify(prev) === JSON.stringify(m) ? prev : m);
+        });
         const u1 = storage.subscribe(`day_${dayScope}_orders`, (arr) => {
           if (arr.length && arr[0].orders) {
             setRawOrders(arr[0].orders);
@@ -19959,7 +20460,7 @@
         const u9 = storage.subscribe(`day_${activeDay()}_lastminute`, setLastminute);
         const u10 = storage.subscribe('push_messages', setPushMessages);
         const u11 = storage.subscribe('followups', setFollowUpsAll);
-        return () => { u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); u9(); u10(); u11(); };
+        return () => { uCas(); u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); u9(); u10(); u11(); };
       }, [session, dayRev]);
 
       const handleLogin = (s) => {
