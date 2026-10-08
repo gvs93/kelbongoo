@@ -627,7 +627,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.85';
+    const APP_VERSION = 'V9.86';
+    // V9.86 — Commande pain Pribon : liste FIXE des 8 pains Brut de Pain (tarif BdP), nom BdP + nom Kelbongoo ;
+    //   récap général additionné par nom de pain (Kelbongoo + Pribon).
     // V9.85 — Prépa : commandes fusionnées d'un même client = UNE ligne par produit (quantités additionnées).
     //   🔐 Suivi & impression › 🥖 Commande pain des magasins Pribon (Pribon Bichat) : quantités par pain,
     //   ajoutée au dispatch pain (bloc « PRIBON BICHAT ») et au récap ; facturation par mois (relevé PDF,
@@ -10607,7 +10609,7 @@
       })();
       const recap = (() => {
         const m = {};
-        siteBlocks.forEach(b => b.lines.forEach(x => { const k = x.produit + '||' + x.producteur; m[k] = m[k] || { produit: x.produit, qty: 0, by: [] }; m[k].qty += x.qty; m[k].by.push(`${b.code} ${x.qty}`); }));
+        siteBlocks.forEach(b => b.lines.forEach(x => { const k = kbPainKey(x.produit); m[k] = m[k] || { produit: x.produit, qty: 0, by: [] }; m[k].qty += x.qty; m[k].by.push(`${b.code} ${x.qty}`); }));
         return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')).map(x => ({ produit: x.produit, qty: x.qty, detail: x.by.join(' · ') }));
       })();
       const total = recap.reduce((s, x) => s + x.qty, 0);
@@ -11138,6 +11140,17 @@
     // La commande s'ajoute au dispatch pain (lieu « PRIBON BICHAT ») et au récap général.
     // ════════════════════════════════════════════════════════════════
     const PRIBON_STORES = [{ code: 'PRIBIC', label: 'PRIBON BICHAT', short: 'PRIBON' }];
+    // Pains Brut de Pain commandables pour les magasins Pribon (tarif Brut de Pain, modifiable dans l'appli)
+    const BRUT_DE_PAIN = [
+      { bdp: 'Brioche tressée',    name: 'Brioche tressée',                      poids: '470 g',  price: 5.90 },
+      { bdp: 'Meule 1 kg BIO',     name: 'La miche nature au levain BIO 1kg',    poids: '1000 g', price: 4.50 },
+      { bdp: 'Meule 500 g BIO',    name: 'La miche nature au levain BIO 500g',   poids: '500 g',  price: 2.65 },
+      { bdp: 'Meule graine BIO',   name: 'La miche graines au levain BIO',       poids: '500 g',  price: 2.85 },
+      { bdp: 'Pain complet BIO',   name: 'Pain complet BIO',                     poids: '500 g',  price: 2.55 },
+      { bdp: 'Pain norvégien BIO', name: 'Pain norvegien au levain Bio',         poids: '1100 g', price: 8.00 },
+      { bdp: 'Petit épeautre BIO', name: 'Pain au petit épeautre BIO',           poids: '340 g',  price: 2.59 },
+      { bdp: 'Sarrasin Riz',       name: 'Pain sans gluten (traces possibles)',  poids: '320 g',  price: 3.25 },
+    ];
     function kbPainKey(name) { return normalizeText(kbProdName(name)).replace(/[^a-z0-9]+/g, ' ').trim(); }
     async function kbPainPribonForDay(day) {
       const out = [];
@@ -11162,15 +11175,9 @@
       React.useEffect(() => { readCache('products').then(d => setProdCache(d || {})).catch(() => {}); }, []);
       React.useEffect(() => { const u = storage.subscribe('pain_pribon', arr => setAll(arr || [])); return u; }, []);
       const tarif = React.useMemo(() => ((all.find(d => d.id === 'tarif') || {}).prices) || {}, [all]);
-      // Liste des pains : produits « pain » du catalogue appli + catalogue fournisseurs (Brut de pain / boulangerie)
-      const breads = React.useMemo(() => {
-        const m = {};
-        const catByKey = {}; (catalogue || []).forEach(p => { catByKey[kbPainKey(p.produit)] = p; });
-        Object.values(prodCache || {}).forEach(p => { if (p && p.name && Number(p.dispatchType) === 1) { const k = kbPainKey(p.name); m[k] = m[k] || { key: k, name: kbProdName(p.name), producer: p.producer || '' }; } });
-        (catalogue || []).forEach(p => { if (/brut\s*de\s*pain|boulang/i.test(p.producteur || '')) { const k = kbPainKey(p.produit); m[k] = m[k] || { key: k, name: kbProdName(p.produit), producer: p.producteur || '' }; } });
-        Object.values(m).forEach(b => { const c = catByKey[b.key]; b.defPrice = c ? (c.prixAchat || c.prixHT || 0) : 0; });
-        return Object.values(m).sort((a, b) => a.name.localeCompare(b.name, 'fr'));
-      }, [prodCache, catalogue]);
+      // V9.86 — liste FIXE des pains Brut de Pain (tarif Brut de Pain). « bdp » = nom Brut de Pain (bon de commande),
+      // « name » = nom Kelbongoo (celui du dispatch pain) → le récap général additionne bien les mêmes pains.
+      const breads = React.useMemo(() => BRUT_DE_PAIN.map(b => ({ key: kbPainKey(b.name), name: b.name, bdp: b.bdp, poids: b.poids, producer: 'Brut de pain', defPrice: b.price })), []);
       const docId = `${day}_${store}`;
       // charge la commande existante du jour / magasin
       React.useEffect(() => {
@@ -11263,8 +11270,8 @@
                 return (
                   <div key={b.key} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: q ? '#fff8e1' : (i % 2 ? '#fff' : '#fafafa'), borderBottom: '1px solid var(--line)' }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 17, fontWeight: 900 }}>🍞 {b.name}</div>
-                      <div style={{ fontSize: 12, color: 'var(--ink-mute)', display: 'flex', gap: 6, alignItems: 'center' }}>{b.producer}
+                      <div style={{ fontSize: 17, fontWeight: 900 }}>🍞 {b.bdp || b.name}{b.poids ? <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-mute)' }}> · {b.poids}</span> : null}</div>
+                      <div style={{ fontSize: 12, color: 'var(--ink-mute)', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>{b.bdp && b.bdp !== b.name ? `= ${b.name}` : b.producer}
                         <span>· prix</span><input disabled={locked} value={prices[b.key] != null ? prices[b.key] : String(priceOf(b))} onChange={e => setPrices(p => ({ ...p, [b.key]: e.target.value }))} inputMode="decimal" style={{ width: 64, fontSize: 12, padding: '2px 4px' }} /><span>€</span></div>
                     </div>
                     <button disabled={locked || !q} onClick={() => addQ(b.key, -1)} style={{ width: 44, height: 44, fontSize: 24, fontWeight: 900, borderRadius: 10, border: '2px solid var(--line)', background: '#fff' }}>−</button>
