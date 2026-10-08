@@ -627,7 +627,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.80';
+    const APP_VERSION = 'V9.81';
+    // V9.81 — Accès KBG sécurisé (claim kbSecure, colonne « Acces KBG sécurisé ») : Prépa › Suivi & impression ›
+    //   Commandes = chargement JSON identique au Master (prépa / MU / dispatch en ligne), invisible sans l'accès.
+    //   Distrib : encadré « À donner en plus du casier » (ND + pains en gros, quantité ≥ 2 en rouge),
+    //   « (à supprimer) » retiré des noms produits. Dispatch pain : DOM détaillé par client, carton + cartons
+    //   de repli « si plein ». DLC : règle en haut, « À surveiller » en gros par inventaire avec reste estimé
+    //   (inventaire − vendus), fiche « que faire ? », cagette partage claire, ROB en bas, plus de ❌.
     // V9.80 — URGENT : la distrib affichait les casiers du JSON au lieu de ceux créés / ajoutés / supprimés en prépa.
     //   Les casiers de la prépa (day_X_prep cs|site||client) priment désormais partout côté distrib (liste clients, recherche,
     //   clôture/non-récupérés, dispatch). Le JSON d'origine reste dans o.casiersJson (ruptures ancien site inchangées).
@@ -1097,6 +1103,18 @@
       try { if (fb && fb.auth) await window.__firebase.signOut(fb.auth); } catch (_) {}
     }
     // Session locale acceptée seulement si elle correspond au jeton Firebase (anti-falsification localStorage)
+    // V9.81 — Accès KBG sécurisé : claim kbSecure posé par kbgLogin (colonne « Acces KBG sécurisé » du registre).
+    // Master (admin) = toujours sécurisé. Les droits réels d'écriture restent contrôlés par les règles Firestore.
+    // V9.81 — Nom produit affiché : retire les mentions internes du catalogue de l'ancien site
+    // (« (à supprimer) », « (a supprimer) »…) qui font croire au distributeur qu'il faut retirer le produit.
+    function kbProdName(n) { return String(n || '').replace(/\s*[\(\[]\s*(?:à|a)\s+supprimer\s*[\)\]]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim(); }
+    // Pastille quantité : grosse et rouge dès qu'il faut en donner plus d'un.
+    function KbQty({ q, big }) {
+      const n = Number(q) || 1; const many = n > 1;
+      return <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',minWidth: big ? 44 : 34,height: big ? 40 : 30,padding:'0 8px',borderRadius:8,fontWeight:900,fontSize: big ? 22 : 17,
+        background: many ? 'var(--danger)' : 'var(--bg-muted)', color: many ? '#fff' : 'var(--ink)', border: many ? '2px solid var(--danger)' : '2px solid var(--line)', flex:'0 0 auto'}}>{n}×</span>;
+    }
+    function kbIsSecure() { const c = window.__kbClaims; return !!(c && (c.admin === true || c.kbSecure === true)); }
     function kbSessionMatchesClaims(sess) {
       const c = window.__kbClaims;
       if (!sess || !c || !c.uid) return false;
@@ -3749,24 +3767,35 @@
                               <span className="badge" style={{marginLeft:8,background:'var(--bg-muted)',color:'var(--ink-mute)'}}>hors master</span>
                             )}
                           </div>
-                          {/* Résumé : pain 🍞 + ND 🥬 + dispatch dernière minute */}
-                          {(pains.length > 0 || ndItems.length > 0 || lmItems.length > 0) && (
-                            <div style={{marginTop:4,display:'flex',flexDirection:'column',gap:2,fontSize:12}}>
-                              {pains.length > 0 && (
-                                <div style={{color:'var(--warn)'}}>🍞 {pains.map(p => p.produit + (p.qty>1?` ×${p.qty}`:'')).join(', ')}</div>
-                              )}
-                              {ndItems.length > 0 && (
-                                <div style={{color:'var(--accent-dark)',fontWeight:600}}>🥬 {ndItems.map(p => p.produit + (p.qty>1?` ×${p.qty}`:'')).join(', ')}</div>
-                              )}
-                              {lmItems.length > 0 && (
-                                <div style={{
-                                  marginTop:4, color:'#fff', fontWeight:700, fontSize:12,
-                                  background:'var(--danger)', borderRadius:6, padding:'4px 8px',
-                                  display:'inline-block',
-                                }}>
-                                  🔴 ND Dernière minute (Supprimé dans l'autre appli — à RAJOUTER, sinon le client ne sera pas facturé !) : {lmItems.map(p => p.produit + (p.qty>1?` ×${p.qty}`:'')).join(', ')}
+                          {/* V9.81 — Encadré « À DONNER EN PLUS » : ND (cagette, à la main) + pains, en GROS, quantités bien visibles */}
+                          {(pains.length > 0 || ndItems.length > 0) && (
+                            <div style={{marginTop:8,border:'3px solid var(--accent-dark)',borderRadius:10,padding:'8px 10px',background:'var(--accent-soft)'}}>
+                              <div style={{fontSize:13,fontWeight:900,letterSpacing:'.04em',textTransform:'uppercase',color:'var(--accent-dark)',marginBottom:6}}>👐 À donner en plus du casier</div>
+                              {ndItems.map((p, k) => (
+                                <div key={'nd'+k} style={{display:'flex',alignItems:'center',gap:10,padding:'4px 0',borderTop: k ? '1px dashed var(--line)' : 'none'}}>
+                                  <KbQty q={p.qty} />
+                                  <span style={{fontSize:18,fontWeight:800,color:'var(--ink)',lineHeight:1.2}}>🥬 {kbProdName(p.produit)}</span>
+                                  <span style={{marginLeft:'auto',fontSize:11,fontWeight:700,color:'var(--accent-dark)',whiteSpace:'nowrap'}}>cagette ND</span>
                                 </div>
-                              )}
+                              ))}
+                              {pains.map((p, k) => (
+                                <div key={'pa'+k} style={{display:'flex',alignItems:'center',gap:10,padding:'4px 0',borderTop: (k || ndItems.length) ? '1px dashed var(--line)' : 'none'}}>
+                                  <KbQty q={p.qty} />
+                                  <span style={{fontSize:18,fontWeight:800,color:'var(--warn)',lineHeight:1.2}}>🍞 {kbProdName(p.produit)}</span>
+                                  <span style={{marginLeft:'auto',fontSize:11,fontWeight:700,color:'var(--warn)',whiteSpace:'nowrap'}}>{casiersSec.length ? `casier 🍞 ${casiersSec.join(', ')}` : 'pain'}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {lmItems.length > 0 && (
+                            <div style={{marginTop:8,color:'#fff',fontWeight:800,fontSize:15,background:'var(--danger)',borderRadius:8,padding:'8px 10px'}}>
+                              <div style={{fontSize:12,textTransform:'uppercase',letterSpacing:'.04em',marginBottom:4}}>🔴 À rajouter au client (non facturé)</div>
+                              {lmItems.map((p, k) => (
+                                <div key={'lm'+k} style={{display:'flex',alignItems:'center',gap:8,padding:'2px 0'}}>
+                                  <span style={{background:'#fff',color:'var(--danger)',borderRadius:6,padding:'0 8px',fontWeight:900,fontSize:17}}>{Number(p.qty)||1}×</span>
+                                  <span>{kbProdName(p.produit)}</span>
+                                </div>
+                              ))}
                             </div>
                           )}
                           <div className="list-item-sub" style={{marginTop:4,display:'flex',gap:10,alignItems:'baseline',flexWrap:'wrap'}}>
@@ -3986,7 +4015,7 @@
       const Section = ({ emoji, titre, items, color }) => (
         items && items.length > 0 ? (
           <div style={{ marginBottom: 12 }}>
-            <h4 style={{ margin: '0 0 6px', fontSize: 13, color }}>{emoji} {titre}</h4>
+            <h4 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 900, color }}>{emoji} {titre}</h4>
             <div className="stack" style={{ gap: 3 }}>
               {items.map((p, i) => {
                 const pct = reducedByKey[p.id || p.produit] || 0;
@@ -3994,9 +4023,9 @@
                 return (
                   <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid var(--border)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 13, alignItems: 'center' }}>
-                      <span style={{ minWidth: 0 }}>{p.produit}{p.producteur ? ` · ${p.producteur}` : ''}{pct > 0 && <span style={{ color: 'var(--info)', fontSize: 11 }}> · −{pct}%</span>}</span>
+                      <span style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}><KbQty q={p.qty} /><span>{kbProdName(p.produit)}{p.producteur ? ` · ${p.producteur}` : ''}{pct > 0 && <span style={{ color: 'var(--info)', fontSize: 11 }}> · −{pct}%</span>}</span></span>
                       <span style={{ whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span><strong>×{p.qty}</strong> <span style={{ color: 'var(--ink-mute)' }}>{lineEuro(p)}</span></span>
+                        <span style={{ color: 'var(--ink-mute)' }}>{lineEuro(p)}</span>
                         <button onClick={() => setRefundFor(p)} title="Remise / remboursement"
                           style={{ border: rf ? '1px solid var(--info)' : '1px solid var(--border)', background: rf ? 'var(--info-soft)' : 'var(--bg-card,#fff)', color: rf ? 'var(--info)' : 'var(--ink-soft)', borderRadius: 8, padding: '4px 8px', fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}>
                           {rf ? `−${rf.pct}%` : '⚠️'}
@@ -6598,7 +6627,7 @@
         const now = new Date().toISOString();
         try {
           await storage.setDoc('dlc_watch', id, {
-            produit: p?.name || '', producteur: p?.producer || '',
+            produit: p?.name || '', producteur: p?.producer || '', productId: String(productId || ''),
             dlc: dlcDate, qty, qtyInit: qty,
             invDay: invDate, domShort: false,
             status: 'watch',
@@ -10004,6 +10033,30 @@
       const l = ((order.casiersFrais && order.casiersFrais.length) ? order.casiersFrais : (order.casiersSec || [])).map(x => String(x).trim()).filter(Boolean);
       return [...new Set(l)];
     }
+    // V9.81 — Pain en livraison à domicile : pas de cagette remise en main propre → le pain va DIRECTEMENT
+    // dans un carton du client avant le départ. Carton principal = 1er casier sec (sinon 1er carton) ;
+    // les autres cartons du client sont indiqués « si plein » (rappel : DOM = cartons, pas casiers).
+    function kbDomPainClients(data, opts) {
+      const includeTest = !!(opts && opts.includeTest); const off = (opts && opts.prodOff) || {};
+      const by = {};
+      for (const o of (data.orders || [])) {
+        if (String(o.site || '').toUpperCase() !== 'DOM') continue;
+        if (!includeTest && o._test) continue;
+        const pains = (o.items || []).filter(it => it.cat === 'pain' && !off[it.producteur || '—'] && (parseInt(it.qty, 10) || 0) > 0);
+        if (!pains.length) continue;
+        const client = o.name || '(client)';
+        const c = by[client] = by[client] || { client, nm: kbSplitName(o), cartons: [], sec: [], pains: {} };
+        kbClientCasiers(data.prep, 'DOM', client, o).forEach(x => { if (!c.cartons.includes(x)) c.cartons.push(x); });
+        (o.casiersSec || []).map(x => String(x).trim()).filter(Boolean).forEach(x => { if (!c.sec.includes(x)) c.sec.push(x); });
+        pains.forEach(it => { const k = it.produit || '(pain)'; c.pains[k] = (c.pains[k] || 0) + (parseInt(it.qty, 10) || 0); });
+      }
+      return Object.values(by).map(c => {
+        const cartons = c.cartons.slice().sort(casCmp);
+        const main = c.sec.find(x => cartons.includes(x)) || cartons[0] || '';
+        return { client: c.client, prenom: c.nm.prenom, nom: c.nm.nom, cartons, main, alts: cartons.filter(x => x !== main),
+          pains: Object.entries(c.pains).map(([produit, qty]) => ({ produit, qty })).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')) };
+      }).sort((a, b) => casCmp(a.main || 'ZZZ', b.main || 'ZZZ') || a.client.localeCompare(b.client));
+    }
     // Lignes « livraison à domicile » (1 par client, regroupement par nom comme la prépa)
     function kbDomRows(data, opts) {
       const includeTest = !!(opts && opts.includeTest);
@@ -10111,8 +10164,46 @@
       const oneLine = (txt, maxW) => { let t = txt; if (doc.getTextWidth(t) <= maxW) return t; while (t.length > 3 && doc.getTextWidth(t + '...') > maxW) t = t.slice(0, -1); return t + '...'; };
       let first = true;
       const newPage = () => { if (!first) doc.addPage(); first = false; };
+      // V9.81 — DOM : une ligne par client → carton principal en GROS + cartons de repli « si plein »
+      const domPages = (b) => {
+        const cl = b.clients; const total = cl.reduce((s, c) => s + c.pains.reduce((t, p) => t + p.qty, 0), 0);
+        const TOP = 70, BOTTOM = 276;
+        const rowH = (c) => Math.max(20, 9 + c.pains.length * 6.5);
+        const pages = []; let cur = [], hUsed = 0;
+        cl.forEach(c => { const h = rowH(c); if (cur.length && hUsed + h > BOTTOM - TOP) { pages.push(cur); cur = []; hUsed = 0; } cur.push(c); hUsed += h; });
+        if (cur.length) pages.push(cur);
+        pages.forEach((chunk, pi) => {
+          newPage(); doc.setTextColor(0);
+          doc.setFillColor(0, 0, 0); doc.roundedRect(146, 8, 52, 36, 3, 3, 'F');
+          doc.setTextColor(255, 255, 255); const fsc = fit('DOM', 46, 64, 30); doc.setFontSize(fsc); doc.text('DOM', 172, 26 + (fsc * PT) / 2.8, { align: 'center' });
+          doc.setTextColor(0); fit('LIVRAISON A DOMICILE', 128, 30, 18); doc.text('LIVRAISON A DOMICILE', L, 26);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(13); doc.text('PAIN DIRECTEMENT DANS LE CARTON DU CLIENT', L, 38);
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.text(doc.splitTextToSize(kbPdfTxt('Rappel : livraison à domicile = cartons, pas casiers. Si le carton indiqué est plein, prendre le carton entre parenthèses.'), 128).slice(0, 2), L, 43.5);
+          doc.setFontSize(12); doc.text(dateTxt + (pages.length > 1 ? `  (page ${pi + 1}/${pages.length})` : ''), L, 54);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(20); doc.text(`${total} PAIN${total > 1 ? 'S' : ''}`, R, 54, { align: 'right' });
+          doc.setLineWidth(0.8); doc.line(L, 58, R, 58);
+          let y = TOP - 6;
+          chunk.forEach((c, i) => {
+            const h = rowH(c);
+            if (i % 2 === 0) { doc.setFillColor(240, 240, 240); doc.rect(L, y, R - L, h, 'F'); }
+            doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor(0);
+            doc.text(oneLine(kbPdfTxt(String(c.nom || c.client).toUpperCase() + ' ' + (c.prenom || '')), 112), L + 3, y + 7);
+            doc.setFontSize(13);
+            c.pains.forEach((p, k) => doc.text(oneLine(kbPdfTxt(`${p.qty} x ${p.produit}`), 112), L + 6, y + 14 + k * 6.5));
+            // carton principal en gros + repli
+            doc.setDrawColor(0); doc.setLineWidth(0.8); doc.rect(R - 66, y + 1.5, 64, c.alts.length ? 11 : h - 3);
+            doc.setFontSize(19); doc.text(kbPdfTxt('CARTON ' + (c.main || '?')), R - 34, y + 9.5, { align: 'center' });
+            if (c.alts.length) { doc.setFontSize(10.5); doc.text(oneLine(kbPdfTxt(`(si carton ${c.main} plein : carton ${c.alts.join(' ou ')})`), 66), R - 34, y + 18, { align: 'center' }); }
+            y += h;
+          });
+          doc.setFont('helvetica', 'normal'); doc.setFontSize(11); doc.setTextColor(60);
+          doc.rect(L, 283, 5, 5); doc.text('Pains mis dans les cartons  -  vérifié par : ________________', L + 8, 287);
+          doc.setTextColor(0);
+        });
+      };
       // 1 page (ou plus si très long) par lieu
       siteBlocks.forEach(b => {
+        if (b.clients && b.clients.length) { domPages(b); return; }
         const lines = b.lines; const total = lines.reduce((s, x) => s + x.qty, 0);
         const TOP = 64, BOTTOM = 276, MINH = 13, MAXH = 26;
         const perPage = Math.max(1, Math.floor((BOTTOM - TOP) / MINH));
@@ -10314,8 +10405,10 @@
         const by = {};
         lines.forEach(l => { const m = (by[l.site] = by[l.site] || {}); const k = l.produit + '||' + l.producteur; m[k] = m[k] || { produit: l.produit, producteur: l.producteur, qty: 0 }; m[k].qty += l.qty; });
         const order = (c) => { const i = SITES.indexOf(c); return i < 0 ? 999 : i; };
+        const domCl = kbDomPainClients(data, { includeTest, prodOff });
         return Object.keys(by).sort((a, b) => kbPrintSite(a).localeCompare(kbPrintSite(b), 'fr') || order(a) - order(b))
-          .map(code => ({ code, name: kbPrintSite(code), lines: Object.values(by[code]).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')) }));
+          .map(code => ({ code, name: kbPrintSite(code), lines: Object.values(by[code]).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')),
+            clients: code === 'DOM' && domCl.length ? domCl : null }));
       })();
       const recap = (() => {
         const m = {};
@@ -10368,7 +10461,25 @@
                   <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.1 }}>{b.name}</div>
                   <div style={{ fontSize: 30, fontWeight: 900, border: '2px solid #fff', borderRadius: 8, padding: '0 10px' }}>{b.code}</div>
                 </div>
-                {b.lines.map((x, i) => (
+                {b.code === 'DOM' && (
+                  <div style={{ padding: '8px 14px', background: '#fff7ed', borderBottom: '2px solid #111', fontSize: 13, fontWeight: 700 }}>
+                    🏠 Livraison à domicile = <b>CARTONS</b>, pas de casier : chaque pain va directement dans le carton du client avant le départ.
+                    {!b.clients && <div style={{ color: 'var(--danger)', marginTop: 4 }}>⚠️ Détail par client indisponible (commandes non chargées) : total seulement.</div>}
+                  </div>
+                )}
+                {b.clients && b.clients.map((c, i) => (
+                  <div key={'c' + i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '8px 14px', background: i % 2 ? '#fff' : '#f4f4f4' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 16, fontWeight: 900 }}>{String(c.nom || c.client).toUpperCase()} <span style={{ fontWeight: 600 }}>{c.prenom}</span></div>
+                      {c.pains.map((p, k) => <div key={k} style={{ fontSize: 15, fontWeight: 700 }}>🍞 {p.qty} × {p.produit}</div>)}
+                    </div>
+                    <div style={{ textAlign: 'center', flex: '0 0 auto' }}>
+                      <div style={{ fontSize: 22, fontWeight: 900, border: '2px solid #111', borderRadius: 8, padding: '2px 10px' }}>CARTON {c.main || '?'}</div>
+                      {c.alts.length > 0 && <div style={{ fontSize: 12, fontWeight: 700, marginTop: 3 }}>(si carton {c.main} plein → carton {c.alts.join(' ou ')})</div>}
+                    </div>
+                  </div>
+                ))}
+                {!b.clients && b.lines.map((x, i) => (
                   <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 14px', background: i % 2 ? '#fff' : '#f4f4f4' }}>
                     <div style={{ minWidth: 0 }}><div style={{ fontSize: 17, fontWeight: 800 }}>{x.produit}</div>{x.producteur && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{x.producteur}</div>}</div>
                     <div style={{ fontSize: 34, fontWeight: 900, minWidth: 64, textAlign: 'center', border: '2px solid #111', borderRadius: 8 }}>{x.qty}</div>
@@ -10837,9 +10948,9 @@
           { key:'printpain',   icon:'🍞', label:'Impression dispatch pain',       desc:'1 feuille A4 par lieu — mise en cartons à 5h' },
           { key:'printlabels', icon:'🏷️', label:'Impression étiquettes livraison', desc:'Livraison à domicile — 1 étiquette par carton (après clôture)' },
         ]},
-        { title: '📥 Commandes', items: [
-          { key:'muload', icon:'📥', label:'Chargement des commandes (provisoire ancien site)', desc:'À 10h : PDF Totaux de l\u2019ancien site → MU exacte' },
-        ]},
+        ...(kbIsSecure() ? [{ title: '🔐 Commandes (accès sécurisé)', items: [
+          { key:'cmdload', icon:'📥', label:'Chargement des commandes', desc:'Même fichier JSON que Master › Chargement → met en ligne la prépa, la MU exacte, le dispatch' },
+        ]}] : []),
         { title: '🧭 Suivi', items: [
           { key:'pdpreturns', icon:'↩️', label:'Retours PDP', desc:'Retours des points de distribution' },
           { key:'dlcwatch',   icon:'🟠', label:'DLC',         desc:'Surveillance des dates courtes' },
@@ -17514,7 +17625,7 @@
       return <FlRuptureBlock day={day} session={session} manquants={manquants} />;
     }
 
-    function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta, adminEmail, onLogoutAdmin }) {
+    function AdminPage({ session, ordersMeta, productsMeta, consumersMeta, catalogueMeta, adminEmail, onLogoutAdmin, ordersOnly, setTab }) {
       const showToast = React.useContext(ToastContext);
       const [flSync, setFlSync] = React.useState(null); // résultat synchro FL au dernier chargement catalogue
       const [csvFile, setCsvFile] = React.useState(null);
@@ -17677,11 +17788,13 @@
             uploadedBy: session.name, uploadedAt: new Date().toISOString(),
           });
           // Historique CA (1 doc/date) — alimente le tableau de bord Bilan
-          await storage.setDoc(
-            'ca_history', dayKey,
-            buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily', res.manquants, res.remises),
-            { replace: true }
-          );
+          try {
+            await storage.setDoc(
+              'ca_history', dayKey,
+              buildCaHistoryDoc(dayKey, res.caBySite, res.salesByProduct, res.orders.length, 'daily', res.manquants, res.remises),
+              { replace: true }
+            );
+          } catch (e) { console.warn('ca_history', e); if (!session.isMaster) showToast('⚠️ Historique CA non écrit (droits) — à recharger par le master'); }
           // Garde-fou : on ne bascule le jour actif automatiquement que si le fichier
           // concerne AUJOURD'HUI. Pour une autre date (ex. demain préparé à l'avance),
           // on demande confirmation pour ne pas masquer la distribution en cours.
@@ -17939,16 +18052,8 @@
       const catalogueAge = catalogueMeta ? daysSince(catalogueMeta.uploadedAt) : null;
       const catalogueStale = catalogueAge !== null && catalogueAge >= 7;
 
-      return (
-        <div className="stack">
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-            <h1 style={{margin:0}}>📥 Chargement</h1>
-            {adminEmail && onLogoutAdmin && <button className="btn-ghost" style={{fontSize:12}} onClick={onLogoutAdmin} title={adminEmail}>🔓 {adminEmail === 'master-fallback' ? 'secours' : adminEmail} · déconnexion</button>}
-          </div>
-
-          <LoadStatusCard />
-
-          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'6px 2px -2px'}}>▸ Chargement du jour</div>
+      const v4Card = (
+        <>
           {/* ====== V4 : CHARGEMENT UNIFIÉ (3 fichiers JSON) ====== */}
           <div className="card" style={{border:'2px solid var(--accent)'}}>
             <h3 style={{marginBottom:4}}>🚀 Chargement du jour (nouveau)</h3>
@@ -18075,6 +18180,41 @@
               </div>
             )}
           </div>
+
+        </>
+      );
+
+      // V9.81 — Accès KBG sécurisé (Prépa › Suivi & impression › Commandes) : uniquement le chargement du jour,
+      // EXACTEMENT le même que Master › Chargement (JSON) → prépa, MU exacte, dispatch en ligne.
+      if (ordersOnly) {
+        return (
+          <div className="stack">
+            {setTab && <KbBackToHub setTab={setTab} />}
+            <h1 style={{margin:0}}>📥 Chargement des commandes</h1>
+            <div className="alert-info" style={{fontSize:13}}>🔐 Accès sécurisé · {session.name}. Même chargement que le Master : le fichier <b>JSON des commandes</b> met en ligne la prépa, la MU exacte et le dispatch.</div>
+            <LoadStatusCard />
+            {v4Card}
+            {setTab && (
+              <details style={{marginTop:6}}>
+                <summary style={{fontSize:13,color:'var(--ink-mute)',cursor:'pointer'}}>Repli seulement : PDF « Totaux » de l'ancien site</summary>
+                <button className="btn-secondary btn-block" style={{marginTop:8}} onClick={() => setTab('muload')}>📄 Ouvrir le chargement PDF Totaux (repli)</button>
+              </details>
+            )}
+          </div>
+        );
+      }
+
+      return (
+        <div className="stack">
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+            <h1 style={{margin:0}}>📥 Chargement</h1>
+            {adminEmail && onLogoutAdmin && <button className="btn-ghost" style={{fontSize:12}} onClick={onLogoutAdmin} title={adminEmail}>🔓 {adminEmail === 'master-fallback' ? 'secours' : adminEmail} · déconnexion</button>}
+          </div>
+
+          <LoadStatusCard />
+
+          <div style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'6px 2px -2px'}}>▸ Chargement du jour</div>
+          {v4Card}
 
           {/* F&L (Rajout + MAJ Rungis) déplacé dans l'onglet « F&L » — plus ici. */}
 
@@ -18459,13 +18599,69 @@
     }
 
 
+    // ════════════════════════════════════════════════════════════════
+    // V9.81 — DLC lisible : règle en haut · « À surveiller » en gros (cliquable) avec la date de
+    // l'inventaire et le RESTE estimé (inventaire − vendus depuis) · cagette partage · ROB tout en bas.
+    // Vendus = quantités des commandes des distributions APRÈS l'inventaire (jusqu'à aujourd'hui,
+    // + demain si la prépa de demain est clôturée : la marchandise est déjà sortie du stock).
+    // ════════════════════════════════════════════════════════════════
+    function kbDlcKeyName(produit, producteur) { return normalizeText(kbProdName(produit || '')).trim() + '|' + normalizeText(producteur || '').trim(); }
+    function kbDlcBase(i) {
+      const created = String(i.createdAt || '').slice(0, 10);
+      if (i.qtyCount != null && i.countDay) return { qty: Number(i.qtyCount) || 0, from: i.countDay, counted: true };
+      return { qty: Number(i.qtyInit != null ? i.qtyInit : i.qty) || 0, from: i.invDay || created || todayKey(), counted: false };
+    }
+    function useDlcSales(items) {
+      const [sales, setSales] = React.useState({ byId: {}, byName: {}, byProd: {}, days: [], ready: false });
+      const sig = items.map(i => i.id + ':' + kbDlcBase(i).from).sort().join(',');
+      React.useEffect(() => {
+        let stop = false;
+        (async () => {
+          const today = todayKey();
+          const froms = items.map(i => kbDlcBase(i).from).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+          if (!froms.length) { setSales({ byId: {}, byName: {}, byProd: {}, days: [], ready: true }); return; }
+          let start = addDays(froms[0], 1); const minStart = addDays(today, -21); if (start < minStart) start = minStart;
+          const tomorrow = addDays(today, 1);
+          const days = []; for (let d = start; d <= tomorrow; d = addDays(d, 1)) days.push(d);
+          const res = await Promise.all(days.map(async d => {
+            const [od, meta] = await Promise.all([
+              storage.getDoc(`day_${d}_orders`, 'data').catch(() => null),
+              d > today ? storage.getDoc(`day_${d}_prep`, 'meta').catch(() => null) : Promise.resolve(null),
+            ]);
+            if (d > today && !(meta && meta.closed)) return null; // demain : seulement si la prépa est clôturée
+            return { d, orders: (od && od.orders) || [] };
+          }));
+          const byId = {}, byName = {}, byProd = {}, used = [];
+          res.filter(Boolean).forEach(({ d, orders }) => {
+            if (!orders.length) return; used.push(d);
+            orders.forEach(o => { if (o._test) return; (o.items || []).forEach(it => {
+              const q = Number(it.qty) || 0; if (!q) return;
+              if (it.id) { const m = byId[it.id] = byId[it.id] || {}; m[d] = (m[d] || 0) + q; }
+              const kn = kbDlcKeyName(it.produit, it.producteur); const m2 = byName[kn] = byName[kn] || {}; m2[d] = (m2[d] || 0) + q;
+              const kp = normalizeText(kbProdName(it.produit || '')).trim(); const m3 = byProd[kp] = byProd[kp] || {}; m3[d] = (m3[d] || 0) + q;
+            }); });
+          });
+          if (!stop) setSales({ byId, byName, byProd, days: used, ready: true });
+        })().catch(() => { if (!stop) setSales(s => ({ ...s, ready: true })); });
+        return () => { stop = true; };
+      }, [sig]);
+      return sales;
+    }
+    function kbDlcSold(i, sales, from) {
+      const m = (i.productId && sales.byId[i.productId]) || sales.byName[kbDlcKeyName(i.produit, i.producteur)] || (!i.producteur ? sales.byProd[normalizeText(kbProdName(i.produit || '')).trim()] : null);
+      if (!m) return { sold: 0, found: false };
+      let sold = 0; Object.entries(m).forEach(([d, q]) => { if (d > from) sold += q; });
+      return { sold, found: true };
+    }
+
     function DlcWatchPage({ session, products, orders, catalogue }) {
       const showToast = React.useContext(ToastContext);
       const [items, setItems] = React.useState([]);
       const [loaded, setLoaded] = React.useState(false);
       const [showForm, setShowForm] = React.useState(false);
       const [busy, setBusy] = React.useState(false);
-      const [showWatch, setShowWatch] = React.useState(true);
+      const [sheet, setSheet] = React.useState(null);      // item ouvert (que faire ?)
+      const [qtyEdit, setQtyEdit] = React.useState('');
 
       React.useEffect(() => {
         const unsub = storage.subscribe('dlc_watch', (arr) => { setItems(arr); setLoaded(true); });
@@ -18475,30 +18671,38 @@
       const today = todayKey();
       const active = items.filter(i => (!i.status || i.status === 'watch') && i.dlc);
       const resolved = items.filter(i => i.status && i.status !== 'watch');
+      const sales = useDlcSales(active);
 
-      // Pour chaque produit, on calcule la DERNIÈRE navette ROB utile avant la DLC.
-      //  • dépassée OU plus aucune navette avant la DLC → cagette PARTAGE (perte sèche)
-      //  • dernière navette utile = aujourd'hui → à ENVOYER À ROB aujourd'hui (dernière chance)
-      //  • navette utile plus tard dans la semaine → à SURVEILLER (rien à faire today)
       const isFriday = new Date().getDay() === 5;
       const enriched = React.useMemo(() => {
         return active.map(i => {
           const days = dlcDaysLeft(i.dlc, today);
           const lastNav = lastNavetteBeforeDLC(i.dlc, new Date());
+          const base = kbDlcBase(i);
+          const s = kbDlcSold(i, sales, base.from);
+          const reste = Math.max(0, base.qty - s.sold);
           let bucket;
           if (days != null && days <= 0) bucket = 'partage';                 // périmé → partage (perte sèche)
-          else if (days != null && days <= 3) bucket = 'rob';                // Règle 1 : DLC ≤ aujourd'hui+3 → ROB
+          else if (i.forceRob || (days != null && days <= 3)) bucket = 'rob'; // Règle 1 : DLC ≤ aujourd'hui+3 → ROB
           else if (isFriday && days != null && days <= 7) bucket = 'roll';   // Règle 2 (vendredi) : ≤ aujourd'hui+7 → roll
           else bucket = 'watch';
-          return { ...i, days, lastNav, bucket };
+          if (s.found && base.qty > 0 && reste <= 0) bucket = 'vendu';      // tout vendu d'après les commandes
+          return { ...i, days, lastNav, bucket, base, sold: s.sold, salesFound: s.found, reste };
         }).sort((a, b) => (a.days==null?999:a.days) - (b.days==null?999:b.days));
-      }, [items, isFriday]);
+      }, [items, isFriday, sales]);
 
       const robToday  = enriched.filter(i => i.bucket === 'rob');
-      const rollItems = enriched.filter(i => i.bucket === 'roll');
       const partage   = enriched.filter(i => i.bucket === 'partage');
-      const watch     = enriched.filter(i => i.bucket === 'watch');
-      const pdpItems  = enriched.filter(i => i.source === 'retour_pdp');
+      const watchAll  = enriched.filter(i => i.bucket === 'watch' || i.bucket === 'roll');
+      const vendus    = enriched.filter(i => i.bucket === 'vendu');
+      const qtyOf = (i) => (i.reste != null && i.salesFound) ? Math.max(1, i.reste) : (parseFloat(i.qty) || 1);
+
+      // Groupes « à surveiller » par inventaire
+      const invGroups = React.useMemo(() => {
+        const g = {};
+        watchAll.forEach(i => { const k = i.invDay || String(i.createdAt || '').slice(0, 10) || '—'; (g[k] = g[k] || []).push(i); });
+        return Object.entries(g).sort((a, b) => b[0].localeCompare(a[0]));
+      }, [watchAll]);
 
       const priceOf = (i) => {
         const prod = (catalogue || []).find(p => p.produit === i.produit && p.producteur === i.producteur);
@@ -18509,11 +18713,10 @@
         return prod ? (prod.unite || '') : '';
       };
 
-      // Écrit la perte (destination 'pribon' = ROB) + marque l'item parti ROB.
       const markSentToRob = async (list, initials) => {
         const dateKey = today;
         for (const i of list) {
-          const unitPrice = priceOf(i); const qty = parseFloat(i.qty) || 1;
+          const unitPrice = priceOf(i); const qty = qtyOf(i);
           await storage.setDoc('losses', `lossrob_${i.id}`, {
             id: `lossrob_${i.id}`,
             productKey: `${i.producteur || ''}|${i.produit || ''}`,
@@ -18527,12 +18730,12 @@
             day: dateKey, fromDlc: true,
             createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
           });
-          await storage.setDoc('dlc_watch', i.id, { status: 'rob', resolvedAt: new Date().toISOString(), resolvedBy: session.name, robSentDate: dateKey });
+          await storage.setDoc('dlc_watch', i.id, { status: 'rob', qtySent: qty, resolvedAt: new Date().toISOString(), resolvedBy: session.name, robSentDate: dateKey });
         }
       };
 
       const sendOneToPartage = async (i) => {
-        const unitPrice = priceOf(i); const qty = parseFloat(i.qty) || 1;
+        const unitPrice = priceOf(i); const qty = qtyOf(i);
         const expired = i.days !== null && i.days <= 0;
         await storage.setDoc('losses', `losspart_${i.id}`, {
           id: `losspart_${i.id}`,
@@ -18542,15 +18745,14 @@
           usingWeight: false, quantity: qty, weight: 0,
           unitPrice, totalValue: unitPrice * qty,
           dlc: i.dlc || '',
-          remark: `DLC ${expired ? 'dépassée' : 'courte'} → cagette partage équipe`,
+          remark: `DLC ${expired ? 'dépassée' : 'courte'} → cagette partage équipe (perte sèche)`,
           day: today, fromDlc: true,
           createdBy: session.name, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         });
         await storage.setDoc('dlc_watch', i.id, { status: 'perte', resolvedAt: new Date().toISOString(), resolvedBy: session.name });
-        showToast(`${i.produit} → cagette partage`);
+        showToast(`${kbProdName(i.produit)} → cagette partage équipe (perte sèche)`);
       };
 
-      // BL ROB (PDF) — « Push KBG du jour »
       const buildRobBL = (list) => {
         const { jsPDF } = window.jspdf;
         const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
@@ -18560,7 +18762,7 @@
         doc.setFontSize(10); doc.setFont(undefined, 'normal');
         doc.text(`Envoyé le ${formatDateShort(today)} · ${list.length} produit(s)`, 14, 21);
         doc.setTextColor(0, 0, 0);
-        const rows = list.map(i => [ i.produit || '', i.producteur || '', String(i.qty || 1), i.dlc ? formatDateShort(i.dlc) : '—' ]);
+        const rows = list.map(i => [ kbProdName(i.produit), i.producteur || '', String(qtyOf(i)), i.dlc ? formatDateShort(i.dlc) : '—' ]);
         doc.autoTable({
           startY: 36, head: [['Produit', 'Producteur', 'Qté', 'DLC']], body: rows,
           styles: { fontSize: 9, cellPadding: 2 },
@@ -18569,26 +18771,23 @@
         });
         const fy = doc.lastAutoTable.finalY + 8;
         doc.setFontSize(9); doc.setTextColor(100, 100, 100);
-        doc.text('À gérer en magasin selon les DLC (FIFO). — App Distribution Kelbongoo', 14, fy);
+        doc.text('À gérer en magasin selon les DLC (FIFO). — Appli Kelbongoo', 14, fy);
         return doc;
       };
-
       const genBlPdf = () => {
-        if (!robToday.length) { showToast('Rien à envoyer à ROB aujourd\u2019hui'); return; }
+        if (!robToday.length) { showToast('Rien à envoyer à ROB aujourd’hui'); return; }
         if (!window.jspdf) { showToast('PDF indisponible, recharge la page'); return; }
         buildRobBL(robToday).save(`Push_KBG_ROB_${today}.pdf`);
       };
-
-      // Envoie le BL à gestion@pribon.org (objet « Push kbg du jour ») + écrit les pertes + marque parti ROB.
       const sendRob = async (initials) => {
-        if (!robToday.length) { showToast('Rien à envoyer à ROB aujourd\u2019hui'); return; }
+        if (!robToday.length) { showToast('Rien à envoyer à ROB aujourd’hui'); return; }
         if (!initials || !initials.trim()) { showToast('Initiales obligatoires pour valider'); return; }
         if (!confirm(`Envoyer ${robToday.length} produit(s) à ROB ?\n\n• BL « Push kbg du jour » envoyé à gestion@pribon.org\n• Comptés en perte (envoi Pribon/ROB) de la semaine\n• Sortis de la surveillance DLC`)) return;
         setBusy(true);
         try {
-          const lines = robToday.map(i => `• ${i.produit}${i.qty>1?` ×${i.qty}`:''}${i.producteur?` — ${i.producteur}`:''}${i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''}`).join('\n');
+          const lines = robToday.map(i => `• ${kbProdName(i.produit)} ×${qtyOf(i)}${i.producteur?` — ${i.producteur}`:''}${i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''}`).join('\n');
           const subject = 'Push kbg du jour';
-          const body = `Bonjour,\n\nPush KBG du ${formatDateShort(today)} pour Robespierre — ${robToday.length} produit(s) à gérer selon les DLC :\n\n${lines}\n\nContrôle effectué par : ${initials}\n\nMerci,\n— App Distribution Kelbongoo`;
+          const body = `Bonjour,\n\nPush KBG du ${formatDateShort(today)} pour Robespierre — ${robToday.length} produit(s) à gérer selon les DLC :\n\n${lines}\n\nContrôle effectué par : ${initials}\n\nMerci,\n— Appli Kelbongoo`;
           let mailOk = false, mailErr = '';
           try {
             let payload = { secret: FRESHDESK_SECRET, action: 'send_mail', to: 'gestion@pribon.org', subject, body };
@@ -18599,7 +18798,6 @@
             const r = await stockPost(payload);
             mailOk = !!(r && r.ok); if (!mailOk) mailErr = (r && r.error) || 'inconnue';
           } catch (e) { mailErr = e.message; }
-          // On enregistre la perte + sortie de surveillance même si le mail échoue (le BL reste générable manuellement).
           await markSentToRob(robToday, initials);
           if (mailOk) showToast(`✓ BL envoyé à gestion@pribon.org · ${robToday.length} produit(s) → perte ROB`);
           else showToast(`⚠️ Pertes enregistrées, mais mail KO (${mailErr}). Génère le BL en PDF et envoie-le à la main.`);
@@ -18609,43 +18807,22 @@
 
       const reopen = async (i) => { await storage.setDoc('dlc_watch', i.id, { status: 'watch', resolvedAt: '', resolvedBy: '' }); };
       const remove = async (i) => { if (confirm('Supprimer cette ligne DLC ?')) await storage.deleteDoc('dlc_watch', i.id); };
-      // Croix ❌ : le produit a été vendu / parti à temps en boutique → il sort de la console,
-      // SANS perte ni envoi ROB. Évite que la console se sature de fausses « DLC dépassée ».
       const markEcoule = async (i) => {
-        if (!confirm(`« ${i.produit} » a été vendu / parti à temps ?\n\nIl sort de la console DLC — aucune perte, aucun envoi ROB.`)) return;
         await storage.setDoc('dlc_watch', i.id, { status: 'ecoule', resolvedAt: new Date().toISOString(), resolvedBy: session.name });
-        showToast(`✓ ${i.produit} écoulé — retiré de la console`);
+        showToast(`✓ ${kbProdName(i.produit)} : tout vendu — retiré de la liste`);
+      };
+      const toRob = async (i, on) => { await storage.setDoc('dlc_watch', i.id, { forceRob: !!on }); showToast(on ? `🚚 ${kbProdName(i.produit)} → liste « À envoyer à ROB » (en bas)` : `${kbProdName(i.produit)} → remis à surveiller`); };
+      const saveCount = async (i, v) => {
+        const q = parseFloat(String(v).replace(',', '.'));
+        if (isNaN(q) || q < 0) { showToast('Quantité invalide'); return false; }
+        await storage.setDoc('dlc_watch', i.id, { qtyCount: q, countDay: today, qty: q, lastCheckAt: new Date().toISOString(), lastCheckBy: session.name });
+        showToast(`✓ ${kbProdName(i.produit)} : ${q} compté(s) aujourd'hui`); return true;
       };
 
-      const navHint = (i) => i.lastNav ? `dernière navette utile : ${i.lastNav.label}` : 'plus de navette avant la DLC';
-
-      // Navette(s) ROB encore à venir aujourd'hui + prochaine navette (date) après aujourd'hui
-      const _now = new Date();
-      const todayNavs = NAVETTE_ROB.filter(n => {
-        if (n.dow !== _now.getDay()) return false;
-        const dep = new Date(_now); dep.setHours(n.hour, 0, 0, 0);
-        return dep > _now;
-      });
-      const hasNavToday = todayNavs.length > 0;
-      const nextNavDate = (() => {
-        for (let i = 1; i <= 12; i++) {
-          const d = new Date(_now); d.setHours(0,0,0,0); d.setDate(d.getDate() + i);
-          if (NAVETTE_ROB.some(n => n.dow === d.getDay()))
-            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-        }
-        return null;
-      })();
-
-      // Seuils DLC datés (ce que l'équipe doit regarder concrètement) :
-      //  • Vigilance = écouler en premier : DLC avant le mardi suivant (samedi + 3j de garantie client).
-      //  • Retrait   = sortir de la vente : DLC à J+3 ou moins (ROB selon navette, sinon partage).
-      const pivotRob  = addDays(today, 3);   // Règle 1 : retirer DLC ≤ aujourd'hui+3 → ROB
-      const pivotRoll = addDays(today, 7);   // Règle 2 (vendredi) : roll DLC ≤ aujourd'hui+7
+      const pivotRob  = addDays(today, 3);
+      const pivotRoll = addDays(today, 7);
       const [initials, setInitials] = React.useState('');
-      const [showHelp, setShowHelp] = React.useState(false);
 
-      // RESET COMPLET de la console DLC (master) — supprime toutes les lignes dlc_watch.
-      // Ne touche PAS aux pertes déjà enregistrées (collection 'losses').
       const resetAll = async () => {
         if (!session.isMaster) { showToast('Master uniquement'); return; }
         if (!confirm(`Supprimer TOUTES les lignes DLC (${items.length}) ?\n\nLes pertes déjà enregistrées ne sont PAS touchées.\nAction irréversible.`)) return;
@@ -18657,187 +18834,178 @@
         finally { setBusy(false); }
       };
 
+      // Pastille DLC (couleur selon l'urgence)
+      const DlcTag = ({ i }) => {
+        const d = i.days; const c = d == null ? 'var(--ink-mute)' : d <= 0 ? 'var(--danger)' : d <= 3 ? '#6e4a9c' : d <= 7 ? 'var(--warn)' : '#2e7d32';
+        const txt = d == null ? 'DLC ?' : d < 0 ? `périmé depuis ${-d} j` : d === 0 ? "DLC aujourd'hui" : d === 1 ? 'DLC demain' : `dans ${d} jours`;
+        return <span style={{ display:'inline-block', background:c, color:'#fff', borderRadius:8, padding:'3px 10px', fontWeight:800, fontSize:14, whiteSpace:'nowrap' }}>DLC {i.dlc ? formatDateShort(i.dlc) : '—'} · {txt}</span>;
+      };
+      // Bloc quantité : RESTE en gros + calcul en clair
+      const QtyBlock = ({ i }) => (
+        <div style={{ textAlign:'center', flex:'0 0 auto', minWidth:86 }}>
+          <div style={{ fontSize:11, fontWeight:800, color:'var(--ink-mute)', textTransform:'uppercase' }}>{i.salesFound && i.sold > 0 ? 'Il reste' : 'Quantité'}</div>
+          <div style={{ fontSize:34, fontWeight:900, lineHeight:1 }}>{i.salesFound ? i.reste : (i.base.qty || i.qty || '?')}</div>
+          {i.salesFound && i.sold > 0 && <div style={{ fontSize:11, color:'var(--ink-soft)', marginTop:2 }}>{i.base.qty} {i.base.counted ? 'comptés' : 'à l’inv.'} − {i.sold} vendu{i.sold > 1 ? 's' : ''}</div>}
+        </div>
+      );
+      const ItemCard = ({ i, accent }) => (
+        <button onClick={() => { setSheet(i); setQtyEdit(String(i.salesFound ? i.reste : (i.base.qty || i.qty || ''))); }}
+          style={{ display:'flex', alignItems:'center', gap:12, width:'100%', textAlign:'left', padding:'12px 12px', border:'2px solid ' + (accent || 'var(--line)'), borderRadius:12, background:'var(--bg-card)', cursor:'pointer', boxShadow:'var(--shadow-sm)' }}>
+          <div style={{ minWidth:0, flex:1 }}>
+            <div style={{ fontSize:19, fontWeight:900, lineHeight:1.2 }}>{kbProdName(i.produit)}</div>
+            {i.producteur && <div style={{ fontSize:12, color:'var(--ink-mute)', marginBottom:4 }}>{i.producteur}{i.source==='retour_pdp' ? ' · ↩️ retour PDP' : ''}</div>}
+            <DlcTag i={i} />
+            {i.bucket === 'roll' && <div style={{ fontSize:13, fontWeight:800, color:'#6e4a9c', marginTop:4 }}>🟣 À mettre sur le roll (contrôle de mardi)</div>}
+          </div>
+          <QtyBlock i={i} />
+          <span style={{ fontSize:26, color:'var(--ink-mute)' }}>›</span>
+        </button>
+      );
+      const Section = ({ title, sub, color, count, children }) => (
+        <div className="card" style={{ borderLeft:'6px solid ' + color, padding:'14px 14px' }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
+            <div style={{ fontSize:20, fontWeight:900 }}>{title}</div>
+            <span style={{ background:color, color:'#fff', borderRadius:20, padding:'2px 12px', fontWeight:900, fontSize:18 }}>{count}</span>
+          </div>
+          {sub && <div style={{ fontSize:13, color:'var(--ink-soft)', margin:'2px 0 10px' }}>{sub}</div>}
+          <div className="stack" style={{ gap:8 }}>{children}</div>
+        </div>
+      );
+      const Rule = ({ e, c, a, b }) => (
+        <div style={{ display:'flex', gap:10, alignItems:'center', padding:'7px 0', borderTop:'1px solid var(--line)' }}>
+          <span style={{ fontSize:24, width:32, textAlign:'center' }}>{e}</span>
+          <div style={{ flex:1, fontSize:15, lineHeight:1.3 }}><b style={{ color:c }}>{a}</b><br/>{b}</div>
+        </div>
+      );
+
       return (
-        <div style={{marginTop:10}}>
+        <div className="stack" style={{marginTop:10}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-            <h1 style={{margin:0}}>🟠 DLC</h1>
-            {session.isMaster && items.length > 0 && (
-              <button className="btn-ghost" style={{fontSize:12,color:'var(--danger)',border:'1px solid var(--danger)',padding:'5px 10px',borderRadius:8}} disabled={busy} onClick={resetAll}>
-                🗑️ Réinitialiser la console DLC
-              </button>
-            )}
-          </div>
-
-          {/* ====== BANDEAU INSTRUCTION DU JOUR (règles datées) ====== */}
-          <div className="card" style={{borderLeft:'5px solid var(--master)',background:'var(--master-soft)',padding:'14px 16px'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-              <div style={{fontSize:13,color:'var(--ink-soft)',textTransform:'capitalize'}}>Nous sommes le {dayLabelShort(today)} — contrôle à faire avant 10h</div>
-              <button className="btn-ghost" style={{fontSize:12,border:'1px solid var(--master)',color:'var(--master)',padding:'4px 10px',borderRadius:8}} onClick={()=>setShowHelp(s=>!s)}>❓ Que faire ?</button>
-            </div>
-
-            <div style={{marginTop:8,fontSize:14,lineHeight:1.5,background:'var(--bg-card,#fff)',borderRadius:8,padding:'10px 12px'}}>
-              <div style={{fontWeight:800,fontSize:15}}>🔴 Règle 1 — à retirer pour ROB</div>
-              <div>Sortir de la vente <strong>toute DLC ≤ <span style={{textTransform:'capitalize'}}>{dayLabelShort(pivotRob)}</span></strong> ({formatDateShort(pivotRob)}) → envoi ROB. <strong>{robToday.length}</strong> produit(s).</div>
-              {isFriday && (
-                <div style={{marginTop:8,paddingTop:8,borderTop:'1px solid var(--line)'}}>
-                  <div style={{fontWeight:800,fontSize:15}}>🟣 Règle 2 (vendredi) — à mettre sur roll</div>
-                  <div>Placer sur le roll <strong>toute DLC ≤ <span style={{textTransform:'capitalize'}}>{dayLabelShort(pivotRoll)}</span></strong> ({formatDateShort(pivotRoll)}) pour le contrôle de la semaine prochaine. <strong>{rollItems.length}</strong> produit(s).</div>
-                </div>
-              )}
-            </div>
-
-            {showHelp && (
-              <div style={{marginTop:10,fontSize:13,lineHeight:1.55,background:'var(--bg-card,#fff)',borderRadius:8,padding:'10px 12px',border:'1px dashed var(--master)'}}>
-                <div style={{fontWeight:700,marginBottom:4}}>📋 Marche à suivre (avant 10h)</div>
-                <ol style={{margin:'0 0 0 18px',padding:0}}>
-                  <li>Contrôle d'abord {isFriday?'les produits sur le roll, puis ':''}le rayon.</li>
-                  <li>Retire tout ce qui a une <strong>DLC ≤ {formatDateShort(pivotRob)}</strong> → zone ROB.</li>
-                  {isFriday && <li>Mets sur le <strong>roll</strong> tout ce qui a une DLC ≤ {formatDateShort(pivotRoll)} (semaine suivante).</li>}
-                  <li>Les produits <strong>périmés</strong> → cagette partage équipe (perte sèche).</li>
-                  <li>Saisis tes <strong>initiales</strong> puis valide l'envoi ROB → BL généré + perte enregistrée automatiquement.</li>
-                </ol>
-              </div>
-            )}
-            {pdpItems.length > 0 && (
-              <div style={{marginTop:8,fontSize:13,fontWeight:600,color:'var(--accent-dark,#7a4a00)',background:'var(--accent-soft,#fff4e0)',padding:'6px 10px',borderRadius:8}}>
-                ↩️ {pdpItems.length} retour(s) PDP avec DLC — inclus dans les listes ci-dessous.
-              </div>
-            )}
-          </div>
-
-          {/* ============ À ENVOYER À ROB (Règle 1) ============ */}
-          <div className="card" style={{borderLeft:'4px solid var(--master)',background: robToday.length?'var(--master-soft)':'transparent'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-              <div>
-                <div style={{fontWeight:800,fontSize:16}}>🚚 À envoyer à ROB</div>
-                <div style={{fontSize:12,color:'var(--ink-mute)'}}>DLC ≤ {formatDateShort(pivotRob)}</div>
-              </div>
-              <span className="badge badge-master" style={{fontSize:13}}>{robToday.length}</span>
-            </div>
-            {robToday.length === 0 ? (
-              <p style={{fontSize:13,color:'var(--ink-mute)',marginTop:8,marginBottom:0}}>Rien à envoyer aujourd'hui. 👍</p>
-            ) : (
-              <>
-                <div className="stack" style={{gap:6,marginTop:10}}>
-                  {robToday.map(i => (
-                    <div key={i.id} style={{padding:'8px 10px',border:'1px solid var(--line)',borderRadius:8,background:'var(--bg-card)'}}>
-                      <div style={{display:'flex',justifyContent:'space-between',gap:8,alignItems:'center'}}>
-                        <div style={{minWidth:0}}>
-                          <div style={{fontWeight:600,fontSize:14}}>{i.produit}{i.qty>1?` ×${i.qty}`:''}</div>
-                          <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''}</div>
-                        </div>
-                        <div style={{display:'flex',gap:4,alignItems:'center',flexShrink:0}}>
-                          <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:15,padding:'4px 8px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
-                          <button className="btn-ghost" style={{fontSize:11,padding:'4px 8px',color:'var(--warn)'}} onClick={()=>sendOneToPartage(i)}>→ partage</button>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{display:'flex',gap:8,marginTop:12,alignItems:'center',flexWrap:'wrap'}}>
-                  <input value={initials} onChange={e=>setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Init." style={{width:80,boxSizing:'border-box',padding:'8px 10px',fontSize:14,border:'1px solid var(--line)',borderRadius:8,textTransform:'uppercase'}} />
-                  <button className="btn-primary" style={{flex:1,minWidth:150,background:'var(--master)'}} disabled={busy || !initials.trim()} onClick={()=>sendRob(initials.trim())}>
-                    {busy ? 'Envoi…' : `✅ Valider l'envoi ROB → BL + perte`}
-                  </button>
-                  <button className="btn-secondary" disabled={busy} onClick={genBlPdf}>📄 BL PDF</button>
-                </div>
-                {!initials.trim() && <div style={{fontSize:11,color:'var(--danger)',marginTop:6}}>Initiales obligatoires pour valider (contrôle avant 10h).</div>}
-                <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:6}}>Le BL « Push kbg du jour » part à gestion@pribon.org. Les produits sont comptés en <strong>perte (ROB)</strong> et sortis de la console.</div>
-              </>
-            )}
-          </div>
-
-          {/* ============ À METTRE SUR ROLL (Règle 2 — vendredi) ============ */}
-          {isFriday && (
-            <div className="card" style={{borderLeft:'4px solid #6e4a9c',background: rollItems.length?'rgba(110,74,156,0.06)':'transparent'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-                <div>
-                  <div style={{fontWeight:800,fontSize:16}}>🟣 À mettre sur roll</div>
-                  <div style={{fontSize:12,color:'var(--ink-mute)'}}>DLC ≤ {formatDateShort(pivotRoll)} · contrôle semaine prochaine</div>
-                </div>
-                <span className="badge" style={{background:'rgba(110,74,156,0.15)',color:'#6e4a9c',fontSize:13}}>{rollItems.length}</span>
-              </div>
-              {rollItems.length === 0 ? (
-                <p style={{fontSize:13,color:'var(--ink-mute)',marginTop:8,marginBottom:0}}>Rien à mettre sur roll.</p>
-              ) : (
-                <div className="stack" style={{gap:4,marginTop:10}}>
-                  {rollItems.map(i => (
-                    <div key={i.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'6px 8px',border:'1px solid var(--line)',borderRadius:8,alignItems:'center'}}>
-                      <span style={{minWidth:0}}><strong>{i.produit}</strong>{i.qty>1?` ×${i.qty}`:''} <span style={{color:'var(--ink-mute)',fontSize:11}}>· {i.producteur}</span></span>
-                      <span style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap'}}>DLC {formatDateShort(i.dlc)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ============ CAGETTE PARTAGE ÉQUIPE ============ */}
-          <div className="card" style={{borderLeft:'4px solid var(--warn)'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-              <div style={{fontWeight:700,fontSize:15}}>🤝 Cagette partage équipe</div>
-              <span className="badge" style={{background:'var(--warn-soft)',color:'var(--warn)',fontSize:13}}>{partage.length}</span>
-            </div>
-            <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:2,marginBottom:partage.length?8:0}}>DLC dépassée ou plus aucune navette ROB avant la DLC → perte sèche, cagette salariés.</div>
-            {partage.length > 0 && (
-              <div className="stack" style={{gap:6}}>
-                {partage.map(i => (
-                  <div key={i.id} style={{padding:'8px 10px',border:'1px solid var(--line)',borderRadius:8}}>
-                    <div style={{display:'flex',justifyContent:'space-between',gap:8,alignItems:'center'}}>
-                      <div style={{minWidth:0}}>
-                        <div style={{fontWeight:600,fontSize:14}}>{i.produit}{i.qty>1?` ×${i.qty}`:''}</div>
-                        <div style={{fontSize:11,color:'var(--ink-mute)'}}>{i.producteur}{i.dlc?` · DLC ${formatDateShort(i.dlc)}`:''} · {i.days!=null && i.days<=0?'dépassée':navHint(i)}</div>
-                      </div>
-                      <div style={{display:'flex',gap:4,alignItems:'center',flexShrink:0}}>
-                        <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:15,padding:'4px 8px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
-                        <button className="btn-secondary" style={{fontSize:12,padding:'6px 10px'}} onClick={()=>sendOneToPartage(i)}>Mis en cagette</button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* ============ À SURVEILLER (navette plus tard) ============ */}
-          <div className="card">
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer'}} onClick={()=>setShowWatch(s=>!s)}>
-              <div style={{fontWeight:600}}>👀 À surveiller <span style={{fontWeight:400,fontSize:12,color:'var(--ink-mute)'}}>({watch.length}) — encore vendable, navette plus tard</span></div>
-              <span style={{fontSize:13,color:'var(--ink-mute)'}}>{showWatch?'▾':'▸'}</span>
-            </div>
-            {showWatch && (
-              watch.length === 0
-                ? <p style={{fontSize:13,color:'var(--ink-mute)',marginTop:8,marginBottom:0}}>Rien à surveiller.</p>
-                : <div className="stack" style={{gap:4,marginTop:8}}>
-                    {watch.map(i => (
-                      <div key={i.id} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:13,padding:'4px 0',borderTop:'1px solid var(--line)',alignItems:'center'}}>
-                        <span style={{minWidth:0}}><strong>{i.produit}</strong>{i.qty>1?` ×${i.qty}`:''} <span style={{color:'var(--ink-mute)',fontSize:11}}>· {i.producteur}{i.source==='retour_pdp'?' · ↩️ retour PDP':''}</span></span>
-                        <span style={{display:'flex',gap:6,alignItems:'center',flexShrink:0}}>
-                          <span style={{color:'var(--ink-mute)',fontSize:11,whiteSpace:'nowrap'}}>DLC {formatDateShort(i.dlc)}{i.lastNav?` · ROB ${dayLabelShort(i.lastNav.date).replace(/ \d.*/,'')}`:''}</span>
-                          <button className="btn-ghost" title="Vendu / parti à temps → retirer (sans perte)" style={{fontSize:13,padding:'0 4px',color:'var(--ink-mute)'}} onClick={()=>markEcoule(i)}>❌</button>
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-            )}
-          </div>
-
-          {/* Ajout manuel d'un produit DLC */}
-          <div style={{display:'flex',justifyContent:'flex-end',marginTop:4}}>
-            <button className="btn-secondary" style={{fontSize:13}} onClick={()=>setShowForm(s=>!s)}>{showForm?'Fermer':'+ Produit DLC'}</button>
+            <h1 style={{margin:0}}>🟠 DLC — dates courtes</h1>
+            <button className="btn-secondary" style={{fontSize:14}} onClick={()=>setShowForm(s=>!s)}>{showForm?'Fermer':'+ Ajouter un produit'}</button>
           </div>
           {showForm && <DlcWatchForm products={products} session={session} onClose={()=>setShowForm(false)} />}
 
+          {/* ====== 1. LA RÈGLE DLC ====== */}
+          <div className="card" style={{ border:'3px solid var(--ink)', padding:'12px 14px' }}>
+            <div style={{ fontSize:18, fontWeight:900 }}>📏 La règle DLC</div>
+            <div style={{ fontSize:13, color:'var(--ink-soft)', textTransform:'capitalize', marginBottom:4 }}>{dayLabelShort(today)} · inventaire des DLC sensibles chaque mardi · contrôle avant 10h</div>
+            <Rule e="🗑️" c="var(--danger)" a="DLC dépassée" b={<>→ <b>cagette partage équipe</b> (perte sèche)</>} />
+            <Rule e="🚚" c="#6e4a9c" a={`DLC jusqu'au ${formatDateShort(pivotRob)} (3 jours ou moins)`} b={<>→ retirer du rayon, <b>envoyer à ROB</b> par la navette</>} />
+            {isFriday && <Rule e="🟣" c="#6e4a9c" a={`Vendredi : DLC jusqu'au ${formatDateShort(pivotRoll)}`} b={<>→ mettre <b>sur le roll</b> pour le contrôle de mardi</>} />}
+            <Rule e="👀" c="#2e7d32" a="DLC plus tard" b={<>→ reste en rayon, <b>à vendre en premier</b> (à surveiller)</>} />
+            <div style={{ fontSize:13, color:'var(--ink-soft)', marginTop:6 }}>👉 Touche un produit pour dire ce que tu en fais.</div>
+          </div>
+
+          {/* ====== 2. À SURVEILLER (en gros) ====== */}
+          {invGroups.length === 0 && loaded && (
+            <div className="card" style={{ borderLeft:'6px solid #2e7d32', fontSize:16, fontWeight:700 }}>👀 À surveiller : rien en ce moment. 👍</div>
+          )}
+          {invGroups.map(([inv, list]) => (
+            <Section key={inv} color="#2e7d32" count={list.length}
+              title="👀 À surveiller"
+              sub={<span style={{ fontSize:15 }}>{/^\d{4}-\d{2}-\d{2}$/.test(inv) ? <>Inventaire du <b style={{textTransform:'capitalize'}}>{kbDateLong(inv)}</b></> : 'Ajout manuel'}{sales.ready ? (sales.days.length ? ` · ventes comptées jusqu'au ${formatDateShort(sales.days[sales.days.length-1])}` : ' · pas encore de vente depuis') : ' · calcul des ventes…'}</span>}>
+              {list.map(i => <ItemCard key={i.id} i={i} />)}
+            </Section>
+          ))}
+
+          {/* ====== 3. TOUT VENDU (d'après les commandes) ====== */}
+          {vendus.length > 0 && (
+            <Section color="var(--ink-mute)" count={vendus.length} title="✅ Tout vendu ?" sub="D'après les commandes depuis l'inventaire, il n'en reste plus. Vérifie le rayon puis confirme.">
+              {vendus.map(i => (
+                <div key={i.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'8px 10px', border:'1px solid var(--line)', borderRadius:10 }}>
+                  <div style={{ flex:1, minWidth:0 }}><div style={{ fontSize:16, fontWeight:800 }}>{kbProdName(i.produit)}</div><div style={{ fontSize:12, color:'var(--ink-mute)' }}>{i.base.qty} à l'inventaire − {i.sold} vendus · DLC {formatDateShort(i.dlc)}</div></div>
+                  <button className="btn-primary" style={{ fontSize:14, padding:'10px 12px' }} onClick={() => markEcoule(i)}>✅ Oui, plus en rayon</button>
+                  <button className="btn-secondary" style={{ fontSize:13, padding:'10px 10px' }} onClick={() => { setSheet(i); setQtyEdit(''); }}>Il en reste</button>
+                </div>
+              ))}
+            </Section>
+          )}
+
+          {/* ====== 4. CAGETTE PARTAGE ÉQUIPE ====== */}
+          {partage.length > 0 && (
+            <Section color="var(--danger)" count={partage.length} title="🗑️ Périmé → cagette partage équipe"
+              sub={<>Retire ces produits et mets-les dans la <b>cagette partage équipe</b> (les salariés peuvent se servir). C'est compté en <b>perte sèche</b>. Puis appuie sur « C'est fait ».</>}>
+              {partage.map(i => (
+                <div key={i.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 10px', border:'2px solid var(--danger)', borderRadius:12 }}>
+                  <div style={{ flex:1, minWidth:0 }} onClick={() => { setSheet(i); setQtyEdit(String(qtyOf(i))); }}>
+                    <div style={{ fontSize:18, fontWeight:900 }}>{kbProdName(i.produit)} <span style={{ color:'var(--danger)' }}>×{qtyOf(i)}</span></div>
+                    <DlcTag i={i} />
+                  </div>
+                  <button className="btn-primary" style={{ fontSize:15, padding:'12px 12px', background:'var(--danger)', borderColor:'var(--danger)' }} onClick={() => sendOneToPartage(i)}>✅ C'est fait :<br/>dans la cagette</button>
+                </div>
+              ))}
+            </Section>
+          )}
+
+          {/* ====== 5. À ENVOYER À ROB (tout en bas) ====== */}
+          <Section color="#6e4a9c" count={robToday.length} title="🚚 À envoyer à ROB"
+            sub={<>DLC jusqu'au {formatDateShort(pivotRob)} (ou choisi « envoyer à ROB »). Mets-les dans la zone ROB, tape tes initiales, valide : le bon part à gestion@pribon.org.</>}>
+            {robToday.length === 0
+              ? <div style={{ fontSize:15, color:'var(--ink-mute)' }}>Rien à envoyer aujourd'hui. 👍</div>
+              : <>
+                  {robToday.map(i => <ItemCard key={i.id} i={i} accent="#6e4a9c" />)}
+                  <div style={{ display:'flex', gap:8, marginTop:6, alignItems:'center', flexWrap:'wrap' }}>
+                    <input value={initials} onChange={e=>setInitials(e.target.value.toUpperCase())} maxLength={4} placeholder="Initiales" style={{ width:110, padding:'12px 10px', fontSize:18, fontWeight:800, border:'2px solid #6e4a9c', borderRadius:10, textTransform:'uppercase' }} />
+                    <button className="btn-primary" style={{ flex:1, minWidth:170, fontSize:16, padding:'14px 12px', background:'#6e4a9c', borderColor:'#6e4a9c' }} disabled={busy || !initials.trim()} onClick={()=>sendRob(initials.trim())}>
+                      {busy ? 'Envoi…' : `✅ Valider l'envoi ROB (${robToday.length})`}
+                    </button>
+                    <button className="btn-secondary" disabled={busy} onClick={genBlPdf}>📄 Bon PDF</button>
+                  </div>
+                  {!initials.trim() && <div style={{ fontSize:12, color:'var(--danger)' }}>Initiales obligatoires pour valider.</div>}
+                </>}
+          </Section>
+
           {!loaded && <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p>}
 
+          {/* ====== Fiche produit : que faire ? ====== */}
+          {sheet && (() => {
+            const i = enriched.find(x => x.id === sheet.id) || sheet;
+            const close = () => setSheet(null);
+            const act = async (fn) => { setBusy(true); try { await fn(); close(); } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); } };
+            const Big = ({ onClick, bg, children }) => <button disabled={busy} onClick={onClick} style={{ width:'100%', padding:'16px 14px', fontSize:18, fontWeight:900, borderRadius:12, border:'none', background:bg, color:'#fff', textAlign:'left', cursor:'pointer' }}>{children}</button>;
+            return (
+              <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') close(); }}>
+                <div className="modal">
+                  <div className="modal-header">
+                    <h2 style={{ fontSize:20 }}>{kbProdName(i.produit)}</h2>
+                    <button className="modal-close" onClick={close}>×</button>
+                  </div>
+                  <div style={{ marginBottom:12 }}>
+                    {i.producteur && <div style={{ fontSize:13, color:'var(--ink-mute)' }}>{i.producteur}</div>}
+                    <div style={{ margin:'6px 0' }}><DlcTag i={i} /></div>
+                    {i.base && <div style={{ fontSize:14 }}>
+                      {i.base.counted ? <>Compté le {formatDateShort(i.base.from)} : <b>{i.base.qty}</b></> : <>Inventaire du {/^\d{4}-\d{2}-\d{2}$/.test(i.base.from) ? formatDateShort(i.base.from) : '—'} : <b>{i.base.qty}</b></>}
+                      {i.salesFound ? <> · vendus depuis : <b>{i.sold}</b> · il reste ≈ <b style={{ fontSize:18 }}>{i.reste}</b></> : <> · ventes non trouvées pour ce produit</>}
+                    </div>}
+                  </div>
+                  <div className="stack" style={{ gap:8 }}>
+                    {!i.forceRob && i.bucket !== 'partage' && <Big bg="#6e4a9c" onClick={() => act(() => toRob(i, true))}>🚚 Envoyer à ROB<div style={{ fontSize:13, fontWeight:600 }}>Il passe dans « À envoyer à ROB » (en bas de la page)</div></Big>}
+                    {i.forceRob && <Big bg="#2e7d32" onClick={() => act(() => toRob(i, false))}>↩️ Finalement, laisser en rayon<div style={{ fontSize:13, fontWeight:600 }}>Retour dans « À surveiller »</div></Big>}
+                    <Big bg="var(--danger)" onClick={() => act(() => sendOneToPartage(i))}>🗑️ Perte sèche → cagette partage équipe<div style={{ fontSize:13, fontWeight:600 }}>Retiré de la vente, compté en perte</div></Big>
+                    <Big bg="#455a64" onClick={() => act(() => markEcoule(i))}>✅ Tout vendu / plus en rayon<div style={{ fontSize:13, fontWeight:600 }}>Retiré de la liste, sans perte</div></Big>
+                    <div style={{ border:'2px solid var(--line)', borderRadius:12, padding:'10px 12px' }}>
+                      <div style={{ fontSize:15, fontWeight:800, marginBottom:6 }}>✏️ J'ai compté, il en reste :</div>
+                      <div style={{ display:'flex', gap:8 }}>
+                        <input type="number" inputMode="decimal" min="0" value={qtyEdit} onChange={e => setQtyEdit(e.target.value)} style={{ width:110, fontSize:22, fontWeight:900, padding:'8px 10px', textAlign:'center' }} />
+                        <button className="btn-primary" style={{ flex:1, fontSize:16 }} disabled={busy || qtyEdit === ''} onClick={() => act(async () => { if (Number(qtyEdit) === 0) { await markEcoule(i); } else { await saveCount(i, qtyEdit); } })}>Enregistrer</button>
+                      </div>
+                    </div>
+                    <button className="btn-ghost" onClick={close} style={{ fontSize:15 }}>Annuler</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           {resolved.length > 0 && (
-            <details style={{marginTop:14}}>
-              <summary style={{fontSize:13,color:'var(--ink-mute)',cursor:'pointer'}}>Récemment résolus ({resolved.length})</summary>
+            <details style={{marginTop:6}}>
+              <summary style={{fontSize:13,color:'var(--ink-mute)',cursor:'pointer'}}>Historique : déjà traités ({resolved.length})</summary>
               <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:6}}>
                 {resolved.sort((a,b)=>(b.resolvedAt||'').localeCompare(a.resolvedAt||'')).slice(0,40).map(i => (
                   <div key={i.id} className="card-flat" style={{padding:'8px 10px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
                     <div style={{minWidth:0,fontSize:13}}>
-                      <strong>{i.produit}</strong> <span style={{color:'var(--ink-mute)'}}>· {i.status==='done'?'écoulé':i.status==='rob'?`ROB${i.robSentDate?` (${formatDateShort(i.robSentDate)})`:''}`:'partage'}</span>
+                      <strong>{kbProdName(i.produit)}</strong> <span style={{color:'var(--ink-mute)'}}>· {(i.status==='done'||i.status==='ecoule')?'tout vendu':i.status==='rob'?`envoyé ROB${i.robSentDate?` (${formatDateShort(i.robSentDate)})`:''}`:'cagette partage'}</span>
                     </div>
                     <div style={{display:'flex',gap:4}}>
                       <button className="btn-ghost" style={{fontSize:11,padding:'4px 8px'}} onClick={()=>reopen(i)}>Rouvrir</button>
@@ -18847,6 +19015,9 @@
                 ))}
               </div>
             </details>
+          )}
+          {session.isMaster && items.length > 0 && (
+            <button className="btn-ghost" style={{fontSize:12,color:'var(--danger)',alignSelf:'flex-start'}} disabled={busy} onClick={resetAll}>🗑️ Réinitialiser la console DLC (master)</button>
           )}
         </div>
       );
@@ -20712,7 +20883,10 @@
             {tab === 'suivi' && <PrepSuiviHub setTab={setTab} />}
             {tab === 'printpain' && <PrintPainPage session={effSession} setTab={setTab} />}
             {tab === 'printlabels' && <PrintLabelsPage session={effSession} setTab={setTab} />}
-            {tab === 'muload' && <MuOrdersLoadPage session={effSession} setTab={setTab} />}
+            {tab === 'muload' && kbIsSecure() && <MuOrdersLoadPage session={effSession} setTab={setTab} />}
+            {tab === 'cmdload' && (kbIsSecure()
+              ? <AdminPage session={effSession} ordersOnly setTab={setTab} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />
+              : <div className="card"><KbBackToHub setTab={setTab} /><p style={{fontSize:16,fontWeight:700}}>🔐 Réservé aux personnes avec l'accès KBG sécurisé.</p></div>)}
             {tab === 'inventory' && <InventoryPage session={effSession} />}
             {tab === 'admin' && <AdminPage session={effSession} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
             </React.Fragment>
@@ -20726,7 +20900,7 @@
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
                 <span className="tab-icon">🚚</span>Manquants & ND
               </button>
-              <button className={['suivi','pdpreturns','dlcwatch','losses','printpain','printlabels','muload'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
+              <button className={['suivi','pdpreturns','dlcwatch','losses','printpain','printlabels','muload','cmdload'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
                 <span className="tab-icon">🖨️</span>Suivi &amp; impression
               </button>
               <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
