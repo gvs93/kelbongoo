@@ -627,7 +627,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.83';
+    const APP_VERSION = 'V9.85';
+    // V9.85 — Prépa : commandes fusionnées d'un même client = UNE ligne par produit (quantités additionnées).
+    //   🔐 Suivi & impression › 🥖 Commande pain des magasins Pribon (Pribon Bichat) : quantités par pain,
+    //   ajoutée au dispatch pain (bloc « PRIBON BICHAT ») et au récap ; facturation par mois (relevé PDF,
+    //   « Marquer facturé » + n° de facture). Collection Firestore pain_pribon (règle à ajouter).
+    // V9.84 — Pilotage › Température : plantage « st.sensors is undefined » au 1er chargement (état loading sans liste).
     // V9.83 — Master › Pilotage › ♻️ Pertes ROB : € envoyés à Robespierre par semaine (pertes en cours +
     //   semaines archivées), moyenne 4 semaines, barres ; clic = détail par jour et produit. Perte sèche à part.
     // V9.82 — URGENT dispatch dernière minute : attribution aux CLIENTS à l'affichage (ruptures réelles JSON
@@ -10404,7 +10409,7 @@
           doc.setTextColor(0); const nm = kbPdfTxt(b.name); const fsn = fit(nm, 128, 54, 22);
           if (doc.getTextWidth(nm) <= 128) doc.text(nm, L, 30);
           else { const parts = doc.splitTextToSize(nm, 128).slice(0, 2); doc.setFontSize(Math.max(22, fsn)); doc.text(parts, L, 21); }
-          doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.text('À METTRE DANS LE CARTON ' + b.code, L, 46);
+          doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.text(b.pribon ? kbPdfTxt('MAGASIN PRIBON (pas le Bichat Kelbongoo) - carton ' + b.name) : 'À METTRE DANS LE CARTON ' + b.code, L, 46);
           doc.setFont('helvetica', 'normal'); doc.setFontSize(12); doc.text(dateTxt + (pages.length > 1 ? `  (page ${pi + 1}/${pages.length})` : ''), L, 54);
           doc.setFont('helvetica', 'bold'); doc.setFontSize(20); doc.text(`${total} PAIN${total > 1 ? 'S' : ''}`, R, 54, { align: 'right' });
           doc.setLineWidth(0.8); doc.line(L, 58, R, 58);
@@ -10546,6 +10551,9 @@
       const [data, reload] = useKbDayData(day);
       const [prodOff, setProdOff] = React.useState({});
       const [includeTest, setIncludeTest] = React.useState(false);
+      // V9.85 — commandes pain des magasins Pribon (ajoutées au dispatch et au récap)
+      const [pribon, setPribon] = React.useState([]);
+      React.useEffect(() => { let stop = false; kbPainPribonForDay(day).then(r => { if (!stop) setPribon(r); }); return () => { stop = true; }; }, [day, data]);
       const [totBusy, setTotBusy] = React.useState(false);
       const [totErr, setTotErr] = React.useState('');
       const showToastP = React.useContext(ToastContext);
@@ -10590,9 +10598,12 @@
         lines.forEach(l => { const m = (by[l.site] = by[l.site] || {}); const k = l.produit + '||' + l.producteur; m[k] = m[k] || { produit: l.produit, producteur: l.producteur, qty: 0 }; m[k].qty += l.qty; });
         const order = (c) => { const i = SITES.indexOf(c); return i < 0 ? 999 : i; };
         const domCl = kbDomPainClients(data, { includeTest, prodOff });
-        return Object.keys(by).sort((a, b) => kbPrintSite(a).localeCompare(kbPrintSite(b), 'fr') || order(a) - order(b))
+        const kbBlocks = Object.keys(by).sort((a, b) => kbPrintSite(a).localeCompare(kbPrintSite(b), 'fr') || order(a) - order(b))
           .map(code => ({ code, name: kbPrintSite(code), lines: Object.values(by[code]).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')),
             clients: code === 'DOM' && domCl.length ? domCl : null }));
+        const prBlocks = pribon.map(o => ({ code: o.storeInfo.short, name: o.storeInfo.label, pribon: true,
+          lines: (o.lines || []).filter(l => l.qty > 0).map(l => ({ produit: l.name, producteur: l.producer || '', qty: l.qty })).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')) }));
+        return [...kbBlocks, ...prBlocks];
       })();
       const recap = (() => {
         const m = {};
@@ -10633,8 +10644,8 @@
             const t = b.lines.reduce((s, x) => s + x.qty, 0);
             return (
               <div key={b.code} className="card" style={{ padding: 0, overflow: 'hidden' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#111', color: '#fff', padding: '10px 14px', gap: 10 }}>
-                  <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.1 }}>{b.name}</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: b.pribon ? '#5d4037' : '#111', color: '#fff', padding: '10px 14px', gap: 10 }}>
+                  <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.1 }}>{b.name}{b.pribon && <div style={{ fontSize: 12, fontWeight: 700 }}>⚠️ magasin PRIBON — pas le Bichat Kelbongoo</div>}</div>
                   <div style={{ fontSize: 30, fontWeight: 900, border: '2px solid #fff', borderRadius: 8, padding: '0 10px' }}>{b.code}</div>
                 </div>
                 {b.code === 'DOM' && (
@@ -11118,6 +11129,200 @@
        SUIVI & IMPRESSION (Prépa) — hub : impressions + chargement commandes
        + Retours PDP / DLC / Pertes. Réduit le nombre d'onglets en bas.
        ============================================================ */
+    // ════════════════════════════════════════════════════════════════
+    // V9.85 — COMMANDE PAIN DES MAGASINS PRIBON (accès KBG sécurisé)
+    // Collection Firestore « pain_pribon » :
+    //   • `${jour}_${magasin}` = { type:'order', date, store, lines:[{key,name,producer,qty,price}], total, nb, by, at,
+    //                              invoiced, invoiceRef, invoicedAt, invoicedBy }
+    //   • 'tarif' = { prices: { key: prix € } }  (prix proposé par défaut = prix d'achat catalogue)
+    // La commande s'ajoute au dispatch pain (lieu « PRIBON BICHAT ») et au récap général.
+    // ════════════════════════════════════════════════════════════════
+    const PRIBON_STORES = [{ code: 'PRIBIC', label: 'PRIBON BICHAT', short: 'PRIBON' }];
+    function kbPainKey(name) { return normalizeText(kbProdName(name)).replace(/[^a-z0-9]+/g, ' ').trim(); }
+    async function kbPainPribonForDay(day) {
+      const out = [];
+      for (const st of PRIBON_STORES) {
+        try { const d = await storage.getDoc('pain_pribon', `${day}_${st.code}`); if (d && (d.lines || []).some(l => l.qty > 0)) out.push({ ...d, storeInfo: st }); } catch (_) {}
+      }
+      return out;
+    }
+    function PainPribonPage({ session, setTab, catalogue }) {
+      const showToast = React.useContext(ToastContext);
+      const [view, setView] = React.useState('cmd'); // cmd | fact
+      const [day, setDay] = React.useState(() => activeDay());
+      const [store, setStore] = React.useState(PRIBON_STORES[0].code);
+      const [qty, setQty] = React.useState({});
+      const [prices, setPrices] = React.useState({});
+      const [extra, setExtra] = React.useState([]); // pains ajoutés hors liste [{key,name,producer}]
+      const [existing, setExisting] = React.useState(null);
+      const [all, setAll] = React.useState([]);
+      const [busy, setBusy] = React.useState(false);
+      const [newName, setNewName] = React.useState('');
+      const [prodCache, setProdCache] = React.useState({});
+      React.useEffect(() => { readCache('products').then(d => setProdCache(d || {})).catch(() => {}); }, []);
+      React.useEffect(() => { const u = storage.subscribe('pain_pribon', arr => setAll(arr || [])); return u; }, []);
+      const tarif = React.useMemo(() => ((all.find(d => d.id === 'tarif') || {}).prices) || {}, [all]);
+      // Liste des pains : produits « pain » du catalogue appli + catalogue fournisseurs (Brut de pain / boulangerie)
+      const breads = React.useMemo(() => {
+        const m = {};
+        const catByKey = {}; (catalogue || []).forEach(p => { catByKey[kbPainKey(p.produit)] = p; });
+        Object.values(prodCache || {}).forEach(p => { if (p && p.name && Number(p.dispatchType) === 1) { const k = kbPainKey(p.name); m[k] = m[k] || { key: k, name: kbProdName(p.name), producer: p.producer || '' }; } });
+        (catalogue || []).forEach(p => { if (/brut\s*de\s*pain|boulang/i.test(p.producteur || '')) { const k = kbPainKey(p.produit); m[k] = m[k] || { key: k, name: kbProdName(p.produit), producer: p.producteur || '' }; } });
+        Object.values(m).forEach(b => { const c = catByKey[b.key]; b.defPrice = c ? (c.prixAchat || c.prixHT || 0) : 0; });
+        return Object.values(m).sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+      }, [prodCache, catalogue]);
+      const docId = `${day}_${store}`;
+      // charge la commande existante du jour / magasin
+      React.useEffect(() => {
+        const d = all.find(x => x.id === docId) || null; setExisting(d);
+        const q = {}, pr = {}, ex = [];
+        (d && d.lines || []).forEach(l => { q[l.key] = l.qty; pr[l.key] = l.price; if (!breads.some(b => b.key === l.key)) ex.push({ key: l.key, name: l.name, producer: l.producer || '' }); });
+        setQty(q); setPrices(pr); setExtra(ex);
+      }, [docId, all.length, breads.length]);
+      const list = [...breads, ...extra.filter(e => !breads.some(b => b.key === e.key))];
+      const priceOf = (b) => prices[b.key] != null && prices[b.key] !== '' ? Number(String(prices[b.key]).replace(',', '.')) || 0 : (tarif[b.key] != null ? Number(tarif[b.key]) : (b.defPrice || 0));
+      const nb = list.reduce((t, b) => t + (Number(qty[b.key]) || 0), 0);
+      const total = list.reduce((t, b) => t + (Number(qty[b.key]) || 0) * priceOf(b), 0);
+      const locked = !!(existing && existing.invoiced);
+      const eur = (v) => (Number(v) || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+      const setQ = (k, v) => setQty(q => ({ ...q, [k]: Math.max(0, Math.min(999, v)) }));
+      const addQ = (k, d) => setQty(q => ({ ...q, [k]: Math.max(0, Math.min(999, (Number(q[k]) || 0) + d)) }));
+      const save = async () => {
+        if (locked) { showToast('Commande déjà facturée : non modifiable'); return; }
+        const lines = list.filter(b => (Number(qty[b.key]) || 0) > 0).map(b => ({ key: b.key, name: b.name, producer: b.producer || '', qty: Number(qty[b.key]) || 0, price: Math.round(priceOf(b) * 100) / 100 }));
+        setBusy(true);
+        try {
+          if (!lines.length && existing) { await storage.deleteDoc('pain_pribon', docId); showToast('Commande supprimée'); return; }
+          if (!lines.length) { showToast('Indique au moins une quantité'); return; }
+          const st = PRIBON_STORES.find(s => s.code === store);
+          await storage.setDoc('pain_pribon', docId, { type: 'order', date: day, store, storeName: st.label, lines, nb: lines.reduce((t, l) => t + l.qty, 0),
+            total: Math.round(lines.reduce((t, l) => t + l.qty * l.price, 0) * 100) / 100, by: session.name, at: new Date().toISOString(), invoiced: false }, { replace: true });
+          const np = { ...tarif }; lines.forEach(l => { np[l.key] = l.price; });
+          await storage.setDoc('pain_pribon', 'tarif', { prices: np, by: session.name, at: new Date().toISOString() }, { replace: true });
+          showToast(`✓ Commande ${st.label} du ${formatDateShort(day)} : ${lines.reduce((t, l) => t + l.qty, 0)} pains — ajoutée au dispatch pain`);
+        } catch (e) { showToast('Erreur : ' + e.message + (/permission/i.test(e.message) ? ' (règle Firestore pain_pribon à déployer)' : '')); }
+        finally { setBusy(false); }
+      };
+
+      // ----- Facturation -----
+      const orders = all.filter(d => d.type === 'order' && d.store === store).sort((a, b) => b.date.localeCompare(a.date));
+      const months = {}; orders.forEach(o => { const m = o.date.slice(0, 7); (months[m] = months[m] || []).push(o); });
+      const monthLabel = (m) => { const [y, mo] = m.split('-'); return `${KB_MOIS[Number(mo) - 1]} ${y}`; };
+      const markInvoiced = async (m, list) => {
+        const todo = list.filter(o => !o.invoiced); if (!todo.length) return;
+        const ref = window.prompt(`N° / référence de la facture pour ${PRIBON_STORES.find(s => s.code === store).label} — ${monthLabel(m)} (${eur(todo.reduce((t, o) => t + (o.total || 0), 0))}) :`, `PAIN-${store}-${m}`);
+        if (!ref) return;
+        setBusy(true);
+        try { for (const o of todo) await storage.setDoc('pain_pribon', o.id, { invoiced: true, invoiceRef: ref, invoicedAt: new Date().toISOString(), invoicedBy: session.name }); showToast(`✓ ${todo.length} commande(s) marquée(s) facturée(s) — ${ref}`); }
+        catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const unInvoice = async (o) => {
+        if (!session.isMaster && !kbIsSecure()) return;
+        if (!window.confirm(`Annuler la facturation du ${formatDateShort(o.date)} (${o.invoiceRef}) ?`)) return;
+        await storage.setDoc('pain_pribon', o.id, { invoiced: false, invoiceRef: '', invoicedAt: '', invoicedBy: '' });
+      };
+      const releve = (m, list) => {
+        if (!window.jspdf) { showToast('PDF indisponible'); return; }
+        const { jsPDF } = window.jspdf; const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+        const st = PRIBON_STORES.find(s => s.code === store);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(18); doc.text(kbPdfTxt(`Relevé pain — ${st.label}`), 14, 18);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(12); doc.text(kbPdfTxt(`${monthLabel(m)} · Kelbongoo`), 14, 26);
+        const body = []; let tot = 0, nbt = 0;
+        list.slice().sort((a, b) => a.date.localeCompare(b.date)).forEach(o => (o.lines || []).forEach(l => { const t = l.qty * l.price; tot += t; nbt += l.qty; body.push([formatDateShort(o.date), kbPdfTxt(l.name), String(l.qty), eur(l.price).replace(/ /g, ' '), eur(t).replace(/ /g, ' '), o.invoiced ? kbPdfTxt(o.invoiceRef || 'facturé') : 'à facturer']); }));
+        doc.autoTable({ startY: 32, head: [['Date', 'Pain', 'Qté', 'Prix u.', 'Total', 'Facture']], body, styles: { fontSize: 9 }, headStyles: { fillColor: [60, 60, 60] } });
+        const y = doc.lastAutoTable.finalY + 8; doc.setFont('helvetica', 'bold'); doc.setFontSize(13);
+        doc.text(kbPdfTxt(`TOTAL : ${nbt} pains · ${eur(tot).replace(/ /g, ' ')}`), 196, y, { align: 'right' });
+        kbOpenPdf(doc, `Releve_pain_${st.short}_${m}.pdf`);
+      };
+
+      const StoreSel = () => (
+        <select value={store} onChange={e => setStore(e.target.value)} style={{ fontSize: 18, fontWeight: 900, padding: '10px 12px' }}>
+          {PRIBON_STORES.map(s => <option key={s.code} value={s.code}>{s.label}</option>)}
+        </select>
+      );
+      return (
+        <div className="stack">
+          <KbBackToHub setTab={setTab} />
+          <h1 style={{ margin: 0 }}>🥖 Commande pain — magasins Pribon</h1>
+          <div className="seg" style={{ alignSelf: 'flex-start' }}>
+            <button className={view === 'cmd' ? 'active' : ''} onClick={() => setView('cmd')}>🥖 Commande</button>
+            <button className={view === 'fact' ? 'active' : ''} onClick={() => setView('fact')}>💶 Facturation</button>
+          </div>
+          {view === 'cmd' ? (<>
+            <div className="card" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', borderLeft: '6px solid #8d6e63' }}>
+              <div><div style={{ fontSize: 12, fontWeight: 800, color: 'var(--ink-mute)' }}>MAGASIN</div><StoreSel /></div>
+              <div><div style={{ fontSize: 12, fontWeight: 800, color: 'var(--ink-mute)' }}>JOUR DE LIVRAISON</div><input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ fontSize: 17, padding: '9px 10px' }} /></div>
+              <div style={{ fontSize: 15, fontWeight: 800, textTransform: 'capitalize' }}>{kbDateLong(day)}</div>
+            </div>
+            {locked && <div className="alert-info" style={{ fontSize: 14 }}>🔒 Commande facturée ({existing.invoiceRef}) : non modifiable.</div>}
+            {existing && !locked && <div className="alert-success" style={{ fontSize: 13 }}>✓ Commande enregistrée par {existing.by} — tu peux la modifier.</div>}
+            <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+              {list.length === 0 && <p style={{ padding: 14, margin: 0, fontSize: 14 }}>Aucun pain trouvé dans le catalogue : ajoute-les ci-dessous.</p>}
+              {list.map((b, i) => {
+                const q = Number(qty[b.key]) || 0;
+                return (
+                  <div key={b.key} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: q ? '#fff8e1' : (i % 2 ? '#fff' : '#fafafa'), borderBottom: '1px solid var(--line)' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 17, fontWeight: 900 }}>🍞 {b.name}</div>
+                      <div style={{ fontSize: 12, color: 'var(--ink-mute)', display: 'flex', gap: 6, alignItems: 'center' }}>{b.producer}
+                        <span>· prix</span><input disabled={locked} value={prices[b.key] != null ? prices[b.key] : String(priceOf(b))} onChange={e => setPrices(p => ({ ...p, [b.key]: e.target.value }))} inputMode="decimal" style={{ width: 64, fontSize: 12, padding: '2px 4px' }} /><span>€</span></div>
+                    </div>
+                    <button disabled={locked || !q} onClick={() => addQ(b.key, -1)} style={{ width: 44, height: 44, fontSize: 24, fontWeight: 900, borderRadius: 10, border: '2px solid var(--line)', background: '#fff' }}>−</button>
+                    <input disabled={locked} value={q || ''} placeholder="0" inputMode="numeric" onChange={e => setQ(b.key, parseInt(e.target.value, 10) || 0)} style={{ width: 58, textAlign: 'center', fontSize: 22, fontWeight: 900, padding: '6px 4px' }} />
+                    <button disabled={locked} onClick={() => addQ(b.key, 1)} style={{ width: 44, height: 44, fontSize: 24, fontWeight: 900, borderRadius: 10, border: 'none', background: '#8d6e63', color: '#fff' }}>+</button>
+                  </div>
+                );
+              })}
+            </div>
+            {!locked && (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Autre pain (hors liste)" style={{ flex: 1, fontSize: 15 }} />
+                <button className="btn-secondary" onClick={() => { const n = newName.trim(); if (!n) return; const k = kbPainKey(n); if (!list.some(b => b.key === k)) setExtra(x => [...x, { key: k, name: n, producer: '' }]); setNewName(''); }}>+ Ajouter</button>
+              </div>
+            )}
+            <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 18, fontWeight: 900 }}>
+              <span>{nb} pain{nb > 1 ? 's' : ''}</span><span>{eur(total)}</span>
+            </div>
+            <button className="btn-primary btn-lg" disabled={busy || locked} onClick={save} style={{ fontSize: 18, padding: 16, background: '#8d6e63', borderColor: '#8d6e63' }}>
+              {busy ? 'Enregistrement…' : '💾 Enregistrer la commande (ajoutée au dispatch pain)'}
+            </button>
+          </>) : (<>
+            <div className="card" style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}><StoreSel />
+              <span style={{ fontSize: 14 }}>À facturer : <b style={{ color: 'var(--danger)', fontSize: 18 }}>{eur(orders.filter(o => !o.invoiced).reduce((t, o) => t + (o.total || 0), 0))}</b></span>
+            </div>
+            {Object.keys(months).length === 0 && <div className="card"><p style={{ margin: 0 }}>Aucune commande enregistrée.</p></div>}
+            {Object.entries(months).map(([m, list]) => {
+              const tot = list.reduce((t, o) => t + (o.total || 0), 0), nbm = list.reduce((t, o) => t + (o.nb || 0), 0);
+              const todo = list.filter(o => !o.invoiced), todoEur = todo.reduce((t, o) => t + (o.total || 0), 0);
+              return (
+                <div key={m} className="card" style={{ borderLeft: '6px solid ' + (todo.length ? 'var(--danger)' : '#2e7d32') }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: 19, fontWeight: 900, textTransform: 'capitalize' }}>{monthLabel(m)}</div>
+                    <div style={{ fontSize: 15 }}>{nbm} pains · <b>{eur(tot)}</b></div>
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 800, margin: '6px 0', color: todo.length ? 'var(--danger)' : '#2e7d32' }}>
+                    {todo.length ? `⏳ À facturer : ${eur(todoEur)} (${todo.length} livraison${todo.length > 1 ? 's' : ''})` : '✅ Tout est facturé'}
+                  </div>
+                  <div className="stack" style={{ gap: 2 }}>
+                    {list.slice().sort((a, b) => a.date.localeCompare(b.date)).map(o => (
+                      <div key={o.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 13, padding: '4px 0', borderTop: '1px solid var(--line)' }}>
+                        <span><b style={{ textTransform: 'capitalize' }}>{dayLabelShort(o.date)}</b> · {o.nb} pains <span style={{ color: 'var(--ink-mute)' }}>({(o.lines || []).map(l => `${l.qty} ${l.name}`).join(', ')})</span></span>
+                        <span style={{ whiteSpace: 'nowrap' }}><b>{eur(o.total)}</b> {o.invoiced ? <span style={{ color: '#2e7d32', cursor: 'pointer' }} title="Annuler la facturation" onClick={() => unInvoice(o)}>✅ {o.invoiceRef}</span> : <span style={{ color: 'var(--danger)' }}>⏳</span>}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                    <button className="btn-secondary" onClick={() => releve(m, list)}>📄 Relevé PDF du mois</button>
+                    {todo.length > 0 && <button className="btn-primary" disabled={busy} onClick={() => markInvoiced(m, list)}>✅ Marquer facturé ({eur(todoEur)})</button>}
+                  </div>
+                </div>
+              );
+            })}
+          </>)}
+        </div>
+      );
+    }
+
     function PrepSuiviHub({ setTab }) {
       const groups = [
         { title: '🖨️ Impression', items: [
@@ -11132,6 +11337,9 @@
           { key:'dlcwatch',   icon:'🟠', label:'DLC',         desc:'Surveillance des dates courtes' },
           { key:'losses',     icon:'🗑️', label:'Pertes',      desc:'Saisie des pertes' },
         ]},
+        ...(kbIsSecure() ? [{ title: '🔐 Magasins Pribon', items: [
+          { key:'painpribon', icon:'🥖', label:'Commande pain des magasins Pribon', desc:'Pribon Bichat · ajoutée au dispatch pain · suivi facturation' },
+        ]}] : []),
       ];
       return (
         <div className="stack">
@@ -11660,7 +11868,7 @@
         const unsub = storage.subscribe(`day_${day}_orders`, (arr) => {
           const data = (arr || []).find(d => d.id === 'data') || (arr || [])[0];
           const orders = (data && data.orders) || [];
-          const rws = [], resv = {};
+          const rws = [], resv = {}, rIdx = {};
           orders.forEach(o => {
             const site = (o.site || '').toUpperCase();
             const client = o.name || '(client)';
@@ -11668,12 +11876,21 @@
             // V9.74 — casiers du client dans le JSON (frais, sinon sec), ex. Henry = 1 et 2
             const rk = site + '||' + client; if (!resv[rk]) resv[rk] = [];
             ((o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : (o.casiersSec || [])).forEach(n => { const v = String(n).trim(); if (v && !resv[rk].includes(v)) resv[rk].push(v); });
-            (o.items || []).forEach(it => rws.push({
-              site, client, casier: String(casier),
-              id: it.id || '', product: it.produit || '(produit)', producer: it.producteur || '',
-              type: it.type || it.format || '', qty: it.qty || 1, price: it.consumer_price || 0,
-              cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' // V9.66 — 'nd' = cagette ND (remis à la main en distrib)
-            }));
+            (o.items || []).forEach(it => {
+              // V9.85 — commandes FUSIONNÉES (2 commandes du même client) : UNE seule ligne par client et
+              // par produit, quantités additionnées (comme la distrib), au lieu de 2 lignes liées entre elles.
+              const product = it.produit || '(produit)';
+              const mk = site + '||' + client + '||' + product;
+              const ex = rIdx[mk];
+              if (ex) { ex.qty += (it.qty || 1); ex._nOrders = (ex._nOrders || 1) + 1; return; }
+              const row = {
+                site, client, casier: String(casier),
+                id: it.id || '', product, producer: it.producteur || '',
+                type: it.type || it.format || '', qty: it.qty || 1, price: it.consumer_price || 0,
+                cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' // V9.66 — 'nd' = cagette ND (remis à la main en distrib)
+              };
+              rIdx[mk] = row; rws.push(row);
+            });
           });
           Object.values(resv).forEach(a => a.sort(casCmp));
           setRows(rws); setReserved(resv);
@@ -14307,11 +14524,11 @@
       const sites = BOUTIQUES; // locaux équipés de capteurs
 
       const loadSite = React.useCallback(async (site) => {
-        setBySite(prev => ({ ...prev, [site]: { ...(prev[site] || {}), loading: true, err: '' } }));
+        setBySite(prev => ({ ...prev, [site]: { sensors: [], ...(prev[site] || {}), loading: true, err: '' } })); // V9.84 — sensors toujours défini
         try {
           const r = await freshdeskPost({ secret: FRESHDESK_SECRET, action: 'koovea_temp', site, hours: 1, currentOnly: true });
           if (r && r.ok) {
-            setBySite(prev => ({ ...prev, [site]: { loading: false, err: '', sensors: r.sensors || [] } }));
+            setBySite(prev => ({ ...prev, [site]: { loading: false, err: '', sensors: Array.isArray(r.sensors) ? r.sensors : [] } }));
           } else {
             setBySite(prev => ({ ...prev, [site]: { loading: false, err: (r && r.error) || 'Erreur', sensors: [] } }));
           }
@@ -14370,7 +14587,8 @@
           </p>
 
           {sites.map(site => {
-            const st = bySite[site] || { loading: true, sensors: [] };
+            const st0 = bySite[site] || { loading: true, sensors: [] };
+            const st = { ...st0, sensors: Array.isArray(st0.sensors) ? st0.sensors : [] };
             return (
               <div key={site} className="card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
@@ -21175,6 +21393,9 @@
             {tab === 'suivi' && <PrepSuiviHub setTab={setTab} />}
             {tab === 'printpain' && <PrintPainPage session={effSession} setTab={setTab} />}
             {tab === 'printlabels' && <PrintLabelsPage session={effSession} setTab={setTab} />}
+            {tab === 'painpribon' && (kbIsSecure()
+              ? <PainPribonPage session={effSession} setTab={setTab} catalogue={catalogue} />
+              : <div className="card"><KbBackToHub setTab={setTab} /><p style={{fontSize:16,fontWeight:700}}>🔐 Réservé aux personnes avec l'accès KBG sécurisé.</p></div>)}
             {tab === 'cmdload' && (kbIsSecure()
               ? <AdminPage session={effSession} ordersOnly setTab={setTab} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />
               : <div className="card"><KbBackToHub setTab={setTab} /><p style={{fontSize:16,fontWeight:700}}>🔐 Réservé aux personnes avec l'accès KBG sécurisé.</p></div>)}
@@ -21191,7 +21412,7 @@
               <button className={tab==='prepdispatch'?'active':''} onClick={()=>setTab('prepdispatch')}>
                 <span className="tab-icon">🚚</span>Manquants & ND
               </button>
-              <button className={['suivi','pdpreturns','dlcwatch','losses','printpain','printlabels','muload','cmdload'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
+              <button className={['suivi','pdpreturns','dlcwatch','losses','printpain','printlabels','muload','cmdload','painpribon'].includes(tab)?'active':''} onClick={()=>setTab('suivi')}>
                 <span className="tab-icon">🖨️</span>Suivi &amp; impression
               </button>
               <button className={tab==='inventory'?'active':''} onClick={()=>setTab('inventory')}>
