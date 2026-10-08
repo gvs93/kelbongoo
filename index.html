@@ -627,7 +627,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.86';
+    const APP_VERSION = 'V9.87';
+    // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
+    //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
+    //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
     // V9.86 — Commande pain Pribon : liste FIXE des 8 pains Brut de Pain (tarif BdP), nom BdP + nom Kelbongoo ;
     //   récap général additionné par nom de pain (Kelbongoo + Pribon).
     // V9.85 — Prépa : commandes fusionnées d'un même client = UNE ligne par produit (quantités additionnées).
@@ -1157,7 +1160,7 @@
         const line = { id: l.id, produit: l.produit, producteur: l.producteur || '', productId: l.productId || '', total };
         lines.push(line);
         const cands = (clients || []).map(o => {
-          const need = (o.removed || []).filter(r => kbLmMatch(line, r)).reduce((t, r) => t + (Number(r.qty || r.quantity) || 1), 0);
+          const need = [...(o.removed || []), ...(o.items || []).filter(it => it._lm)].filter(r => kbLmMatch(line, r)).reduce((t, r) => t + (Number(r.qty || r.quantity) || 1), 0);
           return { o, need, got: 0 };
         }).filter(c => c.need > 0).sort((a, b) => casCmp(kbCasiersOf(a.o)[0] || 'ZZZ', kbCasiersOf(b.o)[0] || 'ZZZ'));
         let rest = total;
@@ -2214,6 +2217,10 @@
         for (const r of (o.removed || [])) {
           if (matches(r)) q += (r.qty || 0);
         }
+        // V9.87 — produits passés en « dernière minute » à la prépa : restés dans la commande (items._lm)
+        for (const r of (o.items || [])) {
+          if (r._lm && matches(r)) q += (r.qty || 0);
+        }
         if (q <= 0) continue;
         // casier du client : frais d'abord, sinon sec, sinon bac ND
         const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
@@ -2438,7 +2445,7 @@
 
     // Reconstruit l'état prépa (day_X_prep, écriture par clé) en maps status/remiseAll/remiseCli.
     function parsePrepDocs(arr) {
-      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {};
+      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {}, lm = {};
       for (const d of (arr || [])) {
         const id = d.id; if (!id || id === 'counters' || id === 'meta') continue;
         const bar = id.indexOf('|'); if (bar < 0) continue;
@@ -2447,8 +2454,9 @@
         else if (pfx === 'cs') casiers[key] = (d.nums || []).map(String).filter(Boolean); // V9.80 — casiers créés/modifiés en prépa
         else if (pfx === 'rc') remiseCli[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'ra') remiseAll[key] = { pct: d.pct, reason: d.reason };
+        else if (pfx === 'lm') lm[key] = true; // V9.87 — produit passé en « 🟣 Dispatch dernière minute » à la prépa (site||produit)
       }
-      return { status, remiseAll, remiseCli, posedN, casiers };
+      return { status, remiseAll, remiseCli, posedN, casiers, lm };
     }
     // V9.79 — rupture PARTIELLE : quantité manquante d'une ligne (0 si pas en partiel)
     function kbPartMiss(prep, k, qty) {
@@ -2486,7 +2494,8 @@
       }
       const hasStatus = prep.status && Object.keys(prep.status).length;
       const hasRem = (prep.remiseCli && Object.keys(prep.remiseCli).length) || (prep.remiseAll && Object.keys(prep.remiseAll).length);
-      if (!hasStatus && !hasRem) return o;
+      const hasLm = prep.lm && Object.keys(prep.lm).length;
+      if (!hasStatus && !hasRem && !hasLm) return o;
       const items = [], removed = [...(o.removed || [])], reduced = [...(o.reduced || [])];
       for (let it of (o.items || [])) {
         const k = site + '||' + client + '||' + it.produit;
@@ -2500,6 +2509,8 @@
         }
         const rc = (prep.remiseCli && prep.remiseCli[k]) || (prep.remiseAll && prep.remiseAll[site + '||' + it.produit]);
         if (rc && rc.pct) reduced.push({ ...it, percentage: rc.pct });
+        // V9.87 — produit attendu en dernière minute (pas posé à la prépa) : reste dans la commande, marqué _lm
+        if (prep.lm && prep.lm[String(site || '').toUpperCase() + '||' + it.produit]) it = { ...it, _lm: true };
         items.push(it);
       }
       const cat = (c) => items.filter(i => i.cat === c);
