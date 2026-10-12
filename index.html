@@ -755,8 +755,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.93';
-    // V9.93 — Chauffeur : liste master « 🚚 Chauffeurs » (Retours PDP) en plus du claim kbPdp → connecté en Prépa, ne voit que Retours PDP à récupérer.
+    const APP_VERSION = 'V9.94';
+    // V9.94 — Chauffeur SÉCURISÉ : rôle serveur dédié 'pdp' (kbgLogin, colonne « Retour PDP »), règles Firestore limitées
+    //   champ par champ (pdp_returns récupéré/annuler par lui-même, followups en retour PDP), lecture filtrée (requête
+    //   prouvable). Supprimé : liste de noms V9.93 (restriction d'affichage seulement) et l'ancien drapeau kbPdp sur un jeton prépa.
     // V9.92 — Suivi CA : DIAGNOSTIC PAR LIEU (clic sur un lieu → panneau) : pont CA exact (distrib × commandes × panier ×
     //   taux livré), pont clients (absents + où ils ont commandé, nouveaux / revenus / venus d'un autre lieu, fidèles :
     //   fréquence et panier), produits qui font l'écart (rupture ici, plus en vente, baisse partout, propre au lieu),
@@ -1277,8 +1279,10 @@
       const r = await kbCallable('kbgLogin')({ code, role, site });
       await window.__firebase.signInWithCustomToken(fb.auth, r.data.token);
       const c = await kbRefreshClaims(true);
-      if (!c || c.kbRole !== role) throw new Error('Rôle non reconnu par le serveur.');
-      return { name: c.kbName || r.data.name || 'Kelbongoo', site: c.kbSite, uid: c.uid };
+      // V9.94 — le serveur décide : un code coché « Retour PDP » reçoit le rôle dédié 'pdp' (chauffeur), même en entrant par Prépa
+      const ok = c && (c.kbRole === role || (role === 'prep' && c.kbRole === 'pdp'));
+      if (!ok) { try { await window.__firebase.signOut(fb.auth); } catch (_) {} window.__kbClaims = null; throw new Error('Rôle non reconnu par le serveur.'); }
+      return { name: c.kbName || r.data.name || 'Kelbongoo', site: c.kbSite, uid: c.uid, kbRole: c.kbRole };
     }
     // Master : Google (popup) → vérif liste blanche serveur → claim admin
     async function kbMasterGoogleLogin() {
@@ -1510,6 +1514,16 @@
           localStorage.removeItem(this._key(c, 'list'));
           window.dispatchEvent(new CustomEvent('local-data-change', { detail: { collection: c } }));
         }
+      },
+      // V9.94 — abonnement filtré (requête prouvable par les règles Firestore, ex. rôle chauffeur)
+      subscribeWhere(c, field, op, value, callback) {
+        if (!firebaseConfigured) return this.subscribe(c, arr => callback((arr || []).filter(d => op === '==' ? d[field] === value : true)));
+        return fb.onSnapshot(fb.query(fb.collection(fb.db, c), fb.where(field, op, value)), (snap) => {
+          callback(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        }, (err) => {
+          if (err && err.code !== 'permission-denied') console.warn('subscribeWhere ' + c, err);
+          try { callback([]); } catch (_) {}
+        });
       },
       subscribe(c, callback) {
         if (firebaseConfigured) {
@@ -3048,7 +3062,9 @@
         catch (e) { setBusy(false); setPassword(''); setError(kbErrMsg(e)); return; }
         setBusy(false); setPassword('');
         const who = String(r.name || '').trim() || 'Kelbongoo';
-        if (role === 'prep') {
+        if (r.kbRole === 'pdp') {
+          onLogin({ role: 'pdp', isPdp: true, uid: r.uid, site: 'ENTREPOT', name: who, loggedAt: new Date().toISOString() }); // V9.94 — chauffeur
+        } else if (role === 'prep') {
           onLogin({ role: 'prep', isPrep: true, uid: r.uid, site: 'ENTREPOT', name: who, loggedAt: new Date().toISOString() });
         } else {
           onLogin({ role: 'distrib', uid: r.uid, site, name: who, loggedAt: new Date().toISOString() });
@@ -5092,6 +5108,7 @@
           ...f, forceReturnPdp: true, forceReturnPdpBy: session.name, forceReturnPdpAt: new Date().toISOString(),
           updatedBy: session.name, updatedAt: new Date().toISOString(),
         });
+        await kbPickupWrite(f); // V9.94 — visible par le chauffeur (copie minimale)
         showToast('✓ Envoyé en retour PDP');
       };
 
@@ -8010,6 +8027,7 @@
         if (d === 'retour') {
           if (!confirm(`Valider le retour PDP de la commande de ${f.consumer_name || 'ce client'} (${f.site}) ?\nLe chauffeur la ramènera à l'entrepôt.`)) return;
           await storage.setDoc('followups', f.id || f.orderId, { pdpDecision: 'retour', forceReturnPdp: true, forceReturnPdpBy: session.name, forceReturnPdpAt: now, decidedBy: session.name, decidedAt: now });
+          await kbPickupWrite(f); // V9.94 — visible par le chauffeur (copie minimale)
           showToast('↩️ Retour PDP validé — visible par le chauffeur');
         } else {
           await storage.setDoc('followups', f.id || f.orderId, { pdpDecision: 'sav', savSince: now, savLastMailAt: now, savRelances: 0, decidedBy: session.name, decidedAt: now });
@@ -17610,34 +17628,18 @@
       await storage.setDoc('pdp_treatments', '_notyet_' + id, { alertedDay: today, alertOk: ok });
       return { days: days.length, mailed: ok };
     }
-    // V9.93 — chauffeur = claim serveur kbPdp (colonne « Retour PDP », si kbgLogin est à jour)
-    //   OU nom du code perso (kbName, signé par le serveur) présent dans la liste master app_config/pdp_drivers.
-    window.__kbPdpDrivers = window.__kbPdpDrivers || [];
-    const kbDriverNorm = (s) => normalizeText(String(s || '')).replace(/[^a-z0-9]+/g, ' ').trim();
-    function kbIsPdpDriver() {
-      const c = window.__kbClaims;
-      if (!c || c.admin === true) return false;
-      if (c.kbPdp === true) return true;
-      const n = kbDriverNorm(c.kbName);
-      return !!(n && c.kbRole === 'prep' && (window.__kbPdpDrivers || []).includes(n));
+    // V9.94 — chauffeur = rôle serveur dédié 'pdp' (jeton signé par kbgLogin, colonne « Retour PDP » du registre).
+    //   Aucun autre droit : les règles Firestore ne lui ouvrent que pdp_returns (récupéré / annuler) et les followups
+    //   en retour PDP (champs pdpRecovered*). Le nom affiché vient du jeton (kbName), jamais d'une saisie.
+    function kbIsPdpDriver() { const c = window.__kbClaims; return !!(c && c.admin !== true && c.kbRole === 'pdp'); }
+    // V9.94 — « pdp_pickups » : copie MINIMALE d'une commande non récupérée en retour PDP, seule lisible par le chauffeur
+    //   (prénom + initiale, lieu, casier, produits). Jamais e-mail / téléphone / adresse. Écrite par la prépa / le master.
+    function kbPickupLabel(name) { const p = String(name || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : '(client)'; }
+    function kbPickupFrom(f) {
+      return { orderId: String(f.orderId || f.id || ''), site: f.site || '', consumer_name: kbPickupLabel(f.consumer_name), storedCasier: String(f.storedCasier || ''),
+        distribDate: f.distribDate || f.day || '', items: (f.items || []).slice(0, 60).map(it => ({ produit: String(it.produit || ''), qty: it.qty || 1, dlc: it.dlc || '' })) };
     }
-    function KbPdpDriversAdmin() {
-      const showToast = React.useContext(ToastContext);
-      const [names, setNames] = React.useState([]);
-      const [v, setV] = React.useState('');
-      React.useEffect(() => storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'pdp_drivers'); setNames((d && d.names) || []); }), []);
-      const save = async (list) => { try { await storage.setDoc('app_config', 'pdp_drivers', { names: list, updatedAt: new Date().toISOString() }, { replace: true }); } catch (e) { showToast('Erreur : ' + e.message); } };
-      const add = () => { const t = v.trim(); if (!t) return; if (names.some(x => kbDriverNorm(x) === kbDriverNorm(t))) { setV(''); return; } save([...names, t]); setV(''); showToast(`🚚 ${t} : accès chauffeur uniquement`); };
-      return (
-        <div className="card" style={{ borderLeft: '4px solid #1565c0' }}>
-          <div style={{ fontSize: 17, fontWeight: 900 }}>🚚 Chauffeurs (master)</div>
-          <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 8px' }}>Ces personnes, connectées en Prépa avec leur code, ne voient QUE « Retours PDP à récupérer ». Écris le nom exactement comme dans le registre Salariés (Prénom Nom).</div>
-          <div className="chip-group">{names.map(n => <div key={n} className="chip selected" onClick={() => { if (confirm(`Retirer ${n} des chauffeurs ?`)) save(names.filter(x => x !== n)); }}>{n} ✕</div>)}{!names.length && <span style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun chauffeur.</span>}</div>
-          <div style={{ display: 'flex', gap: 6, marginTop: 8 }}><input value={v} onChange={e => setV(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') add(); }} placeholder="Prénom Nom du chauffeur" /><button className="btn-primary" onClick={add}>Ajouter</button></div>
-          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>Le chauffeur doit se déconnecter / reconnecter pour que ça s'applique.</div>
-        </div>
-      );
-    }
+    async function kbPickupWrite(f) { const id = String(f.orderId || f.id || ''); if (id) { try { await storage.setDoc('pdp_pickups', id, kbPickupFrom(f)); } catch (e) { console.warn('pdp_pickups', e); } } }
     const KB_FU_TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
     const kbIsToday = (iso) => !!iso && String(iso).slice(0, 10) === todayKey();
 
@@ -17645,17 +17647,45 @@
       const [manual, setManual] = React.useState(null);
       const [fus, setFus] = React.useState(null);
       const [treats, setTreats] = React.useState(null);
+      const [picks, setPicks] = React.useState(null);
+      const drv = kbIsPdpDriver();
       React.useEffect(() => {
+        // V9.94 — chauffeur : pdp_returns + pdp_pickups (copies minimales) ; jamais followups ni pdp_treatments
         const u1 = storage.subscribe('pdp_returns', a => setManual(a || []));
-        const u2 = storage.subscribe('followups', a => setFus(a || []));
-        const u3 = storage.subscribe('pdp_treatments', a => setTreats(a || []));
-        return () => { u1 && u1(); u2 && u2(); u3 && u3(); };
+        const u4 = storage.subscribe('pdp_pickups', a => setPicks(a || []));
+        const u2 = drv ? (setFus([]), null) : storage.subscribe('followups', a => setFus(a || []));
+        const u3 = drv ? (setTreats([]), null) : storage.subscribe('pdp_treatments', a => setTreats(a || []));
+        return () => { u1 && u1(); u2 && u2(); u3 && u3(); u4 && u4(); };
       }, []);
+      // V9.94 — synchro (prépa / master uniquement) : pdp_pickups ⇄ followups en retour PDP
+      const syncSig = React.useRef('');
+      React.useEffect(() => {
+        if (drv || !fus || !picks) return;
+        const act = fus.filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length);
+        const pk = {}; picks.forEach(p => { pk[p.id] = p; });
+        const ids = new Set(act.map(f => String(f.orderId || f.id)));
+        const toCreate = act.filter(f => !pk[String(f.orderId || f.id)]);
+        const toDelete = picks.filter(p => !ids.has(p.id));
+        const toCopy = act.filter(f => { const p = pk[String(f.orderId || f.id)]; return p && (p.pdpRecoveredAt || '') !== (f.pdpRecoveredAt || ''); });
+        const sig = [toCreate.map(f => f.orderId).join(','), toDelete.map(p => p.id).join(','), toCopy.map(f => f.orderId + (pk[String(f.orderId || f.id)].pdpRecoveredAt || '')).join(',')].join('|');
+        if (sig === '||' || sig === syncSig.current) return;
+        syncSig.current = sig;
+        (async () => {
+          for (const f of toCreate) await kbPickupWrite(f);
+          for (const p of toDelete) { try { await storage.deleteDoc('pdp_pickups', p.id); } catch (e) {} }
+          for (const f of toCopy) { const p = pk[String(f.orderId || f.id)]; try { await storage.setDoc('followups', f.id || f.orderId, { pdpRecoveredAt: p.pdpRecoveredAt || '', pdpRecoveredBy: p.pdpRecoveredBy || '' }); } catch (e) {} }
+        })();
+      }, [drv, fus, picks]);
       return React.useMemo(() => {
-        const ready = !!(manual && fus && treats);
+        const ready = !!(manual && fus && treats && picks);
         const tm = {}; (treats || []).forEach(t => { tm[t.id] = t; });
         const lineId = (f, it, idx) => `${f.orderId}__${it.id || idx}`;
-        const orders = (fus || []).filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length);
+        // V9.94 — la copie pdp_pickups fait foi pour « récupéré » ; le chauffeur ne voit que les copies
+        const pkm = {}; (picks || []).forEach(p => { pkm[p.id] = p; });
+        const orders = drv
+          ? (picks || []).filter(p => Array.isArray(p.items) && p.items.length).map(p => ({ ...p, id: p.id, orderId: p.orderId || p.id, forceReturnPdp: true }))
+          : (fus || []).filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length)
+              .map(f => { const p = pkm[String(f.orderId || f.id)]; return p ? { ...f, pdpRecoveredAt: p.pdpRecoveredAt || '', pdpRecoveredBy: p.pdpRecoveredBy || '' } : f; });
         // À récupérer (chauffeur)
         const recoverManual = (manual || []).filter(r => r.status === 'pending' || r.status === 'missing');
         const recoverOrders = orders.filter(f => !f.pdpRecoveredAt);
@@ -17680,7 +17710,7 @@
         const unlock = tm['_unlock_' + today] || null;
         const blocking = unlock ? 0 : treatManual.filter(r => !nyToday(r.id)).length + treatLines.filter(L => !nyToday(L.id)).length;
         return { ready, tm, lineId, orders, recoverManual, recoverOrders, recoveredTodayManual, recoveredTodayOrders, treatManual, treatLines, toTreat, toRecover: recoverManual.length + recoverOrders.length, treatedToday, valid, notYet, nyToday, unlock, blocking };
-      }, [manual, fus, treats]);
+      }, [manual, fus, treats, picks, drv]);
     }
 
     const KB_DEST_UI = {
@@ -17705,23 +17735,31 @@
       const showToast = React.useContext(ToastContext);
       const B = useKbPdpBoard();
       const [busy, setBusy] = React.useState(false);
-      const isDriver = kbIsPdpDriver() && !session.isMaster;
-      const showDriversAdmin = !!(session.isMaster || session._masterView || (window.__kbClaims && window.__kbClaims.admin === true)); // V9.93
+      const isDriver = session.role === 'pdp' && kbIsPdpDriver();
       const isMaster = !!(session.isMaster || session._masterView);
       const priceOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.prixAchat || p.prixHT || 0) : 0; };
       const uniteOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.unite || '') : ''; };
       const now = () => new Date().toISOString();
 
       // ── Chauffeur ──
+      // V9.94 — écritures limitées par les règles (chauffeur : seulement ses propres « récupéré » / annulations)
+      const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (récupéré par quelqu\'un d\'autre ?)' : 'Erreur : ' + ((e && e.message) || e));
       const toggleManual = async (r) => {
-        if (r.status === 'recovered') { await storage.setDoc('pdp_returns', r.id, { status: 'pending', recoveredBy: '', recoveredAt: '' }); showToast('↩️ Annulé'); return; }
-        await storage.setDoc('pdp_returns', r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
-        muCelebrate(r.qty || 1);
+        try {
+          if (r.status === 'recovered') { await storage.setDoc('pdp_returns', r.id, { status: 'pending', recoveredBy: '', recoveredAt: '' }); showToast('↩️ Annulé'); return; }
+          await storage.setDoc('pdp_returns', r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
+          muCelebrate(r.qty || 1);
+        } catch (e) { denied(e); }
       };
       const toggleOrder = async (f) => {
-        if (f.pdpRecoveredAt) { await storage.setDoc('followups', f.id || f.orderId, { pdpRecoveredAt: '', pdpRecoveredBy: '' }); showToast('↩️ Annulé'); return; }
-        await storage.setDoc('followups', f.id || f.orderId, { pdpRecoveredAt: now(), pdpRecoveredBy: session.name });
-        muCelebrate((f.items || []).length);
+        try {
+          const pid = String(f.orderId || f.id);
+          const val = f.pdpRecoveredAt ? { pdpRecoveredAt: '', pdpRecoveredBy: '' } : { pdpRecoveredAt: now(), pdpRecoveredBy: session.name };
+          if (!isDriver) await kbPickupWrite(f); // la copie existe avant d'y écrire
+          await storage.setDoc('pdp_pickups', pid, val); // V9.94 — fait foi (chauffeur et prépa)
+          if (!isDriver) await storage.setDoc('followups', f.id || f.orderId, val);
+          if (val.pdpRecoveredAt) muCelebrate((f.items || []).length); else showToast('↩️ Annulé');
+        } catch (e) { denied(e); }
       };
 
       // ── Entrepôt : traitement ──
@@ -17872,7 +17910,6 @@
       return (
         <div className="stack" style={{ marginTop: 10 }}>
           <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP · à traiter</h1>
-          {showDriversAdmin && <KbPdpDriversAdmin />}
           {!B.ready && <p>Chargement…</p>}
           {B.ready && (B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length) === 0 && (
             <div className="card" style={{ textAlign: 'center', padding: '22px 14px', border: '3px solid #2e7d32', background: '#e8f5e9' }}>
@@ -22536,13 +22573,6 @@
         else if (s.role === 'master' || s.isMaster) setTab('masterrecap');
         else setTab('clients');
       };
-      // V9.93 — liste master des chauffeurs (app_config/pdp_drivers) → mode « Retours PDP » uniquement
-      const [, setDrvRev] = React.useState(0);
-      React.useEffect(() => {
-        if (!session) return;
-        const u = storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'pdp_drivers'); window.__kbPdpDrivers = ((d && d.names) || []).map(kbDriverNorm).filter(Boolean); setDrvRev(r => r + 1); });
-        return () => { u && u(); };
-      }, [!!session]);
       const handleLogout = () => {
         kbSignOut();
         try { localStorage.removeItem('kb_session_v3'); } catch(e){}
@@ -22786,7 +22816,7 @@
       );
 
       // V9.91 — CHAUFFEUR (accès « Retour PDP ») : uniquement les retours à récupérer, aucun autre onglet
-      if (effSession.role === 'prep' && !effSession._masterView && kbIsPdpDriver()) {
+      if (effSession.role === 'pdp') { // V9.94 — rôle serveur dédié (aucun autre écran)
         return (
           <div className="app-shell">
             {overlay}
