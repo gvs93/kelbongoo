@@ -755,7 +755,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.92';
+    const APP_VERSION = 'V9.93';
+    // V9.93 — Chauffeur : liste master « 🚚 Chauffeurs » (Retours PDP) en plus du claim kbPdp → connecté en Prépa, ne voit que Retours PDP à récupérer.
     // V9.92 — Suivi CA : DIAGNOSTIC PAR LIEU (clic sur un lieu → panneau) : pont CA exact (distrib × commandes × panier ×
     //   taux livré), pont clients (absents + où ils ont commandé, nouveaux / revenus / venus d'un autre lieu, fidèles :
     //   fréquence et panier), produits qui font l'écart (rupture ici, plus en vente, baisse partout, propre au lieu),
@@ -17609,7 +17610,34 @@
       await storage.setDoc('pdp_treatments', '_notyet_' + id, { alertedDay: today, alertOk: ok });
       return { days: days.length, mailed: ok };
     }
-    function kbIsPdpDriver() { const c = window.__kbClaims; return !!(c && c.kbPdp === true && c.admin !== true); }
+    // V9.93 — chauffeur = claim serveur kbPdp (colonne « Retour PDP », si kbgLogin est à jour)
+    //   OU nom du code perso (kbName, signé par le serveur) présent dans la liste master app_config/pdp_drivers.
+    window.__kbPdpDrivers = window.__kbPdpDrivers || [];
+    const kbDriverNorm = (s) => normalizeText(String(s || '')).replace(/[^a-z0-9]+/g, ' ').trim();
+    function kbIsPdpDriver() {
+      const c = window.__kbClaims;
+      if (!c || c.admin === true) return false;
+      if (c.kbPdp === true) return true;
+      const n = kbDriverNorm(c.kbName);
+      return !!(n && c.kbRole === 'prep' && (window.__kbPdpDrivers || []).includes(n));
+    }
+    function KbPdpDriversAdmin() {
+      const showToast = React.useContext(ToastContext);
+      const [names, setNames] = React.useState([]);
+      const [v, setV] = React.useState('');
+      React.useEffect(() => storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'pdp_drivers'); setNames((d && d.names) || []); }), []);
+      const save = async (list) => { try { await storage.setDoc('app_config', 'pdp_drivers', { names: list, updatedAt: new Date().toISOString() }, { replace: true }); } catch (e) { showToast('Erreur : ' + e.message); } };
+      const add = () => { const t = v.trim(); if (!t) return; if (names.some(x => kbDriverNorm(x) === kbDriverNorm(t))) { setV(''); return; } save([...names, t]); setV(''); showToast(`🚚 ${t} : accès chauffeur uniquement`); };
+      return (
+        <div className="card" style={{ borderLeft: '4px solid #1565c0' }}>
+          <div style={{ fontSize: 17, fontWeight: 900 }}>🚚 Chauffeurs (master)</div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 8px' }}>Ces personnes, connectées en Prépa avec leur code, ne voient QUE « Retours PDP à récupérer ». Écris le nom exactement comme dans le registre Salariés (Prénom Nom).</div>
+          <div className="chip-group">{names.map(n => <div key={n} className="chip selected" onClick={() => { if (confirm(`Retirer ${n} des chauffeurs ?`)) save(names.filter(x => x !== n)); }}>{n} ✕</div>)}{!names.length && <span style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun chauffeur.</span>}</div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 8 }}><input value={v} onChange={e => setV(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') add(); }} placeholder="Prénom Nom du chauffeur" /><button className="btn-primary" onClick={add}>Ajouter</button></div>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>Le chauffeur doit se déconnecter / reconnecter pour que ça s'applique.</div>
+        </div>
+      );
+    }
     const KB_FU_TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
     const kbIsToday = (iso) => !!iso && String(iso).slice(0, 10) === todayKey();
 
@@ -17678,6 +17706,7 @@
       const B = useKbPdpBoard();
       const [busy, setBusy] = React.useState(false);
       const isDriver = kbIsPdpDriver() && !session.isMaster;
+      const showDriversAdmin = !!(session.isMaster || session._masterView || (window.__kbClaims && window.__kbClaims.admin === true)); // V9.93
       const isMaster = !!(session.isMaster || session._masterView);
       const priceOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.prixAchat || p.prixHT || 0) : 0; };
       const uniteOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.unite || '') : ''; };
@@ -17843,6 +17872,7 @@
       return (
         <div className="stack" style={{ marginTop: 10 }}>
           <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP · à traiter</h1>
+          {showDriversAdmin && <KbPdpDriversAdmin />}
           {!B.ready && <p>Chargement…</p>}
           {B.ready && (B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length) === 0 && (
             <div className="card" style={{ textAlign: 'center', padding: '22px 14px', border: '3px solid #2e7d32', background: '#e8f5e9' }}>
@@ -22506,6 +22536,13 @@
         else if (s.role === 'master' || s.isMaster) setTab('masterrecap');
         else setTab('clients');
       };
+      // V9.93 — liste master des chauffeurs (app_config/pdp_drivers) → mode « Retours PDP » uniquement
+      const [, setDrvRev] = React.useState(0);
+      React.useEffect(() => {
+        if (!session) return;
+        const u = storage.subscribe('app_config', arr => { const d = (arr || []).find(x => x.id === 'pdp_drivers'); window.__kbPdpDrivers = ((d && d.names) || []).map(kbDriverNorm).filter(Boolean); setDrvRev(r => r + 1); });
+        return () => { u && u(); };
+      }, [!!session]);
       const handleLogout = () => {
         kbSignOut();
         try { localStorage.removeItem('kb_session_v3'); } catch(e){}
