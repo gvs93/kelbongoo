@@ -627,8 +627,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.89';
-    // V9.89 — Mail « Rolls Kelbongoo prêts » (clôture prépa) : gestion@probon.fr ajouté aux destinataires Rungis.
+    const APP_VERSION = 'V9.90';
+    // V9.90 — Mail « Rolls Kelbongoo prêts » (clôture prépa) : gestion@probon.fr ajouté aux destinataires Rungis.
+    // V9.89 — Ancien site : synchro AU FIL DE LA JOURNÉE. Master › Pilotage › Ancien site › « 📡 Poste synchro » :
+    //         publie toutes les 2 min l'état par produit (terminé en prépa ? ruptures ? casiers) pour le script
+    //         Tampermonkey v2 ouvert sur l'ancien admin (même navigateur). Plus de gros report à 18h.
+    //         Sur ce poste uniquement, la déconnexion auto pour inactivité est suspendue tant que la synchro est active.
     // V9.88 — URGENT distrib : commandes FUSIONNÉES de l'ancien site (la 2e commande contient déjà la 1re) → la 1re
     //   (ancienne version) est écartée partout à la lecture de day_X_orders + au chargement JSON (plus de 2 poulets
     //   au lieu de 1 ; CA / prépa / mails / clôture corrigés aussi). Commandes PrestaShop jamais touchées.
@@ -8072,7 +8076,7 @@
         }
       }
       lines.sort(kbCasCmpRow); remises.sort(kbCasCmpRow);
-      return { day, lines, remises, ordered, psRupt, nAncien, nPs, closed: !!(meta && meta.closed), closedBy: (meta && meta.closedBy) || '', closedAt: (meta && meta.closedAt) || '', sent: (sentDoc && sentDoc.sent) || null };
+      return { _orders: (od && od.orders) || [], _prep: prep, day, lines, remises, ordered, psRupt, nAncien, nPs, closed: !!(meta && meta.closed), closedBy: (meta && meta.closedBy) || '', closedAt: (meta && meta.closedAt) || '', sent: (sentDoc && sentDoc.sent) || null };
     }
     // V9.70 — par produit : commandé (ancien site, tous lieux) vs rupture → « tout » (cocher l'horloge) ou partiel (casiers)
     function kbRupturesByProduct(lines, ordered) {
@@ -8409,6 +8413,81 @@
     }
 
     // Master › Pilotage › Ancien site
+
+    // V9.89 — SYNCHRO CONTINUE ANCIEN SITE. État par produit (commandes ANCIEN site uniquement) :
+    //   done = toutes les lignes du produit ont un statut final en prépa (posé / rupture / partiel)
+    //   rupture / full / cas = ruptures à reporter (même calcul que le récap « Ruptures ancien site »)
+    //   sig = empreinte des statuts : le script Tampermonkey attend qu'elle soit stable avant d'agir.
+    function kbHash(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+    async function kbAncienLive(day) {
+      day = day || activeDay();
+      const d = await kbAncienRuptures(day);
+      const P = {};
+      for (const o of d._orders) {
+        if (kbIsPsOrder(o) || o._test) continue;
+        const site = String(o.site || '').toUpperCase(), client = o.name || '(client)';
+        for (const it of (o.items || [])) {
+          const produit = it.produit || '(produit)', producteur = it.producteur || '';
+          const pk = producteur + '||' + produit;
+          const p = P[pk] || (P[pk] = { produit, producteur, ordered: 0, lines: 0, fin: 0, sig: [] });
+          const k = site + '||' + client + '||' + produit, st = d._prep.status[k] || '';
+          p.ordered += it.qty || 1; p.lines++;
+          if (st === 'done' || st === 'rupture' || st === 'partiel') p.fin++;
+          p.sig.push(k + '=' + st + (st === 'partiel' ? ':' + ((d._prep.posedN && d._prep.posedN[k]) || 0) : ''));
+        }
+      }
+      const bp = kbRupturesByProduct(d.lines, d.ordered);
+      const products = Object.values(P).map(p => {
+        const r = bp.find(x => x.producteur === p.producteur && x.produit === p.produit);
+        return { key: p.produit + (p.producteur ? ' ' + p.producteur : ''), produit: p.produit, producteur: p.producteur, ordered: p.ordered,
+          done: p.lines > 0 && p.fin === p.lines, rupture: r ? r.qty : 0, full: !!(r && r.full),
+          cas: r ? r.clients.map(c => ({ loc: c.site, num: String(c.casier || '?'), n: c.qty || 1, lab: c.site + ' ' + String(c.casier || '?') })) : [],
+          sig: kbHash(p.sig.sort().join('|')) };
+      }).sort((a, b) => a.produit.localeCompare(b.produit));
+      return { v: 1, day, at: Date.now(), closed: d.closed, nAncien: d.nAncien, products, recapText: kbRupturesText(d) };
+    }
+    try { window.kbAncienLive = kbAncienLive; } catch (_) {}
+
+    // Carte « 📡 Poste synchro ancien site » (Master › Pilotage › Ancien site).
+    // Publie l'état toutes les 2 min dans window.__kbAncienLive (lu par le script Tampermonkey v2
+    // sur l'onglet de l'ancien admin, même navigateur). Tant que le mode est actif ET que cette page
+    // est ouverte, la déconnexion auto pour inactivité est suspendue sur CE poste.
+    function AncienSyncPosteCard() {
+      const [on, setOn] = React.useState(() => { try { return localStorage.getItem('kb_sync_poste') === '1'; } catch (_) { return false; } });
+      const [last, setLast] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [ack, setAck] = React.useState(null);
+      React.useEffect(() => {
+        try { localStorage.setItem('kb_sync_poste', on ? '1' : '0'); } catch (_) {}
+        window.__kbSyncPoste = on;
+        if (!on) return;
+        let stop = false;
+        const tick = async () => {
+          try { const r = await kbAncienLive(activeDay()); if (stop) return; window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r); setErr(''); }
+          catch (e) { if (!stop) setErr(e.message || String(e)); }
+        };
+        tick();
+        const t = setInterval(tick, 2 * 60 * 1000);
+        const a = setInterval(() => setAck(window.__kbSyncAck || null), 5000);
+        return () => { stop = true; clearInterval(t); clearInterval(a); window.__kbSyncPoste = false; };
+      }, [on]);
+      const nDone = last ? last.products.filter(p => p.done).length : 0;
+      const hm = (ts) => ts ? new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—';
+      return (
+        <div className="card">
+          <h3 style={{ marginBottom: 6 }}>📡 Poste synchro ancien site (toute la journée)</h3>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>À activer sur <b>le PC qui garde l'ancien admin ouvert</b> (avec le script Tampermonkey v2). Chaque produit terminé en prépa est reporté automatiquement sur l'ancien site, au fil de l'eau. Laisser <b>cette page ouverte</b> sur ce PC.</div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+            <button className={on ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setOn(v => !v)}>{on ? '🟢 Synchro active — arrêter' : '▶️ Activer la synchro sur ce poste'}</button>
+            {on && <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Dernière publication {hm(last && last.at)} · {nDone}/{last ? last.products.length : 0} produits terminés en prépa{last && last.closed ? ' · 🔒 prépa clôturée' : ''}</span>}
+          </div>
+          {on && ack && <div style={{ fontSize: 12, marginTop: 6, color: ack.warn ? 'var(--warn)' : 'var(--accent-dark,#2e7d32)' }}>Ancien admin : {ack.applied || 0} produit(s) reporté(s) · {ack.warn || 0} à vérifier · dernier passage {hm(ack.at)}{ack.state ? ' · ' + ack.state : ''}</div>}
+          {on && !ack && <div style={{ fontSize: 12, marginTop: 6, color: 'var(--warn)' }}>⚠️ Pas encore de signal du script sur l'ancien admin (onglet ouvert ? script v2 installé ? mode auto activé ?).</div>}
+          {err && <div className="alert-red" style={{ fontSize: 12, marginTop: 6 }}>Erreur : {err}</div>}
+        </div>
+      );
+    }
+
     function AncienSitePilotagePage({ session }) {
       const [day, setDay] = React.useState(activeDay());
       const [site, setSite] = React.useState('');
@@ -8428,6 +8507,7 @@
             <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ fontSize: 15, padding: '6px 8px' }} />
             <button className="btn-ghost" style={kbBtnSm} onClick={() => setDay(activeDay())}>Jour actif</button>
           </div>
+          <AncienSyncPosteCard />
           <div className="card">
             <h3 style={{ marginBottom: 6 }}>🚫 Ruptures prépa — à reporter sur l'ancien site</h3>
             <AncienRupturesPanel key={'r' + day} day={day} session={session} />
@@ -21373,7 +21453,7 @@
       React.useEffect(() => {
         if (!loggedIn) return;
         let timer = null;
-        const reset = () => { if (timer) clearTimeout(timer); timer = setTimeout(() => logoutRef.current(), INACTIVITY_MS); };
+        const reset = () => { if (timer) clearTimeout(timer); timer = setTimeout(() => { if (window.__kbSyncPoste) return reset(); logoutRef.current(); }, INACTIVITY_MS); }; // V9.89 : pas de déconnexion sur le poste synchro ancien site
         const evs = ['mousedown', 'keydown', 'touchstart', 'click', 'scroll'];
         evs.forEach(e => window.addEventListener(e, reset, { passive: true }));
         reset();
