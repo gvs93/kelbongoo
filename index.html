@@ -627,7 +627,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.87';
+    const APP_VERSION = 'V9.88';
+    // V9.88 — URGENT distrib : commandes FUSIONNÉES de l'ancien site (la 2e commande contient déjà la 1re) → la 1re
+    //   (ancienne version) est écartée partout à la lecture de day_X_orders + au chargement JSON (plus de 2 poulets
+    //   au lieu de 1 ; CA / prépa / mails / clôture corrigés aussi). Commandes PrestaShop jamais touchées.
+    //   Pilotage › Suivi CA › Bilan : « 🔎 Ventes d'un produit » (recherche, période libre, vente RÉELLE hors
+    //   ruptures JSON + prépa, CA réel après remises, export CSV). Historique CA : tous les produits (2500/jour).
     // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
     //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
     //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
@@ -1214,6 +1219,59 @@
       } catch (e) { console.error("Firebase init failed", e); return false; }
     }
 
+
+    // V9.88 — COMMANDES FUSIONNÉES (ancien site) : quand un client repasse commande, l'ancien site crée une
+    //   2e commande qui CONTIENT DÉJÀ la 1re (fusion). L'export garde les deux → le poulet de la 1re était
+    //   compté 2 fois en distrib (et dans le CA). Règle : même lieu + même client + même jour, une commande
+    //   dont tous les produits (quantités ≤) sont contenus dans une autre = ancienne version → écartée.
+    //   Commandes PrestaShop (_ps) jamais touchées. Accesseurs génériques : marche sur le JSON brut et normalisé.
+    function kbDropSuperseded(list, acc) {
+      if (!Array.isArray(list) || list.length < 2) return list;
+      const groups = {};
+      list.forEach((o, i) => {
+        if (!o || acc.isPs(o)) return;
+        const k = acc.site(o) + '||' + acc.client(o) + '||' + acc.day(o);
+        if (!acc.client(o)) return;
+        (groups[k] = groups[k] || []).push(i);
+      });
+      const bag = (o) => { const m = {}; (acc.items(o) || []).forEach(it => { const id = acc.itemId(it); if (id) m[id] = (m[id] || 0) + acc.itemQty(it); }); return m; };
+      const drop = new Set();
+      for (const k in groups) {
+        const idx = groups[k]; if (idx.length < 2) continue;
+        const bags = idx.map(i => bag(list[i]));
+        const size = bags.map(b => Object.values(b).reduce((a, c) => a + c, 0));
+        idx.forEach((i, a) => {
+          if (!size[a]) return;
+          for (let b = 0; b < idx.length; b++) {
+            if (a === b || drop.has(idx[b])) continue;
+            const A = bags[a], B = bags[b];
+            if (!Object.keys(A).every(id => (B[id] || 0) >= A[id])) continue;
+            // B contient A. A est écartée si B est plus grosse, ou à égalité si B est la plus récente (id Mongo croissant).
+            if (size[b] > size[a] || String(acc.id(list[idx[b]])) > String(acc.id(list[i]))) { drop.add(i); break; }
+          }
+        });
+      }
+      if (!drop.size) return list;
+      try { console.info('[KB] commandes fusionnées : ' + drop.size + ' ancienne(s) version(s) écartée(s)'); } catch (_) {}
+      return list.filter((_, i) => !drop.has(i));
+    }
+    const KB_ACC_NORM = {
+      isPs: o => !!o._ps, id: o => o.orderId || '', site: o => String(o.site || '').toUpperCase(),
+      client: o => String(o.consumerId || o.email || o.name || ''), day: o => '',
+      items: o => o.items, itemId: it => it.id || it.produit, itemQty: it => Number(it.qty) || 1,
+    };
+    // RAW : annulées (8) / paniers (0) hors fusion
+    const KB_ACC_RAW = {
+      isPs: o => o.status === 8 || o.status === 0, id: o => oid(o._id), site: o => String(o.locale || '').trim().toUpperCase(),
+      client: o => String(oid(o.consumer_id) || o.consumer_email || o.email || ''),
+      day: o => { const d = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date; return String(d || '').slice(0, 10); },
+      items: o => o.items, itemId: it => oid(it.producerproduct_id), itemQty: it => Number(it.quantity) || 1,
+    };
+    const kbIsDayOrders = (c) => /^day_.+_orders$/.test(c);
+    const kbOrdersRead1 = (c, doc) => kbIsDayOrders(c) ? kbCleanDayOrders(doc) : doc;
+    const kbOrdersRead = (c, arr) => kbIsDayOrders(c) ? (arr || []).map(kbCleanDayOrders) : arr;
+    const kbCleanDayOrders = (doc) => (doc && Array.isArray(doc.orders)) ? { ...doc, orders: kbDropSuperseded(doc.orders, KB_ACC_NORM) } : doc;
+
     // ============================================================
     // STORAGE
     // ============================================================
@@ -1247,22 +1305,22 @@
       async getAll(c) {
         if (firebaseConfigured) {
           const snap = await fb.getDocs(fb.collection(fb.db, c));
-          return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          return kbOrdersRead(c, snap.docs.map(d => ({ id: d.id, ...d.data() })));
         } else {
           const key = this._key(c, 'list');
           const ex = JSON.parse(localStorage.getItem(key) || '{}');
-          return Object.entries(ex).map(([id, data]) => ({ id, ...data }));
+          return kbOrdersRead(c, Object.entries(ex).map(([id, data]) => ({ id, ...data })));
         }
       },
       // Lit un document par id, ou null s'il n'existe pas.
       async getDoc(c, id) {
         if (firebaseConfigured) {
           const snap = await fb.getDoc(fb.doc(fb.db, c, id));
-          return snap.exists() ? { id: snap.id, ...snap.data() } : null;
+          return snap.exists() ? kbOrdersRead1(c, { id: snap.id, ...snap.data() }) : null;
         } else {
           const key = this._key(c, 'list');
           const ex = JSON.parse(localStorage.getItem(key) || '{}');
-          return ex[id] ? { id, ...ex[id] } : null;
+          return ex[id] ? kbOrdersRead1(c, { id, ...ex[id] }) : null;
         }
       },
       // Supprime tous les documents d'une collection (utile pour reset).
@@ -1279,7 +1337,7 @@
       subscribe(c, callback) {
         if (firebaseConfigured) {
           return fb.onSnapshot(fb.collection(fb.db, c), (snap) => {
-            callback(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+            callback(kbOrdersRead(c, snap.docs.map(d => ({ id: d.id, ...d.data() }))));
           }, (err) => {
             // V9.54 : accès refusé (non connecté / rôle insuffisant) → liste vide, pas de plantage
             if (err && err.code !== 'permission-denied') console.warn('subscribe ' + c, err);
@@ -1654,7 +1712,7 @@
     // Renvoie { orders:[...], missingConsumers:Set, missingProducts:Set, dateKey }
     function parseOrdersJSON(jsonText, prodById, consById, statusKeep) {
       const data = typeof jsonText === 'string' ? JSON.parse(jsonText) : jsonText;
-      const arr = Array.isArray(data) ? data : (data.orders || []);
+      const arr = kbDropSuperseded((Array.isArray(data) ? data : (data.orders || [])), KB_ACC_RAW); // V9.88 — fusionnées
       const keep = statusKeep || null; // null = règle par défaut
       const missingConsumers = new Set();
       const missingProducts = new Set();
@@ -1794,7 +1852,7 @@
         manquants: Object.values(aggManquants),
         remises: Object.values(aggRemises),
         caBySite,
-        salesByProduct: Object.values(salesByProduct).sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 300),
+        salesByProduct: Object.values(salesByProduct).sort((a, b) => b.ca_cents - a.ca_cents).slice(0, 2500),
       };
     }
 
@@ -1823,7 +1881,7 @@
         date: dateKey,
         dow: new Date(dateKey + 'T12:00:00').getDay(), // 0=dim … 6=sam
         caBySite: caBySite || {},
-        salesByProduct: (salesByProduct || []).slice(0, 300),
+        salesByProduct: (salesByProduct || []).slice(0, 2500), // V9.88 — tous les produits (recherche)
         manquantsByProduct: (manquantsByProduct || []).slice(0, 400),
         remisesByProduct: (remisesByProduct || []).slice(0, 400),
         totals: totalsFromCaBySite(caBySite),
@@ -1837,7 +1895,7 @@
     // opts.fromKey / opts.toKey : bornes (YYYY-MM-DD) pour limiter les dates écrites.
     function buildDailyAnalytics(jsonText, prodById, opts = {}) {
       const data = typeof jsonText === 'string' ? JSON.parse(jsonText) : jsonText;
-      const arr = Array.isArray(data) ? data : (data.orders || []);
+      const arr = kbDropSuperseded(Array.isArray(data) ? data : (data.orders || []), KB_ACC_RAW); // V9.88 — fusionnées
       const fromKey = opts.fromKey || null;
       const toKey = opts.toKey || null;
       const byDate = {}; // dateKey -> { caBySite, sales, ordersCount }
@@ -1901,7 +1959,7 @@
 
       const docs = {};
       for (const [dateKey, b] of Object.entries(byDate)) {
-        const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 300);
+        const sales = Object.values(b.sales).sort((a, z) => z.ca_cents - a.ca_cents).slice(0, 2500);
         const manq = Object.values(b.manq).sort((a, z) => z.ca_cents - a.ca_cents);
         const rem = Object.values(b.rem).sort((a, z) => z.ca_cents - a.ca_cents);
         docs[dateKey] = buildCaHistoryDoc(dateKey, b.caBySite, sales, b.ordersCount, 'bulk', manq, rem);
@@ -15535,6 +15593,124 @@
       );
     }
 
+    // V9.88 — Bilan › 🔎 Ventes d'un produit : recherche + période libre. VENTE RÉELLE = commandé (JSON, après
+    //   manquants site) − ruptures signalées en prépa (day_X_manquants, hors doublon JSON). CA réel = vendu réel ×
+    //   prix − remises du produit. Jamais le théorique.
+    function KbVentesProduit({ all }) {
+      const today = new Date().toISOString().slice(0, 10);
+      const [from, setFrom] = React.useState('2026-10-01');
+      const [to, setTo] = React.useState(today);
+      const [q, setQ] = React.useState('');
+      const [sel, setSel] = React.useState(null); // clé normalisée
+      const [prep, setPrep] = React.useState({});
+      const [loading, setLoading] = React.useState(false);
+      const catalog = React.useMemo(() => {
+        const m = {};
+        (all || []).forEach(d => [...(d.salesByProduct || []), ...(d.manquantsByProduct || [])].forEach(p => {
+          const k = kbANorm(p.produit); if (!k || p.produit === '(produit inconnu)') return;
+          if (!m[k]) m[k] = { k, produit: p.produit, producteur: p.producteur || '', n: 0 };
+          m[k].n += p.qty || 0;
+        }));
+        return Object.values(m).sort((a, b) => b.n - a.n);
+      }, [all]);
+      const matches = React.useMemo(() => {
+        const t = kbANorm(q); if (!t) return [];
+        const words = t.split(' ');
+        return catalog.filter(c => words.every(w => (c.k + ' ' + kbANorm(c.producteur)).includes(w))).slice(0, 25);
+      }, [q, catalog]);
+      const docs = React.useMemo(() => (all || []).filter(d => d.date && d.date >= from && d.date <= to).sort((a, b) => a.date.localeCompare(b.date)), [all, from, to]);
+      React.useEffect(() => {
+        if (!sel) return; let alive = true;
+        const dates = docs.map(d => d.date).filter(d => !(d in prep)).slice(0, 200);
+        if (!dates.length) return;
+        setLoading(true);
+        (async () => {
+          const res = {};
+          for (let i = 0; i < dates.length; i += 10) {
+            const ch = dates.slice(i, i + 10);
+            const got = await Promise.all(ch.map(dk => storage.getAll(`day_${dk}_manquants`).catch(() => [])));
+            ch.forEach((dk, j) => { res[dk] = got[j] || []; });
+          }
+          if (alive) { setPrep(p => ({ ...p, ...res })); setLoading(false); }
+        })();
+        return () => { alive = false; };
+      }, [sel, docs]);
+      const rows = React.useMemo(() => {
+        if (!sel) return [];
+        return docs.map(d => {
+          const sale = (d.salesByProduct || []).find(p => kbANorm(p.produit) === sel);
+          const jm = (d.manquantsByProduct || []).find(p => kbANorm(p.produit) === sel);
+          const rm = (d.remisesByProduct || []).find(p => kbANorm(p.produit) === sel);
+          const qOrd = sale ? (sale.qty || 0) : 0;
+          const unit = sale && sale.qty ? sale.ca_cents / sale.qty : (jm && jm.qty ? jm.ca_cents / jm.qty : 0);
+          let qPrep = 0;
+          if (!jm) (prep[d.date] || []).forEach(m => { if (m.source === 'prepa' && m.status === 'rupture' && kbANorm(m.produit) === sel) qPrep += (m.manque || m.total || 0); });
+          qPrep = Math.min(qPrep, qOrd);
+          const qJson = jm ? (jm.qty || 0) : 0;
+          const qReel = Math.max(0, qOrd - qPrep);
+          const caReel = Math.max(0, Math.round(qReel * unit) - (rm ? rm.ca_cents || 0 : 0));
+          return { date: d.date, qCmd: qOrd + qJson, qRupt: qJson + qPrep, qReel, caReel, rem: rm ? rm.ca_cents || 0 : 0 };
+        }).filter(r => r.qCmd || r.qReel);
+      }, [sel, docs, prep]);
+      const tot = rows.reduce((a, r) => ({ qCmd: a.qCmd + r.qCmd, qRupt: a.qRupt + r.qRupt, qReel: a.qReel + r.qReel, caReel: a.caReel + r.caReel }), { qCmd: 0, qRupt: 0, qReel: 0, caReel: 0 });
+      const cur = catalog.find(c => c.k === sel);
+      const exportCsv = () => {
+        const lines = [['Date', 'Commandé', 'Ruptures', 'Vendu réel', 'CA réel (€)'].join(';')]
+          .concat(rows.map(r => [r.date, r.qCmd, r.qRupt, r.qReel, (r.caReel / 100).toFixed(2).replace('.', ',')].join(';')))
+          .concat([['TOTAL', tot.qCmd, tot.qRupt, tot.qReel, (tot.caReel / 100).toFixed(2).replace('.', ',')].join(';')]);
+        const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = `ventes_${(cur ? cur.produit : 'produit').replace(/[^a-z0-9]+/gi, '_')}_${from}_${to}.csv`; a.click();
+      };
+      const big = { fontSize: 22, fontWeight: 900 };
+      return (
+        <div className="card" style={{ borderLeft: '3px solid var(--accent)' }}>
+          <h3 style={{ marginTop: 0 }}>🔎 Ventes d'un produit</h3>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+            <div style={{ flex: 1 }}><label>Du</label><input type="date" value={from} onChange={e => setFrom(e.target.value)} /></div>
+            <div style={{ flex: 1 }}><label>Au</label><input type="date" value={to} onChange={e => setTo(e.target.value)} /></div>
+          </div>
+          <input type="search" placeholder="Tape un produit ou un producteur (ex. poulet, tomate…)" value={q}
+            onChange={e => { setQ(e.target.value); setSel(null); }} style={{ fontSize: 16, width: '100%' }} />
+          {!sel && matches.length > 0 && (
+            <div style={{ maxHeight: 260, overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 8, marginTop: 4 }}>
+              {matches.map(m => (
+                <div key={m.k} onClick={() => { setSel(m.k); setQ(m.produit); }} style={{ padding: '10px 12px', borderBottom: '1px solid var(--line)', cursor: 'pointer' }}>
+                  <div style={{ fontWeight: 700 }}>{m.produit}</div>
+                  {m.producteur && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{m.producteur}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+          {!sel && q && !matches.length && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun produit trouvé dans l'historique.</p>}
+          {sel && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <div className="kpi" style={{ flex: 1 }}><div className="kpi-val" style={big}>{tot.qReel.toLocaleString('fr-FR')}</div><div className="kpi-label">Vendu réel</div><div className="kpi-sub">récupéré, hors ruptures</div></div>
+                <div className="kpi" style={{ flex: 1 }}><div className="kpi-val" style={big}>{kbEur(tot.caReel)}</div><div className="kpi-label">CA réel</div><div className="kpi-sub">après remises</div></div>
+                <div className="kpi" style={{ flex: 1 }}><div className="kpi-val" style={{ ...big, color: 'var(--danger)' }}>{tot.qRupt.toLocaleString('fr-FR')}</div><div className="kpi-label">Ruptures</div><div className="kpi-sub">sur {tot.qCmd.toLocaleString('fr-FR')} commandés</div></div>
+              </div>
+              {loading && <p style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Lecture des ruptures prépa…</p>}
+              <div style={{ maxHeight: 320, overflowY: 'auto', marginTop: 8 }}>
+                <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+                  <thead><tr style={{ textAlign: 'right', color: 'var(--ink-mute)' }}><th style={{ textAlign: 'left' }}>Jour</th><th>Cmd</th><th>Rupt.</th><th>Vendu</th><th>CA réel</th></tr></thead>
+                  <tbody>{rows.slice().reverse().map(r => (
+                    <tr key={r.date} style={{ textAlign: 'right', borderTop: '1px solid var(--line)' }}>
+                      <td style={{ textAlign: 'left' }}>{formatDateShort(r.date)}</td><td>{r.qCmd}</td>
+                      <td style={{ color: r.qRupt ? 'var(--danger)' : undefined }}>{r.qRupt || ''}</td>
+                      <td style={{ fontWeight: 800 }}>{r.qReel}</td><td>{kbEur(r.caReel)}</td>
+                    </tr>))}</tbody>
+                </table>
+                {!rows.length && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Pas de vente sur cette période.</p>}
+              </div>
+              <button className="btn-secondary btn-block" style={{ marginTop: 8 }} onClick={exportCsv} disabled={!rows.length}>⬇️ Export CSV (Excel)</button>
+              <p style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>Avant le 12/10/2026, l'historique ne gardait que les 300 meilleures ventes par jour : un petit produit peut manquer sur ces dates.</p>
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function CaDashboard({ session }) {
       const [all, setAll] = React.useState(null); // null = chargement
       const [from, setFrom] = React.useState(() => { const d = new Date(); d.setDate(d.getDate() - 60); return d.toISOString().slice(0,10); });
@@ -15715,6 +15891,9 @@
               ))}
             </div>
           </div>
+
+          {/* V9.88 — recherche produit */}
+          <KbVentesProduit all={all} />
 
           {/* Meilleures ventes */}
           <div className="card">
