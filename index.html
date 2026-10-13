@@ -755,7 +755,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.94';
+    const APP_VERSION = 'V9.95';
     // V9.94 — Chauffeur SÉCURISÉ : rôle serveur dédié 'pdp' (kbgLogin, colonne « Retour PDP »), règles Firestore limitées
     //   champ par champ (pdp_returns récupéré/annuler par lui-même, followups en retour PDP), lecture filtrée (requête
     //   prouvable). Supprimé : liste de noms V9.93 (restriction d'affichage seulement) et l'ancien drapeau kbPdp sur un jeton prépa.
@@ -849,6 +849,9 @@
     //   Casiers : « ➕ / Casier plein » ouvre un choix — casier prévu par l'ancien site (bacs 2, 3…),
     //   automatique (prochain n° libre) ou n° choisi à la main. Un n° = un seul client par lieu
     //   (casiers ancien site frais + sec de tous les clients compris) ; refus si déjà pris.
+    // V9.95 — Présence équipe en direct (kb_presence/<nom>) pour le « Suivi live » de la Console Pribon :
+    //   rôle (prépa / distrib / chauffeur PDP / master), lieu, écran, tâche en cours + avancement ;
+    //   doc ~prep_<jour> = avancement prépa par lieu + ruptures. Écritures regroupées (≥ 8 s), battement 60 s.
     // V9.72 — Push « 🥕 Équipe prépa (MU / prépa) » : plein écran sur l'appli prépa, validation par
     //   initiales, accusé PAR PERSONNE (nom du code perso) → ne revient plus pour celui qui a validé ;
     //   historique master : qui a validé, initiales, heure. Les push boutiques ne s'affichent plus en prépa.
@@ -4083,6 +4086,12 @@
         const ids = o._subOrderIds || [o.orderId];
         return ids.length > 0 && ids.every(id => statusMap[id]?.passed);
       };
+
+      // V9.95 — présence distrib : retraits faits / total sur le lieu
+      React.useEffect(() => {
+        if (!session || session.isMaster || session.role !== 'distrib' || !currentSite) return;
+        kbPresence(session, { task: 'Distribution', site: currentSite, done: visible.filter(isPassed).length, total: visible.length, unit: 'retraits', taskAt: Date.now() });
+      }, [visible, statusMap, currentSite]);
 
       const togglePassed = async (order) => {
         if (isClosed) return;
@@ -12568,6 +12577,22 @@
       }, [rows, prep]);
       const siteProgress = (s) => refProg.site[s] || { done: 0, total: 0 };
       const globalProg = { d: refProg.d, t: refProg.t, pct: refProg.t ? Math.round(refProg.d / refProg.t * 100) : 0, allDone: refProg.t > 0 && refProg.d === refProg.t };
+      // V9.95 — présence : produit ouvert + avancement (lignes traitées / lignes du produit)
+      React.useEffect(() => {
+        if (!day || !rows.length) return;
+        const lines = openProd ? rows.filter(r => r.product === openProd) : [];
+        const miss = lines.reduce((a, r) => a + (missOf(r) > 0 ? 1 : 0), 0);
+        const with_ = openProd ? Object.entries(prep.presence || {}).filter(([u, d]) => u !== user && d.product === openProd).map(([u]) => u) : [];
+        kbPresence(session, { task: openProd || (prep.closed ? 'Prépa clôturée' : 'Prépa · ' + (mode === 'produits' ? 'liste produits' : mode)),
+          done: lines.filter(handled).length, total: lines.length, unit: 'lignes', miss, with: with_, prepDay: day, site: 'ENTREPOT', taskAt: Date.now() });
+      }, [openProd, prep, rows, mode]);
+      // V9.95 — avancement prépa par lieu + ruptures (un doc partagé par jour)
+      React.useEffect(() => {
+        if (!day || !rows.length) return;
+        const rupt = new Set(); rows.forEach(r => { const x = prep.status[K(r)]; if (x === 'rupture' || x === 'partiel') rupt.add(r.product); });
+        const tot = new Set(); rows.forEach(r => { if (prep.status[K(r)] === 'rupture') tot.add(r.product); });
+        kbPrepAggregate(day, { sites: refProg.site, d: refProg.d, t: refProg.t, ruptures: rupt.size, rupturesTotales: tot.size, closed: !!prep.closed, closedBy: prep.closedBy || '' });
+      }, [refProg, prep.closed]);
 
       // ---- actions ----
       const toggleDone = (r) => {
@@ -17632,6 +17657,31 @@
     //   Aucun autre droit : les règles Firestore ne lui ouvrent que pdp_returns (récupéré / annuler) et les followups
     //   en retour PDP (champs pdpRecovered*). Le nom affiché vient du jeton (kbName), jamais d'une saisie.
     function kbIsPdpDriver() { const c = window.__kbClaims; return !!(c && c.admin !== true && c.kbRole === 'pdp'); }
+    // V9.95 — présence équipe (lue par la Console Pribon) : un doc par personne, écritures regroupées.
+    const KB_PRES = 'kb_presence';
+    const kbPresId = (name) => String(name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'inconnu';
+    const kbPresRole = (s) => kbIsPdpDriver() ? 'pdp' : (s && s.isMaster ? 'master' : ((s && s.role) || ''));
+    const __kbPres = {};
+    function kbPresence(session, patch, minGap) {
+      try {
+        if (!session || !session.name || session._masterView || !firebaseConfigured) return;
+        const id = kbPresId(session.name);
+        const st = __kbPres[id] || (__kbPres[id] = { data: {}, timer: null, last: 0 });
+        Object.assign(st.data, patch || {});
+        const flush = () => { st.timer = null; st.last = Date.now();
+          storage.setDoc(KB_PRES, id, { name: session.name, role: kbPresRole(session), at: Date.now(), day: todayKey(), ...st.data }).catch(() => {}); };
+        const wait = (minGap == null ? 8000 : minGap) - (Date.now() - st.last);
+        if (wait <= 0) flush(); else if (!st.timer) st.timer = setTimeout(flush, wait);
+      } catch (e) {}
+    }
+    let __kbPrepAggLast = 0, __kbPrepAggTimer = null, __kbPrepAggData = null;
+    function kbPrepAggregate(day, data) {
+      __kbPrepAggData = { day, ...data };
+      const flush = () => { __kbPrepAggTimer = null; __kbPrepAggLast = Date.now();
+        storage.setDoc(KB_PRES, '~prep_' + day, { ...__kbPrepAggData, at: Date.now() }, { replace: true }).catch(() => {}); };
+      const wait = 20000 - (Date.now() - __kbPrepAggLast);
+      if (wait <= 0) flush(); else if (!__kbPrepAggTimer) __kbPrepAggTimer = setTimeout(flush, wait);
+    }
     // V9.94 — « pdp_pickups » : copie MINIMALE d'une commande non récupérée en retour PDP, seule lisible par le chauffeur
     //   (prénom + initiale, lieu, casier, produits). Jamais e-mail / téléphone / adresse. Écrite par la prépa / le master.
     function kbPickupLabel(name) { const p = String(name || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : '(client)'; }
@@ -17736,6 +17786,12 @@
       const B = useKbPdpBoard();
       const [busy, setBusy] = React.useState(false);
       const isDriver = session.role === 'pdp' && kbIsPdpDriver();
+      // V9.95 — présence chauffeur : retours récupérés aujourd'hui / total
+      React.useEffect(() => {
+        if (!isDriver || !B || !B.ready) return;
+        const done = (B.recoveredTodayManual || []).length + (B.recoveredTodayOrders || []).length;
+        kbPresence(session, { task: 'Retours PDP', site: 'ENTREPOT', done, total: done + (B.toRecover || 0), unit: 'retours', taskAt: Date.now() });
+      }, [isDriver, B]);
       const isMaster = !!(session.isMaster || session._masterView);
       const priceOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.prixAchat || p.prixHT || 0) : 0; };
       const uniteOf = (produit, producteur) => { const p = (catalogue || []).find(x => x.produit === produit && x.producteur === producteur); return p ? (p.unite || '') : ''; };
@@ -22370,6 +22426,16 @@
         if (session && session.role === 'distrib' && !session.isMaster && activeDay() !== todayKey()) setActiveDay(null);
       }, [session && session.role, session && session.isMaster]);
       const [currentSite, setCurrentSite] = React.useState(null);
+      // V9.95 — battement de présence (Console Pribon › Suivi live) : rôle, lieu, écran
+      React.useEffect(() => {
+        if (!session || !session.name || session._masterView) return;
+        const beat = () => kbPresence(session, { site: currentSite || (session.role === 'prep' ? 'ENTREPOT' : ''), page: tab || '', online: true }, 0);
+        beat();
+        const t = setInterval(beat, 60000);
+        const v = () => { if (document.visibilityState === 'visible') beat(); };
+        document.addEventListener('visibilitychange', v);
+        return () => { clearInterval(t); document.removeEventListener('visibilitychange', v); };
+      }, [session && session.name, session && session.role, tab, currentSite]);
 
       const [rawOrders, setRawOrders] = React.useState([]);
       const [ordersMeta, setOrdersMeta] = React.useState(null);
