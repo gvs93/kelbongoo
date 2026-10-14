@@ -756,6 +756,12 @@
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
     const APP_VERSION = 'V9.99';
+    // V9.99 (++) — Prépa › Manquants & ND : onglets dans l'ordre 🚚 Dernière minute · 📦 Manquants · 🥬 ND du jour · 🏷️ Remisés.
+    //   ND du jour inclut TOUTE la dernière minute (🟣 certaine prépa + 🚚 camion), même attribution que la distrib
+    //   (kbLmAttribution) → plus de doublon : un ND passé en 🟣 (ex. chou) sort du ND normal et apparaît UNE fois en
+    //   dernière minute ; si un dispatch camion existe pour le même produit/lieu, il prime sur le 🟣.
+    //   « ✓ Fait » partagé en direct (day_X_prep, docs nd|lieu||n|l||produit) : toucher une ligne en vue Par lieu
+    //   ou Global ; barre X/Y ; feu d'artifice quand tout le ND du jour est fait.
     // V9.99 (+) — Prépa › Manquants & ND : 4 ONGLETS collants en haut (🥬 ND du jour · 🚚 Dernière minute ·
     //   📦 Manquants · 🏷️ Remisés) avec compteurs et pastille « sans raison » ; un seul bloc affiché à la fois ;
     //   ouvre sur le 1er onglet non vide ; vue ND (casier/lieu/global) mémorisée.
@@ -13603,9 +13609,10 @@
       const [remises, setRemises] = React.useState([]);
       const [dayOrders, setDayOrders] = React.useState([]);
       const [prepSt, setPrepSt] = React.useState(null);
+      const [ndDone, setNdDone] = React.useState({}); // V9.99 (++) — site||n|l||produit → qui
 
       React.useEffect(() => {
-        if (!day) { setDispatchData({}); setManquants([]); setLastmin([]); setRemises([]); setDayOrders([]); setPrepSt(null); return; }
+        if (!day) { setDispatchData({}); setManquants([]); setLastmin([]); setRemises([]); setDayOrders([]); setPrepSt(null); setNdDone({}); return; }
         const u0 = storage.subscribe(`day_${day}_dispatch`, (arr) => {
           const map = {};
           for (const d of arr) {
@@ -13626,7 +13633,13 @@
           const doc = (arr || []).find(x => x.id === 'data') || (arr || [])[0];
           setDayOrders(doc && doc.orders ? doc.orders : []);
         });
-        const u5 = storage.subscribe(`day_${day}_prep`, (arr) => setPrepSt(parsePrepDocs(arr)));
+        const u5 = storage.subscribe(`day_${day}_prep`, (arr) => {
+          setPrepSt(parsePrepDocs(arr));
+          // V9.99 (++) — ND du jour « ✓ Fait » (docs nd|…, ignorés par parsePrepDocs / synchro ancien site)
+          const nd = {};
+          for (const d of (arr || [])) { const id = String(d.id || ''); if (id.indexOf('nd|') === 0 && d.v === 'done') { try { nd[decodeURIComponent(id.slice(3))] = d.by || '✓'; } catch (_) {} } }
+          setNdDone(nd);
+        });
         return () => { u0(); u1(); u2(); u3(); u4(); u5(); };
       }, [day]);
       // V9.82 — commandes AVEC la prépa appliquée (ruptures marquées en prépa + casiers prépa) :
@@ -13639,7 +13652,7 @@
 
       // --- Uploads dispatch par site ---
       const [dispSite, setDispSite] = React.useState('');
-      const [ndView, setNdViewRaw] = React.useState(() => { try { return localStorage.getItem('kb_nd_view') || 'casier'; } catch (_) { return 'casier'; } }); // 'casier' | 'lieu' | 'global' — vue ND du jour
+      const [ndView, setNdViewRaw] = React.useState(() => { try { return localStorage.getItem('kb_nd_view') || 'lieu'; } catch (_) { return 'lieu'; } }); // 'casier' | 'lieu' | 'global' — vue ND du jour
       const setNdView = (v) => { setNdViewRaw(v); try { localStorage.setItem('kb_nd_view', v); } catch (_) {} };
       // V9.99 (+) — Manquants & ND organisé en ONGLETS en haut (plus besoin de descendre) : nd | lm | manq | rem
       const [mndTab, setMndTab] = React.useState(null);
@@ -13859,13 +13872,73 @@
       };
 
       const withReason = manquants.filter(m => m.reason).length;
-      // V9.99 (+) — onglets Manquants & ND
-            const ndN = (dayOrdersP || []).reduce((t, o) => t + (o.nds || []).reduce((x, n) => x + (Number(n && n.qty) || 1), 0), 0)
-              + Object.values(dispatchData || {}).reduce((t, d) => t + ((d && Array.isArray(d.nd) && !(dayOrdersP || []).some(o => (o.nds || []).length)) ? d.nd.length : 0), 0);
+
+      // V9.99 (++) — ND DU JOUR : ND normal (hors produits passés en dernière minute) + DERNIÈRE MINUTE complète
+      // (🟣 certaine + 🚚 camion) attribuée comme en distrib → chaque produit n'apparaît qu'UNE fois.
+      const ndData = (() => {
+        const ordersBySite = {};
+        for (const o of (dayOrdersP || [])) { const st = String(o.site || '').toUpperCase(); if (st) (ordersBySite[st] = ordersBySite[st] || []).push(o); }
+        const add = (map, site, cas, p) => {
+          const m = ((map[site] = map[site] || {})[cas] = map[site][cas] || {});
+          const r = m[p.produit] || (m[p.produit] = { produit: p.produit, producteur: p.producteur || '', qty: 0, certain: !!p.certain });
+          r.qty += Number(p.qty) || 0; if (!p.certain) r.certain = false;
+        };
+        const toRows = (map) => { const out = {}; for (const s of Object.keys(map)) { out[s] = {}; for (const c of Object.keys(map[s])) out[s][c] = Object.values(map[s][c]).filter(p => p.qty > 0).sort((a, b) => a.produit.localeCompare(b.produit)); } return out; };
+        // Dernière minute : site -> casier -> produits
+        const lmMap = {};
+        const lmSites = new Set(Object.keys(ordersBySite));
+        for (const l of (lastmin || [])) for (const st of Object.keys(l.allocBySite || {})) lmSites.add(String(st).toUpperCase());
+        for (const site of lmSites) {
+          const a = kbLmAttribution(lastmin, site, ordersBySite[site] || []);
+          for (const arr of Object.values(a.byClient || {})) for (const e of arr) add(lmMap, site, e.casier || 'ND', e);
+          for (const e of (a.left || [])) add(lmMap, site, 'ND', e);
+        }
+        // ND normal : site -> casier -> produits (les ND passés en 🟣 dernière minute sont dans lmMap, pas ici)
+        const nMap = {};
+        for (const o of (dayOrdersP || [])) {
+          const site = String(o.site || '').toUpperCase(); if (!site) continue;
+          const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
+          for (const nd of (o.nds || [])) { if (!nd || !nd.produit || nd._lm) continue; add(nMap, site, casier, { produit: nd.produit, producteur: nd.producteur, qty: Number(nd.qty) || 1 }); }
+        }
+        const normalBySite = toRows(nMap), lmBySiteCasier = toRows(lmMap);
+        // Repli ancien système : PDF ND chargé (sans casier → bac ND), pour les locaux sans commande V4
+        for (const [site, d] of Object.entries(dispatchData || {})) {
+          if (normalBySite[site]) continue;
+          const nd = d && d.nd;
+          if (Array.isArray(nd) && nd.length) normalBySite[site] = { ND: nd.map(p => ({ produit: p.produit, qty: p.total || 0 })) };
+        }
+        // Totaux par lieu (= lignes à cocher « ✓ Fait »)
+        const sumSite = (casMap) => { const m = {}; for (const c of Object.keys(casMap || {})) for (const p of casMap[c]) { const r = m[p.produit] || (m[p.produit] = { produit: p.produit, qty: 0, certain: !!p.certain }); r.qty += (p.qty || 0); if (!p.certain) r.certain = false; } return Object.values(m).filter(r => r.qty > 0).sort((a, b) => a.produit.localeCompare(b.produit)); };
+        const bySite = {}; let total = 0, qty = 0;
+        for (const site of new Set([...Object.keys(normalBySite), ...Object.keys(lmBySiteCasier)])) {
+          const n = sumSite(normalBySite[site]), l = sumSite(lmBySiteCasier[site]);
+          if (!n.length && !l.length) continue;
+          bySite[site] = { n, l }; total += n.length + l.length; qty += n.reduce((t, p) => t + p.qty, 0) + l.reduce((t, p) => t + p.qty, 0);
+        }
+        return { normalBySite, lmBySiteCasier, bySite, total, qty };
+      })();
+      const ndKey = (site, kind, produit) => site + '||' + kind + '||' + produit;
+      const ndDoneCount = Object.entries(ndData.bySite).reduce((t, [site, r]) => t + r.n.filter(p => ndDone[ndKey(site, 'n', p.produit)]).length + r.l.filter(p => ndDone[ndKey(site, 'l', p.produit)]).length, 0);
+      const setNdFait = async (keys, on) => {
+        const who = session.name || 'prépa';
+        const before = ndDoneCount;
+        try {
+          for (const k of keys) {
+            const id = 'nd|' + encodeURIComponent(k);
+            if (on) await storage.setDoc(`day_${day}_prep`, id, { v: 'done', by: who, at: new Date().toISOString() }, { replace: true });
+            else await storage.deleteDoc(`day_${day}_prep`, id).catch(() => {});
+          }
+          const after = before + (on ? keys.filter(k => !ndDone[k]).length : -keys.filter(k => ndDone[k]).length);
+          if (on && ndData.total > 0 && after >= ndData.total) kbCelebrate({ title: `Bravo${who ? ' ' + String(who).split(' ')[0] : ''}, ND du jour fait !`, sub: `${ndData.total} ligne(s) · toutes les cagettes ND sont prêtes 💚` });
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+
+      // V9.99 (++) — onglets Manquants & ND : Dernière minute → Manquants → ND du jour → Remisés
+            const ndN = ndData.qty;
             const mndTabs = [
-              { id: 'nd', icon: '🥬', label: 'ND du jour', n: ndN, color: '#2f5326' },
               { id: 'lm', icon: '🚚', label: 'Dern. minute', n: lmCertain.length + lastmin.length, color: '#7b1fa2' },
               { id: 'manq', icon: '📦', label: 'Manquants', n: manquantsHorsCertain.length, color: '#b45309', warn: manquants.filter(m => !m.reason && !lmByManquant.has(m.id)).length },
+              { id: 'nd', icon: '🥬', label: 'ND du jour', n: ndN, color: '#2f5326', done: ndData.total > 0 && ndDoneCount >= ndData.total },
               { id: 'rem', icon: '🏷️', label: 'Remisés', n: remises.length, color: '#1565c0', warn: remises.filter(r => !r.reason).length },
             ];
             const mndCur = mndTab || (mndTabs.find(t => t.n > 0) || mndTabs[0]).id;
@@ -13934,6 +14007,7 @@
                       <span style={{display:'block',fontSize:24,fontWeight:900,lineHeight:1}}>{t.n}</span>
                       <span style={{display:'block',width:'100%',fontSize:11,fontWeight:800,lineHeight:1.1,whiteSpace:'normal',wordBreak:'break-word'}}>{t.label}</span>
                       {t.warn > 0 && <span style={{position:'absolute',top:-9,right:-4,background:'var(--danger)',color:'#fff',borderRadius:10,fontSize:11,fontWeight:900,padding:'1px 6px',lineHeight:1.3}} title="sans raison">⚠ {t.warn}</span>}
+                      {t.done && <span style={{position:'absolute',top:-9,right:-4,background:'#2e7d32',color:'#fff',borderRadius:10,fontSize:11,fontWeight:900,padding:'1px 6px',lineHeight:1.3}} title="tout est fait">✓ fait</span>}
                     </button>
                   );
                 })}
@@ -14074,65 +14148,12 @@
             </div>
           )}
 
-          {mndCur === 'nd' && !(lastmin.length > 0
-            || (dayOrdersP || []).some(o => (o.nds || []).length > 0)
-            || Object.values(dispatchData || {}).some(d => Array.isArray(d && d.nd) && d.nd.length > 0)) && <p style={{fontSize:14,color:'var(--ink-mute)',textAlign:'center'}}>Aucun ND pour cette distribution.</p>}
-          {mndCur === 'nd' && (lastmin.length > 0
-            || (dayOrdersP || []).some(o => (o.nds || []).length > 0)
-            || Object.values(dispatchData || {}).some(d => Array.isArray(d && d.nd) && d.nd.length > 0)) && (() => {
-            // ND DU JOUR : recap par local. Deux sources réunies :
-            //  • ND NORMAL (noir) = le ND de base. En V4 il vient des commandes (o.nds) ;
-            //    repli sur l'ancien PDF ND (dispatchData[site].nd) si pas de commandes.
-            //  • ND DERNIÈRE MINUTE (rouge) = les dispatch LM, par casier (allocBySite)
+          {mndCur === 'nd' && ndData.total === 0 && <p style={{fontSize:14,color:'var(--ink-mute)',textAlign:'center'}}>Aucun ND pour cette distribution.</p>}
+          {mndCur === 'nd' && ndData.total > 0 && (() => {
+            // ND DU JOUR (V9.99 ++) : ND normal (noir) + dernière minute (rouge, 🟣 = déjà facturé) — sans doublon.
+            const { normalBySite, lmBySiteCasier, bySite } = ndData;
             const localsOfDay = (typeof sitesForDate === 'function' ? sitesForDate(day) : SITES) || SITES;
-            // Dernière minute : site -> casier -> [{produit, qty}]
-            const lmBySiteCasier = {};
-            for (const l of lastmin) {
-              for (const [site, arr] of Object.entries(l.allocBySite || {})) {
-                for (const c of (arr || [])) {
-                  if (!c || !(c.qty > 0)) continue;
-                  const cas = c.casier || 'ND';
-                  if (!lmBySiteCasier[site]) lmBySiteCasier[site] = {};
-                  if (!lmBySiteCasier[site][cas]) lmBySiteCasier[site][cas] = [];
-                  lmBySiteCasier[site][cas].push({ produit: l.produit, producteur: l.producteur, qty: c.qty });
-                }
-              }
-            }
-            // ND normal de base : site -> casier -> [{produit, qty}]
-            const normalBySite = {};
-            // 1) V4 : chaque client a un casier (frais, sinon sec, sinon bac ND) → on y range ses ND
-            const aggNd = {}; // site -> casier -> { produit -> qty }
-            for (const o of (dayOrdersP || [])) {
-              const site = (o.site || '').toUpperCase();
-              if (!site) continue;
-              const nds = o.nds || [];
-              if (!nds.length) continue;
-              const casier = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || 'ND';
-              for (const nd of nds) {
-                if (!nd || !nd.produit) continue;
-                if (!aggNd[site]) aggNd[site] = {};
-                if (!aggNd[site][casier]) aggNd[site][casier] = {};
-                aggNd[site][casier][nd.produit] = (aggNd[site][casier][nd.produit] || 0) + (nd.qty || 1);
-              }
-            }
-            for (const [site, casMap] of Object.entries(aggNd)) {
-              normalBySite[site] = {};
-              for (const [cas, m] of Object.entries(casMap)) {
-                normalBySite[site][cas] = Object.entries(m)
-                  .map(([produit, qty]) => ({ produit, qty }))
-                  .sort((a, b) => a.produit.localeCompare(b.produit));
-              }
-            }
-            // 2) Repli ancien système : PDF ND chargé (sans casier → bac ND), pour les locaux sans commande V4
-            for (const [site, d] of Object.entries(dispatchData || {})) {
-              if (normalBySite[site]) continue;
-              const nd = d && d.nd;
-              if (Array.isArray(nd) && nd.length) {
-                normalBySite[site] = { ND: nd.map(p => ({ produit: p.produit, qty: p.total || 0 })) };
-              }
-            }
-            const sitesWithND = new Set([...Object.keys(normalBySite), ...Object.keys(lmBySiteCasier)]);
-            if (sitesWithND.size === 0) return null;
+            const sitesWithND = new Set(Object.keys(bySite));
             const ordered = [...localsOfDay.filter(s => sitesWithND.has(s)), ...[...sitesWithND].filter(s => !localsOfDay.includes(s))];
             const casierSort = (a, b) => {
               if (a === 'ND' && b !== 'ND') return 1;   // bac ND toujours en dernier
@@ -14141,91 +14162,88 @@
               if (!isNaN(na) && !isNaN(nb)) return na - nb;
               return String(a).localeCompare(String(b));
             };
-            // Vue GLOBALE : totaux par produit (tous locaux/casiers confondus) → combien mettre en unité.
-            const globalNormal = {}, globalLm = {};
-            for (const s of Object.keys(normalBySite)) for (const c of Object.keys(normalBySite[s])) for (const p of normalBySite[s][c]) globalNormal[p.produit] = (globalNormal[p.produit]||0) + (p.qty||0);
-            for (const s of Object.keys(lmBySiteCasier)) for (const c of Object.keys(lmBySiteCasier[s])) for (const p of lmBySiteCasier[s][c]) globalLm[p.produit] = (globalLm[p.produit]||0) + (p.qty||0);
-            const globalNormalRows = Object.entries(globalNormal).map(([produit,qty])=>({produit,qty})).sort((a,b)=> b.qty-a.qty || a.produit.localeCompare(b.produit));
-            const globalLmRows = Object.entries(globalLm).map(([produit,qty])=>({produit,qty})).sort((a,b)=> b.qty-a.qty || a.produit.localeCompare(b.produit));
+            const isDone = (site, kind, produit) => !!ndDone[ndKey(site, kind, produit)];
+            const lmTag = (p) => p.certain ? ' 🟣' : '';
+            // Vue GLOBALE : totaux par produit (tous lieux) ; « fait » = fait dans TOUS les lieux concernés
+            const glob = (kind) => {
+              const m = {};
+              for (const site of Object.keys(bySite)) for (const p of bySite[site][kind]) { const r = m[p.produit] || (m[p.produit] = { produit: p.produit, qty: 0, keys: [], certain: !!p.certain }); r.qty += p.qty; r.keys.push(ndKey(site, kind, p.produit)); if (!p.certain) r.certain = false; }
+              return Object.values(m).map(r => ({ ...r, done: r.keys.every(k => ndDone[k]) })).sort((a, b) => (a.done - b.done) || b.qty - a.qty || a.produit.localeCompare(b.produit));
+            };
+            const pct = Math.round(100 * ndDoneCount / Math.max(1, ndData.total)), allDone = ndDoneCount >= ndData.total;
+            // Ligne à toucher (grosse) : ✓ Fait partagé
+            const FaitRow = ({ p, done, red, onTap, sub }) => (
+              <button onClick={onTap} style={{display:'flex',alignItems:'center',gap:10,width:'100%',textAlign:'left',cursor:'pointer',minHeight:52,padding:'8px 10px',margin:'4px 0',borderRadius:10,
+                border:'2px solid ' + (done ? '#2e7d32' : red ? 'var(--danger)' : 'var(--line)'), background: done ? '#e8f5e9' : '#fff', color: done ? '#2e7d32' : red ? 'var(--danger)' : 'var(--ink)'}}>
+                <span style={{flex:'0 0 auto',width:30,height:30,borderRadius:8,display:'inline-flex',alignItems:'center',justifyContent:'center',fontSize:20,fontWeight:900,
+                  border:'2px solid ' + (done ? '#2e7d32' : '#9e9e9e'), background: done ? '#2e7d32' : '#fff', color:'#fff'}}>{done ? '✓' : ''}</span>
+                <KbQty q={p.qty} />
+                <span style={{flex:1,minWidth:0,fontSize:18,fontWeight: red ? 900 : 800,textDecoration: done ? 'line-through' : 'none',opacity: done ? .75 : 1}}>{kbProdName(p.produit)}{red ? lmTag(p) : ''}</span>
+                {sub && <span style={{fontSize:11,color:'var(--ink-mute)',whiteSpace:'nowrap'}}>{sub}</span>}
+              </button>
+            );
             return (
               <div className="card">
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap',marginBottom:6}}>
-                  <h3 style={{margin:0}}>📦 ND du jour</h3>
+                  <h3 style={{margin:0}}>🥬 ND du jour</h3>
                   <div className="filter-row" style={{margin:0}}>
-                    <div className={`chip ${ndView==='casier'?'selected':''}`} onClick={()=>setNdView('casier')}>🧺 Par casier</div>
                     <div className={`chip ${ndView==='lieu'?'selected':''}`} onClick={()=>setNdView('lieu')}>📍 Par lieu</div>
+                    <div className={`chip ${ndView==='casier'?'selected':''}`} onClick={()=>setNdView('casier')}>🧺 Par casier</div>
                     <div className={`chip ${ndView==='global'?'selected':''}`} onClick={()=>setNdView('global')}>🌍 Global</div>
                   </div>
                 </div>
+                <div style={{margin:'4px 0 10px'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:15,fontWeight:900,color: allDone ? '#2e7d32' : 'var(--ink)'}}>
+                    <span>{allDone ? '✓ Tout le ND du jour est fait' : '✓ Fait'}</span><span>{ndDoneCount} / {ndData.total}</span>
+                  </div>
+                  <div style={{height:12,borderRadius:6,background:'var(--bg-muted,#eee)',overflow:'hidden',marginTop:4}}>
+                    <div style={{width:pct+'%',height:'100%',background:'#2e7d32',transition:'width .3s'}} />
+                  </div>
+                  <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>Touche une ligne quand c'est mis dans la cagette ND (partagé en direct). <strong style={{color:'var(--danger)'}}>Rouge = dernière minute</strong> · 🟣 = certaine, déjà facturée.</div>
+                </div>
                 {ndView==='lieu' ? (
-                  <div>
-                    <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0,marginBottom:8}}>Total par produit pour chaque lieu (à mettre dans la cagette ND du lieu). <strong style={{color:'var(--danger)'}}>Rouge = dernière minute.</strong></p>
-                    <div style={{display:'flex',flexDirection:'column',gap:10}}>
-                      {ordered.map(site => {
-                        const lbl = (typeof siteLabel === 'function') ? siteLabel(site) : site;
-                        const sum = (casMap) => { const m = {}; for (const c of Object.keys(casMap || {})) for (const p of casMap[c]) m[p.produit] = (m[p.produit] || 0) + (p.qty || 0); return Object.entries(m).map(([produit, qty]) => ({ produit, qty })).sort((a, b) => a.produit.localeCompare(b.produit)); };
-                        const nRows = sum(normalBySite[site]), lRows = sum(lmBySiteCasier[site]);
-                        const tot = nRows.reduce((t, p) => t + p.qty, 0) + lRows.reduce((t, p) => t + p.qty, 0);
-                        return (
-                          <div key={site} className="card-flat" style={{padding:'10px 12px'}}>
-                            <div style={{display:'flex',alignItems:'baseline',gap:8,marginBottom:6}}>
-                              <span style={{fontWeight:900,fontSize:20}}>{site}</span>
-                              {lbl && lbl !== site && <span style={{color:'var(--ink-mute)',fontSize:13}}>{lbl}</span>}
-                              <span style={{marginLeft:'auto',fontWeight:800,fontSize:14,color:'var(--ink-soft)'}}>{tot} article(s)</span>
-                            </div>
-                            {nRows.map(p => (
-                              <div key={'n'+p.produit} style={{display:'flex',alignItems:'center',gap:10,fontSize:17,fontWeight:700,padding:'5px 0',borderTop:'1px solid var(--line)'}}>
-                                <KbQty q={p.qty} /><span style={{flex:1}}>{kbProdName(p.produit)}</span>
-                              </div>
-                            ))}
-                            {lRows.length > 0 && (
-                              <div style={{marginTop:6,borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'6px 8px'}}>
-                                <div style={{fontSize:11,fontWeight:700,color:'var(--danger)',marginBottom:3}}>🔴 Dernière minute</div>
-                                {lRows.map(p => (
-                                  <div key={'l'+p.produit} style={{display:'flex',alignItems:'center',gap:10,fontSize:17,fontWeight:800,padding:'3px 0',color:'var(--danger)'}}>
-                                    <KbQty q={p.qty} /><span style={{flex:1}}>{kbProdName(p.produit)}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
+                  <div style={{display:'flex',flexDirection:'column',gap:10}}>
+                    {ordered.map(site => {
+                      const lbl = (typeof siteLabel === 'function') ? siteLabel(site) : site;
+                      const r = bySite[site];
+                      const nRows = r.n.map(p => ({ p, done: isDone(site, 'n', p.produit) })).sort((a, b) => a.done - b.done);
+                      const lRows = r.l.map(p => ({ p, done: isDone(site, 'l', p.produit) })).sort((a, b) => a.done - b.done);
+                      const nb = nRows.length + lRows.length, nd = nRows.filter(x => x.done).length + lRows.filter(x => x.done).length;
+                      const tot = r.n.reduce((t, p) => t + p.qty, 0) + r.l.reduce((t, p) => t + p.qty, 0);
+                      const siteDone = nd >= nb;
+                      return (
+                        <div key={site} className="card-flat" style={{padding:'10px 12px',border: siteDone ? '2px solid #2e7d32' : undefined,background: siteDone ? '#f1f8f1' : undefined}}>
+                          <div style={{display:'flex',alignItems:'baseline',gap:8,marginBottom:4}}>
+                            <span style={{fontWeight:900,fontSize:20}}>{siteDone ? '✓ ' : ''}{site}</span>
+                            {lbl && lbl !== site && <span style={{color:'var(--ink-mute)',fontSize:13}}>{lbl}</span>}
+                            <span style={{marginLeft:'auto',fontWeight:800,fontSize:14,color: siteDone ? '#2e7d32' : 'var(--ink-soft)'}}>{nd}/{nb} · {tot} art.</span>
                           </div>
-                        );
-                      })}
-                    </div>
+                          {lRows.length > 0 && (
+                            <div style={{marginBottom:6,borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'4px 6px'}}>
+                              <div style={{fontSize:12,fontWeight:800,color:'var(--danger)'}}>🔴 Dernière minute</div>
+                              {lRows.map(({ p, done }) => <FaitRow key={'l'+p.produit} p={p} done={done} red onTap={() => setNdFait([ndKey(site, 'l', p.produit)], !done)} sub={p.certain ? 'déjà facturé' : 'à rajouter ancienne appli'} />)}
+                            </div>
+                          )}
+                          {nRows.map(({ p, done }) => <FaitRow key={'n'+p.produit} p={p} done={done} onTap={() => setNdFait([ndKey(site, 'n', p.produit)], !done)} />)}
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : ndView==='global' ? (
                   <div>
-                    <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0,marginBottom:8}}>Totaux à mettre en unité, tous locaux confondus. <strong style={{color:'var(--danger)'}}>Rouge = dernière minute.</strong></p>
-                    {globalNormalRows.length===0 && globalLmRows.length===0 ? (
-                      <p style={{fontSize:13,color:'var(--ink-mute)',margin:0}}>Aucun ND aujourd'hui.</p>
-                    ) : (
-                      <>
-                        {globalNormalRows.length>0 && (
-                          <div style={{display:'flex',flexDirection:'column'}}>
-                            {globalNormalRows.map(p => (
-                              <div key={p.produit} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:15,padding:'5px 0',borderBottom:'1px solid var(--line)'}}>
-                                <span>{p.produit}</span><strong style={{whiteSpace:'nowrap'}}>×{p.qty}</strong>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {globalLmRows.length>0 && (
-                          <div style={{marginTop:8,borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'6px 8px'}}>
-                            <div style={{fontSize:11,fontWeight:700,color:'var(--danger)',marginBottom:3}}>🔴 Dernière minute (à rajouter dans l'autre appli, sinon non facturé)</div>
-                            {globalLmRows.map(p => (
-                              <div key={p.produit} style={{display:'flex',justifyContent:'space-between',gap:8,fontSize:15,padding:'3px 0',color:'var(--danger)',fontWeight:600}}>
-                                <span>{p.produit}</span><strong style={{whiteSpace:'nowrap'}}>×{p.qty}</strong>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </>
+                    <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0,marginBottom:8}}>Totaux tous lieux confondus. Toucher = fait pour <strong>tous les lieux</strong>.</p>
+                    {glob('l').length > 0 && (
+                      <div style={{marginBottom:8,borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'4px 6px'}}>
+                        <div style={{fontSize:12,fontWeight:800,color:'var(--danger)'}}>🔴 Dernière minute</div>
+                        {glob('l').map(g => <FaitRow key={'gl'+g.produit} p={g} done={g.done} red onTap={() => setNdFait(g.keys, !g.done)} sub={g.keys.length + ' lieu(x)'} />)}
+                      </div>
                     )}
+                    {glob('n').map(g => <FaitRow key={'gn'+g.produit} p={g} done={g.done} onTap={() => setNdFait(g.keys, !g.done)} sub={g.keys.length + ' lieu(x)'} />)}
                   </div>
                 ) : (
                 <>
                 <p style={{fontSize:12,color:'var(--ink-mute)',marginTop:0,marginBottom:8}}>
-                  Par local et par casier. ND normal en noir. <strong style={{color:'var(--danger)'}}>En rouge = dernière minute → à rajouter dans l'autre appli, sinon non facturé.</strong>
+                  Par lieu et par casier (lecture). Pour cocher « ✓ Fait » : vue <strong>📍 Par lieu</strong>.
                 </p>
                 <div style={{display:'flex',flexDirection:'column',gap:10}}>
                   {ordered.map(site => {
@@ -14234,34 +14252,33 @@
                     const lm = lmBySiteCasier[site] || null;
                     const normalCasiers = normal ? Object.keys(normal).sort(casierSort) : [];
                     const casiers = lm ? Object.keys(lm).sort(casierSort) : [];
+                    const txt = (arr, kind) => arr.map((p, i) => <span key={p.produit} style={isDone(site, kind, p.produit) ? {textDecoration:'line-through',opacity:.6} : null}>{i ? ', ' : ''}{isDone(site, kind, p.produit) ? '✓ ' : ''}{kbProdName(p.produit) + (p.qty > 1 ? ` ×${p.qty}` : '') + (kind === 'l' ? lmTag(p) : '')}</span>);
                     return (
                       <div key={site} className="card-flat" style={{padding:'8px 10px'}}>
                         <div style={{fontWeight:700,fontSize:14,marginBottom:6}}>
                           {site}{lbl && lbl !== site && <span style={{fontWeight:400,color:'var(--ink-mute)',fontSize:12}}> · {lbl}</span>}
                         </div>
-
-                        {normal && normalCasiers.length > 0 && (
-                          <div style={{marginBottom: lm ? 8 : 0}}>
-                            <div style={{fontSize:11,fontWeight:700,color:'var(--ink-soft)',marginBottom:3}}>ND normal — par casier</div>
+                        {lm && casiers.length > 0 && (
+                          <div style={{borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'6px 8px',marginBottom: normalCasiers.length ? 8 : 0}}>
+                            <div style={{fontSize:11,fontWeight:700,color:'var(--danger)',marginBottom:3}}>🔴 Dernière minute (🟣 = déjà facturé ; sinon à rajouter dans l'ancienne appli)</div>
                             <div style={{display:'flex',flexDirection:'column',gap:4}}>
-                              {normalCasiers.map(cas => (
+                              {casiers.map(cas => (
                                 <div key={cas} style={{display:'flex',gap:8,fontSize:13,alignItems:'baseline'}}>
-                                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
-                                  <span style={{flex:1}}>{normal[cas].map(p => p.produit + (p.qty > 1 ? ` ×${p.qty}` : '')).join(', ')}</span>
+                                  <span className="badge" style={{whiteSpace:'nowrap',background:'var(--danger)',color:'#fff'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
+                                  <span style={{flex:1,color:'var(--danger)',fontWeight:600}}>{txt(lm[cas], 'l')}</span>
                                 </div>
                               ))}
                             </div>
                           </div>
                         )}
-
-                        {lm && (
-                          <div style={{borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'6px 8px'}}>
-                            <div style={{fontSize:11,fontWeight:700,color:'var(--danger)',marginBottom:3}}>🔴 Dernière minute (à rajouter sinon non facturé)</div>
+                        {normal && normalCasiers.length > 0 && (
+                          <div>
+                            <div style={{fontSize:11,fontWeight:700,color:'var(--ink-soft)',marginBottom:3}}>ND normal — par casier</div>
                             <div style={{display:'flex',flexDirection:'column',gap:4}}>
-                              {casiers.map(cas => (
+                              {normalCasiers.map(cas => (
                                 <div key={cas} style={{display:'flex',gap:8,fontSize:13,alignItems:'baseline'}}>
-                                  <span className="badge" style={{whiteSpace:'nowrap',background:'var(--danger)',color:'#fff'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
-                                  <span style={{flex:1,color:'var(--danger)',fontWeight:600}}>{lm[cas].map(p => p.produit + (p.qty > 1 ? ` ×${p.qty}` : '')).join(', ')}</span>
+                                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
+                                  <span style={{flex:1}}>{txt(normal[cas], 'n')}</span>
                                 </div>
                               ))}
                             </div>
