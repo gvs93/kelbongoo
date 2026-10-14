@@ -755,7 +755,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.95';
+    const APP_VERSION = 'V9.97';
+    // V9.97 — Distrib : produit prévu en dernière minute puis passé « ❌ Pas arrivé → rupture » (Manquants & ND)
+    //   → bandeau orange sur le client « Rupture finalement — à RETIRER dans l'ancienne appli » (carte + détail).
+    // V9.96 — DISPATCH DERNIÈRE MINUTE « CERTAIN » (produit passé en 🟣 à la prépa) = PRÉSENT :
+    //   • Ancien site / Tampermonkey : la ligne compte comme terminée et n'est jamais une rupture (reste facturée).
+    //   • Distrib : attribué AUTOMATIQUEMENT aux clients (casier) sans clic sur le camion ; message « déjà facturé,
+    //     NE PAS rajouter dans l'ancienne appli ». (Si un dispatch camion existe déjà pour ce produit/lieu, il prime.)
+    //   • Prépa › Manquants & ND : nouvelle catégorie « 🟣 Dispatch dernière minute CERTAIN » au-dessus des manquants
+    //     (lue en direct dans la prépa), bouton « ❌ Pas arrivé → rupture ». Les manquants en dessous = comme avant.
     // V9.94 — Chauffeur SÉCURISÉ : rôle serveur dédié 'pdp' (kbgLogin, colonne « Retour PDP »), règles Firestore limitées
     //   champ par champ (pdp_returns récupéré/annuler par lui-même, followups en retour PDP), lecture filtrée (requête
     //   prouvable). Supprimé : liste de noms V9.93 (restriction d'affichage seulement) et l'ancien drapeau kbPdp sur un jeton prépa.
@@ -1368,6 +1376,24 @@
         }
         if (rest > 0) left.push({ lmId: l.id, produit: l.produit, producteur: l.producteur || '', qty: rest });
       }
+      // V9.96 — dernière minute CERTAINE (🟣 à la prépa, items._lm) : attribuée automatiquement au client,
+      // sans clic camion. Si un dispatch camion existe déjà pour ce produit sur ce lieu, il prime (pas de doublon).
+      const cert = {};
+      for (const o of (clients || [])) {
+        for (const it of (o.items || [])) {
+          if (!it._lm) continue;
+          const probe = { produit: it.produit, producteur: it.producteur || '', productId: it.id || '' };
+          if (lines.some(x => !x.certain && kbLmMatch(x, probe))) continue;
+          const id = 'cert|' + (dispatchNorm((it.producteur || '') + '|' + it.produit) || it.produit);
+          const c = cert[id] || (cert[id] = { id, produit: it.produit, producteur: it.producteur || '', productId: it.id || '', total: 0, certain: true });
+          const q = Number(it.qty || it.quantity) || 1; c.total += q;
+          const cat = String(it.cat || '').toLowerCase();
+          const casier = cat === 'nd' ? 'ND' : (cat === 'pain' || cat === 'sec') ? ((o.casiersSec || [])[0] || (o.casiersFrais || [])[0] || '') : ((o.casiersFrais || [])[0] || (o.casiersSec || [])[0] || '');
+          const k = kbClientKey(o);
+          (byClient[k] = byClient[k] || []).push({ lmId: id, produit: it.produit, producteur: it.producteur || '', qty: q, casier, certain: true });
+        }
+      }
+      for (const c of Object.values(cert)) lines.push(c);
       return { lines, byClient, left };
     }
     function kbIsSecure() { const c = window.__kbClaims; return !!(c && (c.admin === true || c.kbSecure === true)); }
@@ -2778,18 +2804,18 @@
 
     // Reconstruit l'état prépa (day_X_prep, écriture par clé) en maps status/remiseAll/remiseCli.
     function parsePrepDocs(arr) {
-      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {}, lm = {};
+      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {}, lm = {}, lmKo = {};
       for (const d of (arr || [])) {
         const id = d.id; if (!id || id === 'counters' || id === 'meta') continue;
         const bar = id.indexOf('|'); if (bar < 0) continue;
         const pfx = id.slice(0, bar), key = decodeURIComponent(id.slice(bar + 1));
-        if (pfx === 'st') { status[key] = d.v; if (d.v === 'partiel') posedN[key] = d.n || 0; }
+        if (pfx === 'st') { status[key] = d.v; if (d.v === 'partiel') posedN[key] = d.n || 0; if (d.v === 'rupture' && d.lmPasArrive) lmKo[key] = true; }
         else if (pfx === 'cs') casiers[key] = (d.nums || []).map(String).filter(Boolean); // V9.80 — casiers créés/modifiés en prépa
         else if (pfx === 'rc') remiseCli[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'ra') remiseAll[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'lm') lm[key] = true; // V9.87 — produit passé en « 🟣 Dispatch dernière minute » à la prépa (site||produit)
       }
-      return { status, remiseAll, remiseCli, posedN, casiers, lm };
+      return { status, remiseAll, remiseCli, posedN, casiers, lm, lmKo };
     }
     // V9.79 — rupture PARTIELLE : quantité manquante d'une ligne (0 si pas en partiel)
     function kbPartMiss(prep, k, qty) {
@@ -2832,7 +2858,7 @@
       const items = [], removed = [...(o.removed || [])], reduced = [...(o.reduced || [])];
       for (let it of (o.items || [])) {
         const k = site + '||' + client + '||' + it.produit;
-        if (prep.status && prep.status[k] === 'rupture' && !(prep.overrides && prep.overrides[k])) { removed.push({ ...it, reason: 'rupture_prepa' }); continue; }
+        if (prep.status && prep.status[k] === 'rupture' && !(prep.overrides && prep.overrides[k])) { removed.push({ ...it, reason: 'rupture_prepa', ...(prep.lmKo && prep.lmKo[k] ? { _lmKo: true } : {}) }); continue; }
         // V9.79 — rupture partielle : on livre ce qui a été posé, le reste part en manquant
         const miss = (prep.overrides && prep.overrides[k]) ? 0 : kbPartMiss(prep, k, it.qty || 1);
         if (miss > 0) {
@@ -4284,13 +4310,24 @@
                               ))}
                             </div>
                           )}
+                          {(o.removed || []).some(r => r._lmKo) && (
+                            <div style={{marginTop:8,color:'#fff',fontWeight:800,fontSize:15,background:'#e65100',borderRadius:8,padding:'8px 10px'}}>
+                              <div style={{fontSize:13,textTransform:'uppercase',letterSpacing:'.03em',marginBottom:4}}>❌ Rupture finalement (prévu en dernière minute) — à RETIRER dans l'ancienne appli</div>
+                              {(o.removed || []).filter(r => r._lmKo).map((p, k) => (
+                                <div key={'ko'+k} style={{display:'flex',alignItems:'center',gap:8,padding:'2px 0'}}>
+                                  <span style={{background:'#fff',color:'#e65100',borderRadius:6,padding:'0 8px',fontWeight:900,fontSize:17}}>{Number(p.qty || p.quantity)||1}×</span>
+                                  <span>{kbProdName(p.produit)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {lmItems.length > 0 && (
                             <div style={{marginTop:8,color:'#fff',fontWeight:800,fontSize:15,background:'var(--danger)',borderRadius:8,padding:'8px 10px'}}>
-                              <div style={{fontSize:13,textTransform:'uppercase',letterSpacing:'.03em',marginBottom:4}}>🚚 Dispatch dernière minute — à rajouter dans l'ancienne appli (sinon non facturé)</div>
+                              <div style={{fontSize:13,textTransform:'uppercase',letterSpacing:'.03em',marginBottom:4}}>{lmItems.every(p => p.certain) ? '🚚 Dernière minute — à donner · déjà facturé : NE PAS rajouter dans l\'ancienne appli' : '🚚 Dispatch dernière minute — à rajouter dans l\'ancienne appli (sinon non facturé)'}</div>
                               {lmItems.map((p, k) => (
                                 <div key={'lm'+k} style={{display:'flex',alignItems:'center',gap:8,padding:'2px 0'}}>
                                   <span style={{background:'#fff',color:'var(--danger)',borderRadius:6,padding:'0 8px',fontWeight:900,fontSize:17}}>{Number(p.qty)||1}×</span>
-                                  <span>{kbProdName(p.produit)}</span>
+                                  <span>{kbProdName(p.produit)}{p.certain && !lmItems.every(x => x.certain) ? ' (déjà facturé, ne pas rajouter)' : ''}</span>
                                 </div>
                               ))}
                             </div>
@@ -4495,7 +4532,7 @@
               <h2 style={{ fontSize: 22, color: 'var(--danger)' }}>🚚 Ranger le dispatch dernière minute</h2>
               <button className="modal-close" onClick={onClose}>×</button>
             </div>
-            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Mets chaque produit dans le casier indiqué, puis touche « Rangé ». N'oublie pas de le rajouter au client dans l'ancienne appli.</div>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Mets chaque produit dans le casier indiqué, puis touche « Rangé ». 🟣 « Prévu » = déjà facturé, ne rien rajouter. Les autres : à rajouter au client dans l'ancienne appli.</div>
             <div className="stack" style={{ gap: 14 }}>
               {attr.lines.map(l => {
                 const rows = Object.entries(attr.byClient).flatMap(([k, arr]) => arr.filter(x => x.lmId === l.id).map(x => ({ ...x, k, o: byKey[k] })))
@@ -4506,7 +4543,7 @@
                   <div key={l.id} style={{ border: '3px solid var(--danger)', borderRadius: 12, overflow: 'hidden' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--danger)', color: '#fff', padding: '10px 12px' }}>
                       <span style={{ background: '#fff', color: 'var(--danger)', borderRadius: 8, padding: '2px 10px', fontWeight: 900, fontSize: 24 }}>{l.total}×</span>
-                      <span style={{ fontSize: 20, fontWeight: 900, flex: 1, lineHeight: 1.15 }}>{kbProdName(l.produit)}</span>
+                      <span style={{ fontSize: 20, fontWeight: 900, flex: 1, lineHeight: 1.15 }}>{kbProdName(l.produit)}{l.certain ? <span style={{ display:'block', fontSize: 13, fontWeight: 800 }}>🟣 Prévu · déjà facturé, ne pas rajouter</span> : <span style={{ display:'block', fontSize: 13, fontWeight: 800 }}>➕ à rajouter dans l'ancienne appli</span>}</span>
                       <span style={{ fontSize: 14, fontWeight: 800 }}>{nDone}/{rows.length} ✓</span>
                     </div>
                     {rows.map(r => {
@@ -4622,15 +4659,27 @@
             <Section emoji="🥬" titre="Non-dispatch (à remettre à la main)" items={o.nds} color="var(--accent-dark)" />
             <Section emoji="🍞" titre="Pain" items={o.pains} color="var(--warn)" />
             <Section emoji="🧊" titre="Frais (en casier)" items={o.frais} color="var(--accent)" />
+            {(o.removed || []).some(r => r._lmKo) && (
+              <div style={{ marginBottom: 12, background: '#e65100', borderRadius: 8, padding: '10px 12px', color: '#fff' }}>
+                <h4 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 900, color: '#fff' }}>❌ Rupture finalement</h4>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Prévu en dernière minute mais pas arrivé : non livré. À RETIRER du client dans l'ancienne appli (sinon facturé).</div>
+                {(o.removed || []).filter(r => r._lmKo).map((p, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 16, fontWeight: 800, padding: '2px 0' }}>
+                    <span style={{ background:'#fff', color:'#e65100', borderRadius:6, padding:'0 8px', fontWeight:900, fontSize:18 }}>{Number(p.qty || p.quantity) || 1}×</span>
+                    <span>{kbProdName(p.produit)}{p.producteur ? ` · ${p.producteur}` : ''}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {lm.length > 0 && (
               <div style={{ marginBottom: 12, background: 'var(--danger)', borderRadius: 8, padding: '10px 12px', color: '#fff' }}>
                 <h4 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 900, color: '#fff' }}>🚚 Dispatch dernière minute</h4>
-                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Arrivé ce matin : à donner au client ET à rajouter dans l'ancienne appli (sinon non facturé).</div>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{lm.every(p => p.certain) ? 'Prévu en dernière minute : à donner au client. Déjà facturé, NE PAS rajouter dans l\'ancienne appli.' : 'Arrivé ce matin : à donner au client ET à rajouter dans l\'ancienne appli (sinon non facturé).'}</div>
                 <div className="stack" style={{ gap: 4 }}>
                   {lm.map((p, i) => (
                     <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 16, fontWeight: 800, padding: '2px 0' }}>
                       <span style={{ background:'#fff', color:'var(--danger)', borderRadius:6, padding:'0 8px', fontWeight:900, fontSize:18 }}>{Number(p.qty) || 1}×</span>
-                      <span>{kbProdName(p.produit)}{p.producteur ? ` · ${p.producteur}` : ''}</span>
+                      <span>{kbProdName(p.produit)}{p.producteur ? ` · ${p.producteur}` : ''}{p.certain && !lm.every(x => x.certain) ? ' (déjà facturé, ne pas rajouter)' : ''}</span>
                     </div>
                   ))}
                 </div>
@@ -8840,10 +8889,13 @@
           const produit = it.produit || '(produit)', producteur = it.producteur || '';
           const pk = producteur + '||' + produit;
           const p = P[pk] || (P[pk] = { produit, producteur, ordered: 0, lines: 0, fin: 0, sig: [] });
-          const k = site + '||' + client + '||' + produit, st = d._prep.status[k] || '';
+          const k = site + '||' + client + '||' + produit, st0 = d._prep.status[k] || '';
+          // V9.96 — dispatch dernière minute certain (🟣 prépa) = PRÉSENT : ligne terminée, pas une rupture
+          const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + produit]) && st0 !== 'rupture' && st0 !== 'partiel';
+          const st = lmOn ? 'done' : st0;
           p.ordered += it.qty || 1; p.lines++;
           if (st === 'done' || st === 'rupture' || st === 'partiel') p.fin++;
-          p.sig.push(k + '=' + st + (st === 'partiel' ? ':' + ((d._prep.posedN && d._prep.posedN[k]) || 0) : ''));
+          p.sig.push(k + '=' + st + (lmOn ? ':lm' : '') + (st === 'partiel' ? ':' + ((d._prep.posedN && d._prep.posedN[k]) || 0) : ''));
         }
       }
       const bp = kbRupturesByProduct(d.lines, d.ordered);
@@ -13568,6 +13620,39 @@
         return new Set(lastmin.map(l => l.manquantId));
       }, [lastmin]);
 
+      // V9.96 — DISPATCH DERNIÈRE MINUTE CERTAIN : produits passés en 🟣 à la prépa (lu en direct dans day_X_prep)
+      const lmCertain = React.useMemo(() => {
+        const lm = (prepSt && prepSt.lm) || {}; if (!Object.keys(lm).length) return [];
+        const agg = {};
+        for (const o of (dayOrders || [])) {
+          const site = String(o.site || '').toUpperCase(), client = o.name || '(client)';
+          for (const it of (o.items || [])) {
+            if (!lm[site + '||' + it.produit]) continue;
+            const k = site + '||' + client + '||' + it.produit, st = prepSt.status && prepSt.status[k];
+            if (st === 'rupture' || st === 'partiel') continue;
+            const pk = (it.producteur || '') + '||' + it.produit;
+            const a = agg[pk] || (agg[pk] = { produit: it.produit, producteur: it.producteur || '', qty: 0, bySite: {}, keys: [], pks: new Set() });
+            const q = Number(it.qty || it.quantity) || 1;
+            a.qty += q; a.bySite[site] = (a.bySite[site] || 0) + q; a.keys.push(k); a.pks.add(site + '||' + it.produit);
+          }
+        }
+        return Object.values(agg).sort((a, b) => a.produit.localeCompare(b.produit));
+      }, [prepSt, dayOrders]);
+      const certNames = React.useMemo(() => new Set(lmCertain.map(c => normalizeText(kbProdName(c.produit)))), [lmCertain]);
+      const manquantsHorsCertain = React.useMemo(() => manquants.filter(m => !(m.lastMinute && certNames.has(normalizeText(kbProdName(m.produit))))), [manquants, certNames]);
+      const pasArrive = async (c) => {
+        if (!confirm(`« ${kbProdName(c.produit)} » n'est pas arrivé ?\n\n→ passe en RUPTURE pour ${c.keys.length} client(s) (non livré, non facturé dans cette appli).\n⚠️ Vérifie l'ancienne appli : le produit y était compté présent.`)) return;
+        const who = session.name || 'prépa';
+        try {
+          for (const k of c.keys) await storage.setDoc(`day_${day}_prep`, 'st|' + encodeURIComponent(k), { v: 'rupture', by: who, lmPasArrive: true }, { replace: true });
+          for (const pk of c.pks) await storage.deleteDoc(`day_${day}_prep`, 'lm|' + encodeURIComponent(pk)).catch(() => {});
+          const id = dispatchNorm(c.producteur + '|' + c.produit) || ('m_' + c.produit).slice(0, 80);
+          await storage.setDoc(`day_${day}_manquants`, id, { produit: c.produit, producteur: c.producteur, cond: '', fini: 0, total: c.qty, manque: c.qty, clients: c.keys.length, bySite: c.bySite,
+            reason: 'rupture_appro', reasonNote: `Dernière minute pas arrivée (${who})`, lastMinute: false, status: 'rupture', source: 'prepa', uploadedBy: who, uploadedAt: new Date().toISOString() });
+          showToast(`❌ ${kbProdName(c.produit)} → rupture (${c.keys.length} client(s))`);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+
       const sitesLoaded = Object.keys(dispatchData || {});
 
       // ÉCRAN 1 : choix de la date (bloquant tant que pas choisi)
@@ -13774,10 +13859,37 @@
             );
           })()}
 
+          {/* ============ V9.96 — DISPATCH DERNIÈRE MINUTE CERTAIN ============ */}
+          {lmCertain.length > 0 && (
+            <div className="card" style={{ border: '3px solid #7b1fa2', background: '#faf3fd' }}>
+              <h3 style={{ margin: 0, fontSize: 20, color: '#7b1fa2' }}>🟣 Dispatch dernière minute CERTAIN ({lmCertain.length})</h3>
+              <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 10px' }}>
+                Produits sûrs d'arriver (marqués 🟣 à la prépa). <strong>Comptés présents</strong> (ancienne appli + Tampermonkey) et <strong>déjà attribués aux casiers</strong> en distrib : <strong>pas besoin du camion</strong>. S'il n'arrive pas → <strong>❌ Pas arrivé</strong>.
+              </p>
+              <div style={{ border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden', background: '#fff' }}>
+                {lmCertain.map((c, i) => (
+                  <div key={c.producteur + c.produit} style={{ padding: '12px', borderTop: i ? '1px solid var(--line)' : 'none' }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                      <span style={{ minWidth: 52, textAlign: 'center', fontSize: 22, fontWeight: 900, color: '#fff', background: '#7b1fa2', borderRadius: 10, padding: '4px 8px' }}>{c.qty}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 900, fontSize: 19, lineHeight: 1.2 }}>🟣 {kbProdName(c.produit)}</div>
+                        <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{c.producteur}{' · ' + Object.entries(c.bySite).map(([k, v]) => `${k} ${v}`).join(' · ')}</div>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                      <span style={{ flex: '1 1 200px', fontSize: 16, fontWeight: 800, color: '#7b1fa2', padding: '10px 12px', borderRadius: 10, border: '2px solid #7b1fa2' }}>✓ Attribué aux casiers automatiquement</span>
+                      <button onClick={() => pasArrive(c)} style={{ flex: '1 1 140px', fontSize: 16, fontWeight: 900, padding: '12px', borderRadius: 12, border: '2px solid var(--danger)', background: '#fff', color: 'var(--danger)', cursor: 'pointer' }}>❌ Pas arrivé → rupture</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* ============ MANQUANTS ============ */}
           <div className="card">
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
-              <h3 style={{margin:0}}>📦 Produits manquants</h3>
+              <h3 style={{margin:0}}>📦 Produits manquants <span style={{fontSize:13,fontWeight:600,color:'var(--ink-mute)'}}>· rupture ou dernière minute possible</span></h3>
               <button className="btn-ghost" onClick={() => setShowManual(s=>!s)} style={{fontSize:13}}>
                 {showManual ? 'Annuler' : '+ Ajouter'}
               </button>
@@ -13805,9 +13917,9 @@
               </div>
             )}
 
-            {manquants.length > 0 ? (
+            {manquantsHorsCertain.length > 0 ? (
               <ManquantsTable
-                manquants={manquants}
+                manquants={manquantsHorsCertain}
                 lmByManquant={lmByManquant}
                 onReason={setReason}
                 onDispatch={(m) => setLmModal(m)}
