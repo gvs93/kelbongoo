@@ -755,7 +755,16 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.97';
+    const APP_VERSION = 'V9.98';
+    // V9.98 — SÉCURITÉ SYNCHRO ANCIEN SITE (incident 14/10 : Tampermonkey a reporté la prépa de la VEILLE avant le début
+    //   de la prépa du jour). Cause : le 📡 Poste synchro publiait activeDay() = la distribution du JOUR (déjà préparée
+    //   la veille, clôturée) au lieu de la distribution PRÉPARÉE (lendemain). Corrigé :
+    //   • le poste publie TOUJOURS le jour de prépa = 1re date FUTURE avec commandes (kbFindPrepDay), recalculé à chaque
+    //     passage (bascule de minuit comprise) ; jamais aujourd'hui ni une date passée ;
+    //   • tant qu'aucun produit n'est touché en prépa ce jour-là → rien de publié comme « terminé » (started=false) ;
+    //   • la carte affiche la date publiée en gros + « prépa pas commencée ».
+    //   Script Tampermonkey v2.1 : refuse tout état dont la date n'est pas FUTURE, refuse un état muet depuis > 15 min,
+    //   et refuse un état « pas commencé » → plus aucun clic avec des infos d'un autre jour.
     // V9.97 — Distrib : produit prévu en dernière minute puis passé « ❌ Pas arrivé → rupture » (Manquants & ND)
     //   → bandeau orange sur le client « Rupture finalement — à RETIRER dans l'ancienne appli » (carte + détail).
     // V9.96 — DISPATCH DERNIÈRE MINUTE « CERTAIN » (produit passé en 🟣 à la prépa) = PRÉSENT :
@@ -8906,7 +8915,8 @@
           cas: r ? r.clients.map(c => ({ loc: c.site, num: String(c.casier || '?'), n: c.qty || 1, lab: c.site + ' ' + String(c.casier || '?') })) : [],
           sig: kbHashLive(p.sig.sort().join('|')) };
       }).sort((a, b) => a.produit.localeCompare(b.produit));
-      return { v: 1, day, at: Date.now(), closed: d.closed, nAncien: d.nAncien, products, recapText: kbRupturesText(d) };
+      const _anyStatus = Object.keys(d._prep.status || {}).some(k => !!d._prep.status[k]);
+      return { v: 1, day, at: Date.now(), closed: d.closed, nAncien: d.nAncien, products, recapText: kbRupturesText(d), _anyStatus };
     }
     try { window.kbAncienLive = kbAncienLive; } catch (_) {}
 
@@ -8925,7 +8935,22 @@
         if (!on) return;
         let stop = false;
         const tick = async () => {
-          try { const r = await kbAncienLive(activeDay()); if (stop) return; window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r); setErr(''); }
+          try {
+            // V9.98 — jour de PRÉPA (distribution suivante), jamais activeDay() (= distribution du jour sur le poste master)
+            const pd = await kbFindPrepDay();
+            if (stop) return;
+            if (!pd || pd <= todayKey()) {
+              const r0 = { v: 2, day: pd || '', at: Date.now(), started: false, closed: false, nAncien: 0, products: [], recapText: '', idle: 'aucune distribution future avec commandes' };
+              window.__kbAncienLive = r0; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r0); setErr(''); return;
+            }
+            const r = await kbAncienLive(pd); if (stop) return;
+            r.v = 2;
+            // prépa commencée = au moins une ligne ancien site avec un statut ce jour-là
+            r.started = r.products.some(p => p.done) || !!(r._anyStatus);
+            if (!r.started) { r.products = r.products.map(p => Object.assign({}, p, { done: false })); r.closed = false; }
+            delete r._anyStatus;
+            window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r); setErr('');
+          }
           catch (e) { if (!stop) setErr(e.message || String(e)); }
         };
         tick();
@@ -8943,6 +8968,14 @@
             <button className={on ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setOn(v => !v)}>{on ? '🟢 Synchro active — arrêter' : '▶️ Activer la synchro sur ce poste'}</button>
             {on && <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Dernière publication {hm(last && last.at)} · {nDone}/{last ? last.products.length : 0} produits terminés en prépa{last && last.closed ? ' · 🔒 prépa clôturée' : ''}</span>}
           </div>
+          {on && last && (
+            <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, fontSize: 15, fontWeight: 700,
+              background: last.day && last.started ? '#eaf1e6' : '#fff4e5', color: last.day && last.started ? '#2f5326' : '#8a4b00' }}>
+              {last.day
+                ? <>🗓️ Publié pour la prépa de la distribution du <span style={{ textTransform: 'capitalize' }}>{new Date(last.day + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })}</span>{last.started ? '' : ' — ⏸️ prépa pas commencée : rien n\'est reporté'}</>
+                : <>⏸️ Aucune distribution future avec commandes — rien n'est reporté</>}
+            </div>
+          )}
           {on && ack && <div style={{ fontSize: 12, marginTop: 6, color: ack.warn ? 'var(--warn)' : 'var(--accent-dark,#2e7d32)' }}>Ancien admin : {ack.applied || 0} produit(s) reporté(s) · {ack.warn || 0} à vérifier · dernier passage {hm(ack.at)}{ack.state ? ' · ' + ack.state : ''}</div>}
           {on && !ack && <div style={{ fontSize: 12, marginTop: 6, color: 'var(--warn)' }}>⚠️ Pas encore de signal du script sur l'ancien admin (onglet ouvert ? script v2 installé ? mode auto activé ?).</div>}
           {err && <div className="alert-red" style={{ fontSize: 12, marginTop: 6 }}>Erreur : {err}</div>}
