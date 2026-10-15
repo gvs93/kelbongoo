@@ -756,6 +756,8 @@
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
     const APP_VERSION = 'V10.02';
+    // V10.02 (+) — MU du jour : présence détaillée (kb_presence) → produit en MU, faits/objectif, pause, total du jour,
+    //   dernier produit terminé ; visible dans Console Pribon › Suivi live et Master › 🟢 Qui fait quoi.
     // V10.02 (+) — Retours PDP (entrepôt) : « ↩️ à traiter » en haut, puis GROSSE carte « 🚚 À récupérer aux boutiques · N »
     //   (orange s'il en reste) qui ouvre la liste par boutique en plein écran (← Retours PDP pour revenir).
     // V10.02 (+) — Prépa du jour : (1) filtre producteur = écran plein avec RECHERCHE (tape 2-3 lettres), « x/y à faire »
@@ -10330,6 +10332,21 @@
       },[entries,operator]);
 
       const totals = React.useMemo(()=>{ let all=0,mine=0; Object.values(entries).forEach(e=>{ if(e.status==='done'){ all+=(e.done||0); if(e.operator===operator) mine+=(e.done||0); } }); return {all,mine}; },[entries,operator]);
+      // V10.02 (+) — présence MU DÉTAILLÉE (Suivi live Console Pribon + 🟢 Qui fait quoi) : produit en cours de mise en unité,
+      //   sachets faits / objectif, en pause ou non, total MU de la personne aujourd'hui, dernier produit terminé.
+      React.useEffect(() => {
+        try {
+          const all = Object.values(entries || {}).filter(Boolean);
+          const mineAll = all.filter(e => e.operator === operator);
+          const cur = mineAll.filter(e => e.status === 'active' || e.status === 'paused').sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0];
+          const doneMine = mineAll.filter(e => e.status === 'done');
+          const muToday = doneMine.reduce((t, e) => t + (e.done || 0), 0);
+          const last = doneMine.sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0))[0];
+          const lastMu = last ? { product: last.product || '', done: last.done || 0, at: last.finishedAt || 0, ms: last.durationMs || 0 } : null;
+          if (cur) kbPresence(session, { task: 'MU · ' + (cur.product || ''), done: cur.inProgress || 0, total: cur.target || 0, unit: cur.uv || 'sachets', taskAt: cur.startedAt || Date.now(), page: 'mu', site: 'ENTREPOT', paused: cur.status === 'paused', muToday, muCount: doneMine.length, lastMu, miss: 0, with: [] });
+          else kbPresence(session, { task: 'MU du jour · choisit un produit', done: 0, total: 0, unit: '', taskAt: Date.now(), page: 'mu', site: 'ENTREPOT', paused: false, muToday, muCount: doneMine.length, lastMu, miss: 0, with: [] });
+        } catch (e) {}
+      }, [entries, operator]);
       // V9.46 — présence live : qui fait quoi en ce moment (MAJ temps réel via Firestore).
       const activeNow = React.useMemo(()=>{
         const list=[];
@@ -17901,7 +17918,8 @@
             </div>
             {(p.task || p.page) && (
               <div style={{ marginTop: 8, fontSize: 17, fontWeight: 800, color: fresh ? 'var(--ink)' : 'var(--ink-soft)' }}>
-                {p.task ? (p.task.startsWith('Prépa') || p.task === 'Distribution' || p.task === 'Retours PDP' ? p.task : '📦 ' + kbProdName(p.task)) : 'Écran : ' + p.page}
+                {p.task ? (p.task.startsWith('MU') ? '⚖️ ' + p.task.replace(/^MU · /, 'MU · ') : p.task.startsWith('Prépa') || p.task === 'Distribution' || p.task === 'Retours PDP' ? p.task : '📦 ' + kbProdName(p.task)) : 'Écran : ' + p.page}
+                {p.paused && String(p.task || '').startsWith('MU') && <span style={{ marginLeft: 8, fontSize: 14, color: '#b45309' }}>⏸️ en pause</span>}
                 {p.total > 0 && <span style={{ marginLeft: 8, fontSize: 15, color: 'var(--accent-dark)' }}>{p.done || 0}/{p.total} {p.unit || ''}</span>}
                 {p.miss > 0 && <span style={{ marginLeft: 8, fontSize: 14, color: 'var(--danger)' }}>· {p.miss} manquant(s)</span>}
                 {p.taskAt && <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}>depuis {ago(p.taskAt)}</span>}
@@ -17909,6 +17927,12 @@
             )}
             {p.total > 0 && <Bar d={p.done || 0} t={p.total} color={r[2]} />}
             {Array.isArray(p.with) && p.with.length > 0 && <div style={{ fontSize: 13, marginTop: 6 }}>👥 avec {p.with.join(', ')}</div>}
+            {(p.muToday > 0 || p.lastMu) && (
+              <div style={{ fontSize: 13, marginTop: 6, color: 'var(--ink-soft)' }}>
+                ⚖️ MU aujourd'hui : <b>{p.muToday || 0}</b> unité(s){p.muCount ? ` · ${p.muCount} produit(s)` : ''}
+                {p.lastMu && p.lastMu.product && <> · dernier : <b>{p.lastMu.product}</b> ({p.lastMu.done}{p.lastMu.ms ? `, ${Math.round(p.lastMu.ms / 60000)} min` : ''}) il y a {ago(p.lastMu.at)}</>}
+              </div>
+            )}
           </div>
         );
       };
