@@ -721,6 +721,7 @@
     //   posés côté serveur (Cloud Functions kbgLogin / kbgClaimAdmin), contrôlés par les règles Firestore.
     // V9.43 : déconnexion auto après 60 min sans interaction (comme l'appli réception).
     const INACTIVITY_MS = 60 * 60 * 1000; // 60 min
+    const KB_IDLE_LOCK_MS = 10 * 60 * 1000; // V10.02 (+) — prépa/distrib : code redemandé après 10 min sans activité
     const PREPARATEURS = ['Robin', 'Diana', 'Mamadou', 'Hamidou', 'Tom', 'Norman', 'Marjorie'];
     const SITES = ["BAR","BIC","BOR","CES","CHA","DOM","FOR","LIL","NCA","NCC","PAD","PDC","PDP","ROB","ROM","STB","TOL"];
     // Nom long de chaque local — pour les mails CLIENTS (le code court "PDP" est incompréhensible
@@ -756,6 +757,12 @@
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
     const APP_VERSION = 'V10.02';
+    // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
+    //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
+    //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
+    //   Prépa & distrib : code redemandé après 10 min sans activité · Dromy : adresses reprises du fichier consommateurs ·
+    //   Chargement JSON : alertes « client/produit inconnu » mémorisées · Mails clients : paquets de 10 + 3 essais ·
+    //   synchro ancien site : catégorie (pain → Dispatch sec) publiée pour Tampermonkey v2.8.
     // V10.02 (+) — MU du jour : présence détaillée (kb_presence) → produit en MU, faits/objectif, pause, total du jour,
     //   dernier produit terminé ; visible dans Console Pribon › Suivi live et Master › 🟢 Qui fait quoi.
     // V10.02 (+) — Retours PDP (entrepôt) : « ↩️ à traiter » en haut, puis GROSSE carte « 🚚 À récupérer aux boutiques · N »
@@ -2010,7 +2017,7 @@
         // Repli : si l'id n'est pas dans le fichier clients, on tente par e-mail porté par la commande.
         const _rawEmail = String(o.consumer_email || o.email || (o.consumer && o.consumer.email) || '').trim().toLowerCase();
         const cons = consById[cid] || (_rawEmail ? consByEmail[_rawEmail] : null) || null;
-        if (!cons) missingConsumers.add(cid);
+        if (!cons) { const _nm = `${o.firstname||''} ${o.lastname||''}`.trim() || String(o.consumer_name||o.name||'').trim() || _rawEmail; missingConsumers.add(_nm ? `${_nm} (${cid})` : cid); } // V10.02 (+) nom lisible
 
         // Date de distribution → clé jour (YYYYMMDD)
         const dIso = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date;
@@ -2047,7 +2054,7 @@
           // V9.59 — infos livraison à domicile (étiquettes + fichier Dromy). Best-effort sur l'export Mongo.
           firstname: cons ? (cons.firstname || '') : String(o.firstname || '').trim(),
           lastname: cons ? (cons.lastname || '') : String(o.lastname || '').trim(),
-          addr: kbAddrFrom(o) || (cons ? cons.addr || null : null),
+          addr: kbAddrBest(kbAddrFrom(o), cons ? cons.addr : null), // V10.02 (+) : l'adresse COMPLÈTE du fichier clients gagne sur un bout d'adresse de la commande
           slot: String(o.delivery_slot || o.slot || o.delivery_time || o.creneau || ((o.delivery_window && o.delivery_window.start) ? (o.delivery_window.start + '-' + (o.delivery_window.end || '')) : '') || ''),
           depotPorte: (kbDepotPorte(o) != null ? kbDepotPorte(o) : (cons ? (cons.depotPorte != null ? cons.depotPorte : null) : null)),
           casiersFrais: (o.bacs_frais || []).map(String),
@@ -3066,6 +3073,41 @@
     // ============================================================
     // LOGIN avec sélection du rôle
     // ============================================================
+    // V10.02 (+) — écran de verrouillage après 10 min d'inactivité (prépa / distrib). L'écran en dessous reste tel quel.
+    function KbIdleLockOverlay({ session, onUnlock, onLogout }) {
+      const [code, setCode] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [err, setErr] = React.useState('');
+      const ref = React.useRef(null);
+      React.useEffect(() => { try { ref.current && ref.current.focus(); } catch (_) {} }, []);
+      const submit = async () => {
+        const c = String(code || '').trim();
+        if (!c) { setErr('Entre ton code personnel.'); return; }
+        setBusy(true); setErr('');
+        try {
+          const r = await kbStaffLogin(c, session.role === 'prep' ? 'prep' : 'distrib', session.role === 'distrib' ? session.site : undefined);
+          setCode(''); setBusy(false);
+          if (r.kbRole === 'pdp') { onLogout(); return; } // code chauffeur : on repasse par l'écran de connexion
+          onUnlock(r);
+        } catch (e) { setBusy(false); setCode(''); setErr(kbErrMsg(e)); }
+      };
+      return (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 3000, background: 'rgba(20,30,20,.92)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+          <div style={{ background: '#fff', borderRadius: 18, padding: '22px 20px', width: '100%', maxWidth: 380, textAlign: 'center', boxShadow: '0 10px 40px rgba(0,0,0,.4)' }}>
+            <div style={{ fontSize: 46, lineHeight: 1 }}>🔒</div>
+            <div style={{ fontSize: 20, fontWeight: 900, marginTop: 6 }}>Qui est là ?</div>
+            <div style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '6px 0 14px' }}>10 min sans activité. Connecté : <b>{session.name}</b>{session.role === 'distrib' && session.site ? ` · ${session.site}` : ''}.<br />Entre <b>ton</b> code personnel pour continuer.</div>
+            <input ref={ref} type="password" inputMode="numeric" autoComplete="off" value={code} onChange={e => setCode(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') submit(); }} placeholder="Code personnel"
+              style={{ width: '100%', boxSizing: 'border-box', fontSize: 22, textAlign: 'center', letterSpacing: 4, padding: '12px 10px', borderRadius: 12, border: '2px solid var(--line)' }} />
+            {err && <div style={{ color: 'var(--danger)', fontSize: 13, fontWeight: 700, marginTop: 8 }}>{err}</div>}
+            <button className="btn-primary btn-block" disabled={busy} onClick={submit} style={{ marginTop: 12, fontSize: 17, padding: 12 }}>{busy ? 'Vérification…' : '✓ Continuer'}</button>
+            <button className="btn-ghost btn-block" onClick={onLogout} style={{ marginTop: 6, fontSize: 13 }}>Se déconnecter</button>
+          </div>
+        </div>
+      );
+    }
+
     function LoginScreen({ onLogin }) {
       const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' (master = overlay séparé)
       const [masterOpen, setMasterOpen] = React.useState(false); // overlay accès master
@@ -8978,7 +9020,7 @@
         for (const it of (o.items || [])) {
           const produit = it.produit || '(produit)', producteur = it.producteur || '';
           const pk = producteur + '||' + produit;
-          const p = P[pk] || (P[pk] = { produit, producteur, ordered: 0, lines: 0, fin: 0, sig: [] });
+          const p = P[pk] || (P[pk] = { produit, producteur, ordered: 0, lines: 0, fin: 0, sig: [], cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais' }); // V10.02 (+) cat : pain → Dispatch sec (Tampermonkey v2.8)
           const k = site + '||' + client + '||' + produit, st0 = d._prep.status[k] || '';
           // V9.96 — dispatch dernière minute certain (🟣 prépa) = PRÉSENT : ligne terminée, pas une rupture
           const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + produit]) && st0 !== 'rupture' && st0 !== 'partiel';
@@ -8991,7 +9033,7 @@
       const bp = kbRupturesByProduct(d.lines, d.ordered);
       const products = Object.values(P).map(p => {
         const r = bp.find(x => x.producteur === p.producteur && x.produit === p.produit);
-        return { key: p.produit + (p.producteur ? ' ' + p.producteur : ''), produit: p.produit, producteur: p.producteur, ordered: p.ordered,
+        return { key: p.produit + (p.producteur ? ' ' + p.producteur : ''), produit: p.produit, producteur: p.producteur, ordered: p.ordered, cat: p.cat,
           done: p.lines > 0 && p.fin === p.lines, rupture: r ? r.qty : 0, full: !!(r && r.full),
           cas: r ? r.clients.map(c => ({ loc: c.site, num: String(c.casier || '?'), n: c.qty || 1, lab: c.site + ' ' + String(c.casier || '?') })) : [],
           sig: kbHashLive(p.sig.sort().join('|')) };
@@ -10918,7 +10960,47 @@
         return { line1: l1, line2: l2, cp, city };
       }
       if (typeof src.address === 'string' && src.address.trim()) return kbAddrParse(src.address);
-      return null;
+      // V10.02 (+) — adresse rangée plus profond (ex. consumer.delivery.address{…}, consumer.addresses.home{…}) : on fouille 3 niveaux
+      const deep = (o, d) => {
+        if (!o || typeof o !== 'object' || d > 3) return null;
+        for (const k of Object.keys(o)) {
+          const v = o[k];
+          if (!v || typeof v !== 'object' || v === src || /^(items|products|lines|pains|nds|frais|removed|reduced|payments?)$/i.test(k)) continue;
+          const arr = Array.isArray(v) ? v : [v];
+          for (const x of arr) {
+            if (!x || typeof x !== 'object') continue;
+            const cp = pick(x, ['postcode', 'postal_code', 'postalCode', 'zip', 'zipcode', 'zip_code', 'code_postal', 'cp']);
+            const l1 = pick(x, ['address1', 'address_line1', 'addressLine1', 'line1', 'street', 'rue', 'adresse', 'address_1', 'address', 'label']);
+            if (cp && /\d{4,5}/.test(cp)) return { line1: l1, line2: pick(x, ['address2', 'address_line2', 'addressLine2', 'line2', 'complement', 'other', 'details', 'digicode', 'instructions']), cp, city: pick(x, ['city', 'ville', 'town', 'locality']) };
+            const r = deep(x, d + 1); if (r) return r;
+          }
+        }
+        return null;
+      };
+      return deep(src, 0);
+    }
+    // V10.02 (+) — garde l'adresse la plus complète (rue + CP d'abord)
+    function kbAddrBest(a, b) {
+      const sc = (x) => x ? (x.line1 ? 2 : 0) + (x.cp ? 1 : 0) + (x.city ? 0.5 : 0) : -1;
+      if (!a) return b || null; if (!b) return a;
+      const best = sc(b) > sc(a) ? b : a, other = best === a ? b : a;
+      return { line1: best.line1 || other.line1 || '', line2: best.line2 || other.line2 || '', cp: best.cp || other.cp || '', city: best.city || other.city || '' };
+    }
+    // V10.02 (+) — Dromy / étiquettes DOM : complète adresse, téléphone, prénom/nom depuis le fichier CONSOMMATEURS en mémoire
+    //   (cas : commandes chargées avant les consommateurs, ou ancien cache sans adresse). Par id client puis par e-mail.
+    async function kbDomEnrich(orders) {
+      const dom = (orders || []).filter(o => String(o.site || '').toUpperCase() === 'DOM' && (!(o.addr && o.addr.line1 && o.addr.cp) || !o.tel));
+      if (!dom.length) return orders;
+      let cons = null; try { cons = await readCache('consumers'); } catch (_) {}
+      if (!cons) return orders;
+      const byEmail = {}; Object.values(cons).forEach(c => { if (c && c.email) byEmail[String(c.email).toLowerCase()] = c; });
+      return orders.map(o => {
+        if (!dom.includes(o)) return o;
+        const c = (o.consumerId && cons[o.consumerId]) || (o.email && byEmail[String(o.email).toLowerCase()]) || null;
+        if (!c) return o;
+        return { ...o, addr: kbAddrBest(o.addr, c.addr), tel: o.tel || c.tel || '', firstname: o.firstname || c.firstname || '', lastname: o.lastname || c.lastname || '', email: o.email || c.email || '',
+          depotPorte: o.depotPorte != null ? o.depotPorte : (c.depotPorte != null ? c.depotPorte : null) };
+      });
     }
     // Dépôt porte : champ explicite si présent, sinon détection dans le complément d'adresse ; null = inconnu.
     function kbDepotPorte(o) {
@@ -10954,7 +11036,9 @@
         else if (d.id === 'totaux') { try { prep.totaux = { rows: JSON.parse(d.json || '[]'), file: d.file, at: d.at, by: d.by }; } catch (e) {} }
         else if (String(d.id).startsWith('cs|')) prep.casiers[decodeURIComponent(d.id.slice(3))] = d.nums || [];
       });
-      return { ordersDoc: od, orders: (od && od.orders) || [], prep };
+      let orders = (od && od.orders) || [];
+      try { orders = await kbDomEnrich(orders); } catch (_) {} // V10.02 (+) adresses DOM depuis consumers
+      return { ordersDoc: od, orders, prep };
     }
     // Casiers/cartons d'un client : même règle que « Prépa du jour » (casier d'origine + « Casier plein → +1 »)
     function kbClientCasiers(prep, site, client, order) {
@@ -11286,8 +11370,58 @@
       return setTab ? <button className="btn-secondary" style={{ fontSize: 13, padding: '6px 12px', alignSelf: 'flex-start' }} onClick={() => setTab('suivi')}>← DLC &amp; suivi</button> : null;
     }
 
+    // V10.02 (+) — ORDRE DU BON DE COMMANDE « BRUT DE PAINS » (fournisseur). Le récap pain et le bon de commande
+    //   suivent cet ordre ; un pain hors liste est mis à la fin (signalé).
+    const KB_BRUT_ORDER = ['Bara aux graines BIO', 'Brioche tressée', 'Meule 1 kg BIO', 'Meule 500 g BIO', 'Meule graine BIO', 'Pain complet BIO', 'Pain norvégien BIO', 'Petit épeautre BIO', 'Petit pain de mie', 'Sarrasin Riz'];
+    function kbBrutTokens(name) {
+      return normalizeText(kbProdName(name)).replace(/(\d)\s*(kg|g)\b/g, '$1 $2').replace(/[^a-z0-9]+/g, ' ').split(' ')
+        .filter(t => t && !['bio', 'aux', 'au', 'a', 'de', 'du', 'des', 'la', 'le', 'et'].includes(t)).map(t => t.replace(/s$/, ''));
+    }
+    const KB_BRUT_TOK = KB_BRUT_ORDER.map(kbBrutTokens);
+    function kbBrutIndex(name) {
+      const t = kbBrutTokens(name); let best = -1, bestN = 0;
+      KB_BRUT_TOK.forEach((ref, i) => { if (ref.every(r => t.includes(r)) && ref.length > bestN) { best = i; bestN = ref.length; } });
+      return best;
+    }
+    function kbBrutSort(list, get) {
+      const g = get || (x => x.produit);
+      return list.slice().sort((a, b) => { const ia = kbBrutIndex(g(a)), ib = kbBrutIndex(g(b)); return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || String(g(a)).localeCompare(String(g(b)), 'fr'); });
+    }
+    // Bon de commande fournisseur : les 10 pains du bon dans l'ordre (0 = « — ») + les pains hors liste à la fin
+    function generatePainOrderPDF(day, recap, opts) {
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const L = 14, R = 196;
+      const rows = KB_BRUT_ORDER.map((lb, i) => ({ produit: lb, qty: 0, detail: '', names: [] }));
+      const extra = [];
+      (recap || []).forEach(x => { const i = kbBrutIndex(x.produit); if (i >= 0) { rows[i].qty += x.qty; rows[i].names.push(x.produit); rows[i].detail = [rows[i].detail, x.detail].filter(Boolean).join(' · '); } else extra.push({ ...x, extra: true }); });
+      const all = rows.concat(extra);
+      const tot = all.reduce((t, x) => t + x.qty, 0);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(24); doc.text(kbPdfTxt('BON DE COMMANDE PAIN'), L, 22);
+      doc.setFontSize(15); doc.text(kbPdfTxt((opts && opts.supplier) || 'Brut de Pains'), L, 31);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(12);
+      doc.text(kbPdfTxt('Livraison pour la distribution du ' + kbDateLong(day)), L, 39);
+      doc.text(kbPdfTxt('Client : KELBONGOO' + ((opts && opts.by) ? '  ·  commandé par ' + opts.by : '') + '  ·  édité le ' + new Date().toLocaleString('fr-FR')), L, 45);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(18); doc.text(`TOTAL : ${tot} pain${tot > 1 ? 's' : ''}`, R, 31, { align: 'right' });
+      doc.setLineWidth(0.7); doc.line(L, 50, R, 50);
+      doc.setFontSize(10); doc.setTextColor(90); doc.text('PRODUIT', L + 2, 57); doc.text(kbPdfTxt('QUANTITÉ'), R - 2, 57, { align: 'right' }); doc.text(kbPdfTxt('détail par lieu'), 140, 57, { align: 'right' }); doc.setTextColor(0);
+      let y = 70; const h = Math.max(9, Math.min(15, 200 / Math.max(1, all.length)));
+      all.forEach((x, i) => {
+        if (y > 280) { doc.addPage(); y = 20; }
+        if (i === KB_BRUT_ORDER.length && extra.length) { doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(180, 60, 0); y += 2; doc.text(kbPdfTxt('Hors bon de commande habituel (vérifier le nom chez le fournisseur) :'), L + 2, y - 2); doc.setTextColor(0); y += 9; }
+        if (i % 2 === 0) { doc.setFillColor(242, 242, 242); doc.rect(L, y - h * 0.7, R - L, h, 'F'); }
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(15, h * 1.3)); doc.setTextColor(x.qty ? 0 : 150);
+        doc.text(kbPdfTxt(x.produit), L + 2, y);
+        if (x.detail) { doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(100); const d = kbPdfTxt(x.detail); doc.text(d.length > 60 ? d.slice(0, 58) + '...' : d, 140, y, { align: 'right' }); }
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(20, h * 1.7)); doc.setTextColor(x.qty ? 0 : 160);
+        doc.text(x.qty ? String(x.qty) : '-', R - 2, y, { align: 'right' }); doc.setTextColor(0);
+        y += h;
+      });
+      return doc;
+    }
+
     // ---------- Page : impression dispatch pain ----------
-    function PrintPainPage({ session, setTab }) {
+    function PrintPainPage({ session, setTab, master }) {
       const [day, setDay] = React.useState(() => activeDay());
       const [confirmed, setConfirmed] = React.useState(false);
       const [data, reload] = useKbDayData(day);
@@ -11350,9 +11484,10 @@
       const recap = (() => {
         const m = {};
         siteBlocks.forEach(b => b.lines.forEach(x => { const k = kbPainKey(x.produit); m[k] = m[k] || { produit: x.produit, qty: 0, by: [] }; m[k].qty += x.qty; m[k].by.push(`${b.code} ${x.qty}`); }));
-        return Object.values(m).sort((a, b) => a.produit.localeCompare(b.produit, 'fr')).map(x => ({ produit: x.produit, qty: x.qty, detail: x.by.join(' · ') }));
+        return kbBrutSort(Object.values(m)).map(x => ({ produit: x.produit, qty: x.qty, detail: x.by.join(' · ') })); // V10.02 (+) ordre du bon Brut de Pains
       })();
       const total = recap.reduce((s, x) => s + x.qty, 0);
+      const printOrder = () => { if (!canPrint) return; kbOpenPdf(generatePainOrderPDF(day, recap, { by: session && session.name }), `Commande_pain_BrutDePains_${day}.pdf`); };
       const chk = kbDayCheck(day, data);
       const canPrint = confirmed && chk.ok && siteBlocks.length > 0;
       // Feuilles par boutique (1 A4 par carton) · une seule boutique · récap général seul
@@ -11360,10 +11495,22 @@
       const printRecap = () => { if (!canPrint) return; kbOpenPdf(generatePainPDF(day, [], recap), `Recap_pain_${day}.pdf`); };
       return (
         <div className="stack">
-          <KbBackToHub setTab={setTab} />
-          <h1 style={{ margin: 0 }}>🍞 Impression dispatch pain</h1>
-          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Une feuille A4 par boutique : nom + code en gros, nombre de pains de chaque sorte à mettre dans son carton. La feuille se glisse ensuite dans le carton.</p>
+          {!master && <KbBackToHub setTab={setTab} />}
+          <h1 style={{ margin: 0 }}>{master ? '🍞 Commande pain & étiquettes' : '🍞 Impression dispatch pain'}</h1>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>{master ? 'Bon de commande Brut de Pains (même ordre que le bon du fournisseur) et feuilles-étiquettes par boutique à glisser dans les cartons.' : 'Une feuille A4 par boutique : nom + code en gros, nombre de pains de chaque sorte à mettre dans son carton. La feuille se glisse ensuite dans le carton.'}</p>
           <KbPrintDatePick day={day} setDay={setDay} data={data} confirmed={confirmed} setConfirmed={setConfirmed} what="dispatch pain" />
+          {master && (
+            <div className="card" style={{ border: '3px solid #5d4037' }}>
+              <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 6 }}>📦 Commande fournisseur — {total} pain{total > 1 ? 's' : ''}</div>
+              {KB_BRUT_ORDER.map((lb, i) => { const q = recap.filter(x => kbBrutIndex(x.produit) === i).reduce((t, x) => t + x.qty, 0); return (
+                <div key={lb} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 2px', borderBottom: '1px solid var(--line)', fontSize: 15, color: q ? 'var(--ink)' : 'var(--ink-mute)', fontWeight: q ? 800 : 500 }}><span>{lb}</span><span style={{ fontSize: 18, fontWeight: 900 }}>{q || '—'}</span></div>
+              ); })}
+              {recap.filter(x => kbBrutIndex(x.produit) < 0).map(x => (
+                <div key={x.produit} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 2px', borderBottom: '1px solid var(--line)', fontSize: 15, color: '#b45309', fontWeight: 800 }}><span>⚠️ {x.produit} <small>(hors bon habituel)</small></span><span style={{ fontSize: 18, fontWeight: 900 }}>{x.qty}</span></div>
+              ))}
+              <button className="btn-primary btn-block" disabled={!canPrint} onClick={printOrder} style={{ marginTop: 10, fontSize: 16, padding: 14, background: '#5d4037', borderColor: '#5d4037' }}>📄 Ouvrir le bon de commande (PDF)</button>
+            </div>
+          )}
           {producers.length > 1 && (
             <div className="card">
               <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Producteurs inclus</div>
@@ -11377,9 +11524,10 @@
             <button className="btn-secondary" style={{ fontSize: 12 }} onClick={reload}>↻ Recharger</button>
           </div>
           <button className="btn-primary btn-lg" disabled={!canPrint} onClick={() => printSites(siteBlocks)} style={{ fontSize: 17, padding: 16 }}>
-            🖨️ Feuilles par boutique — {siteBlocks.length} carton{siteBlocks.length > 1 ? 's' : ''} (1 A4 par boutique)
+            🖨️ {master ? 'Étiquettes pain' : 'Feuilles'} par boutique — {siteBlocks.length} carton{siteBlocks.length > 1 ? 's' : ''} (1 A4 par boutique)
           </button>
           <button className="btn-secondary" disabled={!canPrint} onClick={printRecap}>📋 Récap général — {total} pain{total > 1 ? 's' : ''} à recevoir</button>
+          {!master && <button className="btn-secondary" disabled={!canPrint} onClick={printOrder}>📦 Bon de commande Brut de Pains (PDF)</button>}
           {!confirmed && chk.ok && <div style={{ fontSize: 12, color: 'var(--warn)', textAlign: 'center' }}>Coche « Je confirme » pour imprimer.</div>}
           {!data.loading && chk.ok && siteBlocks.length === 0 && <div className="card"><p style={{ margin: 0, fontSize: 13, color: 'var(--ink-mute)' }}>Aucun pain commandé pour cette distribution{producers.length ? ' (avec les producteurs cochés)' : ''}.</p></div>}
           {siteBlocks.map(b => {
@@ -12458,9 +12606,24 @@
         const prev = data.prep.cmails;
         if (!o.force && prev && prev.sig === sig && !prev.err) return { ok: true, unchanged: true, count: b.mails.length };
         if (!b.mails.length) return { ok: true, count: 0, noEmail: b.noEmail.length, noHours: b.noHours };
-        for (let i = 0; i < b.mails.length; i += 25) {
-          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'client_mails_stage', date: day, mails: b.mails.slice(i, i + 25) });
-          if (!r || r.ok === false) throw new Error((r && r.error) || 'réponse vide du proxy (action client_mails_stage installée ?)');
+        // V10.02 (+) — paquets de 10 + 3 essais : Apps Script renvoie parfois une page HTML Google (plantage
+        //   passager / trop d'exécutions simultanées) → « réponse non-JSON ». Le dépôt est idempotent côté serveur.
+        for (let i = 0; i < b.mails.length; i += 10) {
+          let lastErr = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt) await new Promise(res => setTimeout(res, attempt === 1 ? 3000 : 8000));
+            try {
+              const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'client_mails_stage', date: day, mails: b.mails.slice(i, i + 10) });
+              if (!r || r.ok === false) throw new Error((r && r.error) || 'réponse vide du proxy (action client_mails_stage installée ?)');
+              lastErr = null; break;
+            } catch (e) { lastErr = e; if (e && /permission-denied|unauthenticated/.test(e.code || '')) break; }
+          }
+          if (lastErr) {
+            const m = kbErrMsg(lastErr);
+            throw new Error(/non-JSON|DOCTYPE|ppConfig|<html/i.test(m)
+              ? 'Apps Script KBG STOCK PROXY a planté (page Google au lieu d\'une réponse) — nouvel essai auto toutes les 2 min. Si ça dure : script.google.com › KBG STOCK PROXY › Exécutions.'
+              : m);
+          }
         }
         const n = (t) => b.mails.filter(m => m.type === t).length;
         await storage.setDoc(`day_${day}_prep`, 'cmails', { sig, at: new Date().toISOString(), by: by || '', mode: cfg.mode, count: b.mails.length, cloture: n('cloture'), rappel: n('rappel'), clients: b.clients, noEmail: b.noEmail.slice(0, 50), noHours: b.noHours, err: '' }, { replace: true });
@@ -12988,7 +13151,7 @@
         try {
           const cm = await kbStageClientMails(day, user, { force: true });
           if (cm.ok) showToast(`✉️ Mails clients déposés : ${cm.cloture || 0} récap + ${cm.rappel || 0} rappel(s)${cm.mode === 'test' ? ' (mode TEST)' : ''}`);
-          else if (cm.error) { showToast('⚠️ Mails clients non déposés : ' + cm.error); try { alert('⚠️ Les mails clients ne sont PAS partis.\n\nErreur serveur : ' + cm.error + '\n\nPréviens Henry (Master › Pilotage › Divers › Mails clients).'); } catch (_) {} }
+          else if (cm.error) { showToast('⚠️ Mails clients pas encore déposés (nouvel essai auto toutes les 2 min) : ' + cm.error); }
         } catch (e) { showToast('⚠️ Mails clients : ' + e.message); }
         // V9.61 — 🎆 + ruptures ancien site envoyées automatiquement à hg@ (cohabitation)
         kbCelebrate({ title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`, sub: `${rows.length} lignes préparées · merci l'équipe 💚` });
@@ -17872,6 +18035,144 @@
     }
 
     // ============================================================
+    // V10.02 (+) — 🏠 AUJOURD'HUI (Master, page d'accueil) — comme la console Pribon :
+    //   prépa en cours (avancement par lieu, ruptures, clôture, DOM), équipe en ligne, MU du jour,
+    //   commandes, « À traiter » (cliquable), raccourcis (commande pain, étiquettes DOM…), puis le LIVE détaillé.
+    // ============================================================
+    function KbTodayPage({ session, setTab }) {
+      const [now, setNow] = React.useState(Date.now());
+      const [pres, setPres] = React.useState([]);
+      const [prepDay, setPrepDay] = React.useState(undefined);
+      const [meta, setMeta] = React.useState(null);
+      const [dromy, setDromy] = React.useState(null);
+      const [po, setPo] = React.useState(null);   // commandes de la prépa (distribution suivante)
+      const [to, setTo] = React.useState(null);   // commandes de la distribution du jour
+      const [mailErr, setMailErr] = React.useState('');
+      const [flN, setFlN] = React.useState(() => { try { const v = localStorage.getItem('kb_fl_info_n'); return v == null ? null : Number(v); } catch (_) { return null; } });
+      const today = todayKey();
+      React.useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+      React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
+      React.useEffect(() => kbWatchClientMailsErr(setMailErr), []);
+      React.useEffect(() => { let stop = false; kbFindPrepDay().then(d => { if (!stop) setPrepDay(d || null); }).catch(() => { if (!stop) setPrepDay(null); }); return () => { stop = true; }; }, []);
+      React.useEffect(() => {
+        if (!prepDay) return;
+        let stop = false;
+        const tick = async () => {
+          const [m, d] = await Promise.all([storage.getDoc(`day_${prepDay}_prep`, 'meta').catch(() => null), storage.getDoc(`day_${prepDay}_prep`, 'dromy').catch(() => null)]);
+          if (!stop) { setMeta(m || {}); setDromy(d || null); }
+        };
+        tick(); const t = setInterval(tick, 60000);
+        storage.getDoc(`day_${prepDay}_orders`, 'data').then(d => { if (!stop) setPo((d && d.orders) || []); }).catch(() => { if (!stop) setPo([]); });
+        return () => { stop = true; clearInterval(t); };
+      }, [prepDay]);
+      React.useEffect(() => { let stop = false; storage.getDoc(`day_${today}_orders`, 'data').then(d => { if (!stop) setTo((d && d.orders) || []); }).catch(() => { if (!stop) setTo([]); }); return () => { stop = true; }; }, [today]);
+      React.useEffect(() => { let stop = false; flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }).then(d => { if (!stop && d && d.ok) { const n = kbFlInfoIssues(d.rows || [], false).length; setFlN(n); try { localStorage.setItem('kb_fl_info_n', String(n)); } catch (_) {} } }).catch(() => {}); return () => { stop = true; }; }, []);
+
+      const goSub = (k) => { try { localStorage.setItem('kbg_suivi_sub', k); } catch (e) {} setTab('suivi'); window.scrollTo({ top: 0 }); };
+      const go = (t) => { setTab(t); window.scrollTo({ top: 0 }); };
+      const people = pres.filter(p => p && p.name && !String(p.id || '').startsWith('~'));
+      const online = people.filter(p => now - (p.at || 0) < 3 * 60000);
+      const byRole = (r) => online.filter(p => p.role === r).length;
+      const muToday = people.filter(p => p.day === today).reduce((t, p) => t + (Number(p.muToday) || 0), 0);
+      const muNow = online.filter(p => String(p.task || '').startsWith('MU ·'));
+      const agg = prepDay ? pres.find(p => p.id === '~prep_' + prepDay) : null;
+      const pct = agg && agg.t ? Math.round(100 * (agg.d || 0) / agg.t) : 0;
+      const closed = !!(meta && meta.closed) || !!(agg && agg.closed);
+      const real = (o) => !o._test;
+      const poR = (po || []).filter(real), toR = (to || []).filter(real);
+      const sitesOf = (arr) => { const m = {}; arr.forEach(o => { const s = String(o.site || '').toUpperCase(); m[s] = (m[s] || 0) + 1; }); return Object.entries(m).sort((a, b) => b[1] - a[1]); };
+      const pains = poR.reduce((t, o) => t + (o.items || []).filter(it => it.cat === 'pain').reduce((x, it) => x + (parseInt(it.qty, 10) || 0), 0), 0);
+      const domN = poR.filter(o => String(o.site || '').toUpperCase() === 'DOM').length;
+      const domNoAddr = poR.filter(o => String(o.site || '').toUpperCase() === 'DOM' && !(o.addr && o.addr.line1 && o.addr.cp)).length;
+      let v4 = null; try { v4 = JSON.parse(localStorage.getItem('kb_v4_last') || 'null'); } catch (_) {}
+      const todo = [];
+      if (mailErr) todo.push({ lv: 'red', ic: '📧', t: 'Mails clients en erreur', d: mailErr, on: () => goSub('cmails') });
+      if (prepDay && po && !poR.length) todo.push({ lv: 'red', ic: '📥', t: `Commandes du ${formatDateShort(prepDay)} pas chargées`, d: 'Chargement → fichier JSON des commandes', on: () => go('admin') });
+      if (v4 && ((v4.missingConsumers || []).length || (v4.missingProducts || []).length)) todo.push({ lv: 'red', ic: '👤', t: `Chargement : ${(v4.missingConsumers || []).length} client(s) / ${(v4.missingProducts || []).length} produit(s) inconnus`, d: 'Recharger le fichier Consommateurs / Produits puis les Commandes', on: () => go('admin') });
+      if (flN > 0) todo.push({ lv: 'red', ic: '🥬', t: `${flN} produit(s) F&L incomplets dans le Sheet`, d: 'Sans UV / TYPE / MU en kilo, la prépa ne peut pas faire la MU', on: () => go('fl') });
+      if (prepDay && poR.length && !closed) todo.push({ lv: 'orange', ic: '🥬', t: `Prépa du ${formatDateShort(prepDay)} en cours : ${pct} %`, d: agg ? `${agg.d || 0}/${agg.t || 0} lignes · ${agg.ruptures || 0} rupture(s)` : 'pas encore commencée', on: () => goSub('live') });
+      if (domN && !(meta && (meta.domClosed || meta.closed))) todo.push({ lv: 'orange', ic: '🏠', t: `Livraison à domicile : ${domN} client(s) — DOM pas clôturé`, d: 'Clôturer DOM en prépa puis imprimer les étiquettes', on: () => go('mdom') });
+      if (domNoAddr) todo.push({ lv: 'orange', ic: '📍', t: `${domNoAddr} client(s) DOM sans adresse complète`, d: 'Charger le fichier Consommateurs (adresses) — Dromy les reprend automatiquement', on: () => go('mdom') });
+      if (domN && closed && !(dromy && dromy.sent && dromy.sent.ok) && !(meta && meta.domDromyOk)) todo.push({ lv: 'orange', ic: '🚚', t: 'Fichier Dromy pas envoyé', d: 'Pilotage › Dromy', on: () => goSub('dromy') });
+      if (pains) todo.push({ lv: 'blue', ic: '🍞', t: `Commande pain : ${pains} pain(s) pour le ${formatDateShort(prepDay)}`, d: 'Bon de commande Brut de Pains + étiquettes', on: () => go('mpain') });
+      const LV = { red: ['#fdecea', 'var(--danger)'], orange: ['#fff4e5', '#ef6c00'], blue: ['#eef4ff', '#1565c0'] };
+      const clock = new Date(now).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const Tile = ({ ic, v, l, sub, on, color }) => (
+        <div onClick={on} className="card" style={{ cursor: on ? 'pointer' : 'default', padding: '12px 14px', margin: 0, borderTop: '5px solid ' + (color || 'var(--accent)') }}>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)', fontWeight: 700 }}>{ic} {l}</div>
+          <div style={{ fontSize: 34, fontWeight: 900, lineHeight: 1.1, marginTop: 4 }}>{v}</div>
+          {sub && <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>{sub}</div>}
+        </div>
+      );
+      const sitesAgg = agg && agg.sites ? Object.entries(agg.sites).sort((a, b) => a[0].localeCompare(b[0])) : [];
+      return (
+        <div className="stack">
+          <style>{`@keyframes kbPulse{0%{box-shadow:0 0 0 0 rgba(76,175,80,.7)}70%{box-shadow:0 0 0 10px rgba(76,175,80,0)}100%{box-shadow:0 0 0 0 rgba(76,175,80,0)}}`}</style>
+          <div className="card" style={{ background: 'linear-gradient(135deg,#1f3a24,#3f6e31)', color: '#fff', padding: '16px 18px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ width: 12, height: 12, borderRadius: 6, background: '#4caf50', animation: 'kbPulse 2s infinite' }} />
+              <div style={{ fontSize: 26, fontWeight: 900 }}>Aujourd'hui</div>
+              <div style={{ fontSize: 15, opacity: .9, textTransform: 'capitalize' }}>{formatDateFR()}</div>
+              <div style={{ marginLeft: 'auto', fontSize: 26, fontWeight: 900, fontVariantNumeric: 'tabular-nums' }}>{clock}</div>
+            </div>
+            <div style={{ display: 'flex', gap: 18, alignItems: 'center', marginTop: 14, flexWrap: 'wrap' }}>
+              <div style={{ width: 110, height: 110, borderRadius: '50%', flex: '0 0 auto', display: 'grid', placeItems: 'center',
+                background: `conic-gradient(${closed ? '#a5d6a7' : '#ffd54f'} ${pct * 3.6}deg, rgba(255,255,255,.18) 0)` }}>
+                <div style={{ width: 84, height: 84, borderRadius: '50%', background: '#2b4d2e', display: 'grid', placeItems: 'center', textAlign: 'center' }}>
+                  <div><div style={{ fontSize: 26, fontWeight: 900, lineHeight: 1 }}>{closed ? '🔒' : pct + '%'}</div><div style={{ fontSize: 10, opacity: .85 }}>{closed ? 'clôturée' : 'prépa'}</div></div>
+                </div>
+              </div>
+              <div style={{ flex: 1, minWidth: 200 }}>
+                <div style={{ fontSize: 17, fontWeight: 800 }}>
+                  {prepDay === undefined ? 'Recherche de la prochaine distribution…' : !prepDay ? 'Aucune distribution à venir avec commandes' : `Prépa pour le ${formatDateShort(prepDay)}${closed ? ' · clôturée' + (meta && meta.closedBy ? ' par ' + meta.closedBy : '') : ''}`}
+                </div>
+                {agg && <div style={{ fontSize: 13, opacity: .9, marginTop: 2 }}>{agg.d || 0}/{agg.t || 0} lignes · ❌ {agg.ruptures || 0} rupture(s){agg.rupturesTotales ? ` (${agg.rupturesTotales} totale(s))` : ''}{meta && meta.domClosed ? ' · 🏠 DOM clôturé' : ''}</div>}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: '6px 12px', marginTop: 8 }}>
+                  {sitesAgg.map(([c, v]) => { const p = v.total ? Math.round(100 * (v.done || 0) / v.total) : 0; return (
+                    <div key={c} style={{ fontSize: 12 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 800 }}><span>{c}</span><span>{p === 100 ? '✓' : p + '%'}</span></div>
+                      <div style={{ height: 6, background: 'rgba(255,255,255,.2)', borderRadius: 4, overflow: 'hidden', marginTop: 2 }}><div style={{ width: p + '%', height: '100%', background: p === 100 ? '#a5d6a7' : '#ffd54f' }} /></div>
+                    </div>
+                  ); })}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
+            <Tile ic="🟢" l="Équipe en ligne" v={online.length} sub={`🥬 ${byRole('prep')} prépa · 🛍️ ${byRole('distrib')} distrib${byRole('pdp') ? ' · 🚚 ' + byRole('pdp') : ''}`} on={() => goSub('live')} color="#2e7d32" />
+            <Tile ic="⚖️" l="MU du jour" v={muToday} sub={muNow.length ? 'en cours : ' + muNow.map(p => p.name + ' (' + String(p.task).replace(/^MU · /, '') + ')').join(', ') : 'unités mises en sachet aujourd\'hui'} on={() => goSub('live')} color="#6d4c41" />
+            <Tile ic="📦" l={prepDay ? `Commandes du ${formatDateShort(prepDay)}` : 'Prochaine distrib'} v={po == null ? '…' : poR.length} sub={sitesOf(poR).slice(0, 6).map(([s, n]) => `${s} ${n}`).join(' · ')} color="#1565c0" />
+            <Tile ic="🛍️" l="Distribution du jour" v={to == null ? '…' : toR.length} sub={toR.length ? sitesOf(toR).slice(0, 6).map(([s, n]) => `${s} ${n}`).join(' · ') : 'pas de distribution aujourd\'hui'} on={() => go('masterrecap')} color="#8e24aa" />
+            <Tile ic="🍞" l="Pains à commander" v={po == null ? '…' : pains} sub="Brut de Pains → bon de commande" on={() => go('mpain')} color="#5d4037" />
+            <Tile ic="🏠" l="Livraison domicile" v={po == null ? '…' : domN} sub={domN ? (meta && (meta.domClosed || meta.closed) ? 'DOM clôturé → étiquettes' : 'DOM en préparation') : 'aucune'} on={() => go('mdom')} color="#ef6c00" />
+          </div>
+
+          <div className="card" style={{ padding: '12px 14px' }}>
+            <div style={{ fontSize: 17, fontWeight: 900, marginBottom: 6 }}>📌 À traiter {todo.length ? <span className="badge" style={{ background: todo.some(x => x.lv === 'red') ? 'var(--danger)' : '#ef6c00', color: '#fff' }}>{todo.length}</span> : null}</div>
+            {!todo.length && <div style={{ fontSize: 14, color: 'var(--accent-dark)', fontWeight: 700 }}>✓ Rien d'urgent.</div>}
+            {todo.map((x, i) => (
+              <div key={i} onClick={x.on} style={{ cursor: 'pointer', display: 'flex', gap: 10, alignItems: 'center', padding: '10px 12px', borderRadius: 10, marginTop: 6, background: LV[x.lv][0], borderLeft: '5px solid ' + LV[x.lv][1] }}>
+                <span style={{ fontSize: 22 }}>{x.ic}</span>
+                <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 800, fontSize: 15 }}>{x.t}</div>{x.d && <div style={{ fontSize: 12, color: 'var(--ink-soft)', wordBreak: 'break-word' }}>{x.d}</div>}</div>
+                <span style={{ fontSize: 18, color: LV[x.lv][1] }}>›</span>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
+            {[['🍞', 'Commande pain', () => go('mpain')], ['🏷️', 'Étiquettes DOM', () => go('mdom')], ['🥬', 'F&L / Rungis', () => go('fl')], ['📥', 'Chargement', () => go('admin')], ['📣', 'Push équipes', () => go('push')], ['📜', 'Historique prépa', () => goSub('histo')]].map(([ic, l, on]) => (
+              <button key={l} className="btn-secondary" onClick={on} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: '12px 6px', fontWeight: 800 }}><span style={{ fontSize: 24 }}>{ic}</span>{l}</button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 18, fontWeight: 900, margin: '6px 0 -4px' }}>🟢 En direct</div>
+          <KbLivePage />
+        </div>
+      );
+    }
+
+    // ============================================================
     // V10.02 (+) — 🟢 QUI FAIT QUOI (live) — Master › Pilotage
     //   Lit kb_presence (battement 60 s de chaque appareil + tâche en cours : produit de prépa, retraits distrib,
     //   retours PDP) et ~prep_<jour> (avancement prépa par lieu), + les dernières actions de prépa (journal
@@ -20283,10 +20584,161 @@
     }
 
     // Onglet F&L (master) : Rajout F&L en haut + MAJ FL (Rungis) en dessous.
+    // ============================================================
+    // V10.02 (+) — F&L › 🔎 CONTRÔLE INFO DU SHEET « COMMANDE FL » (Probon)
+    //   Sans UNITE DE VENTE / TYPE / MU EN KILO, la prépa ne peut pas faire la MU ; sans COL (colisage),
+    //   le calcul des colis Rungis / rajouts est impossible. Le master choisit le type (sachet, botte,
+    //   pièce, paquet) + fourchette de poids en grammes → l'appli écrit dans le Sheet :
+    //     UNITE DE VENTE = « type (bas g-haut g) » · TYPE = SACHET/BOTTE/PIECE/PAQUET
+    //     MU EN KILO = moyenne (bas + haut) / 2, en KILO (ex. 450-550 g → 0,5 — même règle que les lignes existantes)
+    //     COL = colisage saisi.
+    //   Écriture : action proxy FL « fl_set_info » (KBG_FL_SetInfo.gs à ajouter au projet FL_Probon_Proxy).
+    // ============================================================
+    const KB_FL_TYPES = [['sachet', 'SACHET', '🛍️'], ['botte', 'BOTTE', '🌿'], ['pièce', 'PIECE', '🥦'], ['paquet', 'PAQUET', '📦']];
+    function kbFlInfoIssues(rows, withInactive) {
+      if (!rows || rows.length < 2) return [];
+      const H = rows[0].map(x => _flNorm(String(x || '')));
+      const col = (al) => { for (const a of al) { const i = H.indexOf(_flNorm(a)); if (i >= 0) return i; } return -1; };
+      const iP = col(['producteur']), iD = col(['designation']), iUv = col(['unite de vente', 'uv']), iT = col(['type']), iMu = col(['mu en kilo', 'mu en kg']), iC = col(['col', 'colisage']), iA = col(['actif ?', 'actif']), iId = col(['id site kbg']);
+      const out = [];
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r] || []; const des = String(row[iD] || '').trim(); if (!des) continue;
+        const actif = iA < 0 || /^actif/i.test(String(row[iA] || '').trim());
+        if (!actif && !withInactive) continue;
+        const uv = String(row[iUv] || '').trim(), type = String(row[iT] || '').trim(), mu = String(row[iMu] == null ? '' : row[iMu]).trim(), colis = String(row[iC] == null ? '' : row[iC]).trim();
+        const muN = parseFloat(mu.replace(',', '.'));
+        const miss = [], warn = [];
+        if (!uv) miss.push('UNITE DE VENTE'); else if (!/\(\s*\d/.test(uv) && !/\d\s*(g|kg)\b/i.test(uv)) warn.push('UNITE DE VENTE sans poids');
+        if (!type) miss.push('TYPE');
+        if (!mu || !(muN > 0)) miss.push('MU EN KILO');
+        if (!colis || !(parseFloat(colis.replace(',', '.')) > 0)) miss.push('COL (colisage)');
+        if (miss.length || warn.length) out.push({ row: r + 1, producer: String(row[iP] || '').trim(), des, uv, type, mu, colis, actif, id: iId >= 0 ? String(row[iId] || '').trim() : '', miss, warn });
+      }
+      // bloquants (MU) d'abord, puis colisage seul, puis format
+      const rank = (x) => x.miss.some(m => m !== 'COL (colisage)') ? 0 : x.miss.length ? 1 : 2;
+      return out.sort((a, b) => (b.actif - a.actif) || rank(a) - rank(b) || a.producer.localeCompare(b.producer) || a.des.localeCompare(b.des));
+    }
+    // fourchette déjà écrite « sachet (450g-550g) » / « pièce (900g-1.1 kg) » → { type, bas, haut } (pré-remplissage)
+    function kbFlParseUv(uv) {
+      const s = String(uv || '').toLowerCase();
+      const t = KB_FL_TYPES.find(([k]) => _flNorm(s).startsWith(_flNorm(k)));
+      const g = (n, u) => { const v = parseFloat(String(n).replace(',', '.')); return isNaN(v) ? '' : Math.round(/kg/.test(u || '') ? v * 1000 : v); };
+      const m = s.match(/(\d+(?:[.,]\d+)?)\s*(kg|g)?\s*-\s*(\d+(?:[.,]\d+)?)\s*(kg|g)/);
+      const one = !m && s.match(/(\d+(?:[.,]\d+)?)\s*(kg|g)\b/);
+      return { type: t ? t[0] : '', bas: m ? g(m[1], m[2] || m[4]) : (one ? g(one[1], one[2]) : ''), haut: m ? g(m[3], m[4]) : (one ? g(one[1], one[2]) : '') };
+    }
+    function kbFlMuKilo(bas, haut) { const b = Number(bas) || 0, h = Number(haut) || 0; if (!(b > 0 && h > 0)) return null; return Math.round(((b + h) / 2) / 1000 * 1000) / 1000; }
+    function FlInfoControlCard({ session, onCount }) {
+      const showToast = React.useContext(ToastContext);
+      const [rows, setRows] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [withInactive, setWithInactive] = React.useState(false);
+      const [edit, setEdit] = React.useState(null); // { it, type, bas, haut, colis }
+      const [busy, setBusy] = React.useState(false);
+      const [open, setOpen] = React.useState(false);
+      const load = React.useCallback(async () => {
+        setErr('');
+        try { const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }); if (!d || !d.ok) throw new Error((d && d.error) || 'lecture impossible'); setRows(d.rows || []); }
+        catch (e) { setErr(e.message); }
+      }, []);
+      React.useEffect(() => { load(); }, [load]);
+      const issues = React.useMemo(() => kbFlInfoIssues(rows, withInactive), [rows, withInactive]);
+      const nAct = React.useMemo(() => kbFlInfoIssues(rows, false).length, [rows]);
+      React.useEffect(() => { if (onCount && rows) onCount(nAct); try { if (rows) localStorage.setItem('kb_fl_info_n', String(nAct)); } catch (_) {} }, [nAct, rows]);
+      const startEdit = (it) => { const p = kbFlParseUv(it.uv); setEdit({ it, type: p.type || (KB_FL_TYPES.find(([k, K]) => _flNorm(K) === _flNorm(it.type)) || [''])[0], bas: p.bas, haut: p.haut, colis: it.colis && parseFloat(it.colis.replace(',', '.')) > 0 ? it.colis : '' }); };
+      const mu = edit ? kbFlMuKilo(edit.bas, edit.haut) : null;
+      const uvTxt = edit && edit.type && mu ? `${edit.type} (${Number(edit.bas)}g-${Number(edit.haut)}g)` : '';
+      const save = async () => {
+        const e = edit; if (!e) return;
+        if (!e.type) { showToast('Choisis le type'); return; }
+        if (!mu) { showToast('Fourchette de poids en grammes : bas et haut'); return; }
+        if (Number(e.bas) > Number(e.haut)) { showToast('La fourchette basse doit être ≤ la haute'); return; }
+        const needCol = e.it.miss.includes('COL (colisage)');
+        const colN = parseFloat(String(e.colis || '').replace(',', '.'));
+        if (needCol && !(colN > 0)) { showToast('Indique le colisage (COL)'); return; }
+        setBusy(true);
+        try {
+          const fields = { uv: uvTxt, type: (KB_FL_TYPES.find(([k]) => k === e.type) || [])[1], muKilo: mu };
+          if (colN > 0) fields.col = colN;
+          const r = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_set_info', tab: FL_SHEET_TAB, row: e.it.row, des: e.it.des, fields, by: session && session.name });
+          if (!r || r.ok === false) throw new Error((r && r.error) || 'réponse vide');
+          showToast(`✓ ${e.it.des} : ${uvTxt} · MU ${String(mu).replace('.', ',')} kg${colN > 0 ? ' · COL ' + colN : ''}`);
+          setEdit(null); load();
+        } catch (x) {
+          const m = x.message || String(x);
+          showToast(/inconnue|unknown|action/i.test(m) ? '⚠️ Le proxy FL ne connaît pas encore « fl_set_info » : ajouter KBG_FL_SetInfo.gs puis Nouvelle version (voir doc).' : 'Erreur : ' + m);
+        } finally { setBusy(false); }
+      };
+      const inp = { width: '100%', boxSizing: 'border-box', padding: '10px', fontSize: 18, borderRadius: 10, border: '2px solid var(--line)', textAlign: 'center' };
+      return (
+        <div className="card" style={{ border: '3px solid ' + (nAct ? 'var(--danger)' : 'var(--accent)'), padding: '12px 14px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', cursor: 'pointer' }} onClick={() => setOpen(o => !o)}>
+            <strong style={{ fontSize: 16 }}>🔎 Contrôle info du Sheet COMMANDE FL</strong>
+            {rows == null && !err && <span style={{ fontSize: 13 }}>lecture…</span>}
+            {rows && <span className="badge" style={{ background: nAct ? 'var(--danger)' : 'var(--accent)', color: '#fff', fontWeight: 900, fontSize: 14 }}>{nAct ? `${nAct} produit(s) actif(s) à compléter` : '✓ tout est complet'}</span>}
+            <span style={{ marginLeft: 'auto', fontSize: 13 }}>{open ? '▾' : '▸'}</span>
+          </div>
+          {err && <div style={{ color: 'var(--danger)', fontSize: 13, marginTop: 6 }}>⚠️ {err}</div>}
+          {open && <>
+            <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0' }}>Sans <b>UNITE DE VENTE</b>, <b>TYPE</b> et <b>MU EN KILO</b>, la prépa ne peut pas faire la MU. Sans <b>COL</b> (colisage), pas de calcul de colis pour Rungis / les rajouts. Clique un produit pour compléter : l'appli écrit directement dans le Sheet.</p>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+              <label style={{ fontSize: 13, display: 'flex', gap: 6, alignItems: 'center' }}><input type="checkbox" checked={withInactive} onChange={e => setWithInactive(e.target.checked)} /> Inclure les produits non actifs</label>
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={load}>↻ Relire le Sheet</button>
+            </div>
+            {issues.length === 0 && rows && <div style={{ fontSize: 14, color: 'var(--accent-dark)', fontWeight: 700 }}>✓ Rien à compléter.</div>}
+            {issues.map(it => (
+              <div key={it.row} onClick={() => startEdit(it)} style={{ cursor: 'pointer', padding: '8px 10px', borderRadius: 10, marginTop: 6, border: '2px solid ' + (it.miss.some(m => m !== 'COL (colisage)') ? 'var(--danger)' : it.miss.length ? '#ef6c00' : 'var(--line)'), background: it.actif ? '#fff' : '#f5f5f5' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                  <strong style={{ fontSize: 15 }}>{it.des}</strong><span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{it.producer} · ligne {it.row}{it.actif ? '' : ' · non actif'}</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 13, fontWeight: 800, color: 'var(--accent-dark)' }}>✏️ Compléter</span>
+                </div>
+                <div style={{ fontSize: 12, marginTop: 3 }}>
+                  {it.miss.map(m => <span key={m} className="badge" style={{ background: m === 'COL (colisage)' ? '#ef6c00' : 'var(--danger)', color: '#fff', marginRight: 4 }}>manque {m}</span>)}
+                  {it.warn.map(m => <span key={m} className="badge" style={{ background: 'var(--warn-soft)', color: 'var(--warn)', marginRight: 4 }}>{m}</span>)}
+                  <span style={{ color: 'var(--ink-mute)' }}> UV « {it.uv || '—'} » · TYPE « {it.type || '—'} » · MU « {it.mu || '—'} » · COL « {it.colis || '—'} »</span>
+                </div>
+              </div>
+            ))}
+          </>}
+          {edit && (
+            <KbSheet title={`Compléter · ${edit.it.des}`} onClose={() => setEdit(null)}>
+              <div style={{ padding: '10px 14px 16px' }}>
+                <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 8 }}>{edit.it.producer} · ligne {edit.it.row} du Sheet</div>
+                <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 6 }}>1. Type</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
+                  {KB_FL_TYPES.map(([k, K, ic]) => (
+                    <button key={k} onClick={() => setEdit(e => ({ ...e, type: k }))} className={edit.type === k ? 'btn-primary' : 'btn-secondary'}
+                      style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '10px 4px', fontSize: 14, fontWeight: 800 }}><span style={{ fontSize: 22 }}>{ic}</span>{k}</button>
+                  ))}
+                </div>
+                <div style={{ fontWeight: 800, fontSize: 14, margin: '12px 0 6px' }}>2. Poids d'une unité (grammes)</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <label style={{ fontSize: 12, fontWeight: 700 }}>Fourchette BASSE (g)<input style={inp} type="number" inputMode="numeric" value={edit.bas} onChange={e => setEdit(x => ({ ...x, bas: e.target.value }))} placeholder="450" /></label>
+                  <label style={{ fontSize: 12, fontWeight: 700 }}>Fourchette HAUTE (g)<input style={inp} type="number" inputMode="numeric" value={edit.haut} onChange={e => setEdit(x => ({ ...x, haut: e.target.value }))} placeholder="550" /></label>
+                </div>
+                <div style={{ fontWeight: 800, fontSize: 14, margin: '12px 0 6px' }}>3. Colisage (COL){edit.it.miss.includes('COL (colisage)') ? ' — obligatoire' : ' — facultatif'}</div>
+                <input style={inp} type="number" inputMode="decimal" value={edit.colis} onChange={e => setEdit(x => ({ ...x, colis: e.target.value }))} placeholder={edit.type === 'sachet' || edit.type === 'paquet' ? 'kg par colis (ex. 5)' : 'unités par colis (ex. 12)'} />
+                <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 4 }}>Sachet : kilos par colis (le nombre de colis = sachets × MU en kilo ÷ COL). Pièce / botte / paquet : unités par colis.</div>
+                <div style={{ marginTop: 12, padding: 10, borderRadius: 10, background: 'var(--accent-soft)', fontSize: 14, lineHeight: 1.6 }}>
+                  <b>Sera écrit dans le Sheet :</b><br />
+                  UNITE DE VENTE : <b>{uvTxt || '—'}</b><br />
+                  TYPE : <b>{edit.type ? (KB_FL_TYPES.find(([k]) => k === edit.type) || [])[1] : '—'}</b><br />
+                  MU EN KILO : <b>{mu ? String(mu).replace('.', ',') : '—'}</b> <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>(moyenne {mu ? Math.round(mu * 1000) : '…'} g)</span><br />
+                  COL : <b>{parseFloat(String(edit.colis || '').replace(',', '.')) > 0 ? edit.colis : (edit.it.colis || '—')}</b>
+                </div>
+                <button className="btn-primary btn-block" disabled={busy} onClick={save} style={{ marginTop: 12, fontSize: 17, padding: 14 }}>{busy ? 'Écriture…' : '✓ Écrire dans le Sheet'}</button>
+              </div>
+            </KbSheet>
+          )}
+        </div>
+      );
+    }
+
     function FLPage({ session }) {
       return (
         <div className="stack">
           <h1 style={{ margin: '0 0 4px' }}>🥬 Fruits &amp; Légumes</h1>
+          <FlInfoControlCard session={session} />
           <FlRuptureCard session={session} />
           <FLMajPage session={session} />
         </div>
@@ -20329,7 +20781,10 @@
       const [psStatus, setPsStatus] = React.useState(null);
       React.useEffect(() => { (async () => { try { const d = await storage.getDoc('app_config', 'kbprepa'); if (d) { if (d.url && !psUrl) setPsUrl(d.url); if (typeof d.test === 'boolean') setPsTest(d.test); setPsAuto(d.auto !== false); } } catch (_) {} })(); }, []);
       React.useEffect(() => storage.subscribe('app_config', arr => setPsStatus(arr.find(d => d.id === 'kbprepa_status') || null)), []);
-      const [v4Result, setV4Result] = React.useState(null);   // {orders, missingConsumers, missingProducts}
+      // V10.02 (+) — résultat du dernier chargement MÉMORISÉ (la page se recharge 1 s après un chargement pour une autre date :
+      //   avant, l'alerte rouge « N client(s) inconnu(s) » disparaissait aussitôt). Reste affiché jusqu'à ✕.
+      const [v4Result, setV4ResultRaw] = React.useState(() => { try { const r = JSON.parse(localStorage.getItem('kb_v4_last') || 'null'); return r && r.dayKey ? r : null; } catch (_) { return null; } });
+      const setV4Result = (r) => { setV4ResultRaw(r); try { r ? localStorage.setItem('kb_v4_last', JSON.stringify({ ...r, at: r.at || Date.now() })) : localStorage.removeItem('kb_v4_last'); } catch (_) {} };
       const [showSecours, setShowSecours] = React.useState(false); // ancien chargement PDF/CSV (repli)
 
       // --- Historique CA en masse (gros export commandes multi-dates) ---
@@ -20484,8 +20939,11 @@
             count: res.orders.length,
             missingConsumers: [...res.missingConsumers],
             missingProducts: [...res.missingProducts],
-            dayKey,
+            dayKey, at: Date.now(),
           });
+          if (res.missingConsumers.size || res.missingProducts.size || (res.missingConsumers.length || res.missingProducts.length)) {
+            try { alert(`⚠️ Chargement OK mais données manquantes :\n${(res.missingConsumers.size || res.missingConsumers.length || 0)} client(s) inconnu(s) → recharger « Consommateurs »\n${(res.missingProducts.size || res.missingProducts.length || 0)} produit(s) inconnu(s) → recharger « Produits »\n\n(Le message reste affiché sur la page Chargement.)`); } catch (_) {}
+          }
           showToast(`✓ ${res.orders.length} commandes chargées`);
           if (dayKey !== todayKey()) {
             setTimeout(() => window.location.reload(), 1200);
@@ -20835,15 +21293,22 @@
 
             {v4Result && (
               <div style={{marginTop:10}}>
-                <div className="alert-success">✓ {v4Result.count} commandes chargées (jour {v4Result.dayKey})</div>
+                <div className="alert-success" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                  <span>✓ {v4Result.count} commandes chargées (distribution du {formatDateShort(v4Result.dayKey)}){v4Result.at ? ` · chargé à ${new Date(v4Result.at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'})}` : ''}</span>
+                  <button className="btn-ghost" style={{padding:'2px 8px',fontSize:13}} onClick={() => setV4Result(null)} title="Masquer">✕</button>
+                </div>
                 {(v4Result.missingConsumers.length > 0 || v4Result.missingProducts.length > 0) && (
                   <div className="alert-red" style={{marginTop:6,fontSize:13}}>
                     <div style={{fontWeight:800,marginBottom:4}}>⚠️ Données manquantes — recharge les fichiers à jour</div>
                     {v4Result.missingProducts.length > 0 && (
-                      <div>• <strong>{v4Result.missingProducts.length} produit(s) inconnu(s)</strong> → charge le fichier <strong>Produits</strong> (MAJ), puis recharge les <strong>Commandes</strong>.</div>
+                      <div>• <strong>{v4Result.missingProducts.length} produit(s) inconnu(s)</strong> → charge le fichier <strong>Produits</strong> (MAJ), puis recharge les <strong>Commandes</strong>.
+                        <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:2,wordBreak:'break-word'}}>{v4Result.missingProducts.slice(0, 15).map(String).join(' · ')}{v4Result.missingProducts.length > 15 ? ' …' : ''}</div>
+                      </div>
                     )}
                     {v4Result.missingConsumers.length > 0 && (
-                      <div>• <strong>{v4Result.missingConsumers.length} client(s) inconnu(s)</strong> → charge le fichier <strong>Consommateurs</strong> (MAJ), puis recharge les <strong>Commandes</strong>.</div>
+                      <div>• <strong>{v4Result.missingConsumers.length} client(s) inconnu(s)</strong> → charge le fichier <strong>Consommateurs</strong> (MAJ), puis recharge les <strong>Commandes</strong>.
+                        <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:2,wordBreak:'break-word'}}>{v4Result.missingConsumers.slice(0, 15).map(String).join(' · ')}{v4Result.missingConsumers.length > 15 ? ' …' : ''}</div>
+                      </div>
                     )}
                     <div style={{marginTop:4,color:'var(--ink-soft)'}}>Tant que ce n'est pas rechargé, ces lignes s'affichent en « inconnu ».</div>
                   </div>
@@ -23295,6 +23760,7 @@
       });
       // Popup de confirmation d'identité (de temps en temps, pas à chaque ouverture)
       const [confirmName, setConfirmName] = React.useState(false);
+      const [idleLock, setIdleLock] = React.useState(false); // V10.02 (+) — re-saisie du code après 10 min sans activité (prépa / distrib)
       const [tab, setTab] = React.useState('clients');
       // V9.91 — navigation demandée par une popup (ex. clôture bloquée → Retours PDP / DLC)
       React.useEffect(() => { const h = (e) => { if (e && e.detail) setTab(e.detail); }; window.addEventListener('kb-go-tab', h); return () => window.removeEventListener('kb-go-tab', h); }, []);
@@ -23432,7 +23898,7 @@
         if (!session) return;
         if (!(session.role === 'master' || session.isMaster)) return;
         if (viewAs === 'distrib' || viewAs === 'prep') return; // en vue distrib/prépa : on laisse Clients/Clôture
-        if (tab === 'clients' || tab === 'closure') setTab('masterrecap');
+        if (tab === 'clients' || tab === 'closure') setTab('today'); // V10.02 (+) — accueil master = « Aujourd'hui »
       }, [session, tab, viewAs]);
 
       // V9.53 — Synchro PrestaShop automatique sur les postes Master et Prépa (auto-limitée à 1 appel / 15 min).
@@ -23557,7 +24023,7 @@
         setCurrentSite(s.site);
         // Tab par défaut selon le rôle
         if (s.role === 'prep') setTab('prepajour');
-        else if (s.role === 'master' || s.isMaster) setTab('masterrecap');
+        else if (s.role === 'master' || s.isMaster) setTab('today');
         else setTab('clients');
       };
       const handleLogout = () => {
@@ -23586,6 +24052,28 @@
         reset();
         return () => { if (timer) clearTimeout(timer); evs.forEach(e => window.removeEventListener(e, reset)); };
       }, [loggedIn]);
+
+      // V10.02 (+) — PRÉPA & DISTRIB : 10 min sans activité → écran « 🔒 Qui est là ? » : chacun retape SON code.
+      //   Même code → on reprend ; code d'un collègue → la session passe à son nom (traçabilité « qui a fait quoi »).
+      //   Pas sur le poste synchro ancien site ni pour le master (même en vue prépa/distrib).
+      const staffRole = session && !session.isMaster && (session.role === 'prep' || session.role === 'distrib') ? session.role : null;
+      React.useEffect(() => {
+        if (!staffRole) { setIdleLock(false); return; }
+        let timer = null;
+        const reset = () => { if (timer) clearTimeout(timer); timer = setTimeout(() => { if (window.__kbSyncPoste) return reset(); setIdleLock(true); }, KB_IDLE_LOCK_MS); };
+        const evs = ['mousedown', 'keydown', 'touchstart', 'click', 'scroll'];
+        evs.forEach(e => window.addEventListener(e, reset, { passive: true }));
+        reset();
+        return () => { if (timer) clearTimeout(timer); evs.forEach(e => window.removeEventListener(e, reset)); };
+      }, [staffRole]);
+      const unlockIdle = (r) => {
+        setIdleLock(false);
+        if (r && r.name && r.name !== session.name) {
+          const upd = { ...session, name: r.name, uid: r.uid || session.uid, confirmedAt: new Date().toISOString(), lastSeen: new Date().toISOString() };
+          try { localStorage.setItem('kb_session_v3', JSON.stringify(upd)); } catch (e) {}
+          setSession(upd);
+        }
+      };
 
       // Rafraîchit lastSeen et décide quand redemander « tu es bien X ? ».
       // On redemande au plus une fois toutes les ~18h d'usage, et seulement
@@ -23760,6 +24248,7 @@
 
       // Overlays plein écran, priorité : confirmation prénom → push → relance bloquante
       const overlay = (() => {
+        if (idleLock && staffRole) return <KbIdleLockOverlay session={session} onUnlock={unlockIdle} onLogout={() => { setIdleLock(false); handleLogout(); }} />;
         if (confirmName) {
           return <ConfirmNameOverlay session={session} onYes={confirmIdentityYes} onNo={confirmIdentityNo} />;
         }
@@ -23949,6 +24438,9 @@
           {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
           {tab === 'suivi' && effSession.isMaster && <SuiviGeneralPage session={effSession} />}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
+          {tab === 'today' && effSession.isMaster && <KbTodayPage session={effSession} setTab={setTab} />}
+          {tab === 'mpain' && effSession.isMaster && <PrintPainPage session={effSession} master />}
+          {tab === 'mdom' && effSession.isMaster && <PrintLabelsPage session={effSession} embedded />}
           {/* anciennes routes conservées (compat liens internes), regroupées désormais sous « Suivi général » */}
           {tab === 'casuivi' && effSession.isMaster && <CaSuiviPage session={effSession} />}
           {tab === 'manqhist' && effSession.isMaster && <ManquantsHistoryPage session={effSession} />}
@@ -23994,6 +24486,11 @@
               </button>
             )}
             {effSession.isMaster && (
+              <button className={tab==='today'?'active':''} onClick={()=>setTab('today')}>
+                <span className="tab-icon">🏠</span>Aujourd'hui
+              </button>
+            )}
+            {effSession.isMaster && (
               <button className={tab==='push'?'active':''} onClick={()=>setTab('push')}>
                 <span className="tab-icon">📣</span>Push
               </button>
@@ -24036,6 +24533,7 @@
       lieux: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zm0-8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', cmails: 'M3 6h18v12H3zm0 0 9 7 9-7', ancien: 'M4 4v6h6M20 20v-6h-6M5 15a8 8 0 0 0 14 2M19 9A8 8 0 0 0 5 7',
       out: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4m7 14 5-5-5-5m5 5H9',
       live: 'M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8',
+      today: 'M3 12h4l3-8 4 16 3-8h4', pain: 'M5 11a7 4 0 0 1 14 0v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2zM9 9v3m3-4v4m3-3v3', dom: 'M3 11 12 4l9 7M5 10v10h14V10M10 20v-5h4v5',
     };
     const KbIco = ({ k }) => <svg viewBox="0 0 24 24" aria-hidden="true"><path d={KB_IC[k] || KB_IC.ca} /></svg>;
     function KbMasterSidebar({ tab, setTab, session, onLogout }) {
@@ -24052,12 +24550,15 @@
       return (
         <nav className="kb-side" aria-label="Navigation master">
           <div className="kb-side-brand"><div className="kb-side-logo">K</div><div><b>Kelbongoo</b><small>Master · {APP_VERSION}</small></div></div>
+          <Item k="today" label="Aujourd'hui" on={tab === 'today'} onClick={() => goTab('today')} />
           <div className="kb-side-sec">Pilotage</div>
           {P('ca', 'Suivi CA')}{P('stats', 'Statistiques')}{P('manq', 'Manquants & remises')}{P('pertes', 'Pertes ROB')}{P('live', '🟢 Qui fait quoi')}{P('histo', 'Historique')}
           <div className="kb-side-sec">Opérations</div>
           <Item k="push" label="Push équipes" on={tab === 'push'} onClick={() => goTab('push')} />
           <Item k="recap" label="Récap du jour" on={tab === 'masterrecap'} onClick={() => goTab('masterrecap')} />
           <Item k="fl" label="Fruits & légumes" on={tab === 'fl'} onClick={() => goTab('fl')} />
+          <Item k="pain" label="Commande pain" on={tab === 'mpain'} onClick={() => goTab('mpain')} />
+          <Item k="dom" label="Étiquettes livraison DOM" on={tab === 'mdom'} onClick={() => goTab('mdom')} />
           <Item k="load" label="Chargement" on={tab === 'admin'} onClick={() => goTab('admin')} />
           <div className="kb-side-sec">Outils</div>
           {P('temp', 'Température')}{P('codes', 'Codes-barres')}{P('dromy', 'Dromy')}{P('lieux', 'Lieux & horaires')}{P('cmails', 'Mails clients', !!mailErr)}{P('ancien', 'Ancien site')}
