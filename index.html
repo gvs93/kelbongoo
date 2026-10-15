@@ -755,7 +755,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V9.99';
+    const APP_VERSION = 'V10.00';
+    // V10.00 — Prépa › Manquants & ND › 🚚 Dernière minute : la quantité PAR LIEU en GROS (couleur du lieu), le total en petit.
+    //   DOM (livraison à domicile) : PAS de ND → chaque produit va DIRECTEMENT dans le carton du client (CARTON n° en gros,
+    //   « si plein → » autres cartons). Vaut aussi pour Prépa du jour (plus de cagette ND pour DOM), ND du jour et les mails.
+    //   Fragiles (salade, herbes, fraises, champignons…) : bouton « 🧺 En casier » dans ND du jour (même doc nx| que Prépa du jour) ;
+    //   bloc « Mis en CASIER » avec ↩ retour cagette. applyPrepToOrder applique enfin nx|/nd| (distrib = même vérité que la prépa).
+    //   Distrib : un ND passé en 🟣 n'apparaît plus deux fois (vert « à donner en plus » + rouge dernière minute).
     // V9.99 (++) — Prépa › Manquants & ND : onglets dans l'ordre 🚚 Dernière minute · 📦 Manquants · 🥬 ND du jour · 🏷️ Remisés.
     //   ND du jour inclut TOUTE la dernière minute (🟣 certaine prépa + 🚚 camion), même attribution que la distrib
     //   (kbLmAttribution) → plus de doublon : un ND passé en 🟣 (ex. chou) sort du ND normal et apparaît UNE fois en
@@ -1346,6 +1352,9 @@
     // V9.81 — Nom produit affiché : retire les mentions internes du catalogue de l'ancien site
     // (« (à supprimer) », « (a supprimer) »…) qui font croire au distributeur qu'il faut retirer le produit.
     function kbProdName(n) { return String(n || '').replace(/\s*[\(\[]\s*(?:à|a)\s+supprimer\s*[\)\]]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim(); }
+    // V10.00 — produits FRAGILES (détectés au nom) : en prépa, possibilité de les mettre en CASIER plutôt qu'en cagette ND
+    const KB_FRAGILE_RX = /\b(salade|laitue|batavia|sucrine|scarole|frisee|feuille de chene|lollo|romaine|mache|roquette|mesclun|pousses?|cresson|epinards?|herbes?|persil|coriandre|basilic|ciboulette|menthe|aneth|cerfeuil|estragon|oseille|fraises?|framboises?|mures?|myrtilles?|groseilles?|cassis|cerises?|champignons?|pleurotes?|shiitake|fleurs?|figues?|abricots?|peches?|brugnons?|nectarines?)\b/;
+    function kbIsFragile(n) { return KB_FRAGILE_RX.test(normalizeText(kbProdName(n))); }
     // Pastille quantité : grosse et rouge dès qu'il faut en donner plus d'un.
     function KbQty({ q, big }) {
       const n = Number(q) || 1; const many = n > 1;
@@ -2826,7 +2835,7 @@
 
     // Reconstruit l'état prépa (day_X_prep, écriture par clé) en maps status/remiseAll/remiseCli.
     function parsePrepDocs(arr) {
-      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {}, lm = {}, lmKo = {};
+      const status = {}, remiseAll = {}, remiseCli = {}, posedN = {}, casiers = {}, lm = {}, lmKo = {}, ndForce = {}, ndOff = {};
       for (const d of (arr || [])) {
         const id = d.id; if (!id || id === 'counters' || id === 'meta') continue;
         const bar = id.indexOf('|'); if (bar < 0) continue;
@@ -2836,8 +2845,12 @@
         else if (pfx === 'rc') remiseCli[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'ra') remiseAll[key] = { pct: d.pct, reason: d.reason };
         else if (pfx === 'lm') lm[key] = true; // V9.87 — produit passé en « 🟣 Dispatch dernière minute » à la prépa (site||produit)
+        // V10.00 — ND de la Prépa du jour : nd|site||produit = cagette ND (forcée ou comptée), nx|site||produit = ND repassé EN CASIER.
+        //   (les docs « ✓ Fait » nd|site||n|l||produit ont v:'done' et 3 segments → ignorés ici)
+        else if (pfx === 'nd') { if (d.v !== 'done' && key.split('||').length === 2) ndForce[key] = true; }
+        else if (pfx === 'nx') ndOff[key] = true;
       }
-      return { status, remiseAll, remiseCli, posedN, casiers, lm, lmKo };
+      return { status, remiseAll, remiseCli, posedN, casiers, lm, lmKo, ndForce, ndOff };
     }
     // V9.79 — rupture PARTIELLE : quantité manquante d'une ligne (0 si pas en partiel)
     function kbPartMiss(prep, k, qty) {
@@ -2876,7 +2889,10 @@
       const hasStatus = prep.status && Object.keys(prep.status).length;
       const hasRem = (prep.remiseCli && Object.keys(prep.remiseCli).length) || (prep.remiseAll && Object.keys(prep.remiseAll).length);
       const hasLm = prep.lm && Object.keys(prep.lm).length;
-      if (!hasStatus && !hasRem && !hasLm) return o;
+      // V10.00 — cagette ND : pas de ND en livraison à domicile (DOM = cartons) ; ND repassé en casier (fragiles…) ; ND forcé
+      const isDom = String(site || '').toUpperCase() === 'DOM';
+      const hasNdx = (prep.ndOff && Object.keys(prep.ndOff).length) || (prep.ndForce && Object.keys(prep.ndForce).length) || (isDom && (o.items || []).some(i => i && i.cat === 'nd'));
+      if (!hasStatus && !hasRem && !hasLm && !hasNdx) return o;
       const items = [], removed = [...(o.removed || [])], reduced = [...(o.reduced || [])];
       for (let it of (o.items || [])) {
         const k = site + '||' + client + '||' + it.produit;
@@ -2892,6 +2908,10 @@
         if (rc && rc.pct) reduced.push({ ...it, percentage: rc.pct });
         // V9.87 — produit attendu en dernière minute (pas posé à la prépa) : reste dans la commande, marqué _lm
         if (prep.lm && prep.lm[String(site || '').toUpperCase() + '||' + it.produit]) it = { ...it, _lm: true };
+        // V10.00 — ND → casier (DOM : toujours dans le carton ; ailleurs : « 🧺 En casier » choisi en prépa) / casier → ND forcé
+        const pkn = String(site || '').toUpperCase() + '||' + it.produit;
+        if (it.cat === 'nd' && (isDom || (prep.ndOff && prep.ndOff[pkn] && !(prep.ndForce && prep.ndForce[pkn])))) it = { ...it, cat: 'frais', _ndCasier: true, _ndCat: 'nd' };
+        else if (it.cat !== 'nd' && it.cat !== 'pain' && !isDom && prep.ndForce && prep.ndForce[pkn] && !(prep.lm && prep.lm[pkn])) it = { ...it, cat: 'nd', _ndForce: true };
         items.push(it);
       }
       const cat = (c) => items.filter(i => i.cat === c);
@@ -4281,7 +4301,8 @@
                     const casiersSec   = isV4 ? (o.casiersSec || [])   : (cd ? cd.sec.map(s => s.casier) : []);
                     // Pain / ND / frais
                     const pains      = isV4 ? (o.pains || []) : (cd ? cd.sec.flatMap(s => s.produits) : []);
-                    const ndItems    = isV4 ? (o.nds || [])   : [];
+                    // V10.00 — ND en dernière minute (🟣) : affiché UNE fois, dans l'encadré rouge (plus de doublon)
+                    const ndItems    = isV4 ? (o.nds || []).filter(p => !p._lm) : [];
                     const fraisItems = isV4 ? (o.frais || []) : (cd ? cd.frais.flatMap(f => f.produits) : []);
                     // Dispatch dernière minute pour les casiers de ce client (inchangé)
                     const lmItems = lmAttr.byClient[kbClientKey(o)] || [];
@@ -4345,7 +4366,7 @@
                               {lmItems.map((p, k) => (
                                 <div key={'lm'+k} style={{display:'flex',alignItems:'center',gap:8,padding:'2px 0'}}>
                                   <span style={{background:'#fff',color:'var(--danger)',borderRadius:6,padding:'0 8px',fontWeight:900,fontSize:17}}>{Number(p.qty)||1}×</span>
-                                  <span>{kbProdName(p.produit)}{p.certain && !lmItems.every(x => x.certain) ? ' (déjà facturé, ne pas rajouter)' : ''}</span>
+                                  <span>{kbProdName(p.produit)}{p.certain && !lmItems.every(x => x.certain) ? ' (déjà facturé, ne pas rajouter)' : ''}{p.certain && p.casier === 'ND' ? ' · 🥬 cagette ND' : ''}</span>
                                 </div>
                               ))}
                             </div>
@@ -12240,7 +12261,7 @@
           const K = c.site + '||' + c.name + '||' + it.product, PK = c.site + '||' + it.product;
           const rem = prep.remCli[K] || prep.remAll[PK];
           const line = { ...it, rem: rem ? { pct: rem.pct, reason: rem.reason } : null };
-          const ndOn = !!prep.nd[PK] || (it.cat === 'nd' && !prep.ndOff[PK] && !prep.lm[PK]);
+          const ndOn = c.site !== 'DOM' && (!!prep.nd[PK] || (it.cat === 'nd' && !prep.ndOff[PK] && !prep.lm[PK])); // V10.00 — DOM : pas de ND (cartons)
           // V9.91 — pain mis en dispatch dernière minute = certain (livré le lendemain matin) → compté dans la commande.
           if (prep.lm[PK] && it.cat === 'pain' && prep.status[K] !== 'rupture') { out.casier.push(line); return; }
           if (prep.lm[PK]) {
@@ -12664,8 +12685,9 @@
       // V9.79 — quantité manquante d'une ligne (rupture totale = qté, partielle = qté − posés)
       const missOf = (r) => { const x = prep.status[K(r)], q = r.qty || 1; if (x === 'rupture') return q; if (x === 'partiel') return Math.max(0, q - Math.min(q, (prep.count || {})[K(r)] || 0)); return 0; };
       // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
-      const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
-      const ndOn = (pk) => !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
+      // V10.00 — pas de ND en livraison à domicile (DOM) : tout va directement dans les CARTONS du client
+      const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd' && r.site !== 'DOM') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
+      const ndOn = (pk) => String(pk).indexOf('DOM||') !== 0 && (!!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]));
       const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
       // V9.77 — progression en RÉFÉRENCES : une référence est faite quand toutes ses lignes sont traitées
@@ -13003,7 +13025,7 @@
             </div>}
 
             <div className="pdj-arow">
-              <div className={"pdj-act nd"+(nd?" on":"")} onClick={()=>toggleND(pk)}>🔴 Cagette ND</div>
+              {site !== 'DOM' && <div className={"pdj-act nd"+(nd?" on":"")} onClick={()=>toggleND(pk)}>🔴 Cagette ND</div>}
               <div className={"pdj-act lm"+(lm?" on":"")} onClick={()=>toggleLM(pk)}>🟣 Dispatch dern. min.</div>
               <div className="pdj-act rupt" onClick={()=>ruptAll(site,product)}>🚫 Rupture tout</div>
               <div className="pdj-act more" onClick={()=>setMoreOpen(m=>({...m,[pk]:!m[pk]}))}>⋯ Autre</div>
@@ -13645,6 +13667,52 @@
       // V9.82 — commandes AVEC la prépa appliquée (ruptures marquées en prépa + casiers prépa) :
       // le dispatch dernière minute attribue ainsi le produit aux bons clients / bons casiers.
       const dayOrdersP = React.useMemo(() => (dayOrders || []).map(o => prepSt ? applyPrepToOrder(o, prepSt) : o), [dayOrders, prepSt]);
+      // V10.00 — LIVRAISON À DOMICILE : pas de ND → tout va DIRECTEMENT dans le carton du client.
+      // Cartons du client = même règle que les étiquettes / dispatch pain (casiers prépa, sinon JSON).
+      const domCartonsOf = (o) => kbClientCasiers((prepSt && prepSt.casiers) ? prepSt : { casiers: {} }, 'DOM', o.name || '(client)', o).slice().sort(casCmp);
+      // produit → [{ main, alts, qty }] (un carton principal par client ; « si plein » = ses autres cartons)
+      const domPlace = React.useMemo(() => {
+        const doms = (dayOrdersP || []).filter(o => String(o.site || '').toUpperCase() === 'DOM');
+        const byKey = {}; for (const o of doms) byKey[kbClientKey(o)] = o;
+        const a = kbLmAttribution(lastmin, 'DOM', doms);
+        const out = {}, left = {};
+        const push = (prod, o, q) => {
+          const k = normalizeText(kbProdName(prod)); const cs = o ? domCartonsOf(o) : [];
+          const main = cs[0] || '?', arr = out[k] || (out[k] = []);
+          const ex = arr.find(x => x.main === main); if (ex) ex.qty += q; else arr.push({ main, alts: cs.slice(1), qty: q, client: o ? (o.name || '') : '' });
+        };
+        for (const [k, arr] of Object.entries(a.byClient || {})) for (const e of arr) push(e.produit, byKey[k], Number(e.qty) || 0);
+        for (const e of (a.left || [])) { const k = normalizeText(kbProdName(e.produit)); left[k] = (left[k] || 0) + (Number(e.qty) || 0); }
+        for (const k of Object.keys(out)) out[k].sort((x, y) => casCmp(x.main, y.main));
+        return { out, left };
+      }, [dayOrdersP, lastmin, prepSt]);
+      const domWhere = (produit) => { const k = normalizeText(kbProdName(produit)); return { list: domPlace.out[k] || [], left: domPlace.left[k] || 0 }; };
+      // V10.00 — ND passé « 🧺 En casier » (fragiles) : même doc que Prépa du jour (nx|lieu||produit ; nd| supprimé)
+      const ndCatSet = React.useMemo(() => { const m = new Set(); for (const o of (dayOrders || [])) { const st = String(o.site || '').toUpperCase(); if (st === 'DOM') continue; for (const it of (o.items || [])) if (it && it.cat === 'nd') m.add(st + '||' + it.produit); } return m; }, [dayOrders]);
+      const ndEnCasier = React.useMemo(() => {
+        const by = {};
+        for (const o of (dayOrdersP || [])) {
+          const site = String(o.site || '').toUpperCase(); if (!site || site === 'DOM') continue;
+          const cas = (o.casiersFrais && o.casiersFrais[0]) || (o.casiersSec && o.casiersSec[0]) || '?';
+          for (const it of (o.items || [])) {
+            if (!it || !it._ndCasier) continue;
+            const r = ((by[site] = by[site] || {})[it.produit] = by[site][it.produit] || { produit: it.produit, qty: 0, cas: {} });
+            const q = Number(it.qty || it.quantity) || 1; r.qty += q; r.cas[cas] = (r.cas[cas] || 0) + q;
+          }
+        }
+        return by;
+      }, [dayOrdersP]);
+      const setNdCasier = async (pks, on) => {
+        const who = session.name || 'prépa';
+        try {
+          for (const pk of pks) {
+            const id = encodeURIComponent(pk);
+            if (on) { await storage.deleteDoc(`day_${day}_prep`, 'nd|' + id).catch(() => {}); await storage.setDoc(`day_${day}_prep`, 'nx|' + id, { on: true, by: who }, { replace: true }); }
+            else await storage.deleteDoc(`day_${day}_prep`, 'nx|' + id).catch(() => {});
+          }
+          showToast(on ? '🧺 Mis en CASIER : à poser dans les casiers des clients (Prépa du jour)' : '↩ Remis en cagette ND');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
 
       const setRemiseReason = async (r, reason) => {
         await storage.setDoc(`day_${day}_remises`, r.id, { ...r, reason });
@@ -13693,9 +13761,10 @@
             const k = site + '||' + client + '||' + it.produit, st = prepSt.status && prepSt.status[k];
             if (st === 'rupture' || st === 'partiel') continue;
             const pk = (it.producteur || '') + '||' + it.produit;
-            const a = agg[pk] || (agg[pk] = { produit: it.produit, producteur: it.producteur || '', qty: 0, bySite: {}, keys: [], pks: new Set() });
+            const a = agg[pk] || (agg[pk] = { produit: it.produit, producteur: it.producteur || '', qty: 0, bySite: {}, keys: [], pks: new Set(), dom: [] });
             const q = Number(it.qty || it.quantity) || 1;
             a.qty += q; a.bySite[site] = (a.bySite[site] || 0) + q; a.keys.push(k); a.pks.add(site + '||' + it.produit);
+            if (site === 'DOM') { const cs = domCartonsOf(o), main = cs[0] || '?', ex = a.dom.find(x => x.main === main); if (ex) ex.qty += q; else a.dom.push({ main, alts: cs.slice(1), qty: q }); } // V10.00
           }
         }
         return Object.values(agg).sort((a, b) => a.produit.localeCompare(b.produit));
@@ -13890,6 +13959,10 @@
         for (const l of (lastmin || [])) for (const st of Object.keys(l.allocBySite || {})) lmSites.add(String(st).toUpperCase());
         for (const site of lmSites) {
           const a = kbLmAttribution(lastmin, site, ordersBySite[site] || []);
+          if (site === 'DOM') { // V10.00 — DOM : directement dans le carton du client
+            const byKey = {}; for (const o of (ordersBySite[site] || [])) byKey[kbClientKey(o)] = o;
+            for (const [k, arr] of Object.entries(a.byClient || {})) for (const e of arr) add(lmMap, site, (byKey[k] && domCartonsOf(byKey[k])[0]) || e.casier || '?', e);
+          } else
           for (const arr of Object.values(a.byClient || {})) for (const e of arr) add(lmMap, site, e.casier || 'ND', e);
           for (const e of (a.left || [])) add(lmMap, site, 'ND', e);
         }
@@ -13932,6 +14005,44 @@
           if (on && ndData.total > 0 && after >= ndData.total) kbCelebrate({ title: `Bravo${who ? ' ' + String(who).split(' ')[0] : ''}, ND du jour fait !`, sub: `${ndData.total} ligne(s) · toutes les cagettes ND sont prêtes 💚` });
         } catch (e) { showToast('Erreur : ' + e.message); }
       };
+
+      // V10.00 — DISPATCH DERNIÈRE MINUTE : ce qu'il faut METTRE PAR LIEU en GROS (couleur du lieu), total en petit.
+      const lieuRank = (s) => { const i = sitesForDay.indexOf(s); return i < 0 ? 999 : i; };
+      const DomCartons = ({ list, left, big }) => (
+        <div style={{display:'flex',flexDirection:'column',gap:4,marginTop:4}}>
+          {list.map(x => (
+            <div key={x.main} style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <span style={{fontSize: big ? 22 : 18,fontWeight:900,border:'3px solid #111',borderRadius:8,padding:'0 10px',background:'#fff',color:'#111'}}>📦 CARTON {x.main}</span>
+              <span style={{fontSize: big ? 26 : 20,fontWeight:900,color:'#111'}}>× {x.qty}</span>
+              {x.alts.length > 0 && <span style={{fontSize:13,fontWeight:700,color:'var(--ink-soft)'}}>(si plein → carton {x.alts.join(' ou ')})</span>}
+            </div>
+          ))}
+          {left > 0 && <div style={{fontSize:14,fontWeight:800,color:'var(--danger)'}}>⚠️ {left} sans client en rupture → pas de carton</div>}
+        </div>
+      );
+      const LieuQty = ({ bySite, dom }) => (
+        <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:8}}>
+          {Object.entries(bySite || {}).filter(([, q]) => q > 0).sort((a, b) => lieuRank(a[0]) - lieuRank(b[0]) || a[0].localeCompare(b[0])).map(([site, q]) => {
+            const col = kbSiteColor(site);
+            if (site === 'DOM') return (
+              <div key={site} style={{flex:'1 1 100%',border:'3px solid ' + col,borderRadius:12,padding:'6px 10px',background:'#f8fafc'}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{background:col,color:'#fff',fontWeight:900,fontSize:20,borderRadius:8,padding:'2px 10px'}}>🏠 DOM</span>
+                  <span style={{fontSize:28,fontWeight:900,color:col}}>{q}</span>
+                  <span style={{fontSize:13,fontWeight:800,color:'var(--ink-soft)'}}>pas de ND : directement dans le carton</span>
+                </div>
+                <DomCartons list={(dom && dom.list) || []} left={(dom && dom.left) || 0} />
+              </div>
+            );
+            return (
+              <div key={site} style={{display:'flex',alignItems:'stretch',borderRadius:12,overflow:'hidden',border:'3px solid ' + col,minHeight:54}}>
+                <span style={{background:col,color:'#fff',fontWeight:900,fontSize:20,padding:'0 10px',display:'flex',alignItems:'center'}}>{site}</span>
+                <span style={{background:'#fff',color:col,fontWeight:900,fontSize:32,padding:'0 14px',display:'flex',alignItems:'center',minWidth:52,justifyContent:'center'}}>{q}</span>
+              </div>
+            );
+          })}
+        </div>
+      );
 
       // V9.99 (++) — onglets Manquants & ND : Dernière minute → Manquants → ND du jour → Remisés
             const ndN = ndData.qty;
@@ -14015,6 +14126,27 @@
             );
           })()}
 
+          {/* ============ V10.00 — ND FRAGILES MIS EN CASIER ============ */}
+          {mndCur === 'nd' && Object.keys(ndEnCasier).length > 0 && (
+            <div className="card" style={{border:'3px solid #0a84ff',background:'#f4f9ff'}}>
+              <h3 style={{margin:'0 0 4px',color:'#0a5fc2'}}>🧺 Mis en CASIER (au lieu de la cagette ND)</h3>
+              <p style={{fontSize:12,color:'var(--ink-soft)',margin:'0 0 8px'}}>À poser dans le casier de chaque client (comme un produit normal en Prépa du jour). En distrib, ils ne sont plus « à donner en plus ».</p>
+              {Object.keys(ndEnCasier).sort((a, b) => lieuRank(a) - lieuRank(b) || a.localeCompare(b)).map(site => (
+                <div key={site} style={{borderTop:'1px solid var(--line)',padding:'6px 0'}}>
+                  <span style={{background:kbSiteColor(site),color:'#fff',fontWeight:900,fontSize:16,borderRadius:8,padding:'1px 8px'}}>{site}</span>
+                  {Object.values(ndEnCasier[site]).sort((a, b) => a.produit.localeCompare(b.produit)).map(r => (
+                    <div key={r.produit} style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',padding:'6px 0'}}>
+                      <KbQty q={r.qty} />
+                      <span style={{fontSize:17,fontWeight:900,flex:'1 1 160px'}}>{kbProdName(r.produit)}</span>
+                      <span style={{fontSize:15,fontWeight:800,color:'#0a5fc2'}}>{Object.entries(r.cas).sort((a, b) => casCmp(a[0], b[0])).map(([c, q]) => `casier ${c}${q > 1 ? ' ×' + q : ''}`).join(' · ')}</span>
+                      <button className="btn-ghost" style={{fontSize:13}} onClick={() => setNdCasier([site + '||' + r.produit], false)}>↩ Cagette ND</button>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* ============ V9.96 — DISPATCH DERNIÈRE MINUTE CERTAIN ============ */}
           {mndCur === 'lm' && lmCertain.length > 0 && (
             <div className="card" style={{ border: '3px solid #7b1fa2', background: '#faf3fd' }}>
@@ -14025,13 +14157,11 @@
               <div style={{ border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden', background: '#fff' }}>
                 {lmCertain.map((c, i) => (
                   <div key={c.producteur + c.produit} style={{ padding: '12px', borderTop: i ? '1px solid var(--line)' : 'none' }}>
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                      <span style={{ minWidth: 52, textAlign: 'center', fontSize: 22, fontWeight: 900, color: '#fff', background: '#7b1fa2', borderRadius: 10, padding: '4px 8px' }}>{c.qty}</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontWeight: 900, fontSize: 19, lineHeight: 1.2 }}>🟣 {kbProdName(c.produit)}</div>
-                        <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{c.producteur}{' · ' + Object.entries(c.bySite).map(([k, v]) => `${k} ${v}`).join(' · ')}</div>
-                      </div>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                      <div style={{ fontWeight: 900, fontSize: 19, lineHeight: 1.2, flex: 1, minWidth: 0 }}>🟣 {kbProdName(c.produit)}{kbIsFragile(c.produit) ? ' 🥀' : ''}</div>
+                      <span style={{ fontSize: 12, color: 'var(--ink-mute)', whiteSpace: 'nowrap' }}>{c.producteur ? c.producteur + ' · ' : ''}total {c.qty}</span>
                     </div>
+                    <LieuQty bySite={c.bySite} dom={{ list: c.dom || [], left: 0 }} />
                     <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
                       <span style={{ flex: '1 1 200px', fontSize: 16, fontWeight: 800, color: '#7b1fa2', padding: '10px 12px', borderRadius: 10, border: '2px solid #7b1fa2' }}>✓ Attribué aux casiers automatiquement</span>
                       <button onClick={() => pasArrive(c)} style={{ flex: '1 1 140px', fontSize: 16, fontWeight: 900, padding: '12px', borderRadius: 12, border: '2px solid var(--danger)', background: '#fff', color: 'var(--danger)', cursor: 'pointer' }}>❌ Pas arrivé → rupture</button>
@@ -14135,12 +14265,9 @@
                         <div className="list-item-name" style={{fontSize:19,fontWeight:900}}>{kbProdName(l.produit)}</div>
                         <button className="btn-ghost" onClick={async()=>{ if(confirm('Annuler ce dispatch ?')) await storage.deleteDoc(`day_${day}_lastminute`, l.id); }} style={{fontSize:13}}>🗑️</button>
                       </div>
-                      <div className="list-item-sub">{l.qtyReceived} reçus · {totalAlloc} attribués</div>
-                      <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
-                        {Object.entries(l.allocBySite || {}).map(([site, arr]) => (
-                          <span key={site} className="badge badge-site" style={{fontSize:16,padding:'6px 10px',fontWeight:900}}>{site} : {arr.reduce((x,c)=>x+c.qty,0)}</span>
-                        ))}
-                      </div>
+                      <div className="list-item-sub" style={{fontSize:12}}>{l.producteur ? l.producteur + ' · ' : ''}total {l.qtyReceived} reçus · {totalAlloc} attribués</div>
+                      <LieuQty bySite={Object.fromEntries(Object.entries(l.allocBySite || {}).map(([site, arr]) => [String(site).toUpperCase(), (arr || []).reduce((x, c) => x + (Number(c.qty) || 0), 0)]))}
+                        dom={(() => { const w = domWhere(l.produit); return { list: w.list, left: w.left }; })()} />
                     </div>
                   );
                 })}
@@ -14172,6 +14299,23 @@
             };
             const pct = Math.round(100 * ndDoneCount / Math.max(1, ndData.total)), allDone = ndDoneCount >= ndData.total;
             // Ligne à toucher (grosse) : ✓ Fait partagé
+            // V10.00 — DOM : où mettre (carton du client) ; fragile : bouton « 🧺 En casier » à côté de la ligne
+            const domOf = (site, kind, produit) => { if (site !== 'DOM') return null; const cm = (kind === 'l' ? lmBySiteCasier : normalBySite)[site] || {}; const m = {}; for (const c of Object.keys(cm)) for (const x of cm[c]) if (x.produit === produit) m[c] = (m[c] || 0) + x.qty; return Object.entries(m).sort((a, b) => casCmp(a[0], b[0])).map(([main, qty]) => ({ main, alts: [], qty })); };
+            const NdLine = ({ site, kind, p, done, red, sub }) => {
+              const dom = domOf(site, kind, p.produit);
+              const pk = site + '||' + p.produit;
+              const canCas = site !== 'DOM' && ndCatSet.has(pk) && kbIsFragile(p.produit) && (kind === 'n' || p.certain);
+              return (
+                <div style={{margin:'4px 0'}}>
+                  <div style={{display:'flex',gap:6,alignItems:'stretch'}}>
+                    <div style={{flex:1,minWidth:0}}><FaitRow p={p} done={done} red={red} onTap={() => setNdFait([ndKey(site, kind, p.produit)], !done)} sub={sub} /></div>
+                    {canCas && <button onClick={() => { if (confirm(`« ${kbProdName(p.produit)} » (${site}) : mettre dans les CASIERS des clients plutôt qu'en cagette ND ?`)) setNdCasier([pk], true); }}
+                      style={{flex:'0 0 auto',margin:'4px 0',padding:'0 10px',borderRadius:10,border:'2px solid #0a84ff',background:'#eaf3ff',color:'#0a5fc2',fontWeight:900,fontSize:14,lineHeight:1.1,cursor:'pointer'}}>🧺 En<br/>casier</button>}
+                  </div>
+                  {dom && dom.length > 0 && <div style={{padding:'0 6px 4px 46px'}}><DomCartons list={dom} left={0} /></div>}
+                </div>
+              );
+            };
             const FaitRow = ({ p, done, red, onTap, sub }) => (
               <button onClick={onTap} style={{display:'flex',alignItems:'center',gap:10,width:'100%',textAlign:'left',cursor:'pointer',minHeight:52,padding:'8px 10px',margin:'4px 0',borderRadius:10,
                 border:'2px solid ' + (done ? '#2e7d32' : red ? 'var(--danger)' : 'var(--line)'), background: done ? '#e8f5e9' : '#fff', color: done ? '#2e7d32' : red ? 'var(--danger)' : 'var(--ink)'}}>
@@ -14221,10 +14365,11 @@
                           {lRows.length > 0 && (
                             <div style={{marginBottom:6,borderLeft:'3px solid var(--danger)',background:'var(--danger-soft)',borderRadius:6,padding:'4px 6px'}}>
                               <div style={{fontSize:12,fontWeight:800,color:'var(--danger)'}}>🔴 Dernière minute</div>
-                              {lRows.map(({ p, done }) => <FaitRow key={'l'+p.produit} p={p} done={done} red onTap={() => setNdFait([ndKey(site, 'l', p.produit)], !done)} sub={p.certain ? 'déjà facturé' : 'à rajouter ancienne appli'} />)}
+                              {lRows.map(({ p, done }) => <NdLine key={'l'+p.produit} site={site} kind="l" p={p} done={done} red sub={p.certain ? 'déjà facturé' : 'à rajouter ancienne appli'} />)}
                             </div>
                           )}
-                          {nRows.map(({ p, done }) => <FaitRow key={'n'+p.produit} p={p} done={done} onTap={() => setNdFait([ndKey(site, 'n', p.produit)], !done)} />)}
+                          {site === 'DOM' && <div style={{fontSize:13,fontWeight:800,color:'#475569',margin:'2px 0 4px'}}>🏠 Livraison à domicile : pas de ND → directement dans le CARTON indiqué</div>}
+                          {nRows.map(({ p, done }) => <NdLine key={'n'+p.produit} site={site} kind="n" p={p} done={done} />)}
                         </div>
                       );
                     })}
@@ -14264,7 +14409,7 @@
                             <div style={{display:'flex',flexDirection:'column',gap:4}}>
                               {casiers.map(cas => (
                                 <div key={cas} style={{display:'flex',gap:8,fontSize:13,alignItems:'baseline'}}>
-                                  <span className="badge" style={{whiteSpace:'nowrap',background:'var(--danger)',color:'#fff'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
+                                  <span className="badge" style={{whiteSpace:'nowrap',background:'var(--danger)',color:'#fff'}}>{cas === 'ND' ? '🧺 Bac ND' : (site === 'DOM' ? `📦 Carton ${cas}` : `Casier ${cas}`)}</span>
                                   <span style={{flex:1,color:'var(--danger)',fontWeight:600}}>{txt(lm[cas], 'l')}</span>
                                 </div>
                               ))}
@@ -14277,7 +14422,7 @@
                             <div style={{display:'flex',flexDirection:'column',gap:4}}>
                               {normalCasiers.map(cas => (
                                 <div key={cas} style={{display:'flex',gap:8,fontSize:13,alignItems:'baseline'}}>
-                                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>{cas === 'ND' ? '🧺 Bac ND' : `Casier ${cas}`}</span>
+                                  <span className="badge badge-site" style={{whiteSpace:'nowrap'}}>{cas === 'ND' ? '🧺 Bac ND' : (site === 'DOM' ? `📦 Carton ${cas}` : `Casier ${cas}`)}</span>
                                   <span style={{flex:1}}>{txt(normal[cas], 'n')}</span>
                                 </div>
                               ))}
