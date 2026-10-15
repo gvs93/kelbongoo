@@ -755,7 +755,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.01';
+    const APP_VERSION = 'V10.02';
+    // V10.02 — Master › Pilotage › Historique › 🧑‍🍳 PRÉPA (onglet par défaut) : par date de distribution, qui a fait quoi et
+    //   à quelle heure (posé / partiel n/q / rupture / casiers / remises / dernière minute / ND / clôture). Filtres : recherche
+    //   produit-client, lieu, casier, opérateur, action, plage horaire ; tri ; compteur par opérateur (cliquable) ; export CSV.
+    //   + JOURNAL day_<date>_preplog : chaque écriture/suppression dans day_<date>_prep est ajoutée (append-only) → l'historique
+    //   garde aussi les actions corrigées ensuite. Sans journal (prépas avant V10.02) : état final de chaque ligne.
     // V10.01 — Prépa › Manquants & ND › 🚚 Dernière minute : chaque LIEU se valide (toucher la pastille = ✓ Fait, re-toucher = annuler).
     //   Même état partagé que ND du jour (day_X_prep, docs nd|lieu||l||produit) → cocher ici = coché là-bas et inversement.
     //   Produit entièrement fait = carte verte, passée en bas ; compteur « x/y lieux » ; feu d'artifice quand tout le ND du jour est fait.
@@ -1527,6 +1532,7 @@
         if (/^day_.+_orders$/.test(c) && data && Array.isArray(data.orders)) data = { ...data, orders: kbStripPayzen(data.orders) };
         if (firebaseConfigured) {
           await fb.setDoc(fb.doc(fb.db, c, id), { ...data, _ts: fb.serverTimestamp() }, { merge });
+          kbPrepLog(c, id, 'set', data); // V10.02 — journal de prépa (append-only)
         } else {
           const key = this._key(c, 'list');
           const ex = JSON.parse(localStorage.getItem(key) || '{}');
@@ -1538,6 +1544,7 @@
       async deleteDoc(c, id) {
         if (firebaseConfigured) {
           await fb.deleteDoc(fb.doc(fb.db, c, id));
+          kbPrepLog(c, id, 'delete', null); // V10.02
         } else {
           const key = this._key(c, 'list');
           const ex = JSON.parse(localStorage.getItem(key) || '{}');
@@ -22247,8 +22254,211 @@
       );
     }
 
+    // ============================================================
+    // V10.02 — HISTORIQUE PRÉPA (Master › Pilotage › Historique › 🧑‍🍳 Prépa)
+    //   Qui a fait quoi, à quelle heure, par date de distribution. Source :
+    //   • day_<date>_prep : état ACTUEL de chaque ligne (st/pc/cs/rc/ra/lm/nd/nx + meta clôture), avec « by » et _ts ;
+    //   • day_<date>_preplog (V10.02) : JOURNAL complet, chaque écriture/suppression en prépa est ajoutée (rien n'est écrasé).
+    //   Tout est filtrable : recherche (produit / client), lieu, casier, opérateur, action, heure ; export CSV.
+    // ============================================================
+    const KB_PREP_COLL_RE = /^day_(\d{4}-\d{2}-\d{2})_prep$/;
+    let kbPrepLastBy = '';
+    function kbPrepLog(c, id, op, data) {
+      try {
+        if (!firebaseConfigured || !KB_PREP_COLL_RE.test(c)) return;
+        if (data && data.by) kbPrepLastBy = String(data.by);
+        const clean = {};
+        for (const [k, v] of Object.entries(data || {})) { if (v === undefined || typeof v === 'function') continue; if (v && typeof v === 'object' && !Array.isArray(v)) continue; clean[k] = v; }
+        const lid = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        fb.setDoc(fb.doc(fb.db, c + 'log', lid), { docId: String(id), op, data: clean, by: (data && data.by) || kbPrepLastBy || '', at: Date.now() }).catch(() => {});
+      } catch (e) {}
+    }
+    const kbTsMs = (t) => { if (!t) return 0; if (typeof t === 'number') return t; if (typeof t.toMillis === 'function') return t.toMillis(); if (t.seconds) return t.seconds * 1000; const n = Date.parse(t); return isNaN(n) ? 0 : n; };
+    // Transforme un doc de prépa (id + champs) en ligne d'historique lisible
+    function kbPrepEvent(docId, d, ctx, at, by, op) {
+      if (!docId) return null;
+      if (docId === 'meta') {
+        if (!d || (!d.closed && !d.closedAt)) return null;
+        return { at: at || kbTsMs(d.closedAt), by: d.closedBy || by || '', type: 'cloture', label: d.closed ? '🔒 Clôture de la prépa' : '🔓 Prépa ré-ouverte', site: '', client: '', produit: '', casier: '' };
+      }
+      if (docId === 'counters' || docId === 'ancien') return null;
+      const bar = docId.indexOf('|'); if (bar < 0) return null;
+      const pfx = docId.slice(0, bar); let key = docId.slice(bar + 1); try { key = decodeURIComponent(key); } catch (e) {}
+      const seg = key.split('||');
+      const base = { at, by: by || (d && d.by) || '', site: '', client: '', produit: '', casier: '', qty: '' };
+      const qtyOf = (site, client, produit) => { const o = ctx.orderBy[site + '||' + client]; if (!o) return ''; const it = (o.items || []).find(i => i.produit === produit); return it ? (Number(it.qty) || 1) : ''; };
+      const casOf = (site, client) => { const pc = ctx.cas[site + '||' + client]; if (pc && pc.length) return pc.join(', '); const o = ctx.orderBy[site + '||' + client]; if (!o) return ''; return [...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String).join(', '); };
+      if (op === 'delete') {
+        if (pfx === 'st' && seg.length === 3) return { ...base, type: 'annul', label: '↩️ Statut annulé', site: seg[0], client: seg[1], produit: seg[2], casier: casOf(seg[0], seg[1]), qty: qtyOf(seg[0], seg[1], seg[2]) };
+        return { ...base, type: 'annul', label: '↩️ Annulé (' + pfx + ')', site: seg[0] || '', produit: seg[seg.length - 1] || '' };
+      }
+      if (pfx === 'st' && seg.length === 3) {
+        const [site, client, produit] = seg, q = qtyOf(site, client, produit);
+        const v = d && d.v;
+        const label = v === 'done' ? '✅ Posé' + (q ? ' ×' + q : '')
+          : v === 'rupture' ? (d.lmPasArrive ? '❌ Rupture (dernière minute pas arrivée)' : '❌ Rupture' + (q ? ' ×' + q : ''))
+          : v === 'partiel' ? '🟠 Partiel : ' + (d.n || 0) + (q ? '/' + q : '') + ' posé(s) → ' + (q ? Math.max(0, q - (d.n || 0)) : '?') + ' manquant(s)'
+          : '• ' + (v || 'statut effacé');
+        return { ...base, type: v === 'done' ? 'pose' : v === 'rupture' ? 'rupture' : v === 'partiel' ? 'partiel' : 'autre', label, site, client, produit, casier: casOf(site, client), qty: q };
+      }
+      if (pfx === 'pc' && seg.length === 3) {
+        const [site, client, produit] = seg, q = qtyOf(site, client, produit);
+        return { ...base, type: 'compteur', label: '🔢 Compteur posés : ' + (d && d.n || 0) + (q ? '/' + q : ''), site, client, produit, casier: casOf(site, client), qty: q };
+      }
+      if (pfx === 'cs' && seg.length === 2) return { ...base, type: 'casier', label: '🧺 Casiers → ' + ((d && d.nums) || []).join(', '), site: seg[0], client: seg[1], casier: ((d && d.nums) || []).join(', ') };
+      if (pfx === 'rc' && seg.length === 3) return { ...base, type: 'remise', label: '💸 Remise client ' + (d && d.pct ? '−' + d.pct + ' %' : 'retirée') + (d && d.reason ? ' (' + d.reason + ')' : ''), site: seg[0], client: seg[1], produit: seg[2], casier: casOf(seg[0], seg[1]) };
+      if (pfx === 'ra' && seg.length === 2) return { ...base, type: 'remise', label: '💸 Remise tout le lieu ' + (d && d.pct ? '−' + d.pct + ' %' : 'retirée') + (d && d.reason ? ' (' + d.reason + ')' : ''), site: seg[0], produit: seg[1] };
+      if (pfx === 'lm' && seg.length === 2) return { ...base, type: 'lm', label: '🟣 Dernière minute CERTAIN', site: seg[0], produit: seg[1] };
+      if (pfx === 'nd') { if (d && d.v === 'done') return { ...base, type: 'nd', label: '🥬 ND ✓ fait', site: seg[0], produit: seg[seg.length - 1] }; return { ...base, type: 'nd', label: '🥬 Mis en cagette ND', site: seg[0], produit: seg[seg.length - 1] }; }
+      if (pfx === 'nx') return { ...base, type: 'nd', label: '🧺 ND repassé en casier', site: seg[0], produit: seg[seg.length - 1] };
+      return { ...base, type: 'autre', label: '• ' + pfx, site: seg[0] || '', produit: seg[seg.length - 1] || '' };
+    }
+    const KB_PREP_TYPES = [
+      ['', 'Toutes les actions'], ['pose', '✅ Posé'], ['partiel', '🟠 Partiel'], ['rupture', '❌ Rupture'], ['compteur', '🔢 Compteur'],
+      ['casier', '🧺 Casiers'], ['remise', '💸 Remises'], ['lm', '🟣 Dernière minute'], ['nd', '🥬 ND'], ['annul', '↩️ Annulations'], ['cloture', '🔒 Clôture'],
+    ];
+    function PrepHistoryView() {
+      const [day, setDay] = React.useState(() => { try { return activeDay(); } catch (e) { return todayKey(); } });
+      const [data, setData] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [q, setQ] = React.useState(''); const [site, setSite] = React.useState(''); const [who, setWho] = React.useState('');
+      const [type, setType] = React.useState(''); const [cas, setCas] = React.useState(''); const [h1, setH1] = React.useState(''); const [h2, setH2] = React.useState('');
+      const [asc, setAsc] = React.useState(false); const [mode, setMode] = React.useState('auto'); // auto | log | etat
+      const [lim, setLim] = React.useState(300);
+      const load = React.useCallback(async () => {
+        setData(null); setErr('');
+        try {
+          const [od, prepArr, logArr] = await Promise.all([
+            storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+            storage.getAll(`day_${day}_prep`).catch(() => []),
+            storage.getAll(`day_${day}_preplog`).catch(() => []),
+          ]);
+          const orderBy = {};
+          for (const o of ((od && od.orders) || [])) orderBy[String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')] = o;
+          const cas = {};
+          for (const d of (prepArr || [])) { if (String(d.id || '').startsWith('cs|')) { let k = d.id.slice(3); try { k = decodeURIComponent(k); } catch (e) {} cas[k] = (d.nums || []).map(String); } }
+          const ctx = { orderBy, cas };
+          const etat = (prepArr || []).map(d => kbPrepEvent(d.id, d, ctx, kbTsMs(d._ts), d.by)).filter(Boolean);
+          const journal = (logArr || []).map(l => { const e = kbPrepEvent(l.docId, l.data || {}, ctx, l.at || kbTsMs(l._ts), l.by, l.op); return e ? { ...e, log: true } : null; }).filter(Boolean);
+          setData({ etat, journal, nOrders: ((od && od.orders) || []).length });
+        } catch (e) { setErr(e.message || String(e)); setData({ etat: [], journal: [], nOrders: 0 }); }
+      }, [day]);
+      React.useEffect(() => { load(); }, [load]);
+      const src = !data ? [] : (mode === 'log' ? data.journal : mode === 'etat' ? data.etat : (data.journal.length ? data.journal : data.etat));
+      const usingLog = data && (mode === 'log' || (mode === 'auto' && data.journal.length > 0));
+      const sites = [...new Set(src.map(r => r.site).filter(Boolean))].sort();
+      const whos = [...new Set(src.map(r => r.by).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'fr'));
+      const nq = normalizeText(q.trim());
+      const hm = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+      const dm = (t) => t ? new Date(t).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' }) : '';
+      const hNum = (t) => { if (!t) return null; const d = new Date(t); return d.getHours() * 60 + d.getMinutes(); };
+      const toMin = (s) => { const m = /^(\d{1,2})(?:[:h](\d{2}))?$/.exec(String(s).trim()); return m ? (+m[1]) * 60 + (+(m[2] || 0)) : null; };
+      const m1 = toMin(h1), m2 = toMin(h2);
+      const rows = src.filter(r => {
+        if (site && r.site !== site) return false;
+        if (who && r.by !== who) return false;
+        if (type && r.type !== type) return false;
+        if (cas.trim() && !String(r.casier || '').split(/,\s*/).some(c => c === cas.trim())) return false;
+        if (nq && !normalizeText([r.produit, r.client, r.label, r.by, r.site].join(' ')).includes(nq)) return false;
+        const hn = hNum(r.at); if (m1 != null && (hn == null || hn < m1)) return false; if (m2 != null && (hn == null || hn > m2)) return false;
+        return true;
+      }).sort((a, b) => asc ? (a.at - b.at) : (b.at - a.at));
+      const byWho = {}; rows.forEach(r => { const k = r.by || '—'; byWho[k] = (byWho[k] || 0) + 1; });
+      const exportCsv = () => {
+        const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+        const head = ['Date', 'Heure', 'Opérateur', 'Action', 'Lieu', 'Casier', 'Client', 'Produit', 'Quantité'];
+        const lines = [head.join(';')].concat(rows.map(r => [dm(r.at), hm(r.at), r.by, r.label, r.site, r.casier, r.client, kbProdName(r.produit), r.qty].map(esc).join(';')));
+        const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `historique_prepa_${day}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      };
+      const reset = () => { setQ(''); setSite(''); setWho(''); setType(''); setCas(''); setH1(''); setH2(''); };
+      const inp = { fontSize: 15, padding: '8px 10px', borderRadius: 10, border: '1px solid var(--line)', minWidth: 0 };
+      return (
+        <div className="stack">
+          <div className="card">
+            <h2 style={{ fontSize: 18, margin: '0 0 4px' }}>🧑‍🍳 Historique de la prépa</h2>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '0 0 10px' }}>Qui a fait quoi, à quelle heure, pour la distribution choisie. Tout est filtrable.</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+              <label style={{ fontWeight: 800 }}>📅 Distribution du <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ ...inp, marginLeft: 6 }} /></label>
+              <button className="btn-secondary" onClick={() => setDay(addDays(day, -1))}>◀︎ Veille</button>
+              <button className="btn-secondary" onClick={() => setDay(addDays(day, 1))}>Lendemain ▶︎</button>
+              <button className="btn-secondary" onClick={load}>🔄 Actualiser</button>
+            </div>
+            {data && (
+              <div style={{ marginTop: 8, fontSize: 12, color: usingLog ? 'var(--accent-dark)' : 'var(--warn)' }}>
+                {usingLog
+                  ? <>📜 Journal complet : chaque action enregistrée ({data.journal.length}), même celles corrigées ensuite.</>
+                  : <>ℹ️ État final de chaque ligne ({data.etat.length}) : la DERNIÈRE action par client × produit (une action corrigée ensuite n'apparaît plus). Le journal complet existe pour les prépas faites à partir de la V10.02.</>}
+                {data.journal.length > 0 && data.etat.length > 0 && (
+                  <span style={{ marginLeft: 8 }}>
+                    <select value={mode} onChange={e => setMode(e.target.value)} style={{ fontSize: 12 }}>
+                      <option value="auto">Journal complet</option><option value="etat">État final seulement</option>
+                    </select>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="card" style={{ position: 'sticky', top: 0, zIndex: 5 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
+              <input placeholder="🔎 Produit, client…" value={q} onChange={e => setQ(e.target.value)} style={{ ...inp, gridColumn: 'span 2' }} />
+              <select value={site} onChange={e => setSite(e.target.value)} style={inp}><option value="">📍 Tous les lieux</option>{sites.map(s => <option key={s} value={s}>{s} · {siteLabel(s)}</option>)}</select>
+              <input placeholder="🧺 Casier n°" value={cas} onChange={e => setCas(e.target.value)} style={inp} inputMode="numeric" />
+              <select value={who} onChange={e => setWho(e.target.value)} style={inp}><option value="">👤 Tous les opérateurs</option>{whos.map(w => <option key={w} value={w}>{w}</option>)}</select>
+              <select value={type} onChange={e => setType(e.target.value)} style={inp}>{KB_PREP_TYPES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
+              <input placeholder="🕐 De (ex 13h)" value={h1} onChange={e => setH1(e.target.value)} style={inp} />
+              <input placeholder="🕐 À (ex 15h30)" value={h2} onChange={e => setH2(e.target.value)} style={inp} />
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8, alignItems: 'center' }}>
+              <strong style={{ fontSize: 15 }}>{rows.length} action(s)</strong>
+              <button className="btn-ghost" onClick={() => setAsc(a => !a)}>{asc ? '⬆️ Plus anciennes d’abord' : '⬇️ Plus récentes d’abord'}</button>
+              <button className="btn-ghost" onClick={reset}>✖ Effacer les filtres</button>
+              <button className="btn-secondary" onClick={exportCsv} disabled={!rows.length}>⬇️ CSV</button>
+            </div>
+            {Object.keys(byWho).length > 1 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                {Object.entries(byWho).sort((a, b) => b[1] - a[1]).map(([w, n]) => (
+                  <span key={w} onClick={() => setWho(who === w ? '' : w)} className="badge" style={{ cursor: 'pointer', fontSize: 13, padding: '4px 10px', background: who === w ? 'var(--accent-dark)' : 'var(--bg-muted)', color: who === w ? '#fff' : 'var(--ink)' }}>👤 {w} · {n}</span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {err && <div className="alert-red">Erreur : {err}</div>}
+          {!data && <div className="card">Chargement…</div>}
+          {data && !rows.length && <div className="empty-state"><div className="icon">📭</div><p>Aucune action{(q || site || who || type || cas || h1 || h2) ? ' avec ces filtres' : ' pour cette date'}.</p></div>}
+          {data && rows.length > 0 && (
+            <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+              {rows.slice(0, lim).map((r, i) => (
+                <div key={i} style={{ display: 'grid', gridTemplateColumns: '78px 1fr', gap: 10, padding: '10px 12px', borderTop: i ? '1px solid var(--line)' : 'none', background: r.type === 'rupture' ? '#fff5f5' : r.type === 'partiel' ? '#fff8ec' : r.type === 'annul' ? '#f4f4f4' : '#fff' }}>
+                  <div style={{ fontVariantNumeric: 'tabular-nums' }}>
+                    <div style={{ fontWeight: 900, fontSize: 16 }}>{hm(r.at).slice(0, 5)}</div>
+                    <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{hm(r.at).slice(6)}s · {dm(r.at)}</div>
+                  </div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'baseline' }}>
+                      <span style={{ fontWeight: 900, fontSize: 15 }}>{r.label}</span>
+                      {r.produit && <span style={{ fontWeight: 700, fontSize: 15 }}>· {kbProdName(r.produit)}</span>}
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4, fontSize: 13 }}>
+                      {r.site && <span className="badge badge-site" onClick={() => setSite(r.site)} style={{ cursor: 'pointer', fontWeight: 900 }}>{r.site}</span>}
+                      {r.casier && <span className="badge" style={{ background: 'var(--accent-soft)', color: 'var(--accent-dark)', fontWeight: 900 }}>🧺 {r.casier}</span>}
+                      {r.client && <span style={{ color: 'var(--ink-soft)' }}>{r.client}</span>}
+                      <span onClick={() => r.by && setWho(r.by)} style={{ marginLeft: 'auto', fontWeight: 800, cursor: r.by ? 'pointer' : 'default' }}>👤 {r.by || '—'}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {rows.length > lim && <div style={{ padding: 12, textAlign: 'center' }}><button className="btn-secondary" onClick={() => setLim(l => l + 300)}>Afficher plus ({rows.length - lim} restantes)</button></div>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function HistoryPage({ session }) {
-      const [histTab, setHistTab] = React.useState('nd'); // 'nd' | 'dlc' | 'pdp' | 'temp'
+      const [histTab, setHistTab] = React.useState('prep'); // V10.02 : 'prep' | 'nd' | 'cmd' | 'dlc' | 'pdp' | 'temp'
       return (
         <div className="stack">
           <h1>📜 Historique</h1>
@@ -22256,12 +22466,14 @@
             Trace des décisions : dispatch dernière minute (ND), produits DLC résolus, retours PDP traités, et alertes température validées. 🚩 = choix qui s'écarte du conseil navette.
           </p>
           <div className="filter-row">
+            <div className={`chip ${histTab==='prep'?'selected':''}`} onClick={()=>setHistTab('prep')}>🧑‍🍳 Prépa</div>
             <div className={`chip ${histTab==='nd'?'selected':''}`} onClick={()=>setHistTab('nd')}>🚚 ND</div>
             <div className={`chip ${histTab==='cmd'?'selected':''}`} onClick={()=>setHistTab('cmd')}>🧾 Commandes</div>
             <div className={`chip ${histTab==='dlc'?'selected':''}`} onClick={()=>setHistTab('dlc')}>🟠 DLC</div>
             <div className={`chip ${histTab==='pdp'?'selected':''}`} onClick={()=>setHistTab('pdp')}>↩️ Retours PDP</div>
             <div className={`chip ${histTab==='temp'?'selected':''}`} onClick={()=>setHistTab('temp')}>🌡️ Température</div>
           </div>
+          {histTab === 'prep' && <PrepHistoryView />}
           {histTab === 'nd' && <NdHistoryPage session={session} />}
           {histTab === 'cmd' && <OrderHistoryView />}
           {histTab === 'dlc' && <HistoryDlcView />}
