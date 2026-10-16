@@ -756,7 +756,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.05';
+    const APP_VERSION = 'V10.08';
     // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
     //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
     //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
@@ -856,6 +856,13 @@
     // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
     //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
     //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
+    // V10.08 — MU : la liste « à ensacher » est complétée par le Sheet COMMANDE FL (fl_read) : tout produit ACTIF de
+    //   TYPE SACHET (ou MU) y entre, avec ESTIMATION MU / UNITE DE VENTE / MU EN KILO. Avant, seule la liste serveur
+    //   get-mu-list (typeVal 'MU', ancien onglet « UNIQUEMENT STOCK… » renommé COMMANDE FL) → ex. Carotte Bio absente.
+    // V10.07 — Prépa › DLC & suivi : 📦 Mise en place = menu déroulant (fermé par défaut) sous « Impression ».
+    // V10.06 — Nouveaux clients (accueil Master) = dates du fichier CONSOMMATEURS : createdAt (inscription) et
+    //   first_order_date (1re commande). Stats compactes par jour/lieu écrites au chargement du fichier (v4_cache
+    //   « consumers_stats »). Remplace le calcul V10.04 par l'historique CA (faux : 302 « nouveaux »).
     // V10.05 — 🧺 PANIER SOLIDAIRE = cagette à part, JAMAIS en casier : reconnu par son nom, classé hors casier (comme ND,
     //   flag solidaire), non basculable en casier. Prépa › DLC & suivi : 📦 MISE EN PLACE (commandes chargées, total,
     //   par lieu avec nb de paniers solidaires).
@@ -1984,9 +1991,34 @@
       }
     }
 
+    // V10.06 — stats clients depuis le fichier consommateurs (Mongo) : inscriptions (createdAt) et 1res commandes
+    //   (first_order_date), par jour (heure de Paris) et par lieu (default_locale), sur ~400 jours.
+    let kbConsStatsLast = null;
+    function kbConsDay(v) {
+      const raw = v && typeof v === 'object' ? (v.$date || v.date || '') : v; if (!raw) return null;
+      const ms = typeof raw === 'number' ? raw : Date.parse(raw); if (!ms || isNaN(ms)) return null;
+      return kbParisParts(ms).ymd;
+    }
+    function kbConsStatsBuild(arr) {
+      const from = addDays(todayKey(), -400);
+      const st = { v: 1, total: 0, maxDay: '', ins: {}, insSite: {}, fo: {}, foSite: {} };
+      const add = (m, ms, d, site) => { m[d] = (m[d] || 0) + 1; const x = ms[d] = ms[d] || {}; x[site] = (x[site] || 0) + 1; };
+      for (const c of (arr || [])) {
+        if (!c) continue; st.total++;
+        const site = String(c.default_locale || '?').trim().toUpperCase() || '?';
+        const a = kbConsDay(c.createdAt), f = kbConsDay(c.first_order_date);
+        if (a && a > st.maxDay) st.maxDay = a;
+        if (a && a >= from) add(st.ins, st.insSite, a, site);
+        if (f && f >= from) add(st.fo, st.foSite, f, site);
+      }
+      st.at = new Date().toISOString();
+      return st;
+    }
+    async function kbSaveConsStats() { if (kbConsStatsLast) { try { await writeCache('consumers_stats', kbConsStatsLast); } catch (e) { console.warn('consumers_stats', e); } } }
     function parseConsumersById(jsonTextOrArr) {
       const data = typeof jsonTextOrArr === 'string' ? JSON.parse(jsonTextOrArr) : jsonTextOrArr;
       const arr = Array.isArray(data) ? data : (data.consumers || []);
+      try { kbConsStatsLast = kbConsStatsBuild(arr); } catch (e) { kbConsStatsLast = null; console.warn('consumers_stats', e); }
       const byId = {};
       for (const c of arr) {
         const id = oid(c._id);
@@ -9951,6 +9983,29 @@
     // compté des sachets (nbMu > 0) remplace le calcul (= quantité réelle).
     // ============================================================
     const MU_REEL_DOC = '_reel';
+    // V10.08 — ajoute à la liste MU (serveur) les lignes ACTIVES de TYPE sachet/MU du Sheet COMMANDE FL absentes de la liste.
+    function kbMuMergeFl(list, flRows){
+      const base = Array.isArray(list) ? list : [];
+      if(!flRows || flRows.length<2) return list;
+      const H = flRows[0].map(h=>normalizeText(String(h||'')).trim());
+      const col=(preds)=>{ for(const p of preds){ const i=H.findIndex(p); if(i>=0) return i; } return -1; };
+      const iD=col([h=>h==='designation', h=>h.includes('designation')]), iP=col([h=>h==='producteur']), iT=col([h=>h==='type']),
+            iA=col([h=>h==='actif ?', h=>h.includes('actif')]), iE=col([h=>h.includes('estimation')]), iU=col([h=>h==='unite de vente', h=>h.includes('unite de vente')]),
+            iK=col([h=>h==='mu en kilo', h=>h.includes('mu en k')]), iId=col([h=>h.includes('id site')]);
+      if(iD<0 || iT<0) return list;
+      const have = new Set(base.map(it=>muKey(muName(it))));
+      const add = [];
+      for(let r=1;r<flRows.length;r++){
+        const row=flRows[r]||[]; const name=String(row[iD]==null?'':row[iD]).trim(); if(!name) continue;
+        const typ=normalizeText(String(row[iT]||'')).trim(); if(typ!=='sachet' && typ!=='mu') continue;
+        if(iA>=0 && !/^actif/.test(normalizeText(String(row[iA]||'')).trim())) continue;
+        const k=muKey(name); if(have.has(k)) continue; have.add(k);
+        const est=parseFloat(String(iE>=0&&row[iE]!=null?row[iE]:'').replace(',','.'));
+        add.push({ produit:name, producteur: iP>=0?String(row[iP]||'').trim():'', uv: iU>=0?String(row[iU]||'').trim():'', estimation: isNaN(est)?0:est,
+          muKilo: iK>=0?row[iK]:'', id: iId>=0?String(row[iId]||'').trim():'', type:'SACHET', _fromFl:true });
+      }
+      return add.length ? [...base, ...add] : list;
+    }
     function muKey(name){ return normalizeText(String(name||'')).replace(/[^a-z0-9]+/g,' ').trim(); } // clé Firestore sûre (pas de . / [ ])
     function muShiftDate(dateKey, delta){
       const [y,m,d] = String(dateKey).split('-').map(Number);
@@ -10338,7 +10393,7 @@
     function MuDuJourPage({ session, setTab }) {
       const operator = session.name;
       const dateKey = todayKey();
-      const [items,setItems]=React.useState(()=>kbMuCacheGet('list'));
+      const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [error,setError]=React.useState('');
       const [search,setSearch]=React.useState('');
@@ -10350,6 +10405,7 @@
       const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
       const [flErr,setFlErr]=React.useState('');
       const [showAprep,setShowAprep]=React.useState(true);
+      const items = React.useMemo(()=>kbMuMergeFl(itemsSrv, flRows), [itemsSrv, flRows]); // V10.08
       const loadFl = React.useCallback(async ()=>{
         setFlErr(''); setBusy(b=>({ ...b, fl:true, t0: b.list ? b.t0 : Date.now() }));
         try{
@@ -10370,7 +10426,7 @@
           if(data.success===false) throw new Error(data.error||'Lecture de la feuille impossible');
           const list = data.items||[];
           setItems(list); kbMuCacheSet('list', list);
-          if(list.length===0) setError('Aucun FL actif de type MU trouvé dans la feuille.'+(data.headers?(' Colonnes détectées : '+data.headers.join(' | ')):''));
+          // V10.08 — liste serveur vide : la liste vient du Sheet COMMANDE FL (TYPE sachet), pas d'erreur bloquante
         }catch(e){ setItems(it=> it || []); setError('Liste MU non mise à jour : '+e.message+(kbMuCacheGet('list')?' — affichage du dernier chargement.':'')); }
         finally{ setBusy(b=>({ ...b, list:false })); }
       },[]);
@@ -10671,8 +10727,9 @@
     function MuReelPage({ session, setTab }) {
       const operator = (session && session.name) || '—';
       const dateKey = todayKey();
-      const [items,setItems]=React.useState(()=>kbMuCacheGet('list'));
+      const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
+      const items = React.useMemo(()=>kbMuMergeFl(itemsSrv, flRows), [itemsSrv, flRows]); // V10.08
       const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [err,setErr]=React.useState('');
       const [entries,setEntries]=React.useState({});
@@ -10684,11 +10741,10 @@
         setErr(''); setBusy({ list:true, fl:true, t0:Date.now() });
         try{
           const [mu, fl] = await Promise.all([
-            kbWithTimeout(flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'), 60000, 'Liste MU').finally(()=>setBusy(b=>({...b,list:false}))),
+            kbWithTimeout(flPost({ action:'get-mu-list', sheetId: MU_SHEET_ID, tab: MU_TAB, typeCol:'TYPE', activeCol:'ACTIF ?', typeVal:'MU' }, 'GET'), 60000, 'Liste MU').catch(e=>({ success:false, error:e.message })).finally(()=>setBusy(b=>({...b,list:false}))),
             kbWithTimeout(flPost({ secret:FRESHDESK_SECRET, action:'fl_read', tab:FL_SHEET_TAB, ts:Date.now() }), 60000, 'Sheet FL').catch(e=>({ ok:false, error:e.message })).finally(()=>setBusy(b=>({...b,fl:false}))),
           ]);
-          if(!mu || mu.success===false) throw new Error((mu&&mu.error)||'liste MU illisible');
-          setItems(mu.items||[]); kbMuCacheSet('list', mu.items||[]);
+          if(mu && mu.success!==false){ setItems(mu.items||[]); kbMuCacheSet('list', mu.items||[]); } else setItems(it=>it||[]); // V10.08 — la liste Sheet FL suffit
           if(!fl || fl.ok===false){ setFlRows(r=>r||[]); setErr('Sheet FL non mis à jour ('+((fl&&fl.error)||'?')+')'+(kbMuCacheGet('fl')?' — chiffres du dernier chargement.':' — commandes = estimation MU.')); }
           else { setFlRows(fl.rows||[]); kbMuCacheSet('fl', fl.rows||[]); }
         }catch(e){ setItems(it=>it||[]); setFlRows(r=>r||[]); setErr('Chargement impossible : '+e.message); }
@@ -12275,6 +12331,7 @@
       const [days, setDays] = React.useState(null);
       const [day, setDay] = React.useState(null);
       const [orders, setOrders] = React.useState(null);
+      const [open, setOpen] = React.useState(false); // V10.07 — menu déroulant
       React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; const d = (l || []).filter(x => x.count > 0); setDays(d); setDay(d.length ? d[0].day : null); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
       React.useEffect(() => { if (!day) return; let stop = false; setOrders(null);
         storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
@@ -12285,8 +12342,15 @@
       const sites = Object.entries(by).sort((a, b) => kbPrintSite(a[0]).localeCompare(kbPrintSite(b[0]), 'fr'));
       return (
         <div style={{ border: '3px solid #1565c0', borderRadius: 'var(--radius)', background: 'var(--bg-card, #fff)', padding: '14px 14px 12px' }}>
-          <div style={{ fontSize: 22, fontWeight: 900 }}>📦 MISE EN PLACE</div>
-          {days === null ? <div style={{ fontSize: 15, marginTop: 6 }}>Chargement…</div>
+          <button onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', background: 'none', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left', color: 'var(--ink)' }}>
+            <span style={{ fontSize: 34, lineHeight: 1 }}>📦</span>
+            <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+              <span style={{ fontSize: 20, fontWeight: 900 }}>MISE EN PLACE</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink-mute)' }}>{days === null ? 'Chargement…' : !days.length ? 'Aucune commande chargée' : `Commandes du ${formatDateShort(day)} : ${orders == null ? '…' : orders.length} cmd · 🧺 ${orders == null ? '…' : solT} panier${solT > 1 ? 's' : ''} solidaire${solT > 1 ? 's' : ''}`}</span>
+            </span>
+            <span style={{ marginLeft: 'auto', fontSize: 26, color: '#1565c0', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }}>▾</span>
+          </button>
+          {open && (days === null ? <div style={{ fontSize: 15, marginTop: 6 }}>Chargement…</div>
             : !days.length ? <div style={{ fontSize: 16, fontWeight: 700, marginTop: 6, color: 'var(--danger)' }}>Aucune commande chargée pour les prochains jours.</div>
             : <>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
@@ -12306,7 +12370,7 @@
                   </div>
                 ))}
               </div>}
-            </>}
+            </>)}
         </div>
       );
     }
@@ -12332,7 +12396,6 @@
       return (
         <div className="stack">
           <h1>📅 DLC &amp; suivi</h1>
-          <KbMiseEnPlace />
           <button onClick={()=>setTab('dlcwatch')}
             style={{display:'flex',alignItems:'center',gap:16,padding:'18px 16px',textAlign:'left',cursor:'pointer',border:'3px solid ' + (nDlc ? '#c62828' : '#2e7d32'),borderRadius:'var(--radius)',background: nDlc ? '#fdecea' : '#e8f5e9',width:'100%'}}>
             <span style={{fontSize:40,lineHeight:1}}>📅</span>
@@ -12359,8 +12422,8 @@
               : "la case « Acces KBG sécurisé » n'est pas cochée pour ce code (après l'avoir cochée : Sortir puis se reconnecter).";
             return <div style={{fontSize:12,color:'var(--ink-mute)',border:'1px dashed var(--line)',borderRadius:8,padding:'8px 10px',order:99}}>🔐 Chargement des commandes masqué : {why}</div>;
           })()}
-          {groups.map(g => (
-            <div key={g.title}>
+          {groups.map(g => (<React.Fragment key={g.title}>
+            <div>
               <div style={{fontSize:12,fontWeight:800,letterSpacing:'.05em',textTransform:'uppercase',color:'var(--ink-mute)',margin:'6px 2px'}}>{g.title}</div>
               <div style={{display:'grid',gridTemplateColumns:'1fr',gap:10}}>
                 {g.items.map(it=>(
@@ -12376,7 +12439,8 @@
                 ))}
               </div>
             </div>
-          ))}
+            {g.title === '🖨️ Impression' && <KbMiseEnPlace />}
+          </React.Fragment>))}
         </div>
       );
     }
@@ -18136,21 +18200,14 @@
     // ============================================================
 
     // ============================================================
-    // V10.04 — 📈 CLIENTS & CA (accueil Master). Source : collection ca_history (1 doc / date de distribution,
-    //   écrit à chaque chargement JSON). Nouveau client = 1re apparition de son identifiant dans siteDetailJ.cl.
+    // V10.04 — 📈 CLIENTS & CA (accueil Master). CA : collection ca_history (1 doc / date de distribution).
+    //   V10.06 — Nouveaux clients : fichier consommateurs (v4_cache consumers_stats), plus l'historique CA.
     // ============================================================
     function kbMondayOf(dk) { const d = new Date(dk + 'T12:00:00'); return addDays(dk, -((d.getDay() + 6) % 7)); }
     function kbHomeStats(docs, today) {
       const list = (docs || []).filter(d => d && /^\d{4}-\d{2}-\d{2}$/.test(d.id || d.date || '')).map(d => ({ ...d, dk: d.date || d.id })).sort((a, b) => a.dk.localeCompare(b.dk));
       const caOf = (d) => { const t = d.totals || totalsFromCaBySite(d.caBySite); return t.reel || 0; };
-      // 1re apparition de chaque client (+ lieu)
-      const first = {}; let withCl = 0, firstDk = null;
-      for (const d of list) {
-        const sd = kbDocJ(d, 'siteDetailJ'); if (!sd) continue; withCl++; if (!firstDk) firstDk = d.dk;
-        for (const [site, v] of Object.entries(sd)) for (const cid of Object.keys((v && v.cl) || {})) if (!first[cid]) first[cid] = { dk: d.dk, site };
-      }
-      const yest = addDays(today, -1), mon = kbMondayOf(today), mStart = today.slice(0, 8) + '01';
-      const newSince = (from) => { const by = {}; let n = 0; for (const f of Object.values(first)) if (f.dk >= from && f.dk !== firstDk) { n++; by[f.site] = (by[f.site] || 0) + 1; } return { n, by: Object.entries(by).sort((a, b) => b[1] - a[1]) }; };
+      const mon = kbMondayOf(today), mStart = today.slice(0, 8) + '01';
       // période [from, to] vs période précédente à jours comparables
       const sum = (from, to) => { let ca = 0, cmd = 0, nd = 0; list.forEach(d => { if (d.dk >= from && d.dk <= to) { ca += caOf(d); cmd += d.ordersCount || 0; nd++; } }); return { ca, cmd, nd, pm: cmd ? ca / cmd : 0 }; };
       const lastDk = (list.filter(d => d.dk <= today).slice(-1)[0] || {}).dk || null;
@@ -18166,14 +18223,32 @@
       const mNow = sum(mStart, mMax), mPrev = sum(pmStart, pmEnd);
       const last = lastDk ? sum(lastDk, lastDk) : null, lastPrev = lastDk ? sum(addDays(lastDk, -7), addDays(lastDk, -7)) : null;
       const weeks = []; for (let i = 7; i >= 0; i--) { const m = addDays(mon, -7 * i); weeks.push({ m, ...sum(m, addDays(m, 6)) }); }
-      return { ok: list.length > 0, withCl, firstDk, nYest: newSince(yest), nWeek: newSince(mon), nMonth: newSince(mStart),
-        wNow, wPrev, wMax, mNow, mPrev, mMax, last, lastPrev, lastDk, weeks, histoWeeks: firstDk ? Math.floor((new Date(today) - new Date(firstDk)) / 604800000) : 0 };
+      return { ok: list.length > 0,
+        wNow, wPrev, wMax, mNow, mPrev, mMax, last, lastPrev, lastDk, weeks };
+    }
+    function kbConsNew(st, today) {
+      if (!st || !st.ins) return null;
+      const yest = addDays(today, -1), mon = kbMondayOf(today), mStart = today.slice(0, 8) + '01';
+      const pm = new Date(today + 'T12:00:00'); pm.setDate(1); pm.setMonth(pm.getMonth() - 1);
+      const pmStart = `${pm.getFullYear()}-${String(pm.getMonth() + 1).padStart(2, '0')}-01`;
+      const pmEnd = pmStart.slice(0, 8) + String(Math.min(Number(today.slice(8, 10)), new Date(pm.getFullYear(), pm.getMonth() + 1, 0).getDate())).padStart(2, '0');
+      const range = (m, ms, a, b) => { let n = 0; const by = {}; for (const [d, v] of Object.entries(m || {})) if (d >= a && d <= b) { n += v; for (const [s, k] of Object.entries((ms || {})[d] || {})) by[s] = (by[s] || 0) + k; } return { n, by: Object.entries(by).sort((x, y) => y[1] - x[1]) }; };
+      const set = (m, ms) => {
+        const y = range(m, ms, yest, today), w = range(m, ms, mon, today), mo = range(m, ms, mStart, today);
+        return { y: { ...y, prev: range(m, ms, addDays(yest, -7), addDays(today, -7)).n, prevLbl: 'mêmes jours S-1' },
+          w: { ...w, prev: range(m, ms, addDays(mon, -7), addDays(today, -7)).n, prevLbl: 'S-1 mêmes jours' },
+          m: { ...mo, prev: range(m, ms, pmStart, pmEnd).n, prevLbl: 'M-1 mêmes jours' } };
+      };
+      return { total: st.total || 0, fileDay: st.maxDay || (st.at || '').slice(0, 10), ins: set(st.ins, st.insSite), fo: set(st.fo, st.foSite) };
     }
     function KbHomeStats({ goSub }) {
       const [docs, setDocs] = React.useState(null);
       const [open, setOpen] = React.useState('');
       React.useEffect(() => { let alive = true; storage.getAll('ca_history').then(a => { if (alive) setDocs(a || []); }).catch(() => { if (alive) setDocs([]); }); return () => { alive = false; }; }, []);
+      const [cst, setCst] = React.useState(undefined); // V10.06 — stats du fichier consommateurs
+      React.useEffect(() => { let alive = true; readCache('consumers_stats').then(c => { if (alive) setCst(c || null); }).catch(() => { if (alive) setCst(null); }); return () => { alive = false; }; }, []);
       const today = todayKey();
+      const C = React.useMemo(() => cst ? kbConsNew(cst, today) : null, [cst, today]);
       const S = React.useMemo(() => docs ? kbHomeStats(docs, today) : null, [docs, today]);
       const eur = (c) => Math.round((c || 0) / 100).toLocaleString('fr-FR') + ' €';
       const Evo = ({ a, b }) => { if (!b) return <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>—</span>; const p = Math.round(100 * (a - b) / b); const c = p > 0 ? '#2e7d32' : p < 0 ? 'var(--danger)' : 'var(--ink-mute)';
@@ -18181,12 +18256,12 @@
       const box = { padding: '12px 14px', margin: 0, cursor: 'pointer' };
       if (!S) return <div className="card" style={{ padding: 14 }}>📈 Chargement des stats…</div>;
       if (!S.ok) return <div className="card" style={{ padding: 14, fontSize: 13 }}>📈 Pas encore d'historique CA (Chargement → Historique CA).</div>;
-      const NewTile = ({ k, l, x }) => (
-        <div className="card" style={{ ...box, borderTop: '5px solid #00897b' }} onClick={() => setOpen(open === k ? '' : k)}>
-          <div style={{ fontSize: 13, color: 'var(--ink-mute)', fontWeight: 700 }}>🆕 Nouveaux clients · {l}</div>
-          <div style={{ fontSize: 34, fontWeight: 900, lineHeight: 1.1, marginTop: 4, color: '#00897b' }}>{S.withCl ? x.n : '—'}</div>
-          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>{x.by.slice(0, 4).map(([s, n]) => `${s} ${n}`).join(' · ') || 'aucun'}</div>
-          {open === k && x.by.length > 4 && <div style={{ fontSize: 12, marginTop: 4 }}>{x.by.slice(4).map(([s, n]) => `${s} ${n}`).join(' · ')}</div>}
+      const NewTile = ({ k, l, x, kind }) => (
+        <div className="card" style={{ ...box, borderTop: '5px solid ' + (kind === 'fo' ? '#00897b' : '#6a1b9a') }} onClick={() => setOpen(open === k ? '' : k)}>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)', fontWeight: 700 }}>{l}</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginTop: 4 }}><span style={{ fontSize: 34, fontWeight: 900, lineHeight: 1.1, color: kind === 'fo' ? '#00897b' : '#6a1b9a' }}>{x.n}</span><Evo a={x.n} b={x.prev} /></div>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{x.prevLbl} : {x.prev}</div>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>{(open === k ? x.by : x.by.slice(0, 4)).map(([s, n]) => `${s} ${n}`).join(' · ') || 'aucun'}{open !== k && x.by.length > 4 ? ' …' : ''}</div>
         </div>
       );
       const CaTile = ({ l, now, prev, sub }) => (
@@ -18204,11 +18279,19 @@
             <div style={{ fontSize: 17, fontWeight: 900 }}>📈 Clients & CA</div>
             <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => goSub('ca')}>Suivi CA ›</button>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
-            <NewTile k="y" l="depuis hier" x={S.nYest} />
-            <NewTile k="w" l="cette semaine" x={S.nWeek} />
-            <NewTile k="m" l="ce mois" x={S.nMonth} />
-          </div>
+          {cst === undefined ? <div style={{ fontSize: 13 }}>Clients : chargement…</div>
+            : !C ? <div style={{ fontSize: 13, padding: '8px 10px', borderRadius: 8, background: '#fff4e5', fontWeight: 700 }}>🆕 Nouveaux clients : recharge le fichier <b>Consommateurs</b> (Chargement) pour activer les stats (dates d'inscription et de 1re commande).</div>
+            : <>
+              <div style={{ fontSize: 13, fontWeight: 800, margin: '2px 0 6px' }}>🆕 Nouveaux clients <span style={{ fontWeight: 500, color: 'var(--ink-mute)' }}>· fichier clients du {formatDateShort(C.fileDay)} ({C.total.toLocaleString('fr-FR')} comptes)</span></div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
+                <NewTile k="iy" kind="ins" l="✍️ Inscrits depuis hier" x={C.ins.y} />
+                <NewTile k="iw" kind="ins" l="✍️ Inscrits cette semaine" x={C.ins.w} />
+                <NewTile k="im" kind="ins" l="✍️ Inscrits ce mois" x={C.ins.m} />
+                <NewTile k="fy" kind="fo" l="🛒 1re commande depuis hier" x={C.fo.y} />
+                <NewTile k="fw" kind="fo" l="🛒 1re commande cette semaine" x={C.fo.w} />
+                <NewTile k="fm" kind="fo" l="🛒 1re commande ce mois" x={C.fo.m} />
+              </div>
+            </>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, marginTop: 10 }}>
             <CaTile l={`CA semaine (au ${formatDateShort(S.wMax)})`} now={S.wNow} prev={S.wPrev} sub="S-1 mêmes jours" />
             <CaTile l={`CA du mois (au ${formatDateShort(S.mMax)})`} now={S.mNow} prev={S.mPrev} sub="M-1 mêmes jours" />
@@ -18226,7 +18309,7 @@
           </div>
           <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8 }}>
             CA = commandes livrées (après ruptures, prix plein ; remises boutique non déduites) · comparaisons à jours de distribution comparables · semaine en cours incluse jusqu'à la dernière date chargée.
-            {S.withCl ? (S.histoWeeks < 8 ? ` ⚠️ Historique clients depuis le ${formatDateShort(S.firstDk)} seulement : « nouveau » = 1re commande depuis cette date.` : ` Nouveau client = 1re commande depuis le ${formatDateShort(S.firstDk)}.`) : ' ⚠️ Pas de détail clients dans l\'historique (recharger l\'Historique CA).'}
+            {' '}Inscrits = date de création du compte · 1re commande = first_order_date du fichier clients (à recharger pour être à jour).
           </div>
         </div>
       );
@@ -21074,7 +21157,7 @@
           let consById;
           if (v4Cons) {
             consById = parseConsumersById(v4Cons);
-            await writeCache('consumers', consById);
+            await writeCache('consumers', consById); await kbSaveConsStats();
           } else {
             const cd = await readCache('consumers');
             if (!cd) { showToast('Aucun fichier consommateurs en mémoire : charge-le une première fois'); setBusy(false); return; }
@@ -21238,7 +21321,7 @@
           }
           if (v4Cons) {
             const consById = parseConsumersById(v4Cons);
-            await writeCache('consumers', consById);
+            await writeCache('consumers', consById); await kbSaveConsStats();
             msg.push(`${Object.keys(consById).length} consommateurs`);
           }
           showToast(`✓ Mémorisé : ${msg.join(' · ')}`);
@@ -21264,7 +21347,7 @@
         setBusy(true);
         try {
           const consById = parseConsumersById(v4Cons);
-          await writeCache('consumers', consById);
+          await writeCache('consumers', consById); await kbSaveConsStats();
           showToast(`✓ Consommateurs mis à jour : ${Object.keys(consById).length}`);
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
