@@ -756,7 +756,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.08';
+    const APP_VERSION = 'V10.09';
     // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
     //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
     //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
@@ -856,6 +856,9 @@
     // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
     //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
     //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
+    // V10.09 — Rajout F&L Rungis : les produits mis en « dispatch dernière minute » à la prépa (docs lm|, considérés
+    //   présents côté client) comptent AUSSI comme manquants à re-commander → ils alimentent la carte « Rajout F&L
+    //   à Rungis ». Avant : seuls day_X_manquants comptaient → un FL passé en dernière minute n'était pas re-commandé.
     // V10.08 — MU : la liste « à ensacher » est complétée par le Sheet COMMANDE FL (fl_read) : tout produit ACTIF de
     //   TYPE SACHET (ou MU) y entre, avec ESTIMATION MU / UNITE DE VENTE / MU EN KILO. Avant, seule la liste serveur
     //   get-mu-list (typeVal 'MU', ancien onglet « UNIQUEMENT STOCK… » renommé COMMANDE FL) → ex. Carotte Bio absente.
@@ -20448,6 +20451,28 @@
     // • Rapprochement incertain → listé « à rapprocher » : on choisit dans la liste,
     //   et le choix est mémorisé (Firebase, partagé en live) pour les prochaines fois.
     // ============================================================
+    // V10.09 — manquants « dispatch dernière minute » : reconstruit la liste des produits F&L passés en
+    //   🟣 dernière minute à la prépa (docs lm| + commandes), pour les faire re-commander à Rungis.
+    function kbLmManquantsFromPrep(prepArr, orders){
+      const prep = parsePrepDocs(prepArr || []);
+      const lm = prep.lm || {}; if(!Object.keys(lm).length) return [];
+      const agg = {};
+      for(const o of (orders||[])){
+        if(o && o._test) continue;
+        const site = String(o.site||'').toUpperCase(), client = o.name || '(client)';
+        for(const it of (o.items||[])){
+          if(!it || it.cat==='pain') continue;                       // le pain n'est pas du F&L Rungis
+          if(!lm[site+'||'+it.produit]) continue;
+          const k = site+'||'+client+'||'+it.produit, st = prep.status && prep.status[k];
+          if(st==='rupture' || st==='partiel') continue;             // déjà compté comme rupture
+          const pk = (it.producteur||'')+'||'+it.produit;
+          const a = agg[pk] || (agg[pk] = { produit: it.produit, producteur: it.producteur||'', qty:0, clients:0 });
+          a.qty += Number(it.qty||it.quantity)||1; a.clients++;
+        }
+      }
+      return Object.values(agg).map(a=>({ id:(dispatchNorm(a.producteur+'|'+a.produit)||('lm_'+a.produit)).slice(0,80),
+        produit:a.produit, producteur:a.producteur, total:a.qty, manque:a.qty, qty:a.qty, clients:a.clients, lastMinute:true, source:'lm_prepa' }));
+    }
     function computeFlBuckets(flIdx, manquants, aliasMap) {
       if (!flIdx) return { ready: false, rows: [], warn: [], todo: [] };
       const rows = [], warn = [], todo = [];
@@ -21029,9 +21054,22 @@
     function FlRuptureCard({ session }) {
       const [day, setDay] = React.useState(null);
       const [prepDay, setPrepDay] = React.useState(null);
-      const [manquants, setManquants] = React.useState([]);
+      const [rawManquants, setManquants] = React.useState([]);
+      const [prepArr, setPrepArr] = React.useState([]);     // V10.09 — docs prépa (dispatch dernière minute)
+      const [lmOrders, setLmOrders] = React.useState([]);   // V10.09 — commandes du jour (quantités LM)
       React.useEffect(() => { let stop = false; kbFindPrepDay().then(d => { if (stop) return; setPrepDay(d || null); setDay(cur => cur || d || activeDay()); }).catch(() => { if (!stop) setDay(cur => cur || activeDay()); }); return () => { stop = true; }; }, []);
       React.useEffect(() => { if (!day) return; setManquants([]); return storage.subscribe(`day_${day}_manquants`, setManquants); }, [day]);
+      React.useEffect(() => { if (!day) return; setPrepArr([]); return storage.subscribe(`day_${day}_prep`, setPrepArr); }, [day]);
+      React.useEffect(() => { if (!day) return; let stop = false; setLmOrders([]); storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setLmOrders((d && d.orders) || []); }).catch(() => {}); return () => { stop = true; }; }, [day]);
+      // V10.09 — fusionne les manquants « classiques » et les 🟣 dispatch dernière minute (produits à re-commander)
+      const manquants = React.useMemo(() => {
+        const base = rawManquants || [];
+        const lm = kbLmManquantsFromPrep(prepArr, lmOrders);
+        if (!lm.length) return base;
+        const have = new Set(base.filter(m => (Number(m.manque!=null?m.manque:(m.total!=null?m.total:m.qty))||0) > 0).map(m => normalizeText(kbProdName(m.produit))));
+        return [...base, ...lm.filter(m => !have.has(normalizeText(kbProdName(m.produit))))];
+      }, [rawManquants, prepArr, lmOrders]);
+      const nLm = React.useMemo(() => manquants.filter(m => m.source === 'lm_prepa').length, [manquants]);
       const [closedInfo, setClosedInfo] = React.useState(null);
       React.useEffect(() => { if (!day) return; let stop = false; setClosedInfo(null); storage.getDoc(`day_${day}_prep`, 'meta').then(m => { if (!stop) setClosedInfo(m || {}); }).catch(() => { if (!stop) setClosedInfo({}); }); return () => { stop = true; }; }, [day]);
       const today = todayKey();
@@ -21045,6 +21083,7 @@
             {closedInfo && (closedInfo.closed
               ? <span style={{ fontSize: 12, fontWeight: 800, color: 'var(--accent-dark)' }}>🔒 prépa clôturée{closedInfo.closedBy ? ' par ' + closedInfo.closedBy : ''} — liste définitive</span>
               : <span style={{ fontSize: 12, fontWeight: 800, color: '#ef6c00' }}>⏳ prépa pas encore clôturée — liste provisoire (les ruptures de prépa s'ajoutent à la clôture)</span>)}
+            {nLm > 0 && <span style={{ fontSize: 12, fontWeight: 800, color: '#7b1fa2' }}>🟣 dont {nLm} en dispatch dernière minute (à re-commander)</span>}
           </div>
           {day ? <FlRuptureBlock key={day} day={day} session={session} manquants={manquants} /> : <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Recherche de la distribution en préparation…</p></div>}
         </>
