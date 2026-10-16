@@ -756,7 +756,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.09';
+    const APP_VERSION = 'V10.12';
     // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
     //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
     //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
@@ -856,6 +856,11 @@
     // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
     //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
     //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
+    // V10.12 — Suivi camion Rungis frais (Geotab) : carte en haut de Master › Pilotage › Rungis. Lit un proxy Apps
+    //   Script (GEOTAB_SUIVI_PROXY.gs) qui garde les identifiants Geotab côté serveur ; position live du camion.
+    // V10.11 — Master › Pilotage › 🥬 Rungis = CONSOLE lecture seule des ENLÈVEMENTS Rungis (Centrale PDP).
+    //   Source : Firebase kelbongoo-prep « enlevements/<id> » (REST). Palettes par magasin (Dispatch/Picking/via
+    //   Kelbongoo), statut attente→envoyé→validé, date de récupération + livraison par magasin, non récupérées.
     // V10.09 — Rajout F&L Rungis : les produits mis en « dispatch dernière minute » à la prépa (docs lm|, considérés
     //   présents côté client) comptent AUSSI comme manquants à re-commander → ils alimentent la carte « Rajout F&L
     //   à Rungis ». Avant : seuls day_X_manquants comptaient → un FL passé en dernière minute n'était pas re-commandé.
@@ -18590,6 +18595,7 @@
           { k: 'cmails', label: 'Mails clients',    icon: '📧' },
           { k: 'ancien', label: 'Ancien site',      icon: '🔁' },
         ] },
+        { k: 'rungis', label: 'Rungis',     icon: '🥬' },
         { k: 'live',   label: 'Qui fait quoi', icon: '🟢' },
         { k: 'histo',  label: 'Historique', icon: '📜' },
       ];
@@ -18637,6 +18643,7 @@
           {sub === 'lieux' && <KbLieuxPage session={session} />}
           {sub === 'cmails' && <KbClientMailsPage session={session} />}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
+          {sub === 'rungis' && <RungisEnlevementsPage session={session} />}
           {sub === 'live' && <KbLivePage />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
@@ -20484,7 +20491,7 @@
         if (res.source === 'exact' || res.source === 'alias') {
           const rec = res.rec;
           const calc = flColisNeeded(rec.type, manque, rec.muKilo, rec.colisage);
-          const item = { id: m.id, manquant: m.produit, producer: rec.producer || m.producteur || '', produit: rec.produit, type: rec.type, manque, muKilo: rec.muKilo, colisage: rec.colisage, colis: calc.colis, ok: calc.ok, reason: calc.reason, unit: calc.unit, besoin: calc.besoin, source: res.source };
+          const item = { id: m.id, manquant: m.produit, producer: rec.producer || m.producteur || '', produit: rec.produit, type: rec.type, manque, muKilo: rec.muKilo, colisage: rec.colisage, colis: calc.colis, ok: calc.ok, source: m.source || '', lastMinute: !!m.lastMinute, reason: calc.reason, unit: calc.unit, besoin: calc.besoin, source: res.source };
           if (calc.ok && calc.colis > 0) rows.push(item); else warn.push(item);
           return;
         }
@@ -21087,6 +21094,195 @@
           </div>
           {day ? <FlRuptureBlock key={day} day={day} session={session} manquants={manquants} /> : <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Recherche de la distribution en préparation…</p></div>}
         </>
+      );
+    }
+
+    // ============================================================
+    // V10.11 — Master › Pilotage › 🥬 Rungis = CONSOLE lecture seule des ENLÈVEMENTS Rungis (Centrale PDP).
+    //   Source : Firebase kelbongoo-prep, nœud « enlevements/<id> » (REST, lecture publique, comme l'Apps Script v7).
+    //   Chaque enlèvement : palettes par magasin, typées 🏭 Dispatch / 📦 Picking / 🥬 via Kelbongoo ; statut
+    //   attente → envoyé → ✅ validé par Rungis (date de récupération + date de livraison par magasin, choisies dans
+    //   leur mail de validation) ; palettes non récupérées (motif). Aucune saisie : tout vient de la Centrale/Console.
+    // ============================================================
+    const KB_ENL_URL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/enlevements.json';
+    // V10.12 — Suivi camion Rungis frais (Geotab). Renseigner après déploiement du proxy GEOTAB_SUIVI_PROXY.gs :
+    const GEOTAB_PROXY_URL = '';   // ← URL /exec du proxy Geotab
+    const GEOTAB_PROXY_KEY = '';   // ← le secret SHARED du proxy
+    function kbCompass(b){ const d=['N','NE','E','SE','S','SO','O','NO']; return d[Math.round(((Number(b)||0)%360)/45)%8]; }
+    function kbAgoMin(iso){ const t=Date.parse(iso); if(!t||isNaN(t)) return ''; const m=Math.round((Date.now()-t)/60000); return m<1?'à l\'instant':m<60?('il y a '+m+' min'):('il y a '+Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')); }
+    function GeotabTruckCard(){
+      const [d,setD]=React.useState(undefined);
+      const [err,setErr]=React.useState('');
+      const [tick,setTick]=React.useState(0);
+      React.useEffect(()=>{
+        if(!GEOTAB_PROXY_URL){ setD('noconf'); return; }
+        let stop=false; setD(undefined);
+        const ctl=(typeof AbortController!=='undefined')?new AbortController():null;
+        const to=setTimeout(()=>{ try{ ctl&&ctl.abort(); }catch(e){} }, 15000);
+        fetch(GEOTAB_PROXY_URL+'?k='+encodeURIComponent(GEOTAB_PROXY_KEY)+'&addr=1&t='+Date.now(), ctl?{signal:ctl.signal}:{})
+          .then(r=>r.json()).then(j=>{ if(stop) return; if(j&&j.ok) setD(j); else { setD(null); setErr((j&&j.error)||'réponse invalide'); } })
+          .catch(e=>{ if(!stop){ setD(null); setErr(e.message||String(e)); } }).finally(()=>clearTimeout(to));
+        return ()=>{ stop=true; clearTimeout(to); try{ ctl&&ctl.abort(); }catch(e){} };
+      },[tick]);
+      React.useEffect(()=>{ if(!GEOTAB_PROXY_URL) return; const t=setInterval(()=>setTick(x=>x+1), 60000); return ()=>clearInterval(t); },[]);
+      const Wrap=(inner)=>(<div className="card" style={{padding:'10px 14px',border:'2px solid #0277bd',background:'#e1f5fe'}}>
+        <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+          <div style={{fontSize:17,fontWeight:900,color:'#01579b',flex:1,minWidth:0}}>🚚❄️ Camion Rungis frais {d&&d.name?<span style={{fontWeight:600,fontSize:13,color:'var(--ink-mute)'}}>· {d.name}</span>:null}</div>
+          {GEOTAB_PROXY_URL && <button className="btn-secondary" style={{fontSize:12}} onClick={()=>setTick(x=>x+1)}>↻</button>}
+        </div>
+        {inner}
+      </div>);
+      if(d==='noconf') return Wrap(<div style={{fontSize:13,marginTop:6}}>Suivi Geotab à configurer : déployer le proxy <b>GEOTAB_SUIVI_PROXY.gs</b> puis renseigner <code>GEOTAB_PROXY_URL</code> et <code>GEOTAB_PROXY_KEY</code> dans l'appli.</div>);
+      if(d===undefined) return Wrap(<div style={{fontSize:13,marginTop:6}}>Localisation du camion…</div>);
+      if(d===null) return Wrap(<div style={{fontSize:13,marginTop:6,color:'var(--danger)'}}>⚠️ Position indisponible : {err} <button className="btn-secondary" style={{fontSize:12,marginLeft:6}} onClick={()=>setTick(x=>x+1)}>Réessayer</button></div>);
+      if(!d.found) return Wrap(<div style={{fontSize:13,marginTop:6}}>Camion non localisé (appareil {d.device}).</div>);
+      const maps='https://www.google.com/maps?q='+d.lat+','+d.lng;
+      const speed=Math.round(Number(d.speed)||0);
+      return Wrap(<div style={{marginTop:6}}>
+        <div style={{display:'flex',gap:14,flexWrap:'wrap',alignItems:'center'}}>
+          <div style={{fontSize:28,fontWeight:900,color:speed>3?'#2e7d32':'#607d8b'}}>{speed} <span style={{fontSize:14}}>km/h</span></div>
+          <div style={{fontSize:14,fontWeight:700}}>{d.isDriving?'🟢 en route':'⚪ à l\'arrêt'}{speed>3?' · cap '+kbCompass(d.bearing):''}</div>
+          <div style={{fontSize:13,color: kbAgoMin(d.dateTime).indexOf('h')>=0?'#c62828':'var(--ink-soft)'}}>🕒 {kbAgoMin(d.dateTime)}{d.communicating===false?' · ⚠️ hors ligne':''}</div>
+        </div>
+        {d.address && <div style={{fontSize:14,marginTop:6}}>📍 {d.address}</div>}
+        <div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:8}}>
+          <a className="btn-primary" href={maps} target="_blank" rel="noreferrer" style={{fontSize:13,padding:'8px 12px',background:'#0277bd',borderColor:'#0277bd',textDecoration:'none'}}>🗺️ Voir sur la carte</a>
+          <a className="btn-secondary" href={'https://my.geotab.com/sasp20/#device,id:'+encodeURIComponent(d.device)} target="_blank" rel="noreferrer" style={{fontSize:13,padding:'8px 12px',textDecoration:'none'}}>Geotab</a>
+        </div>
+      </div>);
+    }
+    const KB_ENL_MOTIFS = { introuvable: 'Palette introuvable', place: 'Pas de place dans le camion', pas_prete: 'Palette pas prête', autre: 'Autre' };
+    const KB_ENL_STORE_LONG = { ROB: 'ROBESPIERRE', TOL: 'TOLBIAC', PDP: 'PORTE DE PANTIN', BIC: 'BICHAT', BAR: 'BARBES', BOR: 'BORREGO', CES: 'CESAR', CHA: 'CHARONNE', FOR: 'FORGE', LIL: 'LILAS', NCA: 'NATION A', NCC: 'NATION C', PAD: 'PADOUE', PDC: 'PLACE DE CLICHY', ROM: 'ROME', STB: 'SAINT-BLAISE' };
+    function kbEnlDay(iso) { const p = String(iso || '').split('-'); return p.length === 3 ? (p[2] + '/' + p[1]) : String(iso || ''); }
+    function kbEnlItems(r) {
+      if (!r) return [];
+      const it = r.items; if (!it) return [];
+      return Array.isArray(it) ? it.filter(Boolean) : Object.keys(it).map(k => it[k]).filter(Boolean);
+    }
+    function kbEnlCat(it) { return it.kbg ? 'kbg' : (String(it.type || '').toUpperCase() === 'PICKING' ? 'picking' : 'dispatch'); }
+    const KB_ENL_CATLABEL = { dispatch: ['🏭 Dispatch', '#1a4d2e'], picking: ['📦 Picking', '#1565c0'], kbg: ['🥬 via Kelbongoo', '#2e7d32'] };
+    const KB_ENL_STATUS = {
+      'attente-23h59': ['⏳ en attente (mail Rungis à 23h59)', '#ef6c00', '#fff3e0'],
+      'envoye': ['📤 envoyé à Rungis — en attente de validation', '#1565c0', '#e3f2fd'],
+      'valide': ['✅ validé par Rungis', '#2e7d32', '#e8f5e9'],
+    };
+    function RungisEnlevementsPage({ session }) {
+      const [raw, setRaw] = React.useState(undefined); // undefined=chargement, null=erreur, {}=données
+      const [err, setErr] = React.useState('');
+      const [openId, setOpenId] = React.useState(null);
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false; setRaw(undefined); setErr('');
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const to = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, 20000);
+        fetch(KB_ENL_URL + '?t=' + Date.now(), ctl ? { signal: ctl.signal } : {})
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(j => { if (!stop) setRaw(j || {}); })
+          .catch(e => { if (!stop) { setRaw(null); setErr(e.message || String(e)); } })
+          .finally(() => clearTimeout(to));
+        return () => { stop = true; clearTimeout(to); try { ctl && ctl.abort(); } catch (e) {} };
+      }, [tick]);
+
+      const list = React.useMemo(() => {
+        const o = raw && typeof raw === 'object' ? raw : {};
+        const limit = Date.now() - 30 * 86400000;
+        return Object.keys(o).map(id => ({ id, ...(o[id] || {}) }))
+          .filter(r => (r.at || r.receivedAt || 0) >= limit || r.status === 'valide' || r.status === 'envoye')
+          .sort((a, b) => (b.at || b.receivedAt || 0) - (a.at || a.receivedAt || 0));
+      }, [raw]);
+      React.useEffect(() => { if (openId == null && list.length) setOpenId(list[0].id); }, [list, openId]);
+
+      if (raw === undefined) return <div className="card" style={{ padding: 14 }}>🥬 Chargement des enlèvements Rungis (Centrale PDP)…</div>;
+      if (raw === null) return <div className="card" style={{ padding: 14 }}>
+        <div style={{ fontWeight: 900, color: 'var(--danger)' }}>⚠️ Lecture des enlèvements impossible</div>
+        <div style={{ fontSize: 13, marginTop: 4 }}>{err} — base Centrale PDP (kelbongoo-prep) injoignable.</div>
+        <button className="btn-secondary" style={{ marginTop: 8 }} onClick={() => setTick(t => t + 1)}>↻ Réessayer</button>
+      </div>;
+
+      const statusBadge = (st) => KB_ENL_STATUS[st] || ['• ' + (st || 'inconnu'), 'var(--ink-mute)', 'var(--line)'];
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <h2 style={{ fontSize: 18, margin: 0 }}>🥬 Enlèvements Rungis</h2>
+              <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '4px 0 0' }}>Demandes de retrait vers les magasins (🏭 Dispatch · 📦 Picking · 🥬 via Kelbongoo), validées par Rungis avec date de récupération et de livraison. Lecture depuis la Centrale PDP.</p>
+            </div>
+            <button className="btn-secondary" style={{ fontSize: 13 }} onClick={() => setTick(t => t + 1)}>↻ Actualiser</button>
+          </div>
+          <GeotabTruckCard />
+          {!list.length && <div className="card" style={{ padding: 14, fontSize: 14 }}>Aucun enlèvement sur les 30 derniers jours.</div>}
+          {list.map(r => {
+            const open = openId === r.id;
+            const items = kbEnlItems(r);
+            const byStore = {};
+            items.forEach(it => { const c = String(it.code || '?').toUpperCase(); (byStore[c] = byStore[c] || []).push(it); });
+            (Array.isArray(r.lieux) ? r.lieux : []).forEach(L => { if (L && L.code && Number(L.dolly) > 0) { const c = String(L.code).toUpperCase(); byStore[c] = byStore[c] || []; } });
+            const cat = { dispatch: 0, picking: 0, kbg: 0 };
+            items.forEach(it => { const n = ((Number(it.n) || 0) + (Number(it.dollies) || 0)) || 1; cat[kbEnlCat(it)] += n; });
+            const [stTxt, stCol, stBg] = statusBadge(r.status);
+            const refused = r.refused && typeof r.refused === 'object' ? Object.keys(r.refused).map(k => r.refused[k]) : [];
+            const stores = Object.keys(byStore).sort((a, b) => (KB_ENL_STORE_LONG[a] || a).localeCompare(KB_ENL_STORE_LONG[b] || b, 'fr'));
+            return (
+              <div key={r.id} className="card" style={{ padding: 0, overflow: 'hidden', border: '2px solid ' + stCol }}>
+                <button onClick={() => setOpenId(open ? null : r.id)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', background: stBg, border: 'none', padding: '12px 14px', cursor: 'pointer', textAlign: 'left' }}>
+                  <span style={{ fontSize: 24 }}>🥬</span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ fontSize: 16, fontWeight: 900 }}>Demande du {r.date || kbEnlDay(new Date(r.at || r.receivedAt || Date.now()).toISOString().slice(0, 10))}{r.by ? ' · ' + r.by : ''}</span>
+                    <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-soft)' }}>{stores.length} magasin(s) · {cat.dispatch ? '🏭 ' + cat.dispatch + ' ' : ''}{cat.picking ? '📦 ' + cat.picking + ' ' : ''}{cat.kbg ? '🥬 ' + cat.kbg + ' ' : ''}{r.relance ? '· 🔴 relance' : ''}</span>
+                  </span>
+                  <span style={{ fontSize: 12, fontWeight: 800, color: stCol, whiteSpace: 'nowrap', maxWidth: 220, textAlign: 'right' }}>{stTxt}{r.status === 'valide' && r.pickup ? ' · récup. ' + kbEnlDay(r.pickup) : ''}</span>
+                  <span style={{ fontSize: 22, color: stCol, transform: open ? 'rotate(180deg)' : 'none' }}>▾</span>
+                </button>
+                {open && (
+                  <div style={{ padding: '10px 14px' }}>
+                    {r.status === 'valide' && <div style={{ background: '#e8f5e9', border: '2px solid #2e7d32', borderRadius: 10, padding: '8px 10px', marginBottom: 10, fontSize: 14 }}>
+                      <b style={{ color: '#2e7d32' }}>✅ Validé par Rungis</b>{r.validatedAt ? ' le ' + new Date(r.validatedAt).toLocaleString('fr-FR') : ''} · 📦 récupération le <b>{kbEnlDay(r.pickup)}</b>
+                    </div>}
+                    {r.note && <div style={{ background: '#fff8e1', border: '2px solid #f9a825', borderRadius: 10, padding: '6px 10px', marginBottom: 10, fontSize: 13 }}>📝 Note Pribon : {r.note}</div>}
+                    {stores.map(c => {
+                      const pals = byStore[c] || [];
+                      const livIso = r.livraison && r.livraison[c];
+                      const lDolly = (Array.isArray(r.lieux) ? r.lieux : []).filter(L => L && String(L.code).toUpperCase() === c).reduce((a, L) => a + (Number(L.dolly) || 0), 0);
+                      return (
+                        <div key={c} style={{ border: '1px solid var(--line)', borderLeft: '6px solid ' + (SITE_NAMES[c] ? kbSiteColor(c) : '#607d8b'), borderRadius: 10, padding: '8px 10px', marginBottom: 8 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+                            <div style={{ fontSize: 15, fontWeight: 900 }}>{c} <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}>{KB_ENL_STORE_LONG[c] || ''}</span></div>
+                            {r.status === 'valide' && <div style={{ fontSize: 13, fontWeight: 700, color: '#1565c0' }}>🚚 livraison le {kbEnlDay(livIso || r.pickup)}</div>}
+                          </div>
+                          {pals.map((it, i) => {
+                            const [lbl, col] = KB_ENL_CATLABEL[kbEnlCat(it)];
+                            const qty = Number(it.dollies) > 0 ? (it.dollies + ' dolly' + (it.dollies > 1 ? 's' : '')) : (Number(it.n) > 0 ? (it.n + ' palette' + (it.n > 1 ? 's' : '')) : 'même palette');
+                            return (
+                              <div key={i} style={{ fontSize: 13, padding: '3px 0', borderTop: i ? '1px dashed var(--line)' : 'none', marginTop: i ? 4 : 6 }}>
+                                <span style={{ fontWeight: 800, color: col }}>{lbl}</span> · <b>{qty}</b>
+                                {it.frais ? <span style={{ color: '#0277bd', fontWeight: 700 }}> · ❄️ frais</span> : null}
+                                {it.zone === 'froid' ? ' · ❄️ ch. froide' : it.zone === 'sec' ? ' · ▣ sec' : ''}
+                                {it.ref ? <span style={{ color: 'var(--ink-mute)' }}> · cde {it.ref}</span> : null}
+                                {it.total ? <span style={{ color: 'var(--ink-mute)' }}> · {it.total} u.</span> : null}
+                                {it.note ? <span style={{ color: '#8d6e00' }}> · ℹ️ {it.note}</span> : null}
+                              </div>
+                            );
+                          })}
+                          {lDolly > 0 && <div style={{ fontSize: 13, color: '#33691e', fontWeight: 700, marginTop: 4 }}>🧀 {lDolly} dolly(s) fromage</div>}
+                          {pals.length === 0 && lDolly === 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>—</div>}
+                        </div>
+                      );
+                    })}
+                    {refused.length > 0 && (
+                      <div style={{ border: '2px solid #c62828', background: '#fdecea', borderRadius: 10, padding: '8px 10px', marginTop: 4 }}>
+                        <div style={{ fontWeight: 900, color: '#c62828', fontSize: 14 }}>❌ {refused.length} palette(s) NON récupérée(s)</div>
+                        {refused.map((x, i) => <div key={i} style={{ fontSize: 13, marginTop: 2 }}><b>{String(x.code || '').toUpperCase()}</b> — {KB_ENL_MOTIFS[x.motif] || x.motif}{x.note ? ' — « ' + x.note + ' »' : ''}</div>)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <div className="card" style={{ padding: '8px 12px', fontSize: 11, color: 'var(--ink-mute)' }}>
+            Source : Centrale PDP (Firebase kelbongoo-prep). 🏭 Dispatch = palette fournisseur éclatée · 📦 Picking = préparée depuis le stock · 🥬 via Kelbongoo = passe par Kelbongoo (pas enlevé par Rungis). Statut et dates renseignés automatiquement par le mail de validation Rungis.
+          </div>
+        </div>
       );
     }
 
@@ -24889,7 +25085,7 @@
           <div className="kb-side-brand"><div className="kb-side-logo">K</div><div><b>Kelbongoo</b><small>Master · {APP_VERSION}</small></div></div>
           <Item k="today" label="Aujourd'hui" on={tab === 'today'} onClick={() => goTab('today')} />
           <div className="kb-side-sec">Pilotage</div>
-          {P('ca', 'Suivi CA')}{P('stats', 'Statistiques')}{P('manq', 'Manquants & remises')}{P('pertes', 'Pertes ROB')}{P('live', '🟢 Qui fait quoi')}{P('histo', 'Historique')}
+          {P('ca', 'Suivi CA')}{P('stats', 'Statistiques')}{P('manq', 'Manquants & remises')}{P('pertes', 'Pertes ROB')}{P('rungis', '🥬 Rungis')}{P('live', '🟢 Qui fait quoi')}{P('histo', 'Historique')}
           <div className="kb-side-sec">Opérations</div>
           <Item k="push" label="Push équipes" on={tab === 'push'} onClick={() => goTab('push')} />
           <Item k="recap" label="Récap du jour" on={tab === 'masterrecap'} onClick={() => goTab('masterrecap')} />
