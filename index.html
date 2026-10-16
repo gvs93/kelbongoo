@@ -756,7 +756,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.02';
+    const APP_VERSION = 'V10.05';
     // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
     //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
     //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
@@ -856,6 +856,14 @@
     // V9.87 — URGENT dispatch dernière minute : les produits passés en « 🟣 Dispatch dernière minute » À LA PRÉPA
     //   restent dans la commande du client (pas en rupture) → ils n'étaient attribués à personne. Ils sont maintenant
     //   lus (lm| dans day_X_prep, items._lm) : bandeau rouge sur le client + casier dans « Ranger » + calcul LM prépa.
+    // V10.05 — 🧺 PANIER SOLIDAIRE = cagette à part, JAMAIS en casier : reconnu par son nom, classé hors casier (comme ND,
+    //   flag solidaire), non basculable en casier. Prépa › DLC & suivi : 📦 MISE EN PLACE (commandes chargées, total,
+    //   par lieu avec nb de paniers solidaires).
+    // V10.04 — Master › 🏠 Aujourd'hui : bloc 📈 « Clients & CA » (lit ca_history) : nouveaux clients depuis hier /
+    //   cette semaine / ce mois (1re commande dans l'historique, détail par lieu au clic), CA semaine et mois vs période
+    //   précédente à jours comparables (%), commandes, panier moyen, dernière distrib vs même jour S-1, CA des 8 semaines.
+    // V10.03 — Dispatch pain : bandeau PRIBON BICHAT visible si aucune commande pour la date (ou saisie à une
+    //   date voisine J±3) ; erreur de lecture pain_pribon affichée au lieu d'être avalée.
     // V9.86 — Commande pain Pribon : liste FIXE des 8 pains Brut de Pain (tarif BdP), nom BdP + nom Kelbongoo ;
     //   récap général additionné par nom de pain (Kelbongoo + Pribon).
     // V9.85 — Prépa : commandes fusionnées d'un même client = UNE ligne par produit (quantités additionnées).
@@ -1535,10 +1543,18 @@
       day: o => { const d = oid(o.distribution_date) || (o.distribution_date && o.distribution_date.$date) || o.distribution_date; return String(d || '').slice(0, 10); },
       items: o => o.items, itemId: it => oid(it.producerproduct_id), itemQty: it => Number(it.quantity) || 1,
     };
+    // V10.05 — panier solidaire : cagette à part, jamais en casier
+    function kbIsSolidaire(name) { return /panier\s*solidaire/i.test(String(name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')); }
+    function kbSolFixItem(it) { return (it && kbIsSolidaire(it.produit) && (it.cat !== 'nd' || !it.solidaire)) ? { ...it, cat: 'nd', solidaire: true } : it; }
+    function kbSolFixOrder(o) {
+      if (!o || !Array.isArray(o.items) || !o.items.some(it => it && kbIsSolidaire(it.produit))) return o;
+      const items = o.items.map(kbSolFixItem);
+      return { ...o, items, pains: items.filter(i => i.cat === 'pain'), nds: items.filter(i => i.cat === 'nd'), ...(Array.isArray(o.frais) ? { frais: items.filter(i => i.cat === 'frais') } : {}) };
+    }
     const kbIsDayOrders = (c) => /^day_.+_orders$/.test(c);
     const kbOrdersRead1 = (c, doc) => kbIsDayOrders(c) ? kbCleanDayOrders(doc) : doc;
     const kbOrdersRead = (c, arr) => kbIsDayOrders(c) ? (arr || []).map(kbCleanDayOrders) : arr;
-    const kbCleanDayOrders = (doc) => (doc && Array.isArray(doc.orders)) ? { ...doc, orders: kbDropSuperseded(doc.orders, KB_ACC_NORM) } : doc;
+    const kbCleanDayOrders = (doc) => (doc && Array.isArray(doc.orders)) ? { ...doc, orders: kbDropSuperseded(doc.orders, KB_ACC_NORM).map(kbSolFixOrder) } : doc;
 
     // ============================================================
     // STORAGE
@@ -1857,7 +1873,7 @@
         const full = `${cu.firstname || ''} ${cu.lastname || ''}`.trim() || (cu.email || '') || '(client PrestaShop)';
         const items = (po.items || []).filter(it => (parseInt(it.qty, 10) || 0) > 0).map(it => {
           const m = byName[nrm(it.name)];
-          let cat = m ? (DISPATCH_TYPE[m.dispatchType] || 'frais') : (/pain|boulang/i.test(it.category || '') ? 'pain' : 'frais');
+          let cat = kbIsSolidaire(it.name) ? 'nd' : m ? (DISPATCH_TYPE[m.dispatchType] || 'frais') : (/pain|boulang/i.test(it.category || '') ? 'pain' : 'frais');
           return { id: 'ps_' + (it.id_product || 0) + '_' + (it.id_attribute || 0), produit: T + (it.name || '(article)'), producteur: it.manufacturer || (m ? m.producer : ''), qty: parseInt(it.qty, 10) || 1, consumer_price: parseInt(it.unit_price_cents, 10) || 0, dispatchType: m ? m.dispatchType : null, cat, ean: it.ean13 || '', _test: test };
         });
         if (!items.length) continue;
@@ -2038,7 +2054,8 @@
             qty: it.quantity || 1,
             consumer_price: it.consumer_price || 0,
             dispatchType: p ? p.dispatchType : null,
-            cat: p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais',
+            cat: (p && kbIsSolidaire(p.name)) ? 'nd' : p ? (DISPATCH_TYPE[p.dispatchType] || 'frais') : 'frais',
+            ...((p && kbIsSolidaire(p.name)) ? { solidaire: true } : {}),
           };
         });
 
@@ -2939,7 +2956,7 @@
         if (prep.lm && prep.lm[String(site || '').toUpperCase() + '||' + it.produit]) it = { ...it, _lm: true };
         // V10.00 — ND → casier (DOM : toujours dans le carton ; ailleurs : « 🧺 En casier » choisi en prépa) / casier → ND forcé
         const pkn = String(site || '').toUpperCase() + '||' + it.produit;
-        if (it.cat === 'nd' && (isDom || (prep.ndOff && prep.ndOff[pkn] && !(prep.ndForce && prep.ndForce[pkn])))) it = { ...it, cat: 'frais', _ndCasier: true, _ndCat: 'nd' };
+        if (it.cat === 'nd' && !it.solidaire && (isDom || (prep.ndOff && prep.ndOff[pkn] && !(prep.ndForce && prep.ndForce[pkn])))) it = { ...it, cat: 'frais', _ndCasier: true, _ndCat: 'nd' };
         else if (it.cat !== 'nd' && it.cat !== 'pain' && !isDom && prep.ndForce && prep.ndForce[pkn] && !(prep.lm && prep.lm[pkn])) it = { ...it, cat: 'nd', _ndForce: true };
         items.push(it);
       }
@@ -11429,7 +11446,12 @@
       const [includeTest, setIncludeTest] = React.useState(false);
       // V9.85 — commandes pain des magasins Pribon (ajoutées au dispatch et au récap)
       const [pribon, setPribon] = React.useState([]);
-      React.useEffect(() => { let stop = false; kbPainPribonForDay(day).then(r => { if (!stop) setPribon(r); }); return () => { stop = true; }; }, [day, data]);
+      const [pribonErr, setPribonErr] = React.useState('');
+      const [pribonMiss, setPribonMiss] = React.useState([]);
+      React.useEffect(() => { let stop = false;
+        kbPainPribonForDay(day).then(async r => { if (stop) return; setPribon(r); setPribonErr(r.err || '');
+          const m = await kbPainPribonNear(day, r); if (!stop) setPribonMiss(m); });
+        return () => { stop = true; }; }, [day, data]);
       const [totBusy, setTotBusy] = React.useState(false);
       const [totErr, setTotErr] = React.useState('');
       const showToastP = React.useContext(ToastContext);
@@ -11529,6 +11551,19 @@
           <button className="btn-secondary" disabled={!canPrint} onClick={printRecap}>📋 Récap général — {total} pain{total > 1 ? 's' : ''} à recevoir</button>
           {!master && <button className="btn-secondary" disabled={!canPrint} onClick={printOrder}>📦 Bon de commande Brut de Pains (PDF)</button>}
           {!confirmed && chk.ok && <div style={{ fontSize: 12, color: 'var(--warn)', textAlign: 'center' }}>Coche « Je confirme » pour imprimer.</div>}
+          {pribonErr && <div className="card" style={{ border: '3px solid #c62828', background: '#ffebee' }}>
+            <div style={{ fontWeight: 900, fontSize: 16, color: '#c62828' }}>⚠️ Commande pain PRIBON illisible</div>
+            <div style={{ fontSize: 13, marginTop: 4 }}>{pribonErr}{/permission/i.test(pribonErr) ? ' → règle Firestore « pain_pribon » : lecture à autoriser pour la prépa.' : ''}</div>
+          </div>}
+          {!pribonErr && pribonMiss.map(({ st, near }) => (
+            <div key={st.code} className="card" style={{ border: '3px solid #5d4037', background: '#efebe9' }}>
+              <div style={{ fontWeight: 900, fontSize: 17, color: '#5d4037' }}>🥖 {st.label} : aucune commande pain pour le {formatDateShort(day)}</div>
+              {near.length
+                ? <div style={{ fontSize: 14, marginTop: 4, fontWeight: 700 }}>⚠️ Commande trouvée à une autre date : {near.map(n => `${formatDateShort(n.day)} (${n.nb} pains)`).join(' · ')} — vérifier la date de saisie.</div>
+                : <div style={{ fontSize: 13, marginTop: 4 }}>Le bloc PRIBON n'apparaît que si la commande est saisie pour CETTE date de distribution.</div>}
+              {kbIsSecure() && <button className="btn-secondary" style={{ marginTop: 8 }} onClick={() => setTab('painpribon')}>🥖 Saisir la commande Pribon</button>}
+            </div>
+          ))}
           {!data.loading && chk.ok && siteBlocks.length === 0 && <div className="card"><p style={{ margin: 0, fontSize: 13, color: 'var(--ink-mute)' }}>Aucun pain commandé pour cette distribution{producers.length ? ' (avec les producteurs cochés)' : ''}.</p></div>}
           {siteBlocks.map(b => {
             const t = b.lines.reduce((s, x) => s + x.qty, 0);
@@ -12043,9 +12078,25 @@
     async function kbPainPribonForDay(day) {
       const out = [];
       for (const st of PRIBON_STORES) {
-        try { const d = await storage.getDoc('pain_pribon', `${day}_${st.code}`); if (d && (d.lines || []).some(l => l.qty > 0)) out.push({ ...d, storeInfo: st }); } catch (_) {}
+        try { const d = await storage.getDoc('pain_pribon', `${day}_${st.code}`); if (d && (d.lines || []).some(l => l.qty > 0)) out.push({ ...d, storeInfo: st }); }
+        catch (e) { out.err = (out.err ? out.err + ' · ' : '') + st.label + ' : ' + (e && e.message || e); }
       }
       return out;
+    }
+    // V10.03 — diagnostic dispatch pain : pour chaque magasin Pribon SANS commande ce jour-là,
+    // cherche une commande saisie à une date voisine (J-3 … J+3) → « saisie au mauvais jour ».
+    async function kbPainPribonNear(day, have) {
+      const res = [];
+      for (const st of PRIBON_STORES) {
+        if ((have || []).some(o => o.storeInfo && o.storeInfo.code === st.code)) continue;
+        const near = [];
+        for (const n of [-1, 1, -2, 2, -3, 3]) {
+          const d2 = addDays(day, n);
+          try { const d = await storage.getDoc('pain_pribon', `${d2}_${st.code}`); if (d && (d.lines || []).some(l => l.qty > 0)) near.push({ day: d2, nb: d.nb || d.lines.reduce((t, l) => t + (l.qty || 0), 0) }); } catch (_) {}
+        }
+        res.push({ st, near });
+      }
+      return res;
     }
     function PainPribonPage({ session, setTab, catalogue }) {
       const showToast = React.useContext(ToastContext);
@@ -12218,6 +12269,47 @@
       );
     }
 
+    // V10.05 — 📦 MISE EN PLACE (Prépa › DLC & suivi) : commandes chargées de la prochaine distribution,
+    //   total, par lieu (couleur du lieu) avec le nombre de 🧺 paniers solidaires (cagette à part).
+    function KbMiseEnPlace() {
+      const [days, setDays] = React.useState(null);
+      const [day, setDay] = React.useState(null);
+      const [orders, setOrders] = React.useState(null);
+      React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; const d = (l || []).filter(x => x.count > 0); setDays(d); setDay(d.length ? d[0].day : null); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
+      React.useEffect(() => { if (!day) return; let stop = false; setOrders(null);
+        storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
+        return () => { stop = true; }; }, [day]);
+      const by = {}; let solT = 0;
+      (orders || []).forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0 }; r.n++;
+        const q = (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); r.sol += q; solT += q; });
+      const sites = Object.entries(by).sort((a, b) => kbPrintSite(a[0]).localeCompare(kbPrintSite(b[0]), 'fr'));
+      return (
+        <div style={{ border: '3px solid #1565c0', borderRadius: 'var(--radius)', background: 'var(--bg-card, #fff)', padding: '14px 14px 12px' }}>
+          <div style={{ fontSize: 22, fontWeight: 900 }}>📦 MISE EN PLACE</div>
+          {days === null ? <div style={{ fontSize: 15, marginTop: 6 }}>Chargement…</div>
+            : !days.length ? <div style={{ fontSize: 16, fontWeight: 700, marginTop: 6, color: 'var(--danger)' }}>Aucune commande chargée pour les prochains jours.</div>
+            : <>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                {days.map(d => <button key={d.day} onClick={() => setDay(d.day)} className={d.day === day ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 15, fontWeight: 800, padding: '8px 12px' }}>Commandes du {formatDateShort(d.day)}</button>)}
+              </div>
+              <div style={{ fontSize: 16, marginTop: 8, textTransform: 'capitalize' }}>Distribution du <b>{formatDateFR(day)}</b></div>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+                <div style={{ flex: 1, minWidth: 140, background: '#e3f2fd', borderRadius: 12, padding: '10px 12px' }}><div style={{ fontSize: 14, fontWeight: 700 }}>Commandes totales</div><div style={{ fontSize: 44, fontWeight: 900, lineHeight: 1 }}>{orders == null ? '…' : orders.length}</div></div>
+                <div style={{ flex: 1, minWidth: 140, background: '#fff3e0', borderRadius: 12, padding: '10px 12px' }}><div style={{ fontSize: 14, fontWeight: 700 }}>🧺 Paniers solidaires</div><div style={{ fontSize: 44, fontWeight: 900, lineHeight: 1, color: '#e65100' }}>{orders == null ? '…' : solT}</div><div style={{ fontSize: 12 }}>cagette à part — jamais en casier</div></div>
+              </div>
+              {orders && sites.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(150px,1fr))', gap: 8, marginTop: 10 }}>
+                {sites.map(([c, r]) => (
+                  <div key={c} style={{ borderRadius: 12, padding: '8px 10px', borderLeft: '8px solid ' + kbSiteColor(c), background: kbSiteColor(c) + '1F' }}>
+                    <div style={{ fontSize: 15, fontWeight: 900 }}>{kbPrintSite(c)} <span style={{ fontSize: 12, opacity: .7 }}>{c}</span></div>
+                    <div style={{ fontSize: 28, fontWeight: 900, lineHeight: 1.1 }}>{r.n} <span style={{ fontSize: 14, fontWeight: 700 }}>cmd</span></div>
+                    <div style={{ fontSize: 16, fontWeight: 800, color: r.sol ? '#e65100' : 'var(--ink-mute)' }}>🧺 {r.sol} panier{r.sol > 1 ? 's' : ''} solidaire{r.sol > 1 ? 's' : ''}</div>
+                  </div>
+                ))}
+              </div>}
+            </>}
+        </div>
+      );
+    }
     function PrepSuiviHub({ setTab }) {
       const board = useDlcBoard();
       const pdp = useKbPdpBoard();
@@ -12240,6 +12332,7 @@
       return (
         <div className="stack">
           <h1>📅 DLC &amp; suivi</h1>
+          <KbMiseEnPlace />
           <button onClick={()=>setTab('dlcwatch')}
             style={{display:'flex',alignItems:'center',gap:16,padding:'18px 16px',textAlign:'left',cursor:'pointer',border:'3px solid ' + (nDlc ? '#c62828' : '#2e7d32'),borderRadius:'var(--radius)',background: nDlc ? '#fdecea' : '#e8f5e9',width:'100%'}}>
             <span style={{fontSize:40,lineHeight:1}}>📅</span>
@@ -12909,7 +13002,7 @@
       // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
       // V10.00 — pas de ND en livraison à domicile (DOM) : tout va directement dans les CARTONS du client
       const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd' && r.site !== 'DOM') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
-      const ndOn = (pk) => String(pk).indexOf('DOM||') !== 0 && (!!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]));
+      const ndOn = (pk) => String(pk).indexOf('DOM||') !== 0 && (kbIsSolidaire(String(pk).split('||').pop()) || !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]));
       const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
       // V9.77 — progression en RÉFÉRENCES : une référence est faite quand toutes ses lignes sont traitées
@@ -13008,6 +13101,7 @@
       const setPoids1 = (r) => { const cur=prep.poids[K(r)]||''; const v=prompt('Poids réel constaté ? (ex : 320g)', cur); if(v!==null) wPoids(K(r), v.trim()||null); };
       const setPoidsProd = (site, product) => { const v=prompt('Poids réel (s\'applique à ce produit) — ex : 320g',''); if(v && v.trim()) rows.filter(r=>r.site===site&&r.product===product).forEach(r=>wPoids(K(r), v.trim())); };
       const toggleND = (pk) => {
+        if (kbIsSolidaire(String(pk).split('||').pop())) { showToast('🧺 Panier solidaire : cagette à part, jamais en casier'); return; } // V10.05
         if (ndOn(pk)) { if (prep.nd[pk]) wND(pk, null); if (ndAuto.has(pk)) wNdOff(pk, true); }
         else { wNdOff(pk, false); wND(pk, { placed:null, alloc:[], shortage:[] }); wLM(pk, false); }
         setMoreOpen(m=>({...m,[pk]:false}));
@@ -14007,6 +14101,7 @@
       }, [dayOrdersP]);
       const setNdCasier = async (pks, on) => {
         const who = session.name || 'prépa';
+        if (on && pks.some(pk => kbIsSolidaire(String(pk).split('||').pop()))) { showToast('🧺 Panier solidaire : cagette à part, jamais en casier'); pks = pks.filter(pk => !kbIsSolidaire(String(pk).split('||').pop())); if (!pks.length) return; } // V10.05
         try {
           for (const pk of pks) {
             const id = encodeURIComponent(pk);
@@ -18039,6 +18134,103 @@
     //   prépa en cours (avancement par lieu, ruptures, clôture, DOM), équipe en ligne, MU du jour,
     //   commandes, « À traiter » (cliquable), raccourcis (commande pain, étiquettes DOM…), puis le LIVE détaillé.
     // ============================================================
+
+    // ============================================================
+    // V10.04 — 📈 CLIENTS & CA (accueil Master). Source : collection ca_history (1 doc / date de distribution,
+    //   écrit à chaque chargement JSON). Nouveau client = 1re apparition de son identifiant dans siteDetailJ.cl.
+    // ============================================================
+    function kbMondayOf(dk) { const d = new Date(dk + 'T12:00:00'); return addDays(dk, -((d.getDay() + 6) % 7)); }
+    function kbHomeStats(docs, today) {
+      const list = (docs || []).filter(d => d && /^\d{4}-\d{2}-\d{2}$/.test(d.id || d.date || '')).map(d => ({ ...d, dk: d.date || d.id })).sort((a, b) => a.dk.localeCompare(b.dk));
+      const caOf = (d) => { const t = d.totals || totalsFromCaBySite(d.caBySite); return t.reel || 0; };
+      // 1re apparition de chaque client (+ lieu)
+      const first = {}; let withCl = 0, firstDk = null;
+      for (const d of list) {
+        const sd = kbDocJ(d, 'siteDetailJ'); if (!sd) continue; withCl++; if (!firstDk) firstDk = d.dk;
+        for (const [site, v] of Object.entries(sd)) for (const cid of Object.keys((v && v.cl) || {})) if (!first[cid]) first[cid] = { dk: d.dk, site };
+      }
+      const yest = addDays(today, -1), mon = kbMondayOf(today), mStart = today.slice(0, 8) + '01';
+      const newSince = (from) => { const by = {}; let n = 0; for (const f of Object.values(first)) if (f.dk >= from && f.dk !== firstDk) { n++; by[f.site] = (by[f.site] || 0) + 1; } return { n, by: Object.entries(by).sort((a, b) => b[1] - a[1]) }; };
+      // période [from, to] vs période précédente à jours comparables
+      const sum = (from, to) => { let ca = 0, cmd = 0, nd = 0; list.forEach(d => { if (d.dk >= from && d.dk <= to) { ca += caOf(d); cmd += d.ordersCount || 0; nd++; } }); return { ca, cmd, nd, pm: cmd ? ca / cmd : 0 }; };
+      const lastDk = (list.filter(d => d.dk <= today).slice(-1)[0] || {}).dk || null;
+      const wTo = addDays(mon, 6), wNow = sum(mon, wTo);
+      const wMax = list.filter(d => d.dk >= mon && d.dk <= wTo).map(d => d.dk).sort().slice(-1)[0] || today;
+      const off = Math.round((new Date(wMax + 'T12:00:00') - new Date(mon + 'T12:00:00')) / 86400000);
+      const wPrev = sum(addDays(mon, -7), addDays(mon, -7 + off));
+      const pm = new Date(today + 'T12:00:00'); pm.setDate(1); pm.setMonth(pm.getMonth() - 1);
+      const pmStart = `${pm.getFullYear()}-${String(pm.getMonth() + 1).padStart(2, '0')}-01`;
+      const mMax = list.filter(d => d.dk >= mStart && d.dk.slice(0, 7) === today.slice(0, 7)).map(d => d.dk).sort().slice(-1)[0] || today;
+      const dom = Number(mMax.slice(8, 10));
+      const pmEnd = pmStart.slice(0, 8) + String(Math.min(dom, new Date(pm.getFullYear(), pm.getMonth() + 1, 0).getDate())).padStart(2, '0');
+      const mNow = sum(mStart, mMax), mPrev = sum(pmStart, pmEnd);
+      const last = lastDk ? sum(lastDk, lastDk) : null, lastPrev = lastDk ? sum(addDays(lastDk, -7), addDays(lastDk, -7)) : null;
+      const weeks = []; for (let i = 7; i >= 0; i--) { const m = addDays(mon, -7 * i); weeks.push({ m, ...sum(m, addDays(m, 6)) }); }
+      return { ok: list.length > 0, withCl, firstDk, nYest: newSince(yest), nWeek: newSince(mon), nMonth: newSince(mStart),
+        wNow, wPrev, wMax, mNow, mPrev, mMax, last, lastPrev, lastDk, weeks, histoWeeks: firstDk ? Math.floor((new Date(today) - new Date(firstDk)) / 604800000) : 0 };
+    }
+    function KbHomeStats({ goSub }) {
+      const [docs, setDocs] = React.useState(null);
+      const [open, setOpen] = React.useState('');
+      React.useEffect(() => { let alive = true; storage.getAll('ca_history').then(a => { if (alive) setDocs(a || []); }).catch(() => { if (alive) setDocs([]); }); return () => { alive = false; }; }, []);
+      const today = todayKey();
+      const S = React.useMemo(() => docs ? kbHomeStats(docs, today) : null, [docs, today]);
+      const eur = (c) => Math.round((c || 0) / 100).toLocaleString('fr-FR') + ' €';
+      const Evo = ({ a, b }) => { if (!b) return <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>—</span>; const p = Math.round(100 * (a - b) / b); const c = p > 0 ? '#2e7d32' : p < 0 ? 'var(--danger)' : 'var(--ink-mute)';
+        return <span style={{ fontSize: 14, fontWeight: 900, color: c }}>{p > 0 ? '▲ +' : p < 0 ? '▼ ' : '= '}{p} %</span>; };
+      const box = { padding: '12px 14px', margin: 0, cursor: 'pointer' };
+      if (!S) return <div className="card" style={{ padding: 14 }}>📈 Chargement des stats…</div>;
+      if (!S.ok) return <div className="card" style={{ padding: 14, fontSize: 13 }}>📈 Pas encore d'historique CA (Chargement → Historique CA).</div>;
+      const NewTile = ({ k, l, x }) => (
+        <div className="card" style={{ ...box, borderTop: '5px solid #00897b' }} onClick={() => setOpen(open === k ? '' : k)}>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)', fontWeight: 700 }}>🆕 Nouveaux clients · {l}</div>
+          <div style={{ fontSize: 34, fontWeight: 900, lineHeight: 1.1, marginTop: 4, color: '#00897b' }}>{S.withCl ? x.n : '—'}</div>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>{x.by.slice(0, 4).map(([s, n]) => `${s} ${n}`).join(' · ') || 'aucun'}</div>
+          {open === k && x.by.length > 4 && <div style={{ fontSize: 12, marginTop: 4 }}>{x.by.slice(4).map(([s, n]) => `${s} ${n}`).join(' · ')}</div>}
+        </div>
+      );
+      const CaTile = ({ l, now, prev, sub }) => (
+        <div className="card" style={{ ...box, borderTop: '5px solid #1565c0' }} onClick={() => goSub('ca')}>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)', fontWeight: 700 }}>💶 {l}</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginTop: 4 }}><span style={{ fontSize: 30, fontWeight: 900, lineHeight: 1.1 }}>{eur(now.ca)}</span><Evo a={now.ca} b={prev.ca} /></div>
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>{now.cmd} cmd (<Evo a={now.cmd} b={prev.cmd} />) · panier {eur(now.pm)} (<Evo a={now.pm} b={prev.pm} />)</div>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 2 }}>{sub} : {eur(prev.ca)} · {prev.cmd} cmd</div>
+        </div>
+      );
+      const maxW = Math.max(1, ...S.weeks.map(w => w.ca));
+      return (
+        <div className="card" style={{ padding: '12px 14px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <div style={{ fontSize: 17, fontWeight: 900 }}>📈 Clients & CA</div>
+            <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => goSub('ca')}>Suivi CA ›</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
+            <NewTile k="y" l="depuis hier" x={S.nYest} />
+            <NewTile k="w" l="cette semaine" x={S.nWeek} />
+            <NewTile k="m" l="ce mois" x={S.nMonth} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, marginTop: 10 }}>
+            <CaTile l={`CA semaine (au ${formatDateShort(S.wMax)})`} now={S.wNow} prev={S.wPrev} sub="S-1 mêmes jours" />
+            <CaTile l={`CA du mois (au ${formatDateShort(S.mMax)})`} now={S.mNow} prev={S.mPrev} sub="M-1 mêmes jours" />
+            {S.last && <CaTile l={`Dernière distrib (${formatDateShort(S.lastDk)})`} now={S.last} prev={S.lastPrev} sub="même jour S-1" />}
+          </div>
+          <div style={{ marginTop: 12, fontSize: 13, fontWeight: 800 }}>CA des 8 dernières semaines</div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 110, marginTop: 6 }}>
+            {S.weeks.map((w, i) => { const cur = i === S.weeks.length - 1; return (
+              <div key={w.m} title={`Sem. du ${formatDateShort(w.m)} : ${eur(w.ca)} · ${w.cmd} cmd`} onClick={() => goSub('ca')} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', cursor: 'pointer', height: '100%', justifyContent: 'flex-end' }}>
+                <div style={{ fontSize: 10, fontWeight: 800, whiteSpace: 'nowrap' }}>{w.ca ? Math.round(w.ca / 100000) + 'k' : ''}</div>
+                <div style={{ width: '100%', height: Math.max(2, Math.round(80 * w.ca / maxW)), background: cur ? '#1565c0' : '#90caf9', borderRadius: '4px 4px 0 0' }} />
+                <div style={{ fontSize: 10, color: 'var(--ink-mute)', marginTop: 2 }}>{formatDateShort(w.m)}</div>
+              </div>
+            ); })}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8 }}>
+            CA = commandes livrées (après ruptures, prix plein ; remises boutique non déduites) · comparaisons à jours de distribution comparables · semaine en cours incluse jusqu'à la dernière date chargée.
+            {S.withCl ? (S.histoWeeks < 8 ? ` ⚠️ Historique clients depuis le ${formatDateShort(S.firstDk)} seulement : « nouveau » = 1re commande depuis cette date.` : ` Nouveau client = 1re commande depuis le ${formatDateShort(S.firstDk)}.`) : ' ⚠️ Pas de détail clients dans l\'historique (recharger l\'Historique CA).'}
+          </div>
+        </div>
+      );
+    }
     function KbTodayPage({ session, setTab }) {
       const [now, setNow] = React.useState(Date.now());
       const [pres, setPres] = React.useState([]);
@@ -18147,6 +18339,8 @@
             <Tile ic="🍞" l="Pains à commander" v={po == null ? '…' : pains} sub="Brut de Pains → bon de commande" on={() => go('mpain')} color="#5d4037" />
             <Tile ic="🏠" l="Livraison domicile" v={po == null ? '…' : domN} sub={domN ? (meta && (meta.domClosed || meta.closed) ? 'DOM clôturé → étiquettes' : 'DOM en préparation') : 'aucune'} on={() => go('mdom')} color="#ef6c00" />
           </div>
+
+          <KbHomeStats goSub={goSub} />
 
           <div className="card" style={{ padding: '12px 14px' }}>
             <div style={{ fontSize: 17, fontWeight: 900, marginBottom: 6 }}>📌 À traiter {todo.length ? <span className="badge" style={{ background: todo.some(x => x.lv === 'red') ? 'var(--danger)' : '#ef6c00', color: '#fff' }}>{todo.length}</span> : null}</div>
