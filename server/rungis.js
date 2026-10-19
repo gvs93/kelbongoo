@@ -23,6 +23,8 @@ const RUNGIS_EMAILS = ['achat@probon.fr', 'gestion@probon.fr', 'hg@probon.fr'];
 const KBG_FL_EXEC_URL = defineSecret('KBG_FL_EXEC_URL');
 const KBG_FL_SHARED_SECRET = defineSecret('KBG_FL_SHARED_SECRET');
 const REGION = 'europe-west1';
+// invoker 'private' : pas de liaison IAM « allUsers » (interdite par la règle d'organisation probon.fr) ;
+// l'accès est ouvert ensuite par gcloud run … --no-invoker-iam-check (comme les autres fonctions).
 
 const ALLOWED = {
   admin: ['rungis_cmd_get', 'rungis_alert'],
@@ -31,7 +33,7 @@ const ALLOWED = {
 };
 const cut = (v, n) => String(v == null ? '' : v).slice(0, n);
 
-exports.kbgRungisLogin = onCall({ region: REGION }, async (req) => {
+exports.kbgRungisLogin = onCall({ region: REGION, invoker: 'private' }, async (req) => {
   const t = req.auth && req.auth.token;
   if (!t) throw new HttpsError('unauthenticated', 'Connexion Google requise.');
   const provider = t.firebase && t.firebase.sign_in_provider;
@@ -46,7 +48,7 @@ exports.kbgRungisLogin = onCall({ region: REGION }, async (req) => {
   return { ok: true, admin: false };
 });
 
-exports.kbgRungis = onCall({ region: REGION, secrets: [KBG_FL_EXEC_URL, KBG_FL_SHARED_SECRET], timeoutSeconds: 120 }, async (req) => {
+exports.kbgRungis = onCall({ region: REGION, invoker: 'private', secrets: [KBG_FL_EXEC_URL, KBG_FL_SHARED_SECRET], timeoutSeconds: 120 }, async (req) => {
   const t = req.auth && req.auth.token;
   if (!t) throw new HttpsError('unauthenticated', 'Connexion requise.');
   const role = t.admin === true ? 'admin' : String(t.kbRole || '');
