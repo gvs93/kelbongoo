@@ -764,7 +764,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.19';
+    const APP_VERSION = 'V10.20';
+    // V10.20 — Master › F&L : « 📦 Suivi des inventaires F&L » (inventaires du soir vs Sheet, chiffres incohérents
+    //   signalés, correction par le master → écrite dans STOCK CAGETTE / STOCK MU du Sheet COMMANDE FL).
     // V10.19 — F&L : produits vendus sans ligne active dans COMMANDE FL → relevé toutes les heures (veille FL Auto v1.3) et
     //   ajoutés quand même à la commande Rungis 5h (ligne orange « demander à Raimbaud de mettre à jour »).
     // V10.18 — Master › Fruits & légumes : retrait des blocs « 🔎 Contrôle info du Sheet » et « MAJ FL — Sxx » (doublons du
@@ -21469,11 +21471,240 @@
       );
     }
 
+    // ============================================================
+    // V10.20 — Master › F&L › 📦 SUIVI DES INVENTAIRES F&L
+    //   Lit les inventaires du soir (Firestore fl_inventory_<jour> + fl_inventory_meta) et le Sheet COMMANDE FL
+    //   (STOCK MU / STOCK CAGETTE / ESTIMATION MU). Repère les chiffres incohérents et permet au master de les
+    //   corriger : la correction est écrite dans le Sheet (action proxy fl_write_stock, comme la validation
+    //   d'inventaire) → COMMANDE PROBON (colis) se recalcule. Historique des corrections dans fl_inventory_meta/<jour>.
+    // ============================================================
+    const KB_INV_NUM = v => { const x = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.')); return isFinite(x) ? x : 0; };
+    function kbInvFlags(r) {
+      const f = [];
+      if (r.sheetDiff) f.push({ lv: 'red', t: 'Sheet ≠ inventaire' });
+      if (r.inv && r.mu > 0 && Math.abs(r.mu - Math.round(r.mu)) > 1e-9) f.push({ lv: 'red', t: 'MU non entière' });
+      if (r.inv && r.colis > 8) f.push({ lv: 'red', t: 'cagettes : chiffre énorme' });
+      if (r.estim > 0 && r.mu > Math.max(10, r.estim * 2)) f.push({ lv: 'orange', t: 'MU en stock > 2 × ventes' });
+      if (r.estim === 0 && r.actif && r.mu >= 10) f.push({ lv: 'orange', t: 'gros stock MU sans vente' });
+      if (r.prev && (r.colis - r.prev.colis >= 2)) f.push({ lv: 'orange', t: `+${String(Math.round((r.colis - r.prev.colis) * 100) / 100).replace('.', ',')} cagettes vs inventaire préc.` });
+      if (r.prev && r.prev.mu >= 5 && r.mu >= r.prev.mu * 3) f.push({ lv: 'orange', t: 'MU ×3 vs inventaire préc.' });
+      if (!r.actif && (r.colis > 0 || r.mu > 0)) f.push({ lv: 'orange', t: 'Non actif mais en stock' });
+      if (r.actif && !r.inv && r.estim > 0) f.push({ lv: 'grey', t: 'pas compté' });
+      return f;
+    }
+    function FlInventorySuiviCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [metas, setMetas] = React.useState(null);
+      const [day, setDay] = React.useState('');
+      const [inv, setInv] = React.useState({});      // key -> doc du jour choisi
+      const [prev, setPrev] = React.useState({});    // key -> doc de l'inventaire précédent
+      const [sheet, setSheet] = React.useState(null); // { rows, at }
+      const [err, setErr] = React.useState('');
+      const [edit, setEdit] = React.useState({});    // key -> { colis, mu } (texte saisi)
+      const [saving, setSaving] = React.useState(false);
+      const [filt, setFilt] = React.useState('alertes'); // 'alertes' | 'tout'
+      const [q, setQ] = React.useState('');
+      const [open, setOpen] = React.useState(true);
+
+      const loadMetas = React.useCallback(async () => {
+        try {
+          const all = (await storage.getAll('fl_inventory_meta')).filter(m => /^\d{4}-\d{2}-\d{2}$/.test(m.id)).sort((a, b) => b.id.localeCompare(a.id));
+          setMetas(all); setDay(d => d || (all[0] && all[0].id) || '');
+        } catch (e) { setErr('Inventaires illisibles : ' + e.message); setMetas([]); }
+      }, []);
+      const loadSheet = React.useCallback(async () => {
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
+          if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
+          const rows = data.rows || [];
+          const H = (rows[0] || []).map(h => String(h || '').trim().toLowerCase());
+          const ix = (...names) => { for (const n of names) { const i = H.indexOf(n); if (i >= 0) return i; } return -1; };
+          const C = { prod: ix('producteur'), des: ix('designation site kelbongoo', 'désignation site kelbongoo', 'designation', 'produit'), act: ix('actif ?', 'actif'),
+            uv: ix('unite de vente', 'unité de vente'), stMu: ix('stock mu'), stCag: ix('stock cagette'), estim: ix('estimation mu'), v5: ix('commande a 5h'),
+            cmd: ix('commande probon (colis)'), col: ix('col'), mu: ix('mu en kilo') };
+          if (C.stMu < 0 || C.stCag < 0) throw new Error('colonnes STOCK MU / STOCK CAGETTE introuvables');
+          const out = [];
+          for (let r = 1; r < rows.length; r++) {
+            const x = rows[r], des = String(x[C.des] || '').trim(); if (!des) continue;
+            const prod = String(x[C.prod] || '').trim(), a = String(C.act >= 0 ? x[C.act] : '').trim().toLowerCase();
+            out.push({ line: r + 1, key: `${prod}__${des}`, prod, des, actif: !(a.indexOf('non') === 0 || a === 'inactif'), uv: C.uv >= 0 ? String(x[C.uv] || '') : '',
+              stMu: KB_INV_NUM(x[C.stMu]), stCag: KB_INV_NUM(x[C.stCag]), estim: C.estim >= 0 ? KB_INV_NUM(x[C.estim]) : 0, v5: C.v5 >= 0 ? KB_INV_NUM(x[C.v5]) : 0,
+              cmd: C.cmd >= 0 ? KB_INV_NUM(x[C.cmd]) : 0, col: C.col >= 0 ? KB_INV_NUM(x[C.col]) : 0 });
+          }
+          setSheet({ rows: out, at: Date.now() });
+        } catch (e) { setErr('Sheet COMMANDE FL illisible : ' + e.message); }
+      }, []);
+      React.useEffect(() => { loadMetas(); loadSheet(); }, [loadMetas, loadSheet]);
+      React.useEffect(() => {
+        if (!day || !metas) return;
+        let dead = false;
+        setInv({}); setPrev({}); setEdit({});
+        const prevDay = (metas.find(m => m.id < day) || {}).id;
+        (async () => {
+          try {
+            const a = await storage.getAll(`fl_inventory_${day}`);
+            const b = prevDay ? await storage.getAll(`fl_inventory_${prevDay}`) : [];
+            if (dead) return;
+            const m1 = {}, m2 = {}; a.forEach(d => { m1[d.id] = d; }); b.forEach(d => { m2[d.id] = d; });
+            setInv(m1); setPrev(m2);
+          } catch (e) { if (!dead) setErr('Inventaire du ' + day + ' illisible : ' + e.message); }
+        })();
+        return () => { dead = true; };
+      }, [day, metas]);
+
+      const latest = metas && metas[0] ? metas[0].id : '';
+      const isLatest = day && day === latest;
+      const meta = (metas || []).find(m => m.id === day) || null;
+      const prevDay = metas ? (metas.find(m => m.id < day) || {}).id : '';
+
+      // Une ligne par produit du Sheet (+ produits comptés absents du Sheet)
+      const rows = React.useMemo(() => {
+        if (!sheet) return [];
+        const seen = {}, out = [];
+        sheet.rows.forEach(s => {
+          seen[s.key] = 1;
+          const d = inv[s.key], p = prev[s.key];
+          const colis = d ? KB_INV_NUM(d.colis) : (isLatest ? s.stCag : 0);
+          // MU : les produits « MU auto » ont mu = 0 dans le doc (stock calculé par l'appli, écrit dans le Sheet à la validation)
+          const mu = d && KB_INV_NUM(d.mu) > 0 ? KB_INV_NUM(d.mu) : (isLatest ? s.stMu : (d ? KB_INV_NUM(d.mu) : 0));
+          const r = { ...s, inv: !!d, colis, mu, by: d ? (d.correctedBy || d.countedBy || '') : '', prev: p ? { colis: KB_INV_NUM(p.colis), mu: KB_INV_NUM(p.mu) } : null,
+            sheetDiff: !!(isLatest && d && (Math.abs(KB_INV_NUM(d.colis) - s.stCag) > 1e-6 || (KB_INV_NUM(d.mu) > 0 && Math.abs(KB_INV_NUM(d.mu) - s.stMu) > 1e-6))) };
+          r.flags = s.actif || r.colis > 0 || r.mu > 0 ? kbInvFlags(r) : [];
+          out.push(r);
+        });
+        Object.keys(inv).forEach(k => {
+          if (seen[k]) return;
+          const d = inv[k];
+          const r = { key: k, prod: d.producer || '', des: d.produit || k, actif: false, line: null, stMu: 0, stCag: 0, estim: 0, v5: 0, cmd: 0, col: 0, uv: d.uv || '',
+            inv: true, colis: KB_INV_NUM(d.colis), mu: KB_INV_NUM(d.mu), by: d.correctedBy || d.countedBy || '', prev: null, sheetDiff: false };
+          r.flags = [{ lv: 'red', t: 'absent du Sheet (nom changé ?)' }].concat(kbInvFlags(r));
+          out.push(r);
+        });
+        return out;
+      }, [sheet, inv, prev, isLatest]);
+
+      const nAlert = rows.filter(r => r.flags.some(f => f.lv !== 'grey')).length;
+      const shown = rows.filter(r => (filt === 'tout' ? (r.actif || r.inv || r.colis > 0 || r.mu > 0) : r.flags.length || edit[r.key])
+        && (!q || normalizeText(r.des + ' ' + r.prod).includes(normalizeText(q))))
+        .sort((a, b) => (b.flags.filter(f => f.lv === 'red').length - a.flags.filter(f => f.lv === 'red').length) || a.prod.localeCompare(b.prod, 'fr') || a.des.localeCompare(b.des, 'fr'));
+      const changed = Object.keys(edit).filter(k => {
+        const r = rows.find(x => x.key === k); if (!r) return false;
+        const e = edit[k];
+        return (e.colis != null && KB_INV_NUM(e.colis) !== r.colis) || (e.mu != null && KB_INV_NUM(e.mu) !== r.mu);
+      });
+
+      const save = async () => {
+        if (!changed.length || !isLatest) return;
+        const items = changed.map(k => {
+          const r = rows.find(x => x.key === k), e = edit[k];
+          return { r, colis: e.colis != null ? Math.max(0, KB_INV_NUM(e.colis)) : r.colis, mu: e.mu != null ? Math.max(0, Math.round(KB_INV_NUM(e.mu))) : r.mu };
+        });
+        if (!confirm(`Corriger ${items.length} produit(s) de l'inventaire du ${formatDateShort(day)} ?\n\n`
+          + items.map(i => `• ${i.r.des} : ${i.r.colis} → ${i.colis} cagette(s) · ${i.r.mu} → ${i.mu} MU`).join('\n')
+          + `\n\nLe Sheet « ${FL_SHEET_TAB} » (STOCK CAGETTE / STOCK MU) est mis à jour → la commande Rungis se recalcule.`)) return;
+        setSaving(true);
+        try {
+          const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_write_stock', tab: FL_SHEET_TAB, date: day,
+            items: items.filter(i => i.r.line).map(i => ({ producer: i.r.prod, produit: i.r.des, colis: i.colis, mu: i.mu })) });
+          if (!data.ok) throw new Error(data.error || 'écriture Sheet refusée');
+          const now = new Date().toISOString(), by = (session && session.name) || 'master';
+          let fsErr = '';
+          for (const i of items) {
+            try {
+              await storage.setDoc(`fl_inventory_${day}`, i.r.key, { id: i.r.key, producer: i.r.prod, produit: i.r.des, uv: i.r.uv || '',
+                colis: i.colis, mu: i.mu, correctedBy: by, correctedAt: now });
+            } catch (e) { fsErr = e.message; }
+          }
+          try {
+            const corr = ((meta && meta.corrections) || []).concat(items.map(i => ({ key: i.r.key, des: i.r.des, colis: [i.r.colis, i.colis], mu: [i.r.mu, i.mu], by, at: now }))).slice(-200);
+            await storage.setDoc('fl_inventory_meta', day, { corrections: corr, lastCorrectedBy: by, lastCorrectedAt: now });
+          } catch (e) { fsErr = fsErr || e.message; }
+          showToast(`✓ ${data.written || 0} ligne(s) corrigée(s) dans le Sheet` + ((data.notFound || []).length ? ` · ${(data.notFound || []).length} non trouvée(s)` : '')
+            + (fsErr ? ' · ⚠️ historique appli non enregistré (' + fsErr + ')' : ''));
+          setEdit({});
+          await loadMetas(); await loadSheet();
+          const a = await storage.getAll(`fl_inventory_${day}`); const m1 = {}; a.forEach(d => { m1[d.id] = d; }); setInv(m1);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setSaving(false); }
+      };
+
+      const fmt = v => String(Math.round((Number(v) || 0) * 100) / 100).replace('.', ',');
+      const cellIn = (r, f) => {
+        const e = edit[r.key] || {}, v = e[f] != null ? e[f] : String(r[f]).replace('.', ',');
+        const dirty = e[f] != null && KB_INV_NUM(e[f]) !== r[f];
+        return <input value={v} disabled={!isLatest || saving} inputMode="decimal" onFocus={ev => ev.target.select()}
+          onChange={ev => setEdit(m => ({ ...m, [r.key]: { ...(m[r.key] || {}), [f]: ev.target.value.replace(/[^\d,.]/g, '') } }))}
+          style={{ width: 62, padding: '6px 6px', fontSize: 16, fontWeight: 800, textAlign: 'center', borderRadius: 8, border: '2px solid ' + (dirty ? '#ef6c00' : 'var(--line)'), background: dirty ? '#fff3e0' : '#fff' }} />;
+      };
+      const flagChip = f => <span key={f.t} style={{ display: 'inline-block', margin: '2px 4px 0 0', padding: '2px 8px', borderRadius: 999, fontSize: 12, fontWeight: 800,
+        background: f.lv === 'red' ? '#fdecea' : f.lv === 'orange' ? '#fff3e0' : '#f1f1f1', color: f.lv === 'red' ? 'var(--danger)' : f.lv === 'orange' ? '#b45309' : 'var(--ink-mute)' }}>{f.t}</span>;
+
+      return (
+        <div className="card" style={{ border: '3px solid ' + (nAlert ? '#ef6c00' : 'var(--accent)'), padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', cursor: 'pointer' }} onClick={() => setOpen(o => !o)}>
+            <strong style={{ fontSize: 19 }}>📦 Suivi des inventaires F&amp;L</strong>
+            {sheet && <span className="badge" style={{ background: nAlert ? '#ef6c00' : 'var(--accent)', color: '#fff', fontWeight: 900, fontSize: 15 }}>{nAlert ? `${nAlert} produit(s) à vérifier` : '✓ cohérent'}</span>}
+            <span style={{ marginLeft: 'auto' }}>{open ? '▾' : '▸'}</span>
+          </div>
+          {err && <div style={{ color: 'var(--danger)', fontWeight: 700, marginTop: 8 }}>⚠️ {err}</div>}
+          {open && <>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 10 }}>
+              <select value={day} onChange={e => setDay(e.target.value)} style={{ fontSize: 16, padding: '8px 10px', borderRadius: 8, fontWeight: 800 }}>
+                {(metas || []).slice(0, 30).map(m => <option key={m.id} value={m.id}>{formatDateShort(m.id)} · {m.validatedBy || '?'}{m.corrections && m.corrections.length ? ' · corrigé' : ''}</option>)}
+              </select>
+              {[['alertes', '⚠️ À vérifier'], ['tout', 'Tout']].map(([k, l]) => <button key={k} onClick={() => setFilt(k)} className={filt === k ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 14, padding: '8px 12px', fontWeight: 800 }}>{l}</button>)}
+              <input value={q} onChange={e => setQ(e.target.value)} placeholder="🔎 produit" style={{ fontSize: 15, padding: '8px 10px', borderRadius: 8, border: '2px solid var(--line)', width: 150 }} />
+              <button className="btn-ghost" onClick={() => { setErr(''); loadMetas(); loadSheet(); }} style={{ fontSize: 13 }}>↻ Relire</button>
+            </div>
+            {meta && <div style={{ fontSize: 13, marginTop: 6, color: 'var(--ink-mute)' }}>
+              Inventaire du <b>{formatDateShort(day)}</b> validé par <b>{meta.validatedBy || '?'}</b>{meta.validatedAt ? ' à ' + new Date(meta.validatedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''}
+              {' · '}{meta.nbSaisis != null ? meta.nbSaisis + ' produit(s) saisis' : ''}{prevDay ? ' · comparé au ' + formatDateShort(prevDay) : ''}
+              {meta.lastCorrectedBy ? <> · dernière correction <b>{meta.lastCorrectedBy}</b> {kbFlaWhen(meta.lastCorrectedAt)}</> : null}
+            </div>}
+            {!isLatest && day && <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 8, background: '#f1f1f1', fontSize: 13, fontWeight: 700 }}>🔒 Ancien inventaire : lecture seule. Seul le dernier inventaire ({formatDateShort(latest)}) peut être corrigé, car c'est lui qui est dans le Sheet.</div>}
+            {!sheet && !err && <div style={{ marginTop: 10 }}>Chargement…</div>}
+            {sheet && <div style={{ overflowX: 'auto', marginTop: 10 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+                <thead><tr style={{ background: 'var(--accent-soft)', textAlign: 'left' }}>
+                  <th style={{ padding: 6 }}>Produit</th><th style={{ padding: 6, textAlign: 'center' }}>Cagettes</th><th style={{ padding: 6, textAlign: 'center' }}>MU (sachets)</th>
+                  <th style={{ padding: 6, textAlign: 'center' }}>Inv. préc.</th><th style={{ padding: 6, textAlign: 'center' }}>Ventes 5h / estim.</th><th style={{ padding: 6, textAlign: 'center' }}>Colis Rungis</th><th style={{ padding: 6 }}>À vérifier</th>
+                </tr></thead>
+                <tbody>
+                  {shown.map(r => <tr key={r.key} style={{ borderTop: '1px solid var(--line)', background: r.flags.some(f => f.lv === 'red') ? '#fff7f6' : undefined }}>
+                    <td style={{ padding: 6 }}><div style={{ fontWeight: 800 }}>{r.des}</div><div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{r.prod}{r.line ? ' · L' + r.line : ''}{r.uv ? ' · ' + r.uv : ''}{r.actif ? '' : ' · Non actif'}{r.by ? ' · ' + r.by : ''}</div></td>
+                    <td style={{ padding: 6, textAlign: 'center' }}>{cellIn(r, 'colis')}{isLatest && r.inv && Math.abs(r.stCag - r.colis) > 1e-6 && <div style={{ fontSize: 11, color: 'var(--danger)' }}>Sheet : {fmt(r.stCag)}</div>}</td>
+                    <td style={{ padding: 6, textAlign: 'center' }}>{cellIn(r, 'mu')}{isLatest && r.inv && Math.abs(r.stMu - r.mu) > 1e-6 && <div style={{ fontSize: 11, color: 'var(--danger)' }}>Sheet : {fmt(r.stMu)}</div>}</td>
+                    <td style={{ padding: 6, textAlign: 'center', color: 'var(--ink-mute)' }}>{r.prev ? `${fmt(r.prev.colis)} c · ${fmt(r.prev.mu)} MU` : '—'}</td>
+                    <td style={{ padding: 6, textAlign: 'center' }}>{fmt(r.v5)} / <b>{fmt(r.estim)}</b></td>
+                    <td style={{ padding: 6, textAlign: 'center', fontWeight: 800 }}>{isLatest ? fmt(r.cmd) : '—'}</td>
+                    <td style={{ padding: 6 }}>{r.flags.map(flagChip)}</td>
+                  </tr>)}
+                  {!shown.length && <tr><td colSpan={7} style={{ padding: 12, textAlign: 'center', color: 'var(--ink-mute)' }}>{filt === 'alertes' ? '✓ Rien d\'incohérent dans cet inventaire.' : 'Aucun produit.'}</td></tr>}
+                </tbody>
+              </table>
+            </div>}
+            {isLatest && <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' }}>
+              <button className="btn-primary" disabled={!changed.length || saving} onClick={save} style={{ fontSize: 16, padding: '10px 16px', fontWeight: 900 }}>
+                {saving ? '⏳ Écriture…' : `💾 Corriger ${changed.length || ''} produit(s) dans le Sheet`}</button>
+              {changed.length > 0 && <button className="btn-ghost" disabled={saving} onClick={() => setEdit({})}>Annuler</button>}
+              <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Écrit STOCK CAGETTE / STOCK MU dans « {FL_SHEET_TAB} » → COMMANDE PROBON (colis) se recalcule.</span>
+            </div>}
+            {meta && (meta.corrections || []).length > 0 && <details style={{ marginTop: 10 }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 800 }}>🕓 Corrections de cet inventaire ({meta.corrections.length})</summary>
+              {meta.corrections.slice().reverse().map((c, i) => <div key={i} style={{ fontSize: 13, padding: '3px 0' }}>
+                {kbFlaWhen(c.at)} · <b>{c.by}</b> · {c.des} : {fmt(c.colis[0])} → <b>{fmt(c.colis[1])}</b> cagette(s), {fmt(c.mu[0])} → <b>{fmt(c.mu[1])}</b> MU</div>)}
+            </details>}
+          </>}
+        </div>
+      );
+    }
+
     function FLPage({ session }) {
       return (
         <div className="stack">
           <h1 style={{ margin: '0 0 4px' }}>🥬 Fruits &amp; Légumes</h1>
           <FlAutoCard session={session} />
+          <FlInventorySuiviCard session={session} />
           <FlRuptureCard session={session} />
           {/* V10.18 : « 🔎 Contrôle info du Sheet » (V10.02) et « MAJ FL — Sxx » (PVTTC) retirés de l'écran :
               le Contrôle auto (KBG_FL_Auto) remplit seul UV / TYPE / MU (site) et COL / prix (PVTTC). Composants gardés en code. */}
