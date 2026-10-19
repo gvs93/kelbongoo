@@ -234,6 +234,7 @@
     }
     .kb-side button:hover { background: rgba(255,255,255,.06); color: #fff; }
     .kb-side button.on { background: rgba(141,196,120,.16); color: #fff; font-weight: 650; box-shadow: inset 2px 0 0 #8dc478; }
+    .kb-side button .kb-em { width: 20px; flex: 0 0 20px; font-size: 17px; line-height: 1; text-align: center; }
     .kb-side button svg { width: 17px; height: 17px; flex: 0 0 17px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; opacity: .9; }
     .kb-side .kb-dot { margin-left: auto; width: 7px; height: 7px; border-radius: 50%; background: #f04438; }
     .kb-side-foot { margin-top: auto; padding: 14px 10px 2px; border-top: 1px solid rgba(255,255,255,.07); display: flex; align-items: center; gap: 10px; }
@@ -756,7 +757,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.12';
+    const APP_VERSION = 'V10.13';
+    // V10.13 — F&L : 🤖 Contrôle auto COMMANDE FL (script serveur KBG_FL_Auto.gs) : ventes du lendemain écrites seules
+    //   dans COMMANDE A 5H vers 4h30 (lecture admin.kelbongoo.com), fiche site + PVTTC Rungis appliquées seules,
+    //   décisions (concordances, rouges, absents, incohérences, écarts de prix) dans F&L et « À traiter ».
+    //   Master : barre latérale avec emojis de couleur, « 🚚 Enlèvement camion Rungis » (ex-Rungis), 🥬 sur Fruits & légumes ;
+    //   Accueil : Clients & CA sur la semaine seulement avec les dates de comparaison ; raccourcis sous « À traiter » retirés.
     // V10.02 (+) 15/10 soir — Master 🏠 Aujourd'hui (accueil : prépa en cours, équipe, MU, À traiter, live) · 🍞 Commande pain
     //   (bon Brut de Pains dans l'ordre du fournisseur + étiquettes) · 🏷️ Étiquettes livraison DOM dans le master ·
     //   F&L 🔎 Contrôle info du Sheet COMMANDE FL (UV / TYPE / MU EN KILO / COL, écriture via fl_set_info) ·
@@ -18222,7 +18228,8 @@
       const wTo = addDays(mon, 6), wNow = sum(mon, wTo);
       const wMax = list.filter(d => d.dk >= mon && d.dk <= wTo).map(d => d.dk).sort().slice(-1)[0] || today;
       const off = Math.round((new Date(wMax + 'T12:00:00') - new Date(mon + 'T12:00:00')) / 86400000);
-      const wPrev = sum(addDays(mon, -7), addDays(mon, -7 + off));
+      const wPrevFrom = addDays(mon, -7), wPrevTo = addDays(mon, -7 + off);
+      const wPrev = sum(wPrevFrom, wPrevTo);
       const pm = new Date(today + 'T12:00:00'); pm.setDate(1); pm.setMonth(pm.getMonth() - 1);
       const pmStart = `${pm.getFullYear()}-${String(pm.getMonth() + 1).padStart(2, '0')}-01`;
       const mMax = list.filter(d => d.dk >= mStart && d.dk.slice(0, 7) === today.slice(0, 7)).map(d => d.dk).sort().slice(-1)[0] || today;
@@ -18232,7 +18239,12 @@
       const last = lastDk ? sum(lastDk, lastDk) : null, lastPrev = lastDk ? sum(addDays(lastDk, -7), addDays(lastDk, -7)) : null;
       const weeks = []; for (let i = 7; i >= 0; i--) { const m = addDays(mon, -7 * i); weeks.push({ m, ...sum(m, addDays(m, 6)) }); }
       return { ok: list.length > 0,
-        wNow, wPrev, wMax, mNow, mPrev, mMax, last, lastPrev, lastDk, weeks };
+        wNow, wPrev, wMax, wPrevFrom, wPrevTo, mNow, mPrev, mMax, last, lastPrev, lastDk, weeks };
+    }
+    // V10.13 — « lun. 6 → sam. 11 oct. » (dates de la période de comparaison, affichées sous chaque tuile)
+    function kbRangeLbl(a, b) {
+      const f = (d, withMonth) => new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', withMonth ? { weekday: 'short', day: 'numeric', month: 'short' } : { weekday: 'short', day: 'numeric' });
+      return a === b ? f(a, true) : `${f(a, a.slice(0, 7) !== b.slice(0, 7))} → ${f(b, true)}`;
     }
     function kbConsNew(st, today) {
       if (!st || !st.ins) return null;
@@ -18244,7 +18256,7 @@
       const set = (m, ms) => {
         const y = range(m, ms, yest, today), w = range(m, ms, mon, today), mo = range(m, ms, mStart, today);
         return { y: { ...y, prev: range(m, ms, addDays(yest, -7), addDays(today, -7)).n, prevLbl: 'mêmes jours S-1' },
-          w: { ...w, prev: range(m, ms, addDays(mon, -7), addDays(today, -7)).n, prevLbl: 'S-1 mêmes jours' },
+          w: { ...w, prev: range(m, ms, addDays(mon, -7), addDays(today, -7)).n, prevLbl: `vs ${kbRangeLbl(addDays(mon, -7), addDays(today, -7))}` },
           m: { ...mo, prev: range(m, ms, pmStart, pmEnd).n, prevLbl: 'M-1 mêmes jours' } };
       };
       return { total: st.total || 0, fileDay: st.maxDay || (st.at || '').slice(0, 10), ins: set(st.ins, st.insSite), fo: set(st.fo, st.foSite) };
@@ -18291,19 +18303,13 @@
             : !C ? <div style={{ fontSize: 13, padding: '8px 10px', borderRadius: 8, background: '#fff4e5', fontWeight: 700 }}>🆕 Nouveaux clients : recharge le fichier <b>Consommateurs</b> (Chargement) pour activer les stats (dates d'inscription et de 1re commande).</div>
             : <>
               <div style={{ fontSize: 13, fontWeight: 800, margin: '2px 0 6px' }}>🆕 Nouveaux clients <span style={{ fontWeight: 500, color: 'var(--ink-mute)' }}>· fichier clients du {formatDateShort(C.fileDay)} ({C.total.toLocaleString('fr-FR')} comptes)</span></div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
-                <NewTile k="iy" kind="ins" l="✍️ Inscrits depuis hier" x={C.ins.y} />
-                <NewTile k="iw" kind="ins" l="✍️ Inscrits cette semaine" x={C.ins.w} />
-                <NewTile k="im" kind="ins" l="✍️ Inscrits ce mois" x={C.ins.m} />
-                <NewTile k="fy" kind="fo" l="🛒 1re commande depuis hier" x={C.fo.y} />
-                <NewTile k="fw" kind="fo" l="🛒 1re commande cette semaine" x={C.fo.w} />
-                <NewTile k="fm" kind="fo" l="🛒 1re commande ce mois" x={C.fo.m} />
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: 10 }}>
+                <NewTile k="iw" kind="ins" l={`✍️ Inscrits cette semaine (${kbRangeLbl(kbMondayOf(today), today)})`} x={C.ins.w} />
+                <NewTile k="fw" kind="fo" l={`🛒 1re commande cette semaine (${kbRangeLbl(kbMondayOf(today), today)})`} x={C.fo.w} />
               </div>
             </>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, marginTop: 10 }}>
-            <CaTile l={`CA semaine (au ${formatDateShort(S.wMax)})`} now={S.wNow} prev={S.wPrev} sub="S-1 mêmes jours" />
-            <CaTile l={`CA du mois (au ${formatDateShort(S.mMax)})`} now={S.mNow} prev={S.mPrev} sub="M-1 mêmes jours" />
-            {S.last && <CaTile l={`Dernière distrib (${formatDateShort(S.lastDk)})`} now={S.last} prev={S.lastPrev} sub="même jour S-1" />}
+            <CaTile l={`CA semaine (${kbRangeLbl(kbMondayOf(today), S.wMax)})`} now={S.wNow} prev={S.wPrev} sub={`vs ${kbRangeLbl(S.wPrevFrom, S.wPrevTo)}`} />
           </div>
           <div style={{ marginTop: 12, fontSize: 13, fontWeight: 800 }}>CA des 8 dernières semaines</div>
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 110, marginTop: 6 }}>
@@ -18332,6 +18338,7 @@
       const [to, setTo] = React.useState(null);   // commandes de la distribution du jour
       const [mailErr, setMailErr] = React.useState('');
       const [flN, setFlN] = React.useState(() => { try { const v = localStorage.getItem('kb_fl_info_n'); return v == null ? null : Number(v); } catch (_) { return null; } });
+      const [flAuto, setFlAuto] = React.useState(null); // V10.13 — rapport du contrôle auto COMMANDE FL
       const today = todayKey();
       React.useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
       React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
@@ -18351,6 +18358,7 @@
       React.useEffect(() => { let stop = false; storage.getDoc(`day_${today}_orders`, 'data').then(d => { if (!stop) setTo((d && d.orders) || []); }).catch(() => { if (!stop) setTo([]); }); return () => { stop = true; }; }, [today]);
       React.useEffect(() => { let stop = false; flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }).then(d => { if (!stop && d && d.ok) { const n = kbFlInfoIssues(d.rows || [], false).length; setFlN(n); try { localStorage.setItem('kb_fl_info_n', String(n)); } catch (_) {} } }).catch(() => {}); return () => { stop = true; }; }, []);
 
+      React.useEffect(() => { let stop = false; flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_report', ts: Date.now() }).then(d => { if (!stop && d && d.ok !== false && d.issues) { setFlAuto(d); try { localStorage.setItem('kb_fl_auto_n', String(kbFlaCount(d))); } catch (_) {} } }).catch(() => {}); return () => { stop = true; }; }, []);
       const goSub = (k) => { try { localStorage.setItem('kbg_suivi_sub', k); } catch (e) {} setTab('suivi'); window.scrollTo({ top: 0 }); };
       const go = (t) => { setTab(t); window.scrollTo({ top: 0 }); };
       const people = pres.filter(p => p && p.name && !String(p.id || '').startsWith('~'));
@@ -18373,6 +18381,17 @@
       if (prepDay && po && !poR.length) todo.push({ lv: 'red', ic: '📥', t: `Commandes du ${formatDateShort(prepDay)} pas chargées`, d: 'Chargement → fichier JSON des commandes', on: () => go('admin') });
       if (v4 && ((v4.missingConsumers || []).length || (v4.missingProducts || []).length)) todo.push({ lv: 'red', ic: '👤', t: `Chargement : ${(v4.missingConsumers || []).length} client(s) / ${(v4.missingProducts || []).length} produit(s) inconnus`, d: 'Recharger le fichier Consommateurs / Produits puis les Commandes', on: () => go('admin') });
       if (flN > 0) todo.push({ lv: 'red', ic: '🥬', t: `${flN} produit(s) F&L incomplets dans le Sheet`, d: 'Sans UV / TYPE / MU en kilo, la prépa ne peut pas faire la MU', on: () => go('fl') });
+      if (flAuto) {
+        const fm = flAuto.meta || {}, fv = fm.ventes || {};
+        if (fm.ventesErr) todo.push({ lv: 'red', ic: '📊', t: 'Ventes 5h NON écrites dans COMMANDE FL', d: fm.ventesErr + ' — Rungis doit remplir la colonne D, ou relancer dans F&L', on: () => go('fl') });
+        else if ((fv.soldMissing || []).length) todo.push({ lv: 'red', ic: '📊', t: `${fv.soldMissing.length} produit(s) vendu(s) pour demain absent(s) de COMMANDE FL`, d: fv.soldMissing.slice(0, 4).map(x => x.des + ' (' + x.n + ')').join(' · '), on: () => go('fl') });
+        const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type));
+        if (fa.length) {
+          const cnt = {}; fa.forEach(i => { cnt[i.type] = (cnt[i.type] || 0) + 1; });
+          const lbl = { concord: 'concordance', noPP: 'ID site', newSale: 'absent du Sheet', saleInactif: 'en vente mais inactif', red: 'rouge Rungis', absentRungis: 'absent PVTTC', incoh: 'incohérence' };
+          todo.push({ lv: 'red', ic: '🥬', t: `COMMANDE FL : ${fa.length} point(s) à décider`, d: Object.entries(cnt).map(([k, n]) => `${n} ${lbl[k] || k}`).join(' · '), on: () => go('fl') });
+        }
+      }
       if (prepDay && poR.length && !closed) todo.push({ lv: 'orange', ic: '🥬', t: `Prépa du ${formatDateShort(prepDay)} en cours : ${pct} %`, d: agg ? `${agg.d || 0}/${agg.t || 0} lignes · ${agg.ruptures || 0} rupture(s)` : 'pas encore commencée', on: () => goSub('live') });
       if (domN && !(meta && (meta.domClosed || meta.closed))) todo.push({ lv: 'orange', ic: '🏠', t: `Livraison à domicile : ${domN} client(s) — DOM pas clôturé`, d: 'Clôturer DOM en prépa puis imprimer les étiquettes', on: () => go('mdom') });
       if (domNoAddr) todo.push({ lv: 'orange', ic: '📍', t: `${domNoAddr} client(s) DOM sans adresse complète`, d: 'Charger le fichier Consommateurs (adresses) — Dromy les reprend automatiquement', on: () => go('mdom') });
@@ -18445,11 +18464,6 @@
             ))}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
-            {[['🍞', 'Commande pain', () => go('mpain')], ['🏷️', 'Étiquettes DOM', () => go('mdom')], ['🥬', 'F&L / Rungis', () => go('fl')], ['📥', 'Chargement', () => go('admin')], ['📣', 'Push équipes', () => go('push')], ['📜', 'Historique prépa', () => goSub('histo')]].map(([ic, l, on]) => (
-              <button key={l} className="btn-secondary" onClick={on} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: '12px 6px', fontWeight: 800 }}><span style={{ fontSize: 24 }}>{ic}</span>{l}</button>
-            ))}
-          </div>
 
           <div style={{ fontSize: 18, fontWeight: 900, margin: '6px 0 -4px' }}>🟢 En direct</div>
           <KbLivePage />
@@ -18595,7 +18609,7 @@
           { k: 'cmails', label: 'Mails clients',    icon: '📧' },
           { k: 'ancien', label: 'Ancien site',      icon: '🔁' },
         ] },
-        { k: 'rungis', label: 'Rungis',     icon: '🥬' },
+        { k: 'rungis', label: 'Enlèvement camion Rungis', icon: '🚚' },
         { k: 'live',   label: 'Qui fait quoi', icon: '🟢' },
         { k: 'histo',  label: 'Historique', icon: '📜' },
       ];
@@ -21043,10 +21057,246 @@
       );
     }
 
+    // ============================================================
+    // V10.13 — F&L › 🤖 CONTRÔLE AUTO « COMMANDE FL » (script serveur KBG_FL_Auto.gs, projet FL_Probon_Proxy)
+    //   • Ventes 5h : chaque matin ≈4h30 le serveur lit sur admin.kelbongoo.com les ventes de la distribution du
+    //     lendemain (Globales › Produits › dernière colonne) et remplit COMMANDE A 5H — Rungis n'a plus à le faire.
+    //   • Contrôle autonome : fiche produit du site (désignation, producteur, unité de vente, type, MU) + PVTTC Rungis
+    //     (code, colisage, prix) écrits seuls ; ici ne restent que les décisions : concordances, rouges Rungis,
+    //     incohérences, écarts de prix, absents. Actions : fl_auto_report / run / concord / setid / add / actif / ignore.
+    // ============================================================
+    const KB_FLA_SECTIONS = [
+      { k: 'ventes',      ic: '📊', t: 'Ventes 5h',                                   c: '#1565c0' },
+      { k: 'concord',     ic: '🤝', t: 'À faire ensemble — quel produit Rungis ?',    c: '#6a1b9a' },
+      { k: 'noPP',        ic: '🔗', t: 'Produit du site introuvable (ID SITE KBG)',   c: '#6a1b9a' },
+      { k: 'newSale',     ic: '🆕', t: 'En vente sur le site, absent de COMMANDE FL', c: '#c62828' },
+      { k: 'saleInactif', ic: '🟢', t: 'En vente sur le site mais « Non actif »',     c: '#c62828' },
+      { k: 'red',         ic: '🔴', t: 'Rouge chez Rungis → passer Non actif ?',      c: '#c62828' },
+      { k: 'absentRungis',ic: '❓', t: 'Dans COMMANDE FL mais pas dans PVTTC',        c: '#ef6c00' },
+      { k: 'incoh',       ic: '⚠️', t: 'Incohérence unité d\'achat Rungis / site',    c: '#ef6c00' },
+      { k: 'pa',          ic: '💶', t: 'Prix d\'achat Rungis ≠ prix producteur site', c: '#ef6c00' },
+      { k: 'pv',          ic: '🏷️', t: 'PVTTC Rungis ≠ prix consommateur site',      c: '#ef6c00' },
+      { k: 'dup',         ic: '👯', t: 'Doublons (même produit site)',                c: '#757575' },
+    ];
+    const KB_FLA_ACTION = ['concord', 'noPP', 'newSale', 'saleInactif', 'red', 'absentRungis', 'incoh'];
+    function kbFlaWhen(iso) { if (!iso) return '—'; const d = new Date(iso); return isNaN(d) ? String(iso) : d.toLocaleString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+    function kbFlaCount(rep) {
+      if (!rep || !rep.issues) return null;
+      const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type)).length;
+      const m = rep.meta || {};
+      return n + (m.ventesErr ? 1 : 0) + (m.ventes && (m.ventes.soldMissing || []).length ? 1 : 0);
+    }
+    function FlAutoCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [rep, setRep] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      const [busy, setBusy] = React.useState('');
+      const [wait, setWait] = React.useState(null);      // { what, since, prev }
+      const [open, setOpen] = React.useState({ concord: true, noPP: true, newSale: true, saleInactif: true, red: true, absentRungis: true, incoh: true, ventes: true });
+      const [codeIn, setCodeIn] = React.useState({});    // saisie libre code Rungis par ligne
+      const by = session && session.name;
+      const load = React.useCallback(async () => {
+        setErr('');
+        try {
+          const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_report', ts: Date.now() });
+          if (!d || d.ok === false) throw new Error((d && d.error) || 'réponse vide');
+          setRep(d);
+          try { localStorage.setItem('kb_fl_auto_n', String(kbFlaCount(d))); } catch (_) {}
+          return d;
+        } catch (e) {
+          const m = e.message || String(e);
+          setErr(/inconnue|unknown/i.test(m) ? 'Le proxy FL ne connaît pas encore « fl_auto_… » : ajouter KBG_FL_Auto.gs + 1 ligne dans doPost puis Nouvelle version (voir doc Drive).' : m);
+          return null;
+        }
+      }, []);
+      React.useEffect(() => { load(); }, [load]);
+      // relance en cours côté serveur → on relit toutes les 15 s jusqu'au nouveau rapport (4 min max)
+      React.useEffect(() => {
+        if (!wait) return;
+        const t = setInterval(async () => {
+          const d = await load(); const m = (d && d.meta) || {};
+          const key = wait.what === 'ventes' ? (m.ventes && m.ventes.at) : (m.controle && m.controle.at);
+          const errNow = wait.what === 'ventes' ? m.ventesErr : m.controleErr;
+          if ((key && key !== wait.prev) || (errNow && (m.ventesErrAt || m.controleErrAt || '') > wait.since) || Date.now() - wait.t0 > 240000) {
+            setWait(null); clearInterval(t);
+            showToast(errNow ? '⚠️ ' + errNow : (wait.what === 'ventes' ? '✓ Ventes de demain écrites dans COMMANDE FL' : '✓ Contrôle terminé'));
+          }
+        }, 15000);
+        return () => clearInterval(t);
+      }, [wait]);
+      const run = async (what) => {
+        setBusy('run-' + what);
+        try {
+          const m = (rep && rep.meta) || {};
+          const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_run', what, by });
+          if (!d || d.ok === false) throw new Error((d && d.error) || 'refus');
+          setWait({ what: what === 'tout' ? 'controle' : what, since: new Date().toISOString(), t0: Date.now(), prev: what === 'ventes' ? (m.ventes && m.ventes.at) : (m.controle && m.controle.at) });
+          showToast('⏳ Lancé sur le serveur — résultat dans 1 à 2 min');
+        } catch (e) { showToast('Erreur : ' + (e.message || e)); } finally { setBusy(''); }
+      };
+      const act = async (key, payload, okMsg, thenControl) => {
+        setBusy(key);
+        try {
+          const d = await flPost({ secret: FRESHDESK_SECRET, ...payload, by });
+          if (!d || d.ok === false) throw new Error((d && d.error) || 'refus');
+          showToast(okMsg);
+          if (thenControl) setWait({ what: 'controle', since: new Date().toISOString(), t0: Date.now(), prev: rep && rep.meta && rep.meta.controle && rep.meta.controle.at });
+          setRep(r => r ? { ...r, issues: r.issues.filter(i => !(i.type === payload._type && String(i.row) === String(payload.row || '') && i.des === (payload._des || i.des))) } : r);
+        } catch (e) { showToast('Erreur : ' + (e.message || e)); } finally { setBusy(''); }
+      };
+      const ignore = (i, label) => act('ign-' + i.type + i.row + i.des, { action: 'fl_auto_ignore', kind: (i.type === 'pa' || i.type === 'pv') && i.data && i.data.rungis != null ? i.type + ':' + i.data.rungis : i.type, des: i.des, row: i.row || '', _type: i.type, _des: i.des }, '✓ ' + (label || 'Ignoré'));
+      const concord = (i, code) => act('cc-' + i.row, { action: 'fl_auto_concord', row: i.row, des: i.des, code, _type: 'concord' }, `✓ Concordance ${i.des} ↔ ${code} — mise à jour du Sheet en cours`, true);
+      const setActif = (i, actif) => act('ac-' + i.type + i.row, { action: 'fl_auto_actif', row: i.row, des: i.des, actif, why: i.type, _type: i.type }, actif ? `✓ ${i.des} passé Actif` : `✓ ${i.des} passé Non actif`);
+      const setId = (i, s) => act('id-' + i.row, { action: 'fl_auto_setid', row: i.row, des: i.des, id: s.id, _type: 'noPP' }, `✓ ${i.des} ↔ ${s.des}`, true);
+      const add = (i, code) => act('ad-' + i.des, { action: 'fl_auto_add', id: i.data && i.data.id, des: i.des, prod: i.prod, code: code || '', _type: 'newSale', _des: i.des }, `✓ ${i.des} ajouté à COMMANDE FL${code ? ' (code ' + code + ')' : ''}`, true);
+
+      const m = (rep && rep.meta) || {};
+      const V = m.ventes || null, Ct = m.controle || null;
+      const issues = (rep && rep.issues) || [];
+      const byType = {}; issues.forEach(i => (byType[i.type] = byType[i.type] || []).push(i));
+      const nAct = kbFlaCount(rep) || 0;
+      const big = { fontSize: 15, padding: '10px 14px', fontWeight: 800 };
+      const chip = (s, on, k) => (
+        <button key={k} className="btn-secondary" disabled={!!busy} onClick={on} style={{ fontSize: 13, padding: '7px 10px', fontWeight: 700, margin: '4px 6px 0 0' }}>{s}</button>
+      );
+      // NB : fonctions de rendu (pas des composants) → les champs de saisie gardent le focus.
+      const rowBox = (i, key, children) => (
+        <div key={key} style={{ padding: '10px 12px', borderRadius: 10, marginTop: 8, background: '#fff', border: '2px solid var(--line)' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            <strong style={{ fontSize: 16 }}>{i.des}</strong>
+            <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{i.prod}{i.row ? ' · ligne ' + i.row : ''}</span>
+          </div>
+          <div style={{ fontSize: 13, marginTop: 3 }}>{i.detail}</div>
+          {children}
+        </div>
+      );
+      const section = (k, n, children) => {
+        const S = KB_FLA_SECTIONS.find(x => x.k === k);
+        if (!n) return null;
+        return (
+          <div style={{ marginTop: 12, borderLeft: '6px solid ' + S.c, background: S.c + '12', borderRadius: 10, padding: '10px 12px' }}>
+            <div onClick={() => setOpen(o => ({ ...o, [k]: !o[k] }))} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <span style={{ fontSize: 24 }}>{S.ic}</span><strong style={{ fontSize: 16 }}>{S.t}</strong>
+              <span className="badge" style={{ background: S.c, color: '#fff', fontWeight: 900, fontSize: 14 }}>{n}</span>
+              <span style={{ marginLeft: 'auto' }}>{open[k] ? '▾' : '▸'}</span>
+            </div>
+            {open[k] && children}
+          </div>
+        );
+      };
+      const list = (k, render) => (byType[k] || []).map((i, j) => rowBox(i, k + j, render(i)));
+      const rungisChips = (i, onPick, label) => (
+        <div>
+          {(i.data && i.data.suggestions || []).filter(s => s.code).map(s => chip(`${label || '✓'} ${s.code} · ${s.des} (${s.sim} %)${s.used ? ' — déjà pris' : ''}`, () => onPick(s.code), s.code))}
+          <div style={{ display: 'flex', gap: 6, marginTop: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input value={codeIn[i.des] || ''} onChange={e => setCodeIn(c => ({ ...c, [i.des]: e.target.value.replace(/\D/g, '') }))} inputMode="numeric" placeholder="autre code Rungis"
+              style={{ width: 150, padding: '8px 10px', fontSize: 15, borderRadius: 8, border: '2px solid var(--line)' }} />
+            <button className="btn-primary" disabled={!!busy || !codeIn[i.des]} onClick={() => onPick(codeIn[i.des])} style={{ fontSize: 13, padding: '8px 12px' }}>Valider ce code</button>
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="card" style={{ border: '3px solid ' + (err || nAct ? 'var(--danger)' : 'var(--accent)'), padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <strong style={{ fontSize: 19 }}>🤖 Contrôle auto COMMANDE FL</strong>
+            {rep && <span className="badge" style={{ background: nAct ? 'var(--danger)' : 'var(--accent)', color: '#fff', fontWeight: 900, fontSize: 15 }}>{nAct ? `${nAct} point(s) à décider` : '✓ rien à décider'}</span>}
+            {wait && <span className="badge" style={{ background: '#fff4e5', color: '#ef6c00', fontWeight: 800 }}>⏳ {wait.what === 'ventes' ? 'lecture des ventes' : 'contrôle'} en cours…</span>}
+            <button className="btn-ghost" style={{ marginLeft: 'auto', fontSize: 13 }} onClick={load}>↻ Relire</button>
+          </div>
+          {err && <div style={{ color: 'var(--danger)', fontSize: 14, marginTop: 8, fontWeight: 700 }}>⚠️ {err}</div>}
+          {rep && <>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))', gap: 10, marginTop: 10 }}>
+              <div style={{ padding: '10px 12px', borderRadius: 10, background: m.ventesErr ? '#fdecea' : '#eef4ff', borderTop: '5px solid ' + (m.ventesErr ? 'var(--danger)' : '#1565c0') }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--ink-mute)' }}>📊 COMMANDE A 5H (ventes de demain)</div>
+                {m.ventesErr ? <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--danger)', marginTop: 4 }}>❌ {m.ventesErr}<div style={{ fontSize: 12, fontWeight: 600 }}>{kbFlaWhen(m.ventesErrAt)}</div></div>
+                  : !V ? <div style={{ fontSize: 15, marginTop: 4 }}>Pas encore lancé</div>
+                  : V.none ? <div style={{ fontSize: 15, marginTop: 4 }}>Pas de vente le {formatDateShort(V.day)} · lu {kbFlaWhen(V.at)}</div>
+                  : <div style={{ marginTop: 4 }}>
+                      <div style={{ fontSize: 22, fontWeight: 900 }}>{V.written} produits <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-mute)' }}>({V.zeros} à 0)</span></div>
+                      <div style={{ fontSize: 13 }}>Vente du <b>{V.titles}</b> · écrit {kbFlaWhen(V.at)}</div>
+                    </div>}
+                <button className="btn-secondary" disabled={!!busy || !!wait} onClick={() => run('ventes')} style={{ ...big, marginTop: 8, width: '100%' }}>📊 Relire les ventes de demain</button>
+              </div>
+              <div style={{ padding: '10px 12px', borderRadius: 10, background: m.controleErr ? '#fdecea' : 'var(--accent-soft)', borderTop: '5px solid ' + (m.controleErr ? 'var(--danger)' : 'var(--accent)') }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--ink-mute)' }}>🔎 Contrôle site + Rungis</div>
+                {m.controleErr ? <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--danger)', marginTop: 4 }}>❌ {m.controleErr}</div>
+                  : !Ct ? <div style={{ fontSize: 15, marginTop: 4 }}>Pas encore lancé</div>
+                  : <div style={{ marginTop: 4 }}>
+                      <div style={{ fontSize: 22, fontWeight: 900 }}>✅ {Ct.changes} correction(s) auto</div>
+                      <div style={{ fontSize: 13 }}>{Ct.rows} produits actifs · PVTTC onglet <b>{Ct.pvTab}</b>{Ct.added ? ` · ${Ct.added} ligne(s) ajoutée(s)` : ''} · {kbFlaWhen(Ct.at)}</div>
+                    </div>}
+                <button className="btn-secondary" disabled={!!busy || !!wait} onClick={() => run('controle')} style={{ ...big, marginTop: 8, width: '100%' }}>🔎 Relancer le contrôle</button>
+              </div>
+            </div>
+
+            {V && !V.none && section('ventes', (V.soldMissing || []).length, <>
+                <div style={{ fontSize: 13, margin: '6px 0' }}>Vendus pour demain mais <b>sans ligne active</b> dans COMMANDE FL → Rungis ne les voit pas :</div>
+                {(V.soldMissing || []).map(x => <div key={x.id} style={{ fontSize: 15, fontWeight: 800, padding: '4px 0' }}>• {x.des} — {x.n} vendu(s)</div>)}
+              </>)}
+            {section('concord', (byType.concord || []).length, <>
+              <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Pas de correspondance sûre dans PVTTC. Choisis le produit Rungis : le code est écrit et la ligne se complète seule (colisage, prix…).</div>
+              {list('concord', i => <>{rungisChips(i, (code) => concord(i, code))}{chip('🚫 Pas chez Rungis', () => ignore(i, 'Noté : pas chez Rungis'), 'ign')}</>)}
+            </>)}
+            {section('noPP', (byType.noPP || []).length, <>
+              {list('noPP', i => <div>{(i.data && i.data.suggestions || []).map(s => chip(`🔗 ${s.des} · ${s.prod} (${s.sim} %)`, () => setId(i, s), s.id))}{chip('Ignorer', () => ignore(i), 'ign')}</div>)}
+            </>)}
+            {section('newSale', (byType.newSale || []).length, <>
+              <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Choisis le code Rungis pour ajouter la ligne (elle se complète seule), ou ajoute-la sans code.</div>
+              {list('newSale', i => <>{rungisChips(i, (code) => add(i, code), '➕')}{chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc')}{chip('Ignorer', () => ignore(i), 'ign')}</>)}
+            </>)}
+            {section('saleInactif', (byType.saleInactif || []).length, <>
+              {list('saleInactif', i => <div>{chip('🟢 Passer Actif', () => setActif(i, true), 'a')}{chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign')}</div>)}
+            </>)}
+            {section('red', (byType.red || []).length, <>
+              {list('red', i => <div>{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
+            </>)}
+            {section('absentRungis', (byType.absentRungis || []).length, <>
+              {list('absentRungis', i => <div>{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
+            </>)}
+            {section('incoh', (byType.incoh || []).length, <>
+              {list('incoh', i => <div>{chip('Vu', () => ignore(i, 'Vu'), 'ign')}</div>)}
+            </>)}
+            {section('pa', (byType.pa || []).length, <>
+              <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Prix Rungis ramené à l'unité vendue (au kilo × poids unitaire, ou à la pièce). Tolérance ±0,10 € (arrondi). À corriger sur le site si besoin.</div>
+              {list('pa', i => <div>{chip('Vu', () => ignore(i, 'Vu'), 'ign')}</div>)}
+            </>)}
+            {section('pv', (byType.pv || []).length, <>
+              {list('pv', i => <div>{chip('Vu', () => ignore(i, 'Vu'), 'ign')}</div>)}
+            </>)}
+            {section('dup', (byType.dup || []).length, <>
+              {list('dup', i => <div>{chip('Vu', () => ignore(i, 'Vu'), 'ign')}</div>)}
+            </>)}
+
+            {(rep.changes || []).length > 0 && (
+              <details style={{ marginTop: 12 }}>
+                <summary style={{ cursor: 'pointer', fontSize: 15, fontWeight: 800 }}>✅ Corrigé automatiquement — {rep.changes.length} dernière(s) modification(s)</summary>
+                <div style={{ maxHeight: 360, overflow: 'auto', marginTop: 6 }}>
+                  {rep.changes.map((c, j) => (
+                    <div key={j} style={{ fontSize: 12.5, padding: '5px 0', borderTop: '1px solid var(--line)' }}>
+                      <b>{c.des}</b> <span style={{ color: 'var(--ink-mute)' }}>L{c.row} · {c.at}</span><br />
+                      {c.col} : <s style={{ color: 'var(--ink-mute)' }}>{String(c.before || '—')}</s> → <b>{String(c.after)}</b> <span style={{ color: 'var(--ink-mute)' }}>({c.src})</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+            {Ct && (Ct.rungisOnly || []).length > 0 && (
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ cursor: 'pointer', fontSize: 14, fontWeight: 700 }}>ℹ️ Chez Rungis (PVTTC) mais pas dans COMMANDE FL — {Ct.rungisOnly.length}</summary>
+                <div style={{ fontSize: 12.5, marginTop: 4 }}>{Ct.rungisOnly.map(x => <div key={x.code}>{x.code} · {x.des}{x.red ? ' 🔴' : ''}</div>)}</div>
+              </details>
+            )}
+          </>}
+        </div>
+      );
+    }
+
     function FLPage({ session }) {
       return (
         <div className="stack">
           <h1 style={{ margin: '0 0 4px' }}>🥬 Fruits &amp; Légumes</h1>
+          <FlAutoCard session={session} />
           <FlInfoControlCard session={session} />
           <FlRuptureCard session={session} />
           <FLMajPage session={session} />
@@ -21204,7 +21454,7 @@
         <div className="stack">
           <div className="card" style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <h2 style={{ fontSize: 18, margin: 0 }}>🥬 Enlèvements Rungis</h2>
+              <h2 style={{ fontSize: 18, margin: 0 }}>🚚 Enlèvement camion Rungis</h2>
               <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '4px 0 0' }}>Demandes de retrait vers les magasins (🏭 Dispatch · 📦 Picking · 🥬 via Kelbongoo), validées par Rungis avec date de récupération et de livraison. Lecture depuis la Centrale PDP.</p>
             </div>
             <button className="btn-secondary" style={{ fontSize: 13 }} onClick={() => setTick(t => t + 1)}>↻ Actualiser</button>
@@ -25068,6 +25318,7 @@
       live: 'M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8',
       today: 'M3 12h4l3-8 4 16 3-8h4', pain: 'M5 11a7 4 0 0 1 14 0v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2zM9 9v3m3-4v4m3-3v3', dom: 'M3 11 12 4l9 7M5 10v10h14V10M10 20v-5h4v5',
     };
+    function kbFlAutoDot() { try { return Number(localStorage.getItem('kb_fl_auto_n') || 0) > 0; } catch (_) { return false; } }
     const KbIco = ({ k }) => <svg viewBox="0 0 24 24" aria-hidden="true"><path d={KB_IC[k] || KB_IC.ca} /></svg>;
     function KbMasterSidebar({ tab, setTab, session, onLogout }) {
       const [cur, setCur] = React.useState(() => { try { return localStorage.getItem('kbg_suivi_sub') || 'ca'; } catch (e) { return 'ca'; } });
@@ -25077,24 +25328,25 @@
       const pilot = ['suivi', 'casuivi', 'stats', 'manqhist', 'histo', 'tempmaster'].includes(tab);
       const goSub = (k) => { try { localStorage.setItem('kbg_suivi_sub', k); } catch (e) {} setCur(k); if (pilot) { try { window.dispatchEvent(new CustomEvent('kb:suivi', { detail: k })); } catch (e) {} } else setTab('suivi'); window.scrollTo({ top: 0 }); };
       const goTab = (t) => { setTab(t); window.scrollTo({ top: 0 }); };
-      const Item = ({ k, label, on, onClick, dot }) => <button className={on ? 'on' : ''} onClick={onClick}><KbIco k={k} /><span>{label}</span>{dot && <span className="kb-dot" />}</button>;
-      const P = (k, label, dot) => <Item key={k} k={k} label={label} on={pilot && cur === k} onClick={() => goSub(k)} dot={dot} />;
+      // V10.13 — emoji de couleur devant chaque entrée (plus lisible que l'icône grise)
+      const Item = ({ k, label, on, onClick, dot, em }) => <button className={on ? 'on' : ''} onClick={onClick}>{em ? <span className="kb-em" aria-hidden="true">{em}</span> : <KbIco k={k} />}<span>{label}</span>{dot && <span className="kb-dot" />}</button>;
+      const P = (k, label, em, dot) => <Item key={k} k={k} label={label} em={em} on={pilot && cur === k} onClick={() => goSub(k)} dot={dot} />;
       const ini = String(session.name || '?').split(/\s+/).map(x => x[0]).join('').slice(0, 2).toUpperCase();
       return (
         <nav className="kb-side" aria-label="Navigation master">
           <div className="kb-side-brand"><div className="kb-side-logo">K</div><div><b>Kelbongoo</b><small>Master · {APP_VERSION}</small></div></div>
-          <Item k="today" label="Aujourd'hui" on={tab === 'today'} onClick={() => goTab('today')} />
+          <Item k="today" em="🏠" label="Aujourd'hui" on={tab === 'today'} onClick={() => goTab('today')} />
           <div className="kb-side-sec">Pilotage</div>
-          {P('ca', 'Suivi CA')}{P('stats', 'Statistiques')}{P('manq', 'Manquants & remises')}{P('pertes', 'Pertes ROB')}{P('rungis', '🥬 Rungis')}{P('live', '🟢 Qui fait quoi')}{P('histo', 'Historique')}
+          {P('ca', 'Suivi CA', '💶')}{P('stats', 'Statistiques', '📊')}{P('manq', 'Manquants & remises', '💸')}{P('pertes', 'Pertes ROB', '♻️')}{P('rungis', 'Enlèvement camion Rungis', '🚚')}{P('live', 'Qui fait quoi', '🟢')}{P('histo', 'Historique', '📜')}
           <div className="kb-side-sec">Opérations</div>
-          <Item k="push" label="Push équipes" on={tab === 'push'} onClick={() => goTab('push')} />
-          <Item k="recap" label="Récap du jour" on={tab === 'masterrecap'} onClick={() => goTab('masterrecap')} />
-          <Item k="fl" label="Fruits & légumes" on={tab === 'fl'} onClick={() => goTab('fl')} />
-          <Item k="pain" label="Commande pain" on={tab === 'mpain'} onClick={() => goTab('mpain')} />
-          <Item k="dom" label="Étiquettes livraison DOM" on={tab === 'mdom'} onClick={() => goTab('mdom')} />
-          <Item k="load" label="Chargement" on={tab === 'admin'} onClick={() => goTab('admin')} />
+          <Item k="push" em="📣" label="Push équipes" on={tab === 'push'} onClick={() => goTab('push')} />
+          <Item k="recap" em="🧾" label="Récap du jour" on={tab === 'masterrecap'} onClick={() => goTab('masterrecap')} />
+          <Item k="fl" em="🥬" label="Fruits & légumes" on={tab === 'fl'} onClick={() => goTab('fl')} dot={kbFlAutoDot()} />
+          <Item k="pain" em="🍞" label="Commande pain" on={tab === 'mpain'} onClick={() => goTab('mpain')} />
+          <Item k="dom" em="🏷️" label="Étiquettes livraison DOM" on={tab === 'mdom'} onClick={() => goTab('mdom')} />
+          <Item k="load" em="📥" label="Chargement" on={tab === 'admin'} onClick={() => goTab('admin')} />
           <div className="kb-side-sec">Outils</div>
-          {P('temp', 'Température')}{P('codes', 'Codes-barres')}{P('dromy', 'Dromy')}{P('lieux', 'Lieux & horaires')}{P('cmails', 'Mails clients', !!mailErr)}{P('ancien', 'Ancien site')}
+          {P('temp', 'Température', '🌡️')}{P('codes', 'Codes-barres', '🏷️')}{P('dromy', 'Dromy', '🛵')}{P('lieux', 'Lieux & horaires', '📍')}{P('cmails', 'Mails clients', '📧', !!mailErr)}{P('ancien', 'Ancien site', '🔁')}
           <div className="kb-side-foot"><span className="kb-side-av">{ini}</span><div>{session.name}<small>{formatDateFR()}</small></div><button onClick={onLogout} title="Se déconnecter"><KbIco k="out" /></button></div>
         </nav>
       );
