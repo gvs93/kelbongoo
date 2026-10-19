@@ -31,6 +31,7 @@ echo ""
 echo "=== 5/5 Déploiement (2-3 min)"
 set +e
 firebase deploy --only functions:rungis --project "$P"
+echo "(Un message « Failed to set the IAM Policy » juste au-dessus est normal avec la règle probon.fr.)"
 echo "=== Ouverture de l'accès (règle probon.fr)"
 gcloud run services update kbgrungislogin --region europe-west1 --no-invoker-iam-check --project "$P" --quiet
 gcloud run services update kbgrungis --region europe-west1 --no-invoker-iam-check --project "$P" --quiet
