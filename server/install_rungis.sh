@@ -5,6 +5,11 @@ set -e
 P=distribkbg
 R=https://raw.githubusercontent.com/gvs93/kelbongoo/main/server
 D=~/kbg-rungis
+echo "=== 0/5 Connexion Firebase"
+if ! firebase projects:list >/dev/null 2>&1; then
+  echo "Reconnexion nécessaire : ouvre le lien affiché, choisis hg@probon.fr, autorise, puis colle le code ici."
+  firebase login --reauth --no-localhost
+fi
 echo "=== 1/5 Préparation du dossier $D"
 mkdir -p "$D/functions" && cd "$D"
 printf '{\n  "functions": [ { "source": "functions", "codebase": "rungis" } ]\n}\n' > firebase.json
