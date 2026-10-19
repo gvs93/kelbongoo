@@ -764,7 +764,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.18';
+    const APP_VERSION = 'V10.19';
+    // V10.19 — F&L : produits vendus sans ligne active dans COMMANDE FL → relevé toutes les heures (veille FL Auto v1.3) et
+    //   ajoutés quand même à la commande Rungis 5h (ligne orange « demander à Raimbaud de mettre à jour »).
     // V10.18 — Master › Fruits & légumes : retrait des blocs « 🔎 Contrôle info du Sheet » et « MAJ FL — Sxx » (doublons du
     //   Contrôle auto) ; libellé « ID site » plus clair.
     // V10.17 — Photos des palettes (Centrale PDP Pribon : dispatch / picking) affichées directement chez le chauffeur et
@@ -18557,7 +18559,7 @@
       if (flAuto) {
         const fm = flAuto.meta || {}, fv = fm.ventes || {};
         if (fm.ventesErr) todo.push({ who: 'fl', lv: 'red', ic: '📊', t: 'Ventes 5h NON écrites dans COMMANDE FL', d: fm.ventesErr + ' — Rungis doit remplir la colonne D, ou relancer dans F&L', on: () => go('fl') });
-        else if ((fv.soldMissing || []).length) todo.push({ who: 'fl', lv: 'red', ic: '📊', t: `${fv.soldMissing.length} produit(s) vendu(s) pour demain absent(s) de COMMANDE FL`, d: fv.soldMissing.slice(0, 4).map(x => x.des + ' (' + x.n + ')').join(' · '), on: () => go('fl') });
+        else { const fmi = kbFlaMissing(fm); if (fmi.list.length) todo.push({ who: 'fl', lv: 'red', ic: '📊', t: `${fmi.list.length} produit(s) vendu(s) pour le ${formatDateShort(fmi.day)} absent(s) de COMMANDE FL — Raimbaud doit mettre le Sheet à jour`, d: fmi.list.slice(0, 4).map(x => x.des + ' (' + x.n + ')').join(' · ') + ' · ajoutés quand même à la commande Rungis', on: () => go('fl') }); }
         const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type));
         if (fa.length) {
           const cnt = {}; fa.forEach(i => { cnt[i.type] = (cnt[i.type] || 0) + 1; });
@@ -21228,7 +21230,7 @@
     //     incohérences, écarts de prix, absents. Actions : fl_auto_report / run / concord / setid / add / actif / ignore.
     // ============================================================
     const KB_FLA_SECTIONS = [
-      { k: 'ventes',      ic: '📊', t: 'Ventes 5h',                                   c: '#1565c0' },
+      { k: 'ventes',      ic: '📊', t: 'Vendus mais absents du Sheet (ajoutés quand même pour Rungis)', c: '#ef6c00' },
       { k: 'concord',     ic: '🤝', t: 'À faire ensemble — quel produit Rungis ?',    c: '#6a1b9a' },
       { k: 'noPP',        ic: '🔗', t: 'Ligne reliée à un produit qui n\'existe plus sur le site (ID SITE KBG)',   c: '#6a1b9a' },
       { k: 'newSale',     ic: '🆕', t: 'En vente sur le site, absent de COMMANDE FL', c: '#c62828' },
@@ -21246,7 +21248,14 @@
       if (!rep || !rep.issues) return null;
       const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type)).length;
       const m = rep.meta || {};
-      return n + (m.ventesErr ? 1 : 0) + (m.ventes && (m.ventes.soldMissing || []).length ? 1 : 0);
+      return n + (m.ventesErr ? 1 : 0) + (kbFlaMissing(m).list.length ? 1 : 0);
+    }
+    // V10.19 — « vendu mais absent du Sheet » : relevé le plus récent entre 4h30 (ventes) et la veille horaire (veille, 7h→22h,
+    //   distribution de la PROCHAINE commande 5h). Ces produits partent quand même dans la commande Rungis (ligne orange).
+    function kbFlaMissing(m) {
+      const v = (m && m.ventes) || null, w = (m && m.veille) || null;
+      const pick = w && !w.none && (!v || String(w.at || '') > String(v.at || '')) ? w : (v && !v.none ? v : null);
+      return { list: (pick && pick.soldMissing) || [], day: pick ? pick.day : '', at: pick ? pick.at : '', hourly: pick === w };
     }
     function FlAutoCard({ session }) {
       const showToast = React.useContext(ToastContext);
@@ -21392,10 +21401,16 @@
               </div>
             </div>
 
-            {V && !V.none && section('ventes', (V.soldMissing || []).length, <>
-                <div style={{ fontSize: 13, margin: '6px 0' }}>Vendus pour demain mais <b>sans ligne active</b> dans COMMANDE FL → Rungis ne les voit pas :</div>
-                {(V.soldMissing || []).map(x => <div key={x.id} style={{ fontSize: 15, fontWeight: 800, padding: '4px 0' }}>• {x.des} — {x.n} vendu(s)</div>)}
-              </>)}
+            {(() => { const MI = kbFlaMissing(m); return section('ventes', MI.list.length, <>
+                <div style={{ fontSize: 13, margin: '6px 0' }}>Vendus pour la distribution du <b>{formatDateShort(MI.day)}</b> mais <b>sans ligne active</b> dans COMMANDE FL.
+                  Ils partent <b>quand même</b> dans la commande Rungis de 5h (ligne orange « demander à Raimbaud de mettre à jour »).
+                  <span style={{ color: 'var(--ink-mute)' }}> Vérifié {MI.hourly ? 'toutes les heures (7h→22h)' : 'à 4h30'} · dernier relevé {kbFlaWhen(MI.at)}</span></div>
+                {MI.list.map(x => <div key={x.id} style={{ fontSize: 15, fontWeight: 800, padding: '4px 0' }}>
+                  • {x.des} — {x.n} vendu(s){x.code ? <span style={{ fontWeight: 600 }}> → code {x.code}, {x.colis != null ? String(x.colis).replace('.', ',') + ' colis' : 'quantité à confirmer'}</span> : <span style={{ color: 'var(--danger)' }}> → pas de code Rungis trouvé</span>}
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}>{x.why === 'inactif' ? ` · ligne ${x.row} « Non actif »` : x.why === 'absent' ? ' · absent du Sheet' : ''}</span>
+                </div>)}
+                {m.veilleErr && <div style={{ fontSize: 12, color: 'var(--danger)' }}>Veille horaire : {m.veilleErr}</div>}
+              </>); })()}
             {section('concord', (byType.concord || []).length, <>
               <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Pas de correspondance sûre dans PVTTC. Choisis le produit Rungis : le code est écrit et la ligne se complète seule (colisage, prix…).</div>
               {list('concord', i => <>{rungisChips(i, (code) => concord(i, code))}{chip('🚫 Pas chez Rungis', () => ignore(i, 'Noté : pas chez Rungis'), 'ign')}</>)}
