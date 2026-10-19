@@ -1,5 +1,5 @@
 /**
- * KBG_FL_Auto.gs — v1.2 (19/10/2026) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
+ * KBG_FL_Auto.gs — v1.3 (19/10/2026) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
  *
  * Deux automatismes sur le Sheet « COMMANDE FL KBG x PROBON » (onglet COMMANDE FL) :
  *
@@ -84,11 +84,12 @@ function kbFlAutoRoute_(data) {
 function flAutoInstall() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     var f = t.getHandlerFunction();
-    if (f === 'flAuto5h' || f === 'flAutoControle' || f === 'flAutoOnce') ScriptApp.deleteTrigger(t);
+    if (f === 'flAuto5h' || f === 'flAutoControle' || f === 'flAutoOnce' || f === 'flAutoVeille') ScriptApp.deleteTrigger(t);
   });
+  ScriptApp.newTrigger('flAutoVeille').timeBased().everyHours(1).create();        // v1.3 : veille « vendu mais absent » (7h→22h)
   ScriptApp.newTrigger('flAuto5h').timeBased().atHour(4).nearMinute(30).everyDays(1).inTimezone(KBA.TZ).create();
   ScriptApp.newTrigger('flAutoControle').timeBased().atHour(14).nearMinute(0).everyDays(1).inTimezone(KBA.TZ).create();
-  Logger.log('Déclencheurs créés : flAuto5h (≈4h30) + flAutoControle (≈14h), fuseau Europe/Paris.');
+  Logger.log('Déclencheurs créés : flAuto5h (≈4h30) + flAutoControle (≈14h) + flAutoVeille (toutes les heures, 7h→22h), fuseau Europe/Paris.');
 }
 
 /** ≈4h30 : contrôle complet (répare les ID site), puis ventes du lendemain → colonne D. */
@@ -138,15 +139,16 @@ function flAutoTest() {
 }
 
 /* ============================ 1) VENTES 5H ============================ */
-function flAutoVentes(targetDay) {
+/** dry=true (veille horaire) : ne touche PAS au Sheet, met seulement à jour meta.veille (produits vendus absents du Sheet). */
+function flAutoVentes(targetDay, dry) {
   var lock = LockService.getScriptLock(); lock.waitLock(60000);
   try {
     var day = targetDay || flAutoDay_(1);
     var ddp = new KbDdp_(); ddp.connect(); ddp.login();
     var gos = flAutoGlobalOrders_(ddp).filter(function (g) { return g.day === day; });
     if (!gos.length) {
-      var m0 = { ventes: { at: new Date().toISOString(), day: day, none: true } };
-      flAutoMeta_(m0); return m0.ventes;
+      var r0 = { at: new Date().toISOString(), day: day, none: true };
+      flAutoMeta_(dry ? { veille: r0 } : { ventes: r0 }); return r0;
     }
     var sold = {}, flProd = {};
     gos.forEach(function (g) {
@@ -172,15 +174,57 @@ function flAutoVentes(targetDay) {
       else { untouched.push({ row: r.row, des: r.des }); return; }
       colVals[i][0] = v; written++; if (!v) zeros++;
     });
-    sh.getRange(2, C.cmd5 + 1, colVals.length, 1).setValues(colVals);
     var titles = gos.map(function (g) { return g.title; }).join(' + ');
-    sh.getRange(1, C.cmd5 + 1).setNote('Rempli automatiquement le ' + Utilities.formatDate(new Date(), KBA.TZ, 'dd/MM HH:mm') + ' — ventes du ' + titles + ' (admin.kelbongoo.com)');
+    if (!dry) sh.getRange(2, C.cmd5 + 1, colVals.length, 1).setValues(colVals);
+    if (!dry) sh.getRange(1, C.cmd5 + 1).setNote('Rempli automatiquement le ' + Utilities.formatDate(new Date(), KBA.TZ, 'dd/MM HH:mm') + ' — ventes du ' + titles + ' (admin.kelbongoo.com)');
     var soldMissing = [];
-    for (var sid in flProd) if (!used[sid] && (sold[sid] || 0) > 0 && !/panier solidaire/i.test(flProd[sid].product_name)) soldMissing.push({ id: sid, des: flProd[sid].product_name, n: sold[sid] });
-    var res = { at: new Date().toISOString(), day: day, titles: titles, written: written, zeros: zeros, untouched: untouched, soldMissing: soldMissing };
-    flAutoMeta_({ ventes: res, ventesErr: '' });
+    var PVc = null, pvLazy = function () { if (!PVc) { try { PVc = flAutoReadPvttc_(); } catch (e) { PVc = { byCode: {}, list: [] }; } } return PVc; };
+    for (var sid in flProd) if (!used[sid] && (sold[sid] || 0) > 0 && !/panier solidaire/i.test(flProd[sid].product_name))
+      soldMissing.push(flAutoMissingInfo_(T, sid, flProd[sid], Number(sold[sid]), pvLazy));
+    var res = { at: new Date().toISOString(), day: day, titles: titles, written: dry ? 0 : written, zeros: zeros, untouched: untouched, soldMissing: soldMissing };
+    flAutoMeta_(dry ? { veille: res } : { ventes: res, ventesErr: '' });
     return res;
   } finally { lock.releaseLock(); }
+}
+
+/** v1.3 — produit VENDU mais sans ligne active dans COMMANDE FL : on calcule quand même de quoi le commander à Rungis.
+ *  1) ligne « Non actif » du Sheet (même ID ou même nom) → code, colisage, MU, prix ;  2) sinon PVTTC (désignation sûre).
+ *  colis = arrondi 0,1 de (ventes × 1,15 arrondi) × MU ÷ colisage (même règle que les colonnes du Sheet, sans stock). */
+function flAutoMissingInfo_(T, sid, fp, n, pvLazy) {
+  var C = T.cols, num = function (v) { var x = Number(String(v == null ? '' : v).replace(/[^\d,.\-]/g, '').replace(',', '.')); return isFinite(x) ? x : 0; };
+  var o = { id: sid, des: fp.product_name, prod: fp.producer_name || '', n: n, estim: Math.round(n * 1.15), code: '', col: 0, mu: 0, pa: 0, colis: null, row: null, why: 'absent' };
+  var r = T.rows.filter(function (x) { return x.des && !x.actifOk && (x.id === sid || kbaSame_(x.des, fp.product_name)); })[0];
+  if (r) {
+    o.row = r.row; o.why = 'inactif';
+    o.code = C.code >= 0 ? String(r.raw[C.code] || '') : ''; o.col = C.col >= 0 ? num(r.raw[C.col]) : 0;
+    o.mu = C.mu >= 0 ? num(r.raw[C.mu]) : 0; o.pa = C.pa >= 0 ? num(r.raw[C.pa]) : 0;
+    if (!o.prod && C.prod >= 0) o.prod = String(r.raw[C.prod] || '');
+  }
+  if (!o.code || !o.col) {
+    var PV = pvLazy(), b = flAutoBestRungis_(fp.product_name, PV, {});
+    var g = o.code ? PV.byCode[o.code] : (b && b.sure) || null;
+    if (g) { o.code = o.code || String(g.code); o.col = o.col || Number(g.col) || 0; o.pa = o.pa || Number(g.pa) || 0; o.ua = String(g.ua || '').toUpperCase(); }
+  }
+  if (!o.mu) o.mu = o.ua === 'PCE' ? flAutoPieces_(fp.product_name) : (Number(fp.unit_weight) || flAutoWeightOf_(fp.product_name) || 0);
+  if (o.mu > 0 && o.col > 0) o.colis = Math.max(0.1, Math.round(o.estim * o.mu / o.col * 10) / 10);
+  return o;
+}
+/** « Pomme Akane 750g Bio » → 0.75 (kg) ; « Carotte 1KG » → 1 ; sinon 0. */
+function flAutoWeightOf_(name) {
+  var m = String(name || '').match(/(\d+(?:[.,]\d+)?)\s*(kg|g)\b/i);
+  if (!m) return 0;
+  var v = Number(m[1].replace(',', '.'));
+  return /kg/i.test(m[2]) ? v : v / 1000;
+}
+
+/** v1.3 — VEILLE HORAIRE (7h→22h) : relit les ventes de la distribution de la PROCHAINE commande 5h
+ *  (avant 5h : demain ; après 5h : après-demain) et liste les produits vendus sans ligne active dans COMMANDE FL.
+ *  Lecture seule : la colonne COMMANDE A 5H n'est pas touchée (elle reste écrite à 4h30). Résultat : meta.veille (appli). */
+function flAutoVeille() {
+  var h = Number(Utilities.formatDate(new Date(), KBA.TZ, 'H'));
+  if (h < 7 || h > 22) return null;
+  try { var v = flAutoVentes(flAutoDay_(h < 5 ? 1 : 2), true); flAutoMeta_({ veilleErr: '' }); return v; }
+  catch (e) { flAutoMeta_({ veilleErr: String(e && e.message || e), veilleErrAt: new Date().toISOString() }); return null; }
 }
 
 /* ============================ 2) CONTRÔLE ============================ */
@@ -464,11 +508,11 @@ function flAutoAddRow_(sh, T, p, code) {
   for (var j = 0; j < lastCol; j++) if (!formulas[j]) raw[j] = '';
   var put = function (k, v) { if (C[k] >= 0) raw[C[k]] = v; };
   put('prod', p.producer_name || ''); put('des', p.product_name || ''); put('code', code || '');
-  put('cmd5', 0); put('actif', 'Actif'); put('id', p._id || p.producerproduct_id || '');
+  put('cmd5', 0); put('actif', 'Actif'); put('id', p.producerproduct_id || p._id || '');
   var hs = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(kbaNorm_);
   ['stock mu', 'stock cagette'].forEach(function (h) { var i = hs.indexOf(h); if (i >= 0 && !formulas[i]) raw[i] = 0; });
   for (var k = 0; k < lastCol; k++) if (!formulas[k]) sh.getRange(at, k + 1).setValue(raw[k]);
-  var row = { row: at, raw: raw, des: String(p.product_name || ''), actifOk: true, id: String(p._id || p.producerproduct_id || ''), code: code ? Number(code) : null };
+  var row = { row: at, raw: raw, des: String(p.product_name || ''), actifOk: true, id: String(p.producerproduct_id || p._id || ''), code: code ? Number(code) : null };
   T.rows.push(row);
   return row;
 }
@@ -526,6 +570,7 @@ function flAutoMeta_(patch) {
     for (var k in patch) m[k] = patch[k];
     var s = JSON.stringify(m);
     if (s.length > 8500 && m.controle && m.controle.rungisOnly) { m.controle.rungisOnly = m.controle.rungisOnly.slice(0, 40); s = JSON.stringify(m); }
+    if (s.length > 8500 && m.veille) { m.veille.untouched = []; m.veille.soldMissing = (m.veille.soldMissing || []).slice(0, 15); s = JSON.stringify(m); }
     if (s.length > 8500 && m.ventes) { m.ventes.untouched = (m.ventes.untouched || []).slice(0, 20); m.ventes.soldMissing = (m.ventes.soldMissing || []).slice(0, 20); s = JSON.stringify(m); }
     props.setProperty('FL_AUTO_META', s);
   }

@@ -1,5 +1,5 @@
 /**
- * KBG_Rungis.gs — v1.2 (19/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_Rungis.gs — v1.3 (19/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
  * ---------------------------------------------------------------------------------------------
  * 1. 5h00 : mail « Commande KBG <date> » à gestion@probon.fr
  *      - corps : CODE PROBON · PRODUCTEUR · DÉSIGNATION · COLIS (gros, lisible)
@@ -142,6 +142,7 @@ function rgCreateSheet_(day, distrib, rows, warn, ajouts) {
   for (var c = 5; c <= head.length; c++) sh.setColumnWidth(c, 115);
   sh.setColumnWidth(15, 210);
   if (n > 1) sh.getRange(1, 1, n, head.length).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  rows.forEach(function (r, i) { if (r.hors) sh.getRange(i + 2, 1, 1, head.length).setBackground('#ffe0b2').setFontWeight('bold'); });
   var aj = ss.insertSheet('Ajouts Rungis');
   var ah = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS AJOUTÉS', 'COLISAGE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'MANQUE (uv)', 'DEMANDÉ LE', 'PAR'];
   var ad = [ah].concat((ajouts || []).map(function (r) { return [r.code, r.producteur, r.designation, r.colis, r.col, r.pa, r.totalHt, r.manque, r.at, r.by]; }));
@@ -173,22 +174,50 @@ function rgXlsxBlob_(ss, name) {
   return res.getBlob().setName(name + '.xlsx');
 }
 
+// ───────────────────────── v1.3 : produits vendus absents du Sheet ─────────────────────────
+var RG_HORS_TXT = 'PAS dans le Sheet COMMANDE FL — demander à Raimbaud de mettre à jour';
+/** Produits vendus pour « distrib » sans ligne active dans COMMANDE FL (relevé de 4h30, meta FL Auto) → lignes de commande.
+ *  Si le code est déjà commandé, on n'ajoute pas de doublon. colis inconnu (pas de colisage / MU) → 0 + « quantité à confirmer ». */
+function rgHors_(distrib, rows) {
+  var m = {}; try { m = JSON.parse(PropertiesService.getScriptProperties().getProperty('FL_AUTO_META') || '{}'); } catch (e) {}
+  var v = m.ventes && m.ventes.day === distrib ? m.ventes : (m.veille && m.veille.day === distrib ? m.veille : null);
+  if (!v || !(v.soldMissing || []).length) return [];
+  var have = {}; (rows || []).forEach(function (r) { if (r.code) have[String(r.code)] = 1; });
+  return v.soldMissing.filter(function (x) { return !x.code || !have[String(x.code)]; }).map(function (x) {
+    var colis = x.colis != null ? Number(x.colis) : 0;
+    return {
+      hors: true, code: String(x.code || ''), producteur: x.prod || '', colis: colis, col: x.col || 0, pa: x.pa || 0,
+      designation: x.des + ' ⚠️ ' + RG_HORS_TXT + (x.colis == null ? ' (quantité à confirmer : ' + x.n + ' vendus)' : ''),
+      totalHt: Math.round(colis * (x.col || 0) * (x.pa || 0) * 100) / 100, cmd5h: x.n, estim: x.estim, stockMu: 0, stockCag: 0,
+      besoinUv: x.estim, uv: '', type: '', id: x.id, n: x.n, actif: false
+    };
+  }).sort(function (a, b) { return a.producteur.localeCompare(b.producteur, 'fr') || a.designation.localeCompare(b.designation, 'fr'); });
+}
+function rgHorsHtml_(rows) {
+  var h = rows.filter(function (r) { return r.hors; });
+  if (!h.length) return '';
+  return '<div style="margin-top:10px;background:#fff3e0;border:3px solid #ef6c00;border-radius:12px;padding:10px 14px;font-size:15px;color:#7a4100">'
+    + '<b style="font-size:17px">⚠️ ' + h.length + ' produit(s) vendu(s) mais PAS dans le Sheet COMMANDE FL</b><br>'
+    + 'Ils sont quand même dans la liste ci-dessous (ligne orange). <b>Demander à Raimbaud de mettre à jour le Sheet.</b></div>';
+}
+
 // ───────────────────────── Mail 5h ─────────────────────────
 function rgMailHtml_(day, distrib, rows, url, warn, ajouts) {
   var tot = rows.reduce(function (a, r) { return a + r.colis; }, 0);
   var box = function (lbl, val, col) { return '<td style="padding:5px"><div style="background:' + col + '14;border-left:8px solid ' + col + ';border-radius:12px;padding:10px 14px"><div style="font-size:13px;color:#555">' + lbl + '</div><div style="font-size:34px;font-weight:900;color:' + col + ';line-height:1.1">' + val + '</div></div></td>'; };
   var lines = rows.map(function (r, i) {
-    return '<tr style="background:' + (i % 2 ? '#f6faf6' : '#ffffff') + '">'
+    return '<tr style="background:' + (r.hors ? '#fff3e0' : (i % 2 ? '#f6faf6' : '#ffffff')) + '">'
       + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:18px;font-weight:900;color:#1a4d2e;white-space:nowrap">' + rgEsc_(r.code || '—') + '</td>'
       + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:13px;color:#555">' + rgEsc_(r.producteur) + '</td>'
       + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:16px;font-weight:700">' + rgEsc_(r.designation) + '</td>'
-      + '<td style="padding:10px 12px;border-bottom:1px solid #e3ebe3;text-align:right;white-space:nowrap"><span style="display:inline-block;min-width:54px;text-align:center;background:#2e7d32;color:#fff;border-radius:10px;padding:4px 10px;font-size:22px;font-weight:900">' + rgFmt_(r.colis, 1) + '</span></td></tr>';
+      + '<td style="padding:10px 12px;border-bottom:1px solid #e3ebe3;text-align:right;white-space:nowrap"><span style="display:inline-block;min-width:54px;text-align:center;background:' + (r.hors ? '#ef6c00' : '#2e7d32') + ';color:#fff;border-radius:10px;padding:4px 10px;font-size:22px;font-weight:900">' + (r.hors && !r.colis ? '?' : rgFmt_(r.colis, 1)) + '</span></td></tr>';
   }).join('');
   return '<div style="font-family:Arial,Helvetica,sans-serif;max-width:680px;color:#1b1b1b">'
     + '<div style="background:#1a4d2e;color:#fff;border-radius:14px;padding:16px 20px">'
     + '<div style="font-size:24px;font-weight:900">🥬 Commande KBG — prépa du ' + rgEsc_(rgLong_(day)) + '</div>'
     + '<div style="font-size:16px;margin-top:2px">Distribution du <b>' + rgEsc_(rgLong_(distrib)) + '</b> · ventes à 5h + 15 %, en colis</div></div>'
     + (warn ? '<div style="margin-top:10px;background:#fdecea;border:2px solid #c62828;border-radius:12px;padding:10px 14px;font-size:14px;font-weight:700;color:#c62828">⚠️ ' + rgEsc_(warn) + '</div>' : '')
+    + rgHorsHtml_(rows)
     + '<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>' + box('Produits', rows.length, '#1565c0') + box('Colis à commander', rgFmt_(tot, 1), '#2e7d32') + '</tr></table>'
     + '<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px;border:1px solid #d7e3d7;border-radius:10px">'
     + '<tr style="background:#e8f5e9"><th style="padding:8px 10px;text-align:left;font-size:12px">CODE PROBON</th><th style="padding:8px 10px;text-align:left;font-size:12px">PRODUCTEUR</th><th style="padding:8px 10px;text-align:left;font-size:12px">DÉSIGNATION</th><th style="padding:8px 12px;text-align:right;font-size:12px">COLIS</th></tr>'
@@ -214,6 +243,7 @@ function rgAjoutsHtml_(ajouts) {
 function rgMailText_(day, distrib, rows, url, warn, ajouts) {
   var out = ['Commande KBG — prépa du ' + rgLong_(day), 'Distribution du ' + rgLong_(distrib), ''];
   if (warn) out.push('ATTENTION : ' + warn, '');
+  if (rows.some(function (r) { return r.hors; })) out.push('ATTENTION : produit(s) vendu(s) mais pas dans le Sheet COMMANDE FL (marqués ⚠️) — demander à Raimbaud de mettre à jour.', '');
   out.push('CODE PROBON | PRODUCTEUR | DÉSIGNATION | COLIS');
   rows.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1)); });
   if (ajouts && ajouts.length) { out.push('', 'AJOUTS RUNGIS (demandés hier soir, à livrer avec cette commande) :'); ajouts.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1)); }); }
@@ -230,6 +260,8 @@ function kbRungisCmd5h(force, testTo, dayOverride) {
     var distrib = rgAddDays_(day, 1);
     var fl = rgReadFL_();
     var rows = rgBuildOrder_(fl);
+    var hors = rgHors_(distrib, rows);              // v1.3 : vendus mais absents / Non actifs dans COMMANDE FL
+    rows = rows.concat(hors);
     var ajouts = rgAjouts_(day, fl);
     var warn = '';
     // v1.2 : la note de la colonne D est « Rempli automatiquement le 20/10 04:31 — … » (sans l'année)
@@ -299,6 +331,7 @@ function rgCmdGet_(day) {
   } else cmd = null; // pas de commande envoyée ce jour-là
   // Commande en cours : état actuel du fichier COMMANDE FL (ce qui partirait maintenant)
   var liveRows = rgBuildOrder_(fl);
+  liveRows = liveRows.concat(rgHors_(rgAddDays_(rgIso_(new Date()), 1), liveRows));
   var live = { day: rgIso_(new Date()), distrib: rgAddDays_(rgIso_(new Date()), 1), at: Utilities.formatDate(new Date(), RG_TZ, 'dd/MM/yyyy HH:mm'),
     rows: liveRows.map(function (r) { var o = {}; RG_COLS.forEach(function (k) { o[k] = r[k]; }); return o; }) };
   return { ok: true, today: rgIso_(new Date()), cmd: cmd, live: live, rajouts: rgAjouts_(day, fl) };
