@@ -394,7 +394,7 @@
 
     /* Role tabs sur login */
     .role-tabs {
-      display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
       background: var(--bg-muted); padding: 4px; border-radius: var(--radius); margin-bottom: 18px;
     }
     /* Accès master discret, tout en bas */
@@ -414,7 +414,8 @@
       color: var(--ink-soft); border: 1px solid transparent;
     }
     .role-tab.active { background: white; color: var(--ink); border-color: var(--line); box-shadow: var(--shadow-sm); }
-    .role-tab .role-icon { display: block; font-size: 20px; margin-bottom: 2px; }
+    .role-tab .role-icon { display: block; font-size: 24px; margin-bottom: 2px; letter-spacing: -2px; }
+    .role-tab small { display: block; font-size: 10.5px; font-weight: 500; color: var(--ink-mute); margin-top: 1px; }
     /* V9.43 : champ code perso (chiffres centrés espacés) */
     .code-input { text-align: center; letter-spacing: 8px; font-size: 24px !important; font-weight: 800; }
 
@@ -757,7 +758,14 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.14';
+    const APP_VERSION = 'V10.15';
+    // V10.15 — RUNGIS : connexion à 3 onglets (🧑‍🌾🧺 Distrib · 🥕🗄️ Prépa · 🚚 Rungis). Rungis + code « Retour PDP » →
+    //   écran chauffeur « 👋 Bonjour NOM » : 📦 À livrer aux boutiques (palettes validées Centrale PDP + rolls/dollies
+    //   Kelbongoo de la clôture de prépa → rungis_runs), ✅ Pris / ❌ Pas pris + motif + note → alerte mail (kbgRungis) ;
+    //   ↩️ À ramener à PDP par boutique, cagette entière cochable produit par produit (pdp_pick_items), feu d'artifice.
+    //   🔐 Espace Rungis (Google : achat@ · hg@ · gestion@, kbgRungisLogin) : commande du jour (mail 5h) + rajouts de
+    //   dernière minute + Excel complet, enlèvements lisibles (à valider · aujourd'hui · à venir · passés + état chauffeur),
+    //   suivi camions frais + F&L. Master : « 🚚 Espace Rungis » dans le sélecteur de vue ; Enlèvement camion Rungis = vue lisible.
     // V10.14 — Accueil Master : « 📌 À traiter » tout en haut, en 3 colonnes : 👤 Pour moi (clients à contacter,
     //   SAV en attente, consignes, oublis, retours PDP, qualité/casse, remboursements, mails, chargement) ·
     //   🚚 Opérations du jour (prépa, DOM, Dromy, pain) · 🥬 F&L — Raimbaud (COMMANDE FL, ventes 5h). Clic → bonne section du Récap.
@@ -1492,6 +1500,7 @@
       if (!sess || !c || !c.uid) return false;
       if (sess.uid && sess.uid !== c.uid) return false;
       if (c._offline) return !!sess.uid;
+      if (sess.role === 'rungis') return c.kbRole === 'rungis' || c.admin === true; // V10.15 — Espace Rungis
       if (sess.role === 'master' || sess.isMaster) return c.admin === true;
       return c.kbRole === sess.role;
     }
@@ -3175,7 +3184,7 @@
     }
 
     function LoginScreen({ onLogin }) {
-      const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' (master = overlay séparé)
+      const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' | 'rungis' (master = overlay séparé)
       const [masterOpen, setMasterOpen] = React.useState(false); // overlay accès master
       const [site, setSite] = React.useState('');
       const [name, setName] = React.useState('');
@@ -3247,6 +3256,19 @@
         } finally { setGBusy(false); setPassword(''); }
       };
 
+      // V10.15 — Espace Rungis : Google, adresses autorisées seulement (vérif serveur kbgRungisLogin)
+      const [rgBusy, setRgBusy] = React.useState(false);
+      const rungisSpaceLogin = async () => {
+        setError(''); setRgBusy(true);
+        try {
+          const u = await kbRungisGoogleLogin();
+          onLogin({ role: 'rungis', uid: u.uid, site: 'RUNGIS', name: u.name, adminEmail: u.email, rungisAdmin: u.admin, loggedAt: new Date().toISOString() });
+        } catch (e) {
+          const code = (e && e.code) || '';
+          setError(/popup-closed|cancelled-popup/.test(code) ? 'Connexion Google annulée.' : kbErrMsg(e));
+        } finally { setRgBusy(false); }
+      };
+
       // V9.43 : connexion par CODE PERSO unique (Prépa + Distrib), validé côté serveur
       // sur le même registre « Salariés » que l'appli réception. Master reste inchangé.
       const handleSubmit = async () => {
@@ -3259,9 +3281,15 @@
         let r;
         // V9.54 : code vérifié par la Cloud Function kbgLogin (anti force brute) → jeton Firebase signé.
         // Le code n'est plus conservé dans la session.
-        try { r = await kbStaffLogin(code, role, site); }
+        try { r = await kbStaffLogin(code, role === 'rungis' ? 'prep' : role, site); }
         catch (e) { setBusy(false); setPassword(''); setError(kbErrMsg(e)); return; }
         setBusy(false); setPassword('');
+        // V10.15 — onglet Rungis : uniquement les codes cochés « Retour PDP » (chauffeur) dans le registre
+        if (role === 'rungis' && r.kbRole !== 'pdp') {
+          await kbSignOut();
+          setError('Ce code n\'a pas l\'accès Rungis. Demande au bureau de cocher « Retour PDP » sur ta ligne du registre.');
+          return;
+        }
         const who = String(r.name || '').trim() || 'Kelbongoo';
         if (r.kbRole === 'pdp') {
           onLogin({ role: 'pdp', isPdp: true, uid: r.uid, site: 'ENTREPOT', name: who, loggedAt: new Date().toISOString() }); // V9.94 — chauffeur
@@ -3284,11 +3312,14 @@
             </div>
 
             <div className="role-tabs">
-              <div className={`role-tab ${role==='distrib'?'active':''}`} onClick={()=>setRole('distrib')}>
-                <span className="role-icon">🚚</span>Distrib
+              <div className={`role-tab ${role==='distrib'?'active':''}`} onClick={()=>{ setRole('distrib'); setError(''); }}>
+                <span className="role-icon">🧑‍🌾🧺</span>Distrib<small>remise au client</small>
               </div>
-              <div className={`role-tab ${role==='prep'?'active':''}`} onClick={()=>setRole('prep')}>
-                <span className="role-icon">📦</span>Prépa
+              <div className={`role-tab ${role==='prep'?'active':''}`} onClick={()=>{ setRole('prep'); setError(''); }}>
+                <span className="role-icon">🥕🗄️</span>Prépa<small>légumes en casiers</small>
+              </div>
+              <div className={`role-tab ${role==='rungis'?'active':''}`} onClick={()=>{ setRole('rungis'); setError(''); }}>
+                <span className="role-icon">🚚</span>Rungis<small>camion</small>
               </div>
             </div>
 
@@ -3343,7 +3374,7 @@
             {/* V9.44 : plus de saisie libre du prénom — l'identité vient du code. */}
 
             <div className="field">
-              <label>Code personnel</label>
+              <label>{role === 'rungis' ? 'Code personnel du chauffeur' : 'Code personnel'}</label>
               <input type="password" inputMode="numeric" className="code-input" value={password}
                 onChange={e => setPassword(e.target.value)} placeholder="••••••"
                 autoComplete="off" onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }} />
@@ -3354,7 +3385,14 @@
 
             {error && <div style={{color:'var(--danger)',fontSize:12,marginBottom:12,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{error}</div>}
 
-            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit} disabled={busy}>{busy ? 'Vérification…' : 'Se connecter'}</button>
+            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit} disabled={busy}>{busy ? 'Vérification…' : (role === 'rungis' ? '🚚 Chauffeur : se connecter' : 'Se connecter')}</button>
+
+            {role === 'rungis' && (
+              <div style={{ marginTop: 14, padding: '12px 12px', border: '2px solid #1565c0', borderRadius: 12, background: '#e3f2fd', textAlign: 'center' }}>
+                <button className="btn-primary btn-block" disabled={rgBusy || !firebaseConfigured} onClick={rungisSpaceLogin} style={{ background: '#1565c0', borderColor: '#1565c0', fontSize: 16, fontWeight: 800 }}>{rgBusy ? 'Vérification…' : '🔐 Espace Rungis (bureau)'}</button>
+                <div style={{ fontSize: 11.5, color: '#0d3c78', marginTop: 6 }}>Connexion Google possible uniquement avec <b>{KB_RUNGIS_EMAILS_TXT}</b>.</div>
+              </div>
+            )}
 
             <div style={{marginTop:14,textAlign:'center',fontSize:11,color:'var(--ink-mute)'}}>
               {firebaseConfigured
@@ -9829,6 +9867,8 @@
       catch (e) { r = { ok: false, error: e.message }; }
       const log = { at: new Date().toISOString(), by: by || '—', to: KB_RUNGIS_TO, list, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue') };
       try { await storage.setDoc(`day_${day}_prep`, 'rungis', log, { replace: true }); } catch (_) {}
+      // V10.15 — copie lisible par le chauffeur et l'Espace Rungis (rolls + dollies à charger par lieu)
+      try { await storage.setDoc('rungis_runs', day, { day, list: (list || []).map(x => ({ site: x.site, rolls: x.rolls || 0, dolly: x.dolly || 0 })), by: by || '', at: log.at }, { replace: true }); } catch (_) {}
       return log;
     }
 
@@ -9882,12 +9922,12 @@
       document.head.appendChild(st);
     }
     const MU_CHEERS = ['Bien jou\u00E9 \uD83D\uDC4F','En feu \uD83D\uDD25','Machine \uD83D\uDCAA','Clean \u2728','Au top \uD83D\uDE4C','Nickel \uD83D\uDC4C','GG \uD83C\uDF89'];
-    function muCelebrate(n) {
+    function muCelebrate(n, unit) { // V10.15 — unit : libellé (défaut « sachet(s) »)
       try { if (navigator.vibrate) navigator.vibrate([18, 40, 18]); } catch (_) {}
       const wrap = document.createElement('div');
       wrap.className = 'mu-cheer';
       const cheer = MU_CHEERS[Math.floor(Math.random() * MU_CHEERS.length)];
-      wrap.innerHTML = '<div class="mu-cheer-badge">+' + (n || 0) + ' sachet' + ((n || 0) > 1 ? 's' : '') + '<br><span>' + cheer + '</span></div>';
+      wrap.innerHTML = '<div class="mu-cheer-badge">+' + (n || 0) + ' ' + (unit ? kbEsc(unit) : ('sachet' + ((n || 0) > 1 ? 's' : ''))) + '<br><span>' + cheer + '</span></div>';
       const COLORS = ['#ef6c00', '#2e7d32', '#f0b429', '#2c4a8c', '#e53935', '#8e24aa'];
       for (let i = 0; i < 18; i++) {
         const c = document.createElement('i');
@@ -18725,7 +18765,7 @@
           {sub === 'lieux' && <KbLieuxPage session={session} />}
           {sub === 'cmails' && <KbClientMailsPage session={session} />}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
-          {sub === 'rungis' && <RungisEnlevementsPage session={session} />}
+          {sub === 'rungis' && <><RungisEnlClearPage /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 800, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'live' && <KbLivePage />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
@@ -21426,30 +21466,35 @@
     // V10.12 — Suivi camion Rungis frais (Geotab). Renseigner après déploiement du proxy GEOTAB_SUIVI_PROXY.gs :
     const GEOTAB_PROXY_URL = '';   // ← URL /exec du proxy Geotab
     const GEOTAB_PROXY_KEY = '';   // ← le secret SHARED du proxy
+    // V10.15 — 2e camion (F&L) : numéro d'appareil Geotab (ex. b12). Vide = carte « à configurer ».
+    const GEOTAB_DEVICE_FL = '';
     function kbCompass(b){ const d=['N','NE','E','SE','S','SO','O','NO']; return d[Math.round(((Number(b)||0)%360)/45)%8]; }
     function kbAgoMin(iso){ const t=Date.parse(iso); if(!t||isNaN(t)) return ''; const m=Math.round((Date.now()-t)/60000); return m<1?'à l\'instant':m<60?('il y a '+m+' min'):('il y a '+Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')); }
-    function GeotabTruckCard(){
+    function GeotabTruckCard({ title, device, color, bg }={}){
+      const multi = device !== undefined; // V10.15 — carte d'un 2e camion (appareil Geotab précis)
+      const T = title || '🚚❄️ Camion Rungis frais', C = color || '#0277bd', BG = bg || '#e1f5fe';
       const [d,setD]=React.useState(undefined);
       const [err,setErr]=React.useState('');
       const [tick,setTick]=React.useState(0);
       React.useEffect(()=>{
-        if(!GEOTAB_PROXY_URL){ setD('noconf'); return; }
+        if(!GEOTAB_PROXY_URL || (multi && !device)){ setD('noconf'); return; }
         let stop=false; setD(undefined);
         const ctl=(typeof AbortController!=='undefined')?new AbortController():null;
         const to=setTimeout(()=>{ try{ ctl&&ctl.abort(); }catch(e){} }, 15000);
-        fetch(GEOTAB_PROXY_URL+'?k='+encodeURIComponent(GEOTAB_PROXY_KEY)+'&addr=1&t='+Date.now(), ctl?{signal:ctl.signal}:{})
+        fetch(GEOTAB_PROXY_URL+'?k='+encodeURIComponent(GEOTAB_PROXY_KEY)+'&addr=1'+(multi?'&device='+encodeURIComponent(device):'')+'&t='+Date.now(), ctl?{signal:ctl.signal}:{})
           .then(r=>r.json()).then(j=>{ if(stop) return; if(j&&j.ok) setD(j); else { setD(null); setErr((j&&j.error)||'réponse invalide'); } })
           .catch(e=>{ if(!stop){ setD(null); setErr(e.message||String(e)); } }).finally(()=>clearTimeout(to));
         return ()=>{ stop=true; clearTimeout(to); try{ ctl&&ctl.abort(); }catch(e){} };
       },[tick]);
-      React.useEffect(()=>{ if(!GEOTAB_PROXY_URL) return; const t=setInterval(()=>setTick(x=>x+1), 60000); return ()=>clearInterval(t); },[]);
-      const Wrap=(inner)=>(<div className="card" style={{padding:'10px 14px',border:'2px solid #0277bd',background:'#e1f5fe'}}>
+      React.useEffect(()=>{ if(!GEOTAB_PROXY_URL || (multi && !device)) return; const t=setInterval(()=>setTick(x=>x+1), 60000); return ()=>clearInterval(t); },[]);
+      const Wrap=(inner)=>(<div className="card" style={{padding:'10px 14px',border:'2px solid '+C,background:BG}}>
         <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-          <div style={{fontSize:17,fontWeight:900,color:'#01579b',flex:1,minWidth:0}}>🚚❄️ Camion Rungis frais {d&&d.name?<span style={{fontWeight:600,fontSize:13,color:'var(--ink-mute)'}}>· {d.name}</span>:null}</div>
+          <div style={{fontSize:17,fontWeight:900,color:C,flex:1,minWidth:0}}>{T} {d&&d.name?<span style={{fontWeight:600,fontSize:13,color:'var(--ink-mute)'}}>· {d.name}</span>:null}</div>
           {GEOTAB_PROXY_URL && <button className="btn-secondary" style={{fontSize:12}} onClick={()=>setTick(x=>x+1)}>↻</button>}
         </div>
         {inner}
       </div>);
+      if(d==='noconf' && multi && GEOTAB_PROXY_URL) return Wrap(<div style={{fontSize:13,marginTop:6}}>À configurer : renseigner le numéro d'appareil Geotab de ce camion (<code>GEOTAB_DEVICE_FL</code>) dans l'appli.</div>);
       if(d==='noconf') return Wrap(<div style={{fontSize:13,marginTop:6}}>Suivi Geotab à configurer : déployer le proxy <b>GEOTAB_SUIVI_PROXY.gs</b> puis renseigner <code>GEOTAB_PROXY_URL</code> et <code>GEOTAB_PROXY_KEY</code> dans l'appli.</div>);
       if(d===undefined) return Wrap(<div style={{fontSize:13,marginTop:6}}>Localisation du camion…</div>);
       if(d===null) return Wrap(<div style={{fontSize:13,marginTop:6,color:'var(--danger)'}}>⚠️ Position indisponible : {err} <button className="btn-secondary" style={{fontSize:12,marginLeft:6}} onClick={()=>setTick(x=>x+1)}>Réessayer</button></div>);
@@ -21600,6 +21645,666 @@
           <div className="card" style={{ padding: '8px 12px', fontSize: 11, color: 'var(--ink-mute)' }}>
             Source : Centrale PDP (Firebase kelbongoo-prep). 🏭 Dispatch = palette fournisseur éclatée · 📦 Picking = préparée depuis le stock · 🥬 via Kelbongoo = passe par Kelbongoo (pas enlevé par Rungis). Statut et dates renseignés automatiquement par le mail de validation Rungis.
           </div>
+        </div>
+      );
+    }
+
+
+    // ============================================================
+    // V10.15 — RUNGIS
+    //   • Connexion « 🚚 Rungis » (code perso du registre, case « Retour PDP ») → écran chauffeur :
+    //       👋 Bonjour NOM · ↩️ À ramener à PDP (retours des boutiques, cochables produit par produit)
+    //       · 📦 À livrer aux boutiques (palettes validées par Rungis + rolls / dollies Kelbongoo),
+    //       pris / pas pris + motif + note → alerte mail rr@ · gestion@ · hg@.
+    //   • 🔐 Espace Rungis (Google : achat@ · hg@ · gestion@) : commande du jour (5h) + rajouts de
+    //       dernière minute + Excel, suivi camions, enlèvements lisibles.
+    //   Données : Firestore rungis_runs / rungis_picks / pdp_pick_items, Centrale PDP (enlèvements, REST
+    //   public), Apps Script FL via la Cloud Function kbgRungis (rungis_cmd_get / rungis_alert).
+    // ============================================================
+    const KB_RUNGIS_EMAILS_TXT = 'achat@probon.fr · hg@probon.fr · gestion@probon.fr';
+    const KB_RG_MOTIFS = [
+      { k: 'place', l: '🚛 Pas de place dans le camion' },
+      { k: 'introuvable', l: '🔍 Palette introuvable' },
+      { k: 'pas_prete', l: '⏳ Pas prête' },
+      { k: 'autre', l: '✏️ Autre' },
+    ];
+    async function kbRungisCall(action, data) {
+      const r = await kbCallable('kbgRungis')({ action, ...(data || {}) });
+      return r.data;
+    }
+    // Espace Rungis : Google (popup) → liste blanche serveur (kbgRungisLogin) → rôle rungis (ou master déjà admin)
+    async function kbRungisGoogleLogin() {
+      const { GoogleAuthProvider, signInWithPopup } = window.__firebase;
+      const prov = new GoogleAuthProvider();
+      prov.setCustomParameters({ prompt: 'select_account' });
+      const cred = await signInWithPopup(fb.auth, prov);
+      try { await kbCallable('kbgRungisLogin')({}); }
+      catch (e) { try { await window.__firebase.signOut(fb.auth); } catch (_) {} throw e; }
+      const c = await kbRefreshClaims(true);
+      if (!c || !(c.admin === true || c.kbRole === 'rungis')) { try { await window.__firebase.signOut(fb.auth); } catch (_) {} throw new Error('Accès Espace Rungis non accordé.'); }
+      return { email: cred.user.email, name: cred.user.displayName || cred.user.email, uid: c.uid, admin: c.admin === true };
+    }
+    // Photo affichée directement (sans clic) quand la source en fournit une
+    function kbPhotoOf(x) {
+      if (!x) return '';
+      const p = x.photo || x.photoUrl || x.photo_url || x.image || x.img || x.picture || (Array.isArray(x.photos) ? x.photos[0] : '');
+      const s = typeof p === 'object' && p ? (p.url || p.src || '') : String(p || '');
+      return /^(https:\/\/|data:image\/)/.test(s) ? s : '';
+    }
+    function KbPhoto({ src, size }) {
+      if (!src) return null;
+      const z = size || 84;
+      return <img src={src} alt="" loading="lazy" style={{ width: z, height: z, objectFit: 'cover', borderRadius: 12, flex: '0 0 auto', border: '2px solid var(--line)', background: '#fff' }} />;
+    }
+    // Lecture des enlèvements (Centrale PDP), rafraîchie toutes les 2 min
+    function useKbEnlevements() {
+      const [raw, setRaw] = React.useState(undefined);
+      const [err, setErr] = React.useState('');
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const to = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, 20000);
+        fetch(KB_ENL_URL + '?t=' + Date.now(), ctl ? { signal: ctl.signal } : {})
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(j => { if (!stop) { setRaw(j || {}); setErr(''); } })
+          .catch(e => { if (!stop) { setRaw(v => v === undefined ? null : v); setErr(e.message || String(e)); } })
+          .finally(() => clearTimeout(to));
+        return () => { stop = true; clearTimeout(to); try { ctl && ctl.abort(); } catch (e) {} };
+      }, [tick]);
+      React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 120000); return () => clearInterval(t); }, []);
+      const list = React.useMemo(() => {
+        const o = raw && typeof raw === 'object' ? raw : {};
+        return Object.keys(o).map(id => ({ id, ...(o[id] || {}) })).sort((a, b) => (b.at || b.receivedAt || 0) - (a.at || a.receivedAt || 0));
+      }, [raw]);
+      return { raw, list, err, reload: () => setTick(x => x + 1) };
+    }
+    const kbRgSafeId = (s) => String(s || '').replace(/[\/#\[\]\.$]/g, '_').slice(0, 140);
+    // Lignes « à prendre à PDP pour les boutiques » : palettes validées par Rungis + rolls / dollies Kelbongoo
+    function kbRungisDeliveryLines(enlList, runs, fromDay, toDay) {
+      const out = [];
+      (enlList || []).forEach(r => {
+        if (r.status !== 'valide' || !r.pickup) return;
+        if (r.pickup < fromDay || r.pickup > toDay) return;
+        const refused = r.refused && typeof r.refused === 'object' ? Object.keys(r.refused).map(k => r.refused[k]) : [];
+        kbEnlItems(r).forEach((it, i) => {
+          const code = String(it.code || '?').toUpperCase();
+          const cat = kbEnlCat(it);
+          const [lbl] = KB_ENL_CATLABEL[cat];
+          const qty = Number(it.dollies) > 0 ? (it.dollies + ' dolly' + (it.dollies > 1 ? 's' : '')) : (Number(it.n) > 0 ? (it.n + ' palette' + (it.n > 1 ? 's' : '')) : 'même palette');
+          const extra = [it.frais ? '❄️ frais' : '', it.zone === 'froid' ? '❄️ ch. froide' : it.zone === 'sec' ? '▣ sec' : '', it.total ? it.total + ' u.' : '', it.ref ? 'cde ' + it.ref : ''].filter(Boolean).join(' · ');
+          out.push({ id: kbRgSafeId('enl_' + r.id + '_' + i), kind: 'enl', site: code, cat, info: cat === 'kbg',
+            label: lbl + ' · ' + qty, sub: extra, note: it.note || '', when: r.pickup, liv: (r.livraison && r.livraison[code]) || r.pickup,
+            photo: kbPhotoOf(it), refused: refused.find(x => String(x.code || '').toUpperCase() === code) || null });
+        });
+        (Array.isArray(r.lieux) ? r.lieux : []).forEach(L => {
+          if (!L || !L.code || !(Number(L.dolly) > 0)) return;
+          const code = String(L.code).toUpperCase();
+          out.push({ id: kbRgSafeId('enl_' + r.id + '_dolly_' + code), kind: 'enl', site: code, cat: 'dolly', label: '🧀 ' + L.dolly + ' dolly' + (L.dolly > 1 ? 's' : '') + ' fromage',
+            sub: '', note: '', when: r.pickup, liv: (r.livraison && r.livraison[code]) || r.pickup, photo: kbPhotoOf(L), refused: null });
+        });
+      });
+      (runs || []).forEach(d => {
+        if (!d || !d.day || d.day < fromDay || d.day > toDay) return;
+        (d.list || []).forEach(x => {
+          if (!x || !x.site || !((x.rolls || 0) + (x.dolly || 0))) return;
+          const site = String(x.site).toUpperCase();
+          out.push({ id: kbRgSafeId('roll_' + d.day + '_' + site), kind: 'roll', site, cat: 'roll',
+            label: '🥬 Kelbongoo · ' + (x.rolls || 0) + ' roll' + ((x.rolls || 0) > 1 ? 's' : '') + (x.dolly ? ' + ' + x.dolly + ' dolly' + (x.dolly > 1 ? 's' : '') : ''),
+            sub: 'rolls des commandes clients', note: '', when: d.day, liv: d.day, photo: '', refused: null });
+        });
+      });
+      return out;
+    }
+    const kbRgDayLbl = (iso) => iso === todayKey() ? "aujourd'hui" : iso === addDays(todayKey(), 1) ? 'demain' : iso === addDays(todayKey(), -1) ? 'hier' : formatDateShort(iso);
+
+    // ───────── Chauffeur : écran d'accueil ─────────
+    function RungisDriverHome({ session }) {
+      const [view, setView] = React.useState('home');
+      const B = useKbPdpBoard();
+      const enl = useKbEnlevements();
+      const [runs, setRuns] = React.useState([]);
+      const [picks, setPicks] = React.useState([]);
+      React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
+      React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
+      const from = addDays(todayKey(), -1), to = addDays(todayKey(), 1);
+      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to), [enl.list, runs, from, to]);
+      const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
+      const livTodo = lines.filter(l => !l.info && !l.refused && !(pk[l.id] && pk[l.id].status)).length;
+      const prenom = String(session.name || '').trim().split(/\s+/)[0] || 'toi';
+      React.useEffect(() => { try { window.scrollTo({ top: 0 }); } catch (e) {} }, [view]);
+
+      const Back = () => <button onClick={() => setView('home')} style={{ alignSelf: 'flex-start', minHeight: 56, fontSize: 19, fontWeight: 900, padding: '8px 18px', borderRadius: 14, border: '2px solid var(--line)', background: 'var(--bg-card)', cursor: 'pointer' }}>← Accueil</button>;
+      if (view === 'retours') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisRetoursView session={session} B={B} /></div>;
+      if (view === 'livraison') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisLivraisonView session={session} lines={lines} pk={pk} enl={enl} /></div>;
+
+      const Tile = ({ ic, title, sub, n, color, onClick }) => (
+        <button onClick={onClick} style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', textAlign: 'left', padding: '20px 16px', minHeight: 120, borderRadius: 20, cursor: 'pointer',
+          border: '4px solid ' + (n ? color : '#2e7d32'), background: n ? color + '14' : '#e8f5e9', color: 'var(--ink)' }}>
+          <span style={{ fontSize: 54, lineHeight: 1 }}>{ic}</span>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <span style={{ display: 'block', fontSize: 25, fontWeight: 900, lineHeight: 1.15 }}>{title}</span>
+            <span style={{ display: 'block', fontSize: 15, fontWeight: 700, color: 'var(--ink-soft)', marginTop: 4 }}>{sub}</span>
+          </span>
+          <span style={{ fontSize: 44, fontWeight: 900, color: n ? color : '#2e7d32', minWidth: 44, textAlign: 'center' }}>{n == null ? '…' : (n || '✓')}</span>
+        </button>
+      );
+      return (
+        <div className="stack" style={{ marginTop: 12 }}>
+          <div style={{ background: 'linear-gradient(135deg,#1a4d2e,#2e7d32)', color: '#fff', borderRadius: 20, padding: '18px 18px' }}>
+            <div style={{ fontSize: 30, fontWeight: 900 }}>👋 Bonjour {prenom} !</div>
+            <div style={{ fontSize: 16, marginTop: 4, opacity: .92, textTransform: 'capitalize' }}>{formatDateFR()} · tournée Rungis 🚚</div>
+          </div>
+          <Tile ic="📦" title="À livrer aux boutiques" sub="À prendre à PDP : palettes validées + rolls Kelbongoo" n={enl.raw === undefined ? null : livTodo} color="#1565c0" onClick={() => setView('livraison')} />
+          <Tile ic="↩️" title="À ramener à PDP" sub="Les cagettes « Retour PDP » de chaque boutique" n={B.ready ? B.toRecover : null} color="#e65100" onClick={() => setView('retours')} />
+          <div style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'center', padding: '4px 10px' }}>Touche une grande carte. Tout ce que tu coches est enregistré tout de suite.</div>
+        </div>
+      );
+    }
+
+    // ───────── Chauffeur : ↩️ produits à ramener à PDP (par boutique, produit par produit) ─────────
+    function RungisRetoursView({ session, B }) {
+      const showToast = React.useContext(ToastContext);
+      const [itemsDoc, setItemsDoc] = React.useState({});
+      const [busy, setBusy] = React.useState(false);
+      const [openOrder, setOpenOrder] = React.useState({});
+      const drv = kbIsPdpDriver();
+      React.useEffect(() => storage.subscribe('pdp_pick_items', a => { const m = {}; (a || []).forEach(d => { m[d.id] = d.items || {}; }); setItemsDoc(m); }), []);
+      const now = () => new Date().toISOString();
+      const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (récupéré par quelqu\'un d\'autre ?)' : 'Erreur : ' + ((e && e.message) || e));
+      const setOrder = async (f, on) => {
+        const pid = String(f.orderId || f.id);
+        const val = on ? { pdpRecoveredAt: now(), pdpRecoveredBy: session.name } : { pdpRecoveredAt: '', pdpRecoveredBy: '' };
+        if (!drv) await kbPickupWrite(f);
+        await storage.setDoc('pdp_pickups', pid, val);
+        if (!drv) await storage.setDoc('followups', f.id || f.orderId, val);
+      };
+      const itemOn = (f, k) => { const m = itemsDoc[String(f.orderId || f.id)] || {}; return !!(m[k] && m[k].at); };
+      const toggleManual = async (r) => {
+        setBusy(true);
+        try {
+          if (r.status === 'recovered') await storage.setDoc('pdp_returns', r.id, { status: 'pending', recoveredBy: '', recoveredAt: '' });
+          else { await storage.setDoc('pdp_returns', r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() }); muCelebrate(r.qty || 1, 'dans le camion'); }
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      const toggleItem = async (f, k) => {
+        const pid = String(f.orderId || f.id);
+        const on = !itemOn(f, k);
+        setBusy(true);
+        try {
+          await storage.setDoc('pdp_pick_items', pid, { items: { [String(k)]: on ? { by: session.name, at: now() } : null } });
+          const n = (f.items || []).length;
+          const cnt = (f.items || []).filter((_, j) => String(j) === String(k) ? on : itemOn(f, j)).length;
+          if (on && cnt === n && !f.pdpRecoveredAt) { await setOrder(f, true); muCelebrate(n, 'dans le camion'); }
+          else if (!on && f.pdpRecoveredAt) await setOrder(f, false);
+        } catch (e) { if (/permission/i.test(String((e && (e.code || e.message)) || ''))) showToast('Coche « ✓ Toute la cagette » (détail produit pas encore activé)'); else denied(e); } finally { setBusy(false); }
+      };
+      const wholeOrder = async (f) => {
+        const pid = String(f.orderId || f.id);
+        const on = !f.pdpRecoveredAt;
+        setBusy(true);
+        try {
+          const items = {}; (f.items || []).forEach((_, j) => { items[String(j)] = on ? { by: session.name, at: now() } : null; });
+          await setOrder(f, on);
+          try { await storage.setDoc('pdp_pick_items', pid, { items }); } catch (_) {} // détail produit : jamais bloquant
+          if (on) muCelebrate((f.items || []).length, 'dans le camion'); else showToast('↩️ Annulé');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      const wholeSite = async (entries) => {
+        setBusy(true);
+        try {
+          for (const x of entries) {
+            if (x.on) continue;
+            if (x.k === 'm') await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
+            else {
+              const items = {}; (x.f.items || []).forEach((_, j) => { items[String(j)] = { by: session.name, at: now() }; });
+              await setOrder(x.f, true);
+              try { await storage.setDoc('pdp_pick_items', String(x.f.orderId || x.f.id), { items }); } catch (_) {}
+            }
+          }
+          muCelebrate(entries.length, 'dans le camion');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+
+      const bySite = {};
+      const add = (s, x) => { (bySite[s || '?'] = bySite[s || '?'] || []).push(x); };
+      if (B.ready) {
+        B.recoverManual.forEach(r => add(r.site, { k: 'm', r, on: false }));
+        B.recoveredTodayManual.forEach(r => add(r.site, { k: 'm', r, on: true }));
+        B.recoverOrders.forEach(f => add(f.site, { k: 'o', f, on: false }));
+        B.recoveredTodayOrders.forEach(f => add(f.site, { k: 'o', f, on: true }));
+      }
+      const sitesK = Object.keys(bySite).sort();
+      const total = sitesK.reduce((a, s) => a + bySite[s].length, 0), on = sitesK.reduce((a, s) => a + bySite[s].filter(x => x.on).length, 0);
+      const done = total > 0 && on === total;
+      const was = React.useRef(null);
+      React.useEffect(() => {
+        if (!B.ready) return;
+        if (was.current === false && done) kbCelebrate({ title: 'Tout est récupéré 🎉', sub: 'Direction PDP, merci ' + (String(session.name || '').split(' ')[0] || '') + ' !' });
+        was.current = done;
+      }, [done, B.ready]);
+
+      const Check = ({ on, big }) => <span style={{ flex: '0 0 auto', width: big ? 52 : 42, height: big ? 52 : 42, borderRadius: 12, border: '3px solid ' + (on ? '#2e7d32' : '#9e9e9e'), background: on ? '#2e7d32' : '#fff', color: '#fff', fontSize: big ? 32 : 26, fontWeight: 900, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{on ? '✓' : ''}</span>;
+      return (
+        <div className="stack">
+          <div>
+            <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Produits à ramener à PDP</h1>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>Dans chaque boutique, prends la cagette <b>« Retour PDP »</b>. Coche ce que tu as dans le camion. À PDP, l'équipe traite.</div>
+          </div>
+          {!B.ready && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
+          {B.ready && !total && <div className="card" style={{ textAlign: 'center', padding: '26px 14px', fontSize: 22, fontWeight: 900, color: '#2e7d32' }}>👍 Rien à ramener aujourd'hui</div>}
+          {total > 0 && (
+            <div style={{ background: 'var(--bg-card)', border: '3px solid ' + (done ? '#2e7d32' : '#e65100'), borderRadius: 16, padding: '12px 14px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 20, fontWeight: 900 }}><span>{on}/{total} récupérés</span><span>{Math.round(on / total * 100)}%</span></div>
+              <div style={{ height: 16, background: 'var(--bg-muted)', borderRadius: 8, marginTop: 8, overflow: 'hidden' }}><div style={{ width: (on / total * 100) + '%', height: '100%', background: '#2e7d32', transition: 'width .4s' }} /></div>
+            </div>
+          )}
+          {sitesK.map(s => {
+            const list = bySite[s];
+            const left = list.filter(x => !x.on).length;
+            return (
+              <div key={s} style={{ border: '3px solid ' + kbSiteColor(s), borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: kbSiteColor(s), color: '#fff' }}>
+                  <span style={{ fontSize: 28, fontWeight: 900 }}>📍 {s}</span>
+                  <span style={{ fontSize: 16, fontWeight: 700, flex: 1, minWidth: 0 }}>{siteLabel(s)}</span>
+                  <span style={{ fontSize: 22, fontWeight: 900 }}>{left ? left + ' à prendre' : '✓'}</span>
+                </div>
+                <div className="stack" style={{ gap: 8, padding: 10 }}>
+                  {list.map(x => x.k === 'm' ? (
+                    <button key={x.r.id} disabled={busy} onClick={() => toggleManual(x.r)} style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '12px', border: '3px solid ' + (x.on ? '#2e7d32' : 'var(--line)'), borderRadius: 14, background: x.on ? '#e8f5e9' : '#fff', cursor: 'pointer' }}>
+                      <Check on={x.on} big />
+                      <KbPhoto src={kbPhotoOf(x.r)} />
+                      <span style={{ flex: 1, minWidth: 0 }}>
+                        <span style={{ display: 'block', fontSize: 21, fontWeight: 900 }}>{kbProdName(x.r.produit || x.r.productLabel)}{(x.r.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{x.r.qty}</span> : ''}</span>
+                        <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{x.r.anomalyLabel || 'Retour PDP'}{x.r.dlc ? ' · DLC ' + formatDateShort(x.r.dlc) : ''}{x.r.remark ? ' · « ' + x.r.remark + ' »' : ''}{x.on && x.r.recoveredAt ? ' · ✓ ' + kbHhmm(x.r.recoveredAt) : ''}</span>
+                      </span>
+                    </button>
+                  ) : (() => {
+                    const f = x.f, pid = String(f.orderId || f.id), items = f.items || [];
+                    const nOn = x.on ? items.length : items.filter((_, j) => itemOn(f, j)).length;
+                    const open = openOrder[pid] !== undefined ? openOrder[pid] : !x.on;
+                    return (
+                      <div key={pid} style={{ border: '3px solid ' + (x.on ? '#2e7d32' : '#8d6e63'), borderRadius: 14, background: x.on ? '#e8f5e9' : '#fffaf5' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px' }}>
+                          <span style={{ fontSize: 34 }}>🧺</span>
+                          <span style={{ flex: 1, minWidth: 0 }} onClick={() => setOpenOrder(o => ({ ...o, [pid]: !open }))}>
+                            <span style={{ display: 'block', fontSize: 20, fontWeight: 900 }}>Cagette entière · {f.consumer_name || '(client)'}</span>
+                            <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{f.storedCasier ? 'Casier ' + f.storedCasier + ' · ' : ''}{nOn}/{items.length} produit(s) cochés · {open ? 'replier ▴' : 'voir le détail ▾'}</span>
+                          </span>
+                          <button disabled={busy} onClick={() => wholeOrder(f)} style={{ minHeight: 52, padding: '6px 12px', borderRadius: 12, border: 'none', fontSize: 15, fontWeight: 900, cursor: 'pointer', background: x.on ? '#9e9e9e' : '#2e7d32', color: '#fff' }}>{x.on ? '↩️ Annuler' : '✓ Toute la cagette'}</button>
+                        </div>
+                        {open && (
+                          <div className="stack" style={{ gap: 6, padding: '0 10px 10px' }}>
+                            {items.map((it, j) => { const io = x.on || itemOn(f, j); return (
+                              <button key={j} disabled={busy} onClick={() => toggleItem(f, j)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 10px', border: '2px solid ' + (io ? '#2e7d32' : 'var(--line)'), borderRadius: 12, background: io ? '#e8f5e9' : '#fff', cursor: 'pointer' }}>
+                                <Check on={io} />
+                                <KbPhoto src={kbPhotoOf(it)} size={64} />
+                                <span style={{ flex: 1, minWidth: 0, fontSize: 18, fontWeight: 800 }}>{kbProdName(it.produit)}{(it.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{it.qty}</span> : ''}{it.dlc ? <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-soft)' }}> · DLC {formatDateShort(it.dlc)}</span> : ''}</span>
+                              </button>); })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })())}
+                  {left > 1 && <button disabled={busy} onClick={() => wholeSite(list)} style={{ minHeight: 56, borderRadius: 14, border: '3px dashed ' + kbSiteColor(s), background: '#fff', fontSize: 17, fontWeight: 900, cursor: 'pointer' }}>✓ J'ai pris tout le retour PDP de {s}</button>}
+                </div>
+              </div>
+            );
+          })}
+          {done && <div style={{ textAlign: 'center', fontSize: 24, fontWeight: 900, color: '#2e7d32', padding: 12 }}>🎉 Tout est dans le camion, direction PDP !</div>}
+        </div>
+      );
+    }
+
+    // ───────── Chauffeur : 📦 à prendre à PDP pour les boutiques ─────────
+    function RungisLivraisonView({ session, lines, pk, enl }) {
+      const showToast = React.useContext(ToastContext);
+      const [ask, setAsk] = React.useState(null); // { line, motif, note }
+      const [busy, setBusy] = React.useState(false);
+      const canWrite = !!(session && (kbIsPdpDriver() || (window.__kbClaims && window.__kbClaims.admin === true)));
+      const save = async (l, data) => {
+        await storage.setDoc('rungis_picks', l.id, { id: l.id, kind: l.kind, ref: l.id, site: l.site, label: l.label, day: l.when, by: session.name, at: new Date().toISOString(), motif: '', note: '', alertOk: false, ...data });
+      };
+      const taken = async (l) => {
+        if (!canWrite) { showToast('Lecture seule'); return; }
+        setBusy(true);
+        try {
+          if (pk[l.id] && pk[l.id].status === 'ok') { await save(l, { status: '' }); showToast('↩️ Annulé'); }
+          else { await save(l, { status: 'ok' }); muCelebrate(1, 'chargé'); }
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const sendMissed = async () => {
+        const { line: l, motif, note } = ask;
+        if (!motif) { showToast('Choisis un motif'); return; }
+        setBusy(true);
+        try {
+          await save(l, { status: 'missed', motif, note: String(note || '').slice(0, 600) });
+          let ok = false;
+          try { const r = await kbRungisCall('rungis_alert', { alert: { kind: l.kind, site: l.site, siteLabel: siteLabel(l.site), label: l.label, motif, note, day: l.when, ref: l.id } }); ok = !!(r && r.ok); } catch (e) { ok = false; }
+          await save(l, { status: 'missed', motif, note: String(note || '').slice(0, 600), alertOk: ok });
+          showToast(ok ? '📧 Alerte envoyée à Raimbaud, gestion et Henry' : '⚠️ Noté, mais le mail d\'alerte n\'est pas parti : préviens le bureau');
+          setAsk(null);
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const undoMissed = async (l) => { setBusy(true); try { await save(l, { status: '' }); } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); } };
+
+      const bySite = {};
+      lines.forEach(l => { (bySite[l.site] = bySite[l.site] || []).push(l); });
+      const sites = Object.keys(bySite).sort((a, b) => a.localeCompare(b));
+      const actionable = lines.filter(l => !l.info && !l.refused);
+      const handled = actionable.filter(l => pk[l.id] && pk[l.id].status).length;
+      const done = actionable.length > 0 && handled === actionable.length;
+      const was = React.useRef(null);
+      React.useEffect(() => {
+        if (was.current === false && done) kbCelebrate({ title: 'Chargement terminé 🎉', sub: 'Tout est noté pour les boutiques. Bonne route !' });
+        was.current = done;
+      }, [done]);
+
+      return (
+        <div className="stack">
+          <div>
+            <h1 style={{ margin: 0, fontSize: 28 }}>📦 À livrer aux boutiques</h1>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>À prendre à PDP. Pour chaque ligne : <b style={{ color: '#2e7d32' }}>✅ Pris</b> ou <b style={{ color: '#c62828' }}>❌ Pas pris</b> (une alerte part au bureau).</div>
+          </div>
+          {enl.raw === undefined && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
+          {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 800 }}>⚠️ Enlèvements illisibles ({enl.err}) <button className="btn-secondary" onClick={enl.reload}>↻</button></div>}
+          {enl.raw !== undefined && !lines.length && <div className="card" style={{ textAlign: 'center', padding: '26px 14px', fontSize: 22, fontWeight: 900, color: '#2e7d32' }}>👍 Rien à prendre pour les boutiques</div>}
+          {actionable.length > 0 && (
+            <div style={{ background: 'var(--bg-card)', border: '3px solid ' + (done ? '#2e7d32' : '#1565c0'), borderRadius: 16, padding: '12px 14px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 20, fontWeight: 900 }}><span>{handled}/{actionable.length} lignes faites</span><span>{Math.round(handled / actionable.length * 100)}%</span></div>
+              <div style={{ height: 16, background: 'var(--bg-muted)', borderRadius: 8, marginTop: 8, overflow: 'hidden' }}><div style={{ width: (handled / actionable.length * 100) + '%', height: '100%', background: '#1565c0', transition: 'width .4s' }} /></div>
+            </div>
+          )}
+          {sites.map(s => (
+            <div key={s} style={{ border: '3px solid ' + (SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b'), borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b', color: '#fff' }}>
+                <span style={{ fontSize: 28, fontWeight: 900 }}>📍 {s}</span>
+                <span style={{ fontSize: 16, fontWeight: 700, flex: 1, minWidth: 0 }}>{siteLabel(s) !== s ? siteLabel(s) : (KB_ENL_STORE_LONG[s] || '')}</span>
+              </div>
+              <div className="stack" style={{ gap: 8, padding: 10 }}>
+                {bySite[s].map(l => {
+                  const p = pk[l.id] || {};
+                  const st = l.refused ? 'refused' : (p.status || '');
+                  const bg = st === 'ok' ? '#e8f5e9' : (st === 'missed' || st === 'refused') ? '#fdecea' : l.info ? 'var(--bg-muted)' : '#fff';
+                  return (
+                    <div key={l.id} style={{ border: '3px solid ' + (st === 'ok' ? '#2e7d32' : (st === 'missed' || st === 'refused') ? '#c62828' : 'var(--line)'), borderRadius: 14, background: bg, padding: 12 }}>
+                      <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                        <KbPhoto src={l.photo} size={96} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 21, fontWeight: 900, lineHeight: 1.2 }}>{l.label}</div>
+                          {l.sub && <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 2 }}>{l.sub}</div>}
+                          {l.note && <div style={{ fontSize: 15, color: '#8d6e00', marginTop: 2 }}>ℹ️ {l.note}</div>}
+                          <div style={{ fontSize: 15, fontWeight: 800, color: '#1565c0', marginTop: 4 }}>🚚 {l.kind === 'roll' ? 'pour la distribution ' : 'à prendre '}{kbRgDayLbl(l.when)}{l.kind !== 'roll' && l.liv && l.liv !== l.when ? ' · livraison ' + kbRgDayLbl(l.liv) : ''}</div>
+                        </div>
+                      </div>
+                      {l.info ? <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink-soft)', marginTop: 8 }}>🥬 Passe dans les rolls Kelbongoo (rien à prendre en plus).</div>
+                        : st === 'refused' ? <div style={{ fontSize: 15, fontWeight: 900, color: '#c62828', marginTop: 8 }}>❌ Déjà signalé non récupéré : {KB_ENL_MOTIFS[l.refused.motif] || l.refused.motif}{l.refused.note ? ' — « ' + l.refused.note + ' »' : ''}</div>
+                        : st === 'ok' ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                            <span style={{ flex: 1, fontSize: 18, fontWeight: 900, color: '#2e7d32' }}>✅ Pris{p.at ? ' à ' + kbHhmm(p.at) : ''}{p.by && p.by !== session.name ? ' par ' + p.by : ''}</span>
+                            {canWrite && <button className="btn-ghost" disabled={busy} onClick={() => taken(l)} style={{ fontSize: 14 }}>Annuler</button>}
+                          </div>)
+                        : st === 'missed' ? (
+                          <div style={{ marginTop: 10 }}>
+                            <div style={{ fontSize: 18, fontWeight: 900, color: '#c62828' }}>❌ Pas pris — {(KB_RG_MOTIFS.find(m => m.k === p.motif) || {}).l || p.motif}</div>
+                            {p.note && <div style={{ fontSize: 15, marginTop: 2 }}>« {p.note} »</div>}
+                            <div style={{ fontSize: 13, color: p.alertOk ? '#2e7d32' : '#c62828', fontWeight: 700, marginTop: 2 }}>{p.alertOk ? '📧 Alerte envoyée' : '⚠️ Alerte mail non partie'}{p.at ? ' · ' + kbHhmm(p.at) : ''}</div>
+                            {canWrite && <button className="btn-ghost" disabled={busy} onClick={() => undoMissed(l)} style={{ fontSize: 13, marginTop: 4 }}>Annuler</button>}
+                          </div>)
+                        : canWrite ? (
+                          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                            <button disabled={busy} onClick={() => taken(l)} style={{ flex: 2, minHeight: 64, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 900, cursor: 'pointer' }}>✅ Pris</button>
+                            <button disabled={busy} onClick={() => setAsk({ line: l, motif: '', note: '' })} style={{ flex: 1, minHeight: 64, borderRadius: 14, border: '3px solid #c62828', background: '#fff', color: '#c62828', fontSize: 18, fontWeight: 900, cursor: 'pointer' }}>❌ Pas pris</button>
+                          </div>)
+                        : <div style={{ fontSize: 14, color: 'var(--ink-mute)', marginTop: 8 }}>⏳ pas encore traité par le chauffeur</div>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          {done && <div style={{ textAlign: 'center', fontSize: 24, fontWeight: 900, color: '#2e7d32', padding: 12 }}>🎉 Tout est fait pour les boutiques !</div>}
+          {ask && (
+            <div className="fs-overlay" onClick={() => !busy && setAsk(null)}>
+              <div className="fs-card" style={{ maxWidth: 440, textAlign: 'left' }} onClick={e => e.stopPropagation()}>
+                <div style={{ fontSize: 24, fontWeight: 900, color: '#c62828' }}>❌ Pas pris</div>
+                <div style={{ fontSize: 17, fontWeight: 800, marginTop: 4 }}>{ask.line.site} · {ask.line.label}</div>
+                <div style={{ fontSize: 15, fontWeight: 700, marginTop: 12 }}>Pourquoi ?</div>
+                <div className="stack" style={{ gap: 6, marginTop: 6 }}>
+                  {KB_RG_MOTIFS.map(m => <button key={m.k} onClick={() => setAsk(a => ({ ...a, motif: m.k }))} style={{ minHeight: 54, borderRadius: 12, fontSize: 18, fontWeight: 800, textAlign: 'left', padding: '8px 12px', cursor: 'pointer', border: '3px solid ' + (ask.motif === m.k ? '#c62828' : 'var(--line)'), background: ask.motif === m.k ? '#fdecea' : '#fff' }}>{m.l}</button>)}
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 700, marginTop: 12 }}>Explique en quelques mots (facultatif)</div>
+                <textarea value={ask.note} onChange={e => setAsk(a => ({ ...a, note: e.target.value }))} rows={3} placeholder="ex. camion plein vendredi, une palette n'a pas pu monter" style={{ width: '100%', fontSize: 16, marginTop: 6, padding: 10, borderRadius: 10, border: '2px solid var(--line)' }} />
+                <button disabled={busy || !ask.motif} onClick={sendMissed} style={{ width: '100%', minHeight: 60, marginTop: 12, borderRadius: 14, border: 'none', background: ask.motif ? '#c62828' : '#bdbdbd', color: '#fff', fontSize: 19, fontWeight: 900, cursor: 'pointer' }}>{busy ? 'Envoi…' : '📧 Valider et prévenir le bureau'}</button>
+                <button className="btn-secondary" disabled={busy} onClick={() => setAsk(null)} style={{ width: '100%', marginTop: 8 }}>Annuler</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ───────── 🔐 ESPACE RUNGIS (achat@ · hg@ · gestion@) ─────────
+    const KB_RG_NAV = [
+      { k: 'cmd', ic: '🥬', l: 'Commande du jour' },
+      { k: 'enl', ic: '📦', l: 'Enlèvements' },
+      { k: 'trucks', ic: '🚚', l: 'Suivi camions' },
+    ];
+    function RungisSpace({ session, onLogout, switcher, overlay }) {
+      const [page, setPage] = React.useState('cmd');
+      return (
+        <div className="app-shell kb-wide">
+          {overlay}
+          <UpdateChecker />
+          <nav className="kb-side" aria-label="Navigation Espace Rungis">
+            <div className="kb-side-brand"><div className="kb-side-logo" style={{ background: 'linear-gradient(135deg,#1565c0,#0d3c78)' }}>R</div><div><b>Espace Rungis</b><small>Kelbongoo · {APP_VERSION}</small></div></div>
+            <div className="kb-side-sec">Rungis</div>
+            {KB_RG_NAV.map(n => <button key={n.k} className={page === n.k ? 'on' : ''} onClick={() => setPage(n.k)}><span className="kb-em">{n.ic}</span>{n.l}</button>)}
+            <div className="kb-side-foot"><div className="kb-side-av">{String(session.name || 'R').slice(0, 1).toUpperCase()}</div><div style={{ fontSize: 12, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{session.adminEmail || session.name}</div></div>
+          </nav>
+          <div className="topbar">
+            <div className="topbar-title">
+              <strong>🚚 Espace Rungis <span className="ver-badge">{APP_VERSION}</span></strong>
+              <small>{session.adminEmail || session.name} · {formatDateFR()}</small>
+            </div>
+            <div className="topbar-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>{switcher}<button className="btn-ghost" onClick={onLogout} style={{ fontSize: 13 }}>Sortir</button></div>
+          </div>
+          <div className="tab-bar" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', margin: '6px 0 10px' }}>
+            {KB_RG_NAV.map(n => <button key={n.k} onClick={() => setPage(n.k)} className={page === n.k ? 'btn-primary' : 'btn-secondary'} style={{ flex: '1 1 30%', fontSize: 15, padding: '10px 6px', fontWeight: 800 }}>{n.ic} {n.l}</button>)}
+          </div>
+          {page === 'cmd' && <RungisCommandePage />}
+          {page === 'enl' && <RungisEnlClearPage />}
+          {page === 'trucks' && <RungisTrucksPage />}
+        </div>
+      );
+    }
+
+    function RungisCommandePage() {
+      const [day, setDay] = React.useState(todayKey());
+      const [data, setData] = React.useState(undefined);
+      const [err, setErr] = React.useState('');
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false; setData(undefined); setErr('');
+        kbRungisCall('rungis_cmd_get', { day }).then(r => { if (stop) return; if (r && r.ok) setData(r); else { setData(null); setErr((r && r.error) || 'réponse invalide'); } })
+          .catch(e => { if (!stop) { setData(null); setErr(kbErrMsg(e)); } });
+        return () => { stop = true; };
+      }, [day, tick]);
+      React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 5 * 60000); return () => clearInterval(t); }, []);
+      const cmd = data && data.cmd, raj = (data && data.rajouts) || [];
+      const rows = (cmd && cmd.rows) || [];
+      const n1 = (v) => String(Math.round((Number(v) || 0) * 10) / 10).replace('.', ',');
+      const eur = (v) => (Number(v) || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR' });
+      const totC = rows.reduce((a, r) => a + (Number(r.colis) || 0), 0), totHt = rows.reduce((a, r) => a + (Number(r.totalHt) || 0), 0);
+      const totR = raj.reduce((a, r) => a + (Number(r.colis) || 0), 0);
+      const exportXlsx = () => {
+        if (typeof XLSX === 'undefined') { alert('Librairie Excel non chargée'); return; }
+        const wb = XLSX.utils.book_new();
+        const h1 = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS À COMMANDER', 'COLISAGE', 'UNITÉ DE VENTE KBG', 'TYPE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'VENTES À 5H', 'ESTIMATION MU (+15 %)', 'STOCK MU', 'STOCK CAGETTE', 'BESOIN (uv)', 'ID SITE KBG'];
+        const a1 = [h1, ...rows.map(r => [r.code, r.producteur, r.designation, Number(r.colis) || 0, r.col, r.uv, r.type, r.pa, r.totalHt, r.cmd5h, r.estim, r.stockMu, r.stockCag, r.besoinUv, r.id]), ['', '', 'TOTAL', Math.round(totC * 10) / 10, '', '', '', '', Math.round(totHt * 100) / 100]];
+        const ws1 = XLSX.utils.aoa_to_sheet(a1); ws1['!cols'] = [10, 28, 36, 12, 10, 18, 9, 12, 13, 10, 12, 9, 11, 10, 26].map(w => ({ wch: w }));
+        XLSX.utils.book_append_sheet(wb, ws1, 'Commande 5h');
+        const h2 = ['ENVOYÉ À', 'DISTRIBUTION', 'PAR', 'CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'MANQUE (uv)', 'COLIS RAJOUTÉS', 'COLISAGE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ'];
+        const ws2 = XLSX.utils.aoa_to_sheet([h2, ...raj.map(r => [r.at, r.distrib, r.by, r.code, r.producteur, r.designation, r.manque, r.colis, r.col, r.pa, r.totalHt])]);
+        ws2['!cols'] = [17, 12, 12, 10, 28, 36, 10, 12, 10, 12, 13].map(w => ({ wch: w }));
+        XLSX.utils.book_append_sheet(wb, ws2, 'Rajouts derniere minute');
+        const info = XLSX.utils.aoa_to_sheet([['Commande KBG', kbCmDate(day)], ['Distribution du', cmd ? kbCmDate(cmd.distrib) : ''], ['Envoyée à', cmd && cmd.sentAt ? cmd.sentAt : 'pas encore envoyée (aperçu)'], ['Fin des commandes clients', '10h'], ['Produits', rows.length], ['Colis', Math.round(totC * 10) / 10], ['Rajouts (colis)', Math.round(totR * 10) / 10]]);
+        XLSX.utils.book_append_sheet(wb, info, 'Infos');
+        XLSX.writeFile(wb, `Commande KBG ${day.split('-').reverse().join('-')}.xlsx`);
+      };
+      const Big = ({ l, v, c }) => <div style={{ flex: '1 1 160px', background: c + '14', borderLeft: '8px solid ' + c, borderRadius: 14, padding: '12px 14px' }}><div style={{ fontSize: 14, color: 'var(--ink-soft)', fontWeight: 700 }}>{l}</div><div style={{ fontSize: 36, fontWeight: 900, color: c, lineHeight: 1.1 }}>{v}</div></div>;
+      const th = { textAlign: 'left', padding: '10px 10px', fontSize: 13, fontWeight: 800, color: '#1a4d2e', background: '#e8f5e9', position: 'sticky', top: 0 };
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '14px 16px', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <h2 style={{ margin: 0, fontSize: 24 }}>🥬 Commande du jour</h2>
+              <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 2, textTransform: 'capitalize' }}>{kbCmDate(day)}{cmd ? ' → distribution du ' + kbCmDate(cmd.distrib) : ''}</div>
+            </div>
+            <button className={day === todayKey() ? 'btn-primary' : 'btn-secondary'} onClick={() => setDay(todayKey())}>Aujourd'hui</button>
+            <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ padding: 8, borderRadius: 10, border: '1px solid var(--line)', fontSize: 14 }} />
+            <button className="btn-secondary" onClick={() => setTick(t => t + 1)}>↻</button>
+            <button className="btn-primary" disabled={!cmd} onClick={exportXlsx} style={{ background: '#1d6f42', borderColor: '#1d6f42', fontSize: 15, fontWeight: 800 }}>⬇️ Excel complet</button>
+          </div>
+          <div style={{ background: '#fff3e0', border: '3px solid #ef6c00', borderRadius: 14, padding: '12px 16px', fontSize: 19, fontWeight: 900, color: '#a64b00' }}>
+            ⏰ Fin des commandes clients à 10h
+            <div style={{ fontSize: 14, fontWeight: 600, marginTop: 2 }}>Vers 10h les commandes exactes sont chargées et la MU se met à jour : les rajouts de dernière minute apparaissent en bas de cette page.</div>
+          </div>
+          {data === undefined && <div className="card" style={{ padding: 18, fontSize: 18 }}>Chargement de la commande…</div>}
+          {data === null && <div className="card" style={{ padding: 16, border: '2px solid var(--danger)' }}><div style={{ fontWeight: 900, color: 'var(--danger)', fontSize: 17 }}>⚠️ Commande illisible</div><div style={{ fontSize: 14, marginTop: 4 }}>{err}</div></div>}
+          {cmd && (
+            <>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                <Big l="Produits" v={rows.length} c="#1565c0" />
+                <Big l="Colis à commander" v={n1(totC)} c="#2e7d32" />
+                <Big l="Rajouts dernière minute" v={raj.length ? n1(totR) + ' colis' : '—'} c="#e65100" />
+              </div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: cmd.live ? '#ef6c00' : '#2e7d32' }}>
+                {cmd.live ? '⏳ Pas encore envoyée : aperçu en direct du fichier (le mail part à 5h).' : `✅ Reçue par mail à ${String(cmd.sentAt).slice(-5).replace(':', 'h')}`}
+                {cmd.fileUrl ? <> · <a href={cmd.fileUrl} target="_blank" rel="noreferrer" style={{ color: '#1565c0' }}>ouvrir le Google Sheet</a></> : null}
+              </div>
+              {cmd.warn && <div style={{ background: '#fdecea', border: '2px solid #c62828', borderRadius: 12, padding: '10px 14px', fontWeight: 800, color: '#c62828' }}>⚠️ {cmd.warn}</div>}
+              <div className="card" style={{ padding: 0, overflow: 'auto', maxHeight: '70vh' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead><tr><th style={th}>CODE PROBON</th><th style={th}>PRODUCTEUR</th><th style={th}>DÉSIGNATION</th><th style={{ ...th, textAlign: 'right' }}>COLIS</th><th style={{ ...th, textAlign: 'right' }}>COLISAGE</th><th style={{ ...th, textAlign: 'right' }}>PA HT</th></tr></thead>
+                  <tbody>
+                    {rows.map((r, i) => (
+                      <tr key={i} style={{ background: i % 2 ? '#f6faf6' : '#fff', borderTop: '1px solid var(--line)' }}>
+                        <td style={{ padding: '10px', fontSize: 20, fontWeight: 900, color: '#1a4d2e', whiteSpace: 'nowrap' }}>{r.code || '—'}</td>
+                        <td style={{ padding: '10px', fontSize: 14, color: 'var(--ink-soft)' }}>{r.producteur}</td>
+                        <td style={{ padding: '10px', fontSize: 17, fontWeight: 700 }}>{r.designation}</td>
+                        <td style={{ padding: '10px', textAlign: 'right' }}><span style={{ display: 'inline-block', minWidth: 60, textAlign: 'center', background: '#2e7d32', color: '#fff', borderRadius: 10, padding: '4px 10px', fontSize: 22, fontWeight: 900 }}>{n1(r.colis)}</span></td>
+                        <td style={{ padding: '10px', textAlign: 'right', fontSize: 14 }}>{r.col || ''}</td>
+                        <td style={{ padding: '10px', textAlign: 'right', fontSize: 14, whiteSpace: 'nowrap' }}>{r.pa ? eur(r.pa) : ''}</td>
+                      </tr>))}
+                    {!rows.length && <tr><td colSpan={6} style={{ padding: 18, fontSize: 17, textAlign: 'center' }}>Aucun colis à commander.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #e65100' }}>
+                <div style={{ background: '#e65100', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>⚡ Rajouts de dernière minute {raj.length ? '· ' + raj.length + ' ligne(s)' : ''}</div>
+                {!raj.length ? <div style={{ padding: 16, fontSize: 16, color: 'var(--ink-soft)' }}>Aucun rajout pour l'instant. Ils apparaissent ici dès que Kelbongoo les envoie (après la prépa).</div> : (
+                  <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead><tr><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>HEURE</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>CODE PROBON</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>PRODUCTEUR</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>DÉSIGNATION</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00', textAlign: 'right' }}>COLIS</th></tr></thead>
+                    <tbody>{raj.map((r, i) => (
+                      <tr key={i} style={{ borderTop: '1px solid var(--line)' }}>
+                        <td style={{ padding: 10, fontSize: 14, whiteSpace: 'nowrap' }}>{String(r.at).slice(11, 16).replace(':', 'h')}<div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{r.by}</div></td>
+                        <td style={{ padding: 10, fontSize: 20, fontWeight: 900, color: '#a64b00' }}>{r.code || '—'}</td>
+                        <td style={{ padding: 10, fontSize: 14, color: 'var(--ink-soft)' }}>{r.producteur}</td>
+                        <td style={{ padding: 10, fontSize: 17, fontWeight: 700 }}>{r.designation}<div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 500 }}>distribution du {r.distrib ? formatDateShort(r.distrib) : '—'} · manque {r.manque}</div></td>
+                        <td style={{ padding: 10, textAlign: 'right' }}><span style={{ display: 'inline-block', minWidth: 54, textAlign: 'center', background: '#e65100', color: '#fff', borderRadius: 10, padding: '4px 10px', fontSize: 22, fontWeight: 900 }}>{n1(r.colis)}</span></td>
+                      </tr>))}</tbody>
+                  </table></div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    function RungisTrucksPage() {
+      return (
+        <div className="stack">
+          <h2 style={{ margin: 0, fontSize: 24 }}>🚚 Suivi camions</h2>
+          <GeotabTruckCard />
+          <GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" />
+        </div>
+      );
+    }
+
+    // Enlèvements, version lisible : 4 blocs (à valider · aujourd'hui · à venir · passés), une ligne par boutique
+    function RungisEnlClearPage() {
+      const enl = useKbEnlevements();
+      const [runs, setRuns] = React.useState([]);
+      const [picks, setPicks] = React.useState([]);
+      React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
+      React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
+      const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
+      const today = todayKey();
+      const all = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, addDays(today, -7), addDays(today, 30)), [enl.list, runs, today]);
+      const pending = enl.list.filter(r => r.status === 'envoye' || r.status === 'attente-23h59');
+      const groups = [
+        { k: 'today', t: "📅 Aujourd'hui", c: '#1565c0', f: l => l.when === today },
+        { k: 'next', t: '🔜 À venir', c: '#2e7d32', f: l => l.when > today },
+        { k: 'past', t: '✔️ Passés (7 jours)', c: '#607d8b', f: l => l.when < today },
+      ];
+      const stateOf = (l) => {
+        if (l.info) return ['🥬 via rolls Kelbongoo', 'var(--ink-mute)'];
+        if (l.refused) return ['❌ non récupérée (' + (KB_ENL_MOTIFS[l.refused.motif] || l.refused.motif) + ')', '#c62828'];
+        const p = pk[l.id];
+        if (p && p.status === 'ok') return ['✅ pris' + (p.at ? ' ' + kbHhmm(p.at) : '') + (p.by ? ' · ' + p.by : ''), '#2e7d32'];
+        if (p && p.status === 'missed') return ['❌ pas pris — ' + ((KB_RG_MOTIFS.find(m => m.k === p.motif) || {}).l || p.motif) + (p.note ? ' « ' + p.note + ' »' : ''), '#c62828'];
+        return ['⏳ à prendre', '#ef6c00'];
+      };
+      const th = { textAlign: 'left', padding: '9px 10px', fontSize: 13, fontWeight: 800, background: 'var(--bg-muted)' };
+      const Table = ({ lines }) => (
+        <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead><tr><th style={th}>BOUTIQUE</th><th style={th}>QUOI</th><th style={th}>À PRENDRE</th><th style={th}>LIVRAISON</th><th style={th}>ÉTAT CHAUFFEUR</th></tr></thead>
+          <tbody>{lines.map(l => { const [s, c] = stateOf(l); return (
+            <tr key={l.id} style={{ borderTop: '1px solid var(--line)' }}>
+              <td style={{ padding: 10, whiteSpace: 'nowrap' }}><span style={{ display: 'inline-block', background: SITE_NAMES[l.site] ? kbSiteColor(l.site) : '#607d8b', color: '#fff', borderRadius: 8, padding: '3px 10px', fontSize: 18, fontWeight: 900 }}>{l.site}</span><div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>{siteLabel(l.site) !== l.site ? siteLabel(l.site) : (KB_ENL_STORE_LONG[l.site] || '')}</div></td>
+              <td style={{ padding: 10 }}><div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><KbPhoto src={l.photo} size={56} /><div><div style={{ fontSize: 16, fontWeight: 800 }}>{l.label}</div>{l.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</div>}{l.note && <div style={{ fontSize: 13, color: '#8d6e00' }}>ℹ️ {l.note}</div>}</div></div></td>
+              <td style={{ padding: 10, fontSize: 15, fontWeight: 700, whiteSpace: 'nowrap' }}>{l.kind === 'roll' ? '—' : kbRgDayLbl(l.when)}</td>
+              <td style={{ padding: 10, fontSize: 15, fontWeight: 700, whiteSpace: 'nowrap', color: '#1565c0' }}>{kbRgDayLbl(l.liv)}</td>
+              <td style={{ padding: 10, fontSize: 14, fontWeight: 800, color: c }}>{s}</td>
+            </tr>); })}</tbody>
+        </table></div>
+      );
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <h2 style={{ margin: 0, fontSize: 24 }}>📦 Enlèvements Rungis</h2>
+              <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 2 }}>Ce que le camion prend à PDP pour chaque boutique, et ce que le chauffeur a réellement chargé.</div>
+            </div>
+            <button className="btn-secondary" onClick={enl.reload}>↻ Actualiser</button>
+          </div>
+          {enl.raw === undefined && <div className="card" style={{ padding: 16 }}>Chargement…</div>}
+          {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 800 }}>⚠️ Centrale PDP injoignable ({enl.err})</div>}
+          {pending.length > 0 && (
+            <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #ef6c00' }}>
+              <div style={{ background: '#ef6c00', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>🟠 À valider par Rungis · {pending.length}</div>
+              {pending.map(r => {
+                const items = kbEnlItems(r);
+                const stores = [...new Set(items.map(it => String(it.code || '?').toUpperCase()))].sort();
+                return <div key={r.id} style={{ padding: '10px 16px', borderTop: '1px solid var(--line)', fontSize: 16 }}><b>Demande du {r.date || formatDateShort(new Date(r.at || r.receivedAt || Date.now()))}</b> · {stores.join(' · ')} · {items.length} ligne(s) <span style={{ color: '#ef6c00', fontWeight: 800 }}>{(KB_ENL_STATUS[r.status] || [r.status])[0]}</span></div>;
+              })}
+            </div>
+          )}
+          {groups.map(g => {
+            const ls = all.filter(g.f).sort((a, b) => (g.k === 'past' ? b.when.localeCompare(a.when) : a.when.localeCompare(b.when)) || a.site.localeCompare(b.site));
+            if (!ls.length && g.k !== 'today') return null;
+            const body = ls.length ? <Table lines={ls} /> : <div style={{ padding: 16, fontSize: 16, color: 'var(--ink-soft)' }}>Rien de prévu aujourd'hui.</div>;
+            if (g.k === 'past') return <details key={g.k} className="card" style={{ padding: 0, overflow: 'hidden' }}><summary style={{ padding: '12px 16px', fontSize: 18, fontWeight: 900, cursor: 'pointer', color: g.c }}>{g.t} · {ls.length}</summary>{body}</details>;
+            return (
+              <div key={g.k} className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid ' + g.c }}>
+                <div style={{ background: g.c, color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>{g.t}{ls.length ? ' · ' + ls.length + ' ligne(s)' : ''}</div>
+                {body}
+              </div>
+            );
+          })}
+          <div className="card" style={{ padding: '8px 12px', fontSize: 12, color: 'var(--ink-mute)' }}>🏭 Dispatch = palette fournisseur éclatée · 📦 Picking = préparée depuis le stock · 🥬 Kelbongoo = rolls de commandes clients (nombre envoyé à la clôture de prépa). État chauffeur = ce qu'il a coché dans l'appli.</div>
         </div>
       );
     }
@@ -25126,7 +25831,9 @@
         ? { ...session, role:'prep', isPrep:true, isMaster:false, site:'ENTREPOT', _masterView:true }
         : (session.isMaster && viewAs === 'distrib')
           ? { ...session, role:'distrib', isMaster:false, _masterView:true }
-          : session;
+          : (session.isMaster && viewAs === 'rungis')
+            ? { ...session, role:'rungis', isMaster:false, _masterView:true }
+            : session;
       const switchView = (v) => { setViewAs(v); setTab(v === 'prep' ? 'prepajour' : 'clients'); };
       // Sélecteur de vue, affiché uniquement pour un vrai master.
       const MasterViewSwitcher = () => (
@@ -25138,11 +25845,16 @@
             <option value="master">⚙️ Vue master</option>
             <option value="distrib">🚚 Vue distrib</option>
             <option value="prep">📦 Vue prépa</option>
+            <option value="rungis">🚚 Espace Rungis</option>
           </select>
         ) : null
       );
 
-      // V9.91 — CHAUFFEUR (accès « Retour PDP ») : uniquement les retours à récupérer, aucun autre onglet
+      // V10.15 — 🔐 ESPACE RUNGIS (Google : achat@ · hg@ · gestion@) — ou master en « Espace Rungis »
+      if (effSession.role === 'rungis') {
+        return <RungisSpace session={effSession} onLogout={handleLogout} switcher={<MasterViewSwitcher />} overlay={overlay} />;
+      }
+      // V9.91 / V10.15 — CHAUFFEUR RUNGIS (code « Retour PDP ») : Bonjour NOM · à livrer aux boutiques · à ramener à PDP
       if (effSession.role === 'pdp') { // V9.94 — rôle serveur dédié (aucun autre écran)
         return (
           <div className="app-shell">
@@ -25150,12 +25862,12 @@
             <UpdateChecker />
             <div className="topbar">
               <div className="topbar-title">
-                <strong>🚚 Retours PDP <span className="ver-badge">{APP_VERSION}</span></strong>
+                <strong>🚚 Rungis <span className="ver-badge">{APP_VERSION}</span></strong>
                 <small>{effSession.name} · {formatDateFR()}</small>
               </div>
               <div className="topbar-actions"><button className="btn-ghost" onClick={handleLogout} style={{fontSize:13}}>Sortir</button></div>
             </div>
-            <PdpReturnsPage session={effSession} catalogue={catalogue} />
+            <RungisDriverHome session={effSession} />
           </div>
         );
       }
