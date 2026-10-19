@@ -394,7 +394,7 @@
 
     /* Role tabs sur login */
     .role-tabs {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
       background: var(--bg-muted); padding: 4px; border-radius: var(--radius); margin-bottom: 18px;
     }
     /* Accès master discret, tout en bas */
@@ -414,8 +414,14 @@
       color: var(--ink-soft); border: 1px solid transparent;
     }
     .role-tab.active { background: white; color: var(--ink); border-color: var(--line); box-shadow: var(--shadow-sm); }
-    .role-tab .role-icon { display: block; font-size: 24px; margin-bottom: 2px; letter-spacing: -2px; }
-    .role-tab small { display: block; font-size: 10.5px; font-weight: 500; color: var(--ink-mute); margin-top: 1px; }
+    .role-tab .role-icon { display: block; font-size: 20px; margin-bottom: 2px; }
+    .role-tab.kb-illu { padding: 8px 6px 10px; font-size: 16px; font-weight: 800; color: var(--ink); background: rgba(255,255,255,.45); border: 2px solid transparent; }
+    .role-tab.kb-illu.active { border-color: #2e7d32; background: #fff; }
+    .role-tab.kb-illu small { display: block; font-size: 11.5px; font-weight: 600; color: var(--ink-mute); margin-top: 1px; }
+    .master-access .kb-rg-entry { display: flex; align-items: center; gap: 12px; width: 100%; margin-top: 10px; padding: 8px 12px; border-radius: 14px; border: 2px solid #1565c0; background: #e3f2fd; cursor: pointer; text-align: left; }
+    .master-access .kb-rg-entry:hover { background: #d0e7fb; color: inherit; }
+    .kb-rg-mtabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
+    @media (min-width: 1100px) { .app-shell.kb-wide .kb-rg-mtabs { display: none; } }
     /* V9.43 : champ code perso (chiffres centrés espacés) */
     .code-input { text-align: center; letter-spacing: 8px; font-size: 24px !important; font-weight: 800; }
 
@@ -758,7 +764,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.15';
+    const APP_VERSION = 'V10.16';
+    // V10.16 — Connexion : 2 onglets illustrés (dessins SVG maison) Distrib / Prépa + camion « Rungis » cliquable sous
+    //   l'Espace master (chauffeur par code OU Espace Rungis Google, aucune adresse affichée). Code chauffeur vérifié sur la
+    //   colonne « Retour PDP » du registre (Apps Script rungis_driver_check) si le serveur ne donne pas déjà le rôle pdp.
+    //   Commande du jour = prépa du jour → distribution du lendemain ; commande 5h / commande en cours ; ajouts Rungis de la
+    //   veille au soir ; plus de « fin des commandes 10h ». Enlèvements : tout part de l'entrepôt PDP, 🗑️ master. Mise en page corrigée.
     // V10.15 — RUNGIS : connexion à 3 onglets (🧑‍🌾🧺 Distrib · 🥕🗄️ Prépa · 🚚 Rungis). Rungis + code « Retour PDP » →
     //   écran chauffeur « 👋 Bonjour NOM » : 📦 À livrer aux boutiques (palettes validées Centrale PDP + rolls/dollies
     //   Kelbongoo de la clôture de prépa → rungis_runs), ✅ Pris / ❌ Pas pris + motif + note → alerte mail (kbgRungis) ;
@@ -1501,6 +1512,7 @@
       if (sess.uid && sess.uid !== c.uid) return false;
       if (c._offline) return !!sess.uid;
       if (sess.role === 'rungis') return c.kbRole === 'rungis' || c.admin === true; // V10.15 — Espace Rungis
+      if (sess.role === 'pdp' && sess.viaPrep) return c.kbRole === 'prep' || c.kbRole === 'pdp'; // V10.16 — chauffeur validé par le registre (colonne Retour PDP)
       if (sess.role === 'master' || sess.isMaster) return c.admin === true;
       return c.kbRole === sess.role;
     }
@@ -3184,7 +3196,10 @@
     }
 
     function LoginScreen({ onLogin }) {
-      const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' | 'rungis' (master = overlay séparé)
+      const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' (master et Rungis = fenêtres séparées)
+      const [rgOpen, setRgOpen] = React.useState(false); // V10.16 — fenêtre Rungis (chauffeur / espace bureau)
+      const [rgCode, setRgCode] = React.useState('');
+      const [rgErr, setRgErr] = React.useState('');
       const [masterOpen, setMasterOpen] = React.useState(false); // overlay accès master
       const [site, setSite] = React.useState('');
       const [name, setName] = React.useState('');
@@ -3259,14 +3274,38 @@
       // V10.15 — Espace Rungis : Google, adresses autorisées seulement (vérif serveur kbgRungisLogin)
       const [rgBusy, setRgBusy] = React.useState(false);
       const rungisSpaceLogin = async () => {
-        setError(''); setRgBusy(true);
+        setRgErr(''); setRgBusy(true);
         try {
           const u = await kbRungisGoogleLogin();
           onLogin({ role: 'rungis', uid: u.uid, site: 'RUNGIS', name: u.name, adminEmail: u.email, rungisAdmin: u.admin, loggedAt: new Date().toISOString() });
         } catch (e) {
           const code = (e && e.code) || '';
-          setError(/popup-closed|cancelled-popup/.test(code) ? 'Connexion Google annulée.' : kbErrMsg(e));
+          setRgErr(/popup-closed|cancelled-popup/.test(code) ? 'Connexion Google annulée.' : kbErrMsg(e));
         } finally { setRgBusy(false); }
+      };
+      // V10.16 — chauffeur Rungis : code perso + case « Retour PDP » (colonne N du registre), vérifiée côté serveur
+      const rungisDriverLogin = async () => {
+        setRgErr('');
+        const code = String(rgCode || '').trim();
+        if (!code) { setRgErr('Entre ton code personnel.'); return; }
+        if (!firebaseConfigured) { setRgErr('Connexion serveur indisponible.'); return; }
+        setRgBusy(true);
+        try {
+          const r = await kbStaffLogin(code, 'prep');
+          let name = r.name, ok = r.kbRole === 'pdp';
+          if (!ok) {
+            let chk = null;
+            try { chk = await flPost({ action: 'rungis_driver_check', code }); } catch (e) { chk = { ok: false, error: e.message }; }
+            if (chk && chk.ok && chk.pdp) ok = true; // le nom reste celui du jeton (règles Firestore)
+            else {
+              await kbSignOut();
+              setRgErr(chk && chk.ok === false ? 'Vérification Rungis impossible (' + (chk.error || 'serveur') + ').' : 'Ce code n\'a pas la case « Retour PDP » cochée dans le registre.');
+              return;
+            }
+          }
+          onLogin({ role: 'pdp', isPdp: true, viaPrep: r.kbRole !== 'pdp', uid: r.uid, site: 'ENTREPOT', name: String(name || '').trim() || 'Chauffeur', loggedAt: new Date().toISOString() });
+        } catch (e) { setRgErr(kbErrMsg(e)); }
+        finally { setRgBusy(false); setRgCode(''); }
       };
 
       // V9.43 : connexion par CODE PERSO unique (Prépa + Distrib), validé côté serveur
@@ -3281,15 +3320,9 @@
         let r;
         // V9.54 : code vérifié par la Cloud Function kbgLogin (anti force brute) → jeton Firebase signé.
         // Le code n'est plus conservé dans la session.
-        try { r = await kbStaffLogin(code, role === 'rungis' ? 'prep' : role, site); }
+        try { r = await kbStaffLogin(code, role, site); }
         catch (e) { setBusy(false); setPassword(''); setError(kbErrMsg(e)); return; }
         setBusy(false); setPassword('');
-        // V10.15 — onglet Rungis : uniquement les codes cochés « Retour PDP » (chauffeur) dans le registre
-        if (role === 'rungis' && r.kbRole !== 'pdp') {
-          await kbSignOut();
-          setError('Ce code n\'a pas l\'accès Rungis. Demande au bureau de cocher « Retour PDP » sur ta ligne du registre.');
-          return;
-        }
         const who = String(r.name || '').trim() || 'Kelbongoo';
         if (r.kbRole === 'pdp') {
           onLogin({ role: 'pdp', isPdp: true, uid: r.uid, site: 'ENTREPOT', name: who, loggedAt: new Date().toISOString() }); // V9.94 — chauffeur
@@ -3312,14 +3345,11 @@
             </div>
 
             <div className="role-tabs">
-              <div className={`role-tab ${role==='distrib'?'active':''}`} onClick={()=>{ setRole('distrib'); setError(''); }}>
-                <span className="role-icon">🧑‍🌾🧺</span>Distrib<small>remise au client</small>
+              <div className={`role-tab kb-illu ${role==='distrib'?'active':''}`} onClick={()=>{ setRole('distrib'); setError(''); }}>
+                <KbIllu svg={KB_ILLU_DISTRIB} />Distrib<small>remise au client</small>
               </div>
-              <div className={`role-tab ${role==='prep'?'active':''}`} onClick={()=>{ setRole('prep'); setError(''); }}>
-                <span className="role-icon">🥕🗄️</span>Prépa<small>légumes en casiers</small>
-              </div>
-              <div className={`role-tab ${role==='rungis'?'active':''}`} onClick={()=>{ setRole('rungis'); setError(''); }}>
-                <span className="role-icon">🚚</span>Rungis<small>camion</small>
+              <div className={`role-tab kb-illu ${role==='prep'?'active':''}`} onClick={()=>{ setRole('prep'); setError(''); }}>
+                <KbIllu svg={KB_ILLU_PREPA} />Prépa<small>produits en casiers</small>
               </div>
             </div>
 
@@ -3374,7 +3404,7 @@
             {/* V9.44 : plus de saisie libre du prénom — l'identité vient du code. */}
 
             <div className="field">
-              <label>{role === 'rungis' ? 'Code personnel du chauffeur' : 'Code personnel'}</label>
+              <label>Code personnel</label>
               <input type="password" inputMode="numeric" className="code-input" value={password}
                 onChange={e => setPassword(e.target.value)} placeholder="••••••"
                 autoComplete="off" onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); }} />
@@ -3385,14 +3415,7 @@
 
             {error && <div style={{color:'var(--danger)',fontSize:12,marginBottom:12,padding:'8px 12px',background:'var(--danger-soft)',borderRadius:8}}>{error}</div>}
 
-            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit} disabled={busy}>{busy ? 'Vérification…' : (role === 'rungis' ? '🚚 Chauffeur : se connecter' : 'Se connecter')}</button>
-
-            {role === 'rungis' && (
-              <div style={{ marginTop: 14, padding: '12px 12px', border: '2px solid #1565c0', borderRadius: 12, background: '#e3f2fd', textAlign: 'center' }}>
-                <button className="btn-primary btn-block" disabled={rgBusy || !firebaseConfigured} onClick={rungisSpaceLogin} style={{ background: '#1565c0', borderColor: '#1565c0', fontSize: 16, fontWeight: 800 }}>{rgBusy ? 'Vérification…' : '🔐 Espace Rungis (bureau)'}</button>
-                <div style={{ fontSize: 11.5, color: '#0d3c78', marginTop: 6 }}>Connexion Google possible uniquement avec <b>{KB_RUNGIS_EMAILS_TXT}</b>.</div>
-              </div>
-            )}
+            <button className="btn-primary btn-block btn-lg" onClick={handleSubmit} disabled={busy}>{busy ? 'Vérification…' : 'Se connecter'}</button>
 
             <div style={{marginTop:14,textAlign:'center',fontSize:11,color:'var(--ink-mute)'}}>
               {firebaseConfigured
@@ -3403,8 +3426,35 @@
             {/* Accès master — discret, tout en bas. Clic ⇒ connexion Google directe. */}
             <div className="master-access">
               <button onClick={() => setMasterOpen(true)}>⚙️ Espace master</button>
+              {/* V10.16 — Rungis : camion cliquable → chauffeur (code) ou Espace Rungis (bureau) */}
+              <button className="kb-rg-entry" onClick={() => { setRgOpen(true); setRgErr(''); }}>
+                <span style={{ flex: '0 0 96px' }}><KbIllu svg={KB_ILLU_TRUCK} h={54} /></span>
+                <span style={{ flex: 1, minWidth: 0 }}><b style={{ display: 'block', fontSize: 16, color: '#0d3c78' }}>Rungis</b><span style={{ fontSize: 12, color: '#1e4f86' }}>Chauffeur ou espace Rungis</span></span>
+                <span style={{ fontSize: 24, color: '#1565c0' }}>›</span>
+              </button>
             </div>
           </div>
+
+          {rgOpen && (
+            <div className="fs-overlay" onClick={() => !rgBusy && setRgOpen(false)}>
+              <div className="fs-card" style={{ maxWidth: 400 }} onClick={e => e.stopPropagation()}>
+                <KbIllu svg={KB_ILLU_TRUCK} h={70} />
+                <h2 style={{ marginTop: 6 }}>Rungis</h2>
+                <div style={{ textAlign: 'left', marginTop: 8 }}>
+                  <div style={{ fontWeight: 800, fontSize: 15 }}>🚚 Chauffeur</div>
+                  <input type="password" inputMode="numeric" className="code-input" value={rgCode} onChange={e => setRgCode(e.target.value)} placeholder="••••••" autoComplete="off" onKeyDown={e => { if (e.key === 'Enter') rungisDriverLogin(); }} style={{ marginTop: 6 }} />
+                  <button className="btn-primary btn-block" disabled={rgBusy} onClick={rungisDriverLogin} style={{ marginTop: 8, fontSize: 17, fontWeight: 800, background: '#1565c0', borderColor: '#1565c0' }}>{rgBusy ? 'Vérification…' : 'Entrer'}</button>
+                </div>
+                <div style={{ borderTop: '1px dashed var(--line)', margin: '16px 0 12px' }} />
+                <div style={{ textAlign: 'left' }}>
+                  <div style={{ fontWeight: 800, fontSize: 15 }}>🔐 Espace Rungis (bureau)</div>
+                  <button className="btn-secondary btn-block" disabled={rgBusy || !firebaseConfigured} onClick={rungisSpaceLogin} style={{ marginTop: 6, fontSize: 15, fontWeight: 700 }}>Se connecter avec Google</button>
+                </div>
+                {rgErr && <div style={{ color: 'var(--danger)', fontSize: 13, marginTop: 12, padding: '8px 12px', background: 'var(--danger-soft)', borderRadius: 8, textAlign: 'left' }}>{rgErr}</div>}
+                <div style={{ marginTop: 14, textAlign: 'center' }}><button className="btn-ghost" disabled={rgBusy} onClick={() => setRgOpen(false)}>Fermer</button></div>
+              </div>
+            </div>
+          )}
 
           {/* Overlay Master : ouverture directe du compte Google autorisé */}
           {masterOpen && (
@@ -21661,17 +21711,25 @@
     //   Données : Firestore rungis_runs / rungis_picks / pdp_pick_items, Centrale PDP (enlèvements, REST
     //   public), Apps Script FL via la Cloud Function kbgRungis (rungis_cmd_get / rungis_alert).
     // ============================================================
-    const KB_RUNGIS_EMAILS_TXT = 'achat@probon.fr · hg@probon.fr · gestion@probon.fr';
+    // V10.16 — illustrations de connexion (dessinées pour l'appli, SVG inline)
+    const KB_ILLU_DISTRIB = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 110\"> <ellipse cx=\"80\" cy=\"102\" rx=\"70\" ry=\"5\" fill=\"#000\" opacity=\".08\"/> <path d=\"M30 100 V66 q0-14 14-14 h8 q14 0 14 14 V100 Z\" fill=\"#2e7d32\"/> <path d=\"M38 62 h20 v38 h-20 z\" fill=\"#43a047\"/> <rect x=\"44\" y=\"70\" width=\"8\" height=\"6\" rx=\"1.5\" fill=\"#c8e6c9\"/> <circle cx=\"48\" cy=\"38\" r=\"12\" fill=\"#f1c19b\"/> <path d=\"M36 36 q2-13 13-13 q11 0 12 12 q-6-5-13-5 q-7 0-12 6z\" fill=\"#4e342e\"/> <circle cx=\"52\" cy=\"38\" r=\"1.4\" fill=\"#3e2723\"/><path d=\"M50 43 q3 2 5 0\" stroke=\"#3e2723\" stroke-width=\"1.4\" fill=\"none\" stroke-linecap=\"round\"/> <path d=\"M60 64 q12 2 22 2\" stroke=\"#2e7d32\" stroke-width=\"8\" stroke-linecap=\"round\" fill=\"none\"/> <circle cx=\"84\" cy=\"66\" r=\"4.5\" fill=\"#f1c19b\"/> <path d=\"M74 64 q12-22 24 0\" stroke=\"#8d6e63\" stroke-width=\"3\" fill=\"none\"/> <path d=\"M70 64 h32 l-4 20 h-24 z\" fill=\"#a1887f\"/> <path d=\"M73 70 h26 M74 76 h24\" stroke=\"#795548\" stroke-width=\"1.6\"/> <circle cx=\"79\" cy=\"61\" r=\"5\" fill=\"#e53935\"/><path d=\"M79 56 l1-3\" stroke=\"#2e7d32\" stroke-width=\"1.6\"/> <path d=\"M86 63 l10-14 2 2z\" fill=\"#fb8c00\"/><path d=\"M96 49 l3-4 M97 50 l5-2\" stroke=\"#43a047\" stroke-width=\"1.8\" stroke-linecap=\"round\"/> <ellipse cx=\"91\" cy=\"60\" rx=\"5\" ry=\"3.5\" fill=\"#7cb342\"/> <path d=\"M112 100 V68 q0-14 13-14 h6 q13 0 13 14 V100 Z\" fill=\"#1565c0\"/> <circle cx=\"128\" cy=\"40\" r=\"12\" fill=\"#c68b62\"/> <path d=\"M116 38 q1-14 12-14 q12 0 12 13 q-2-7-12-7 q-9 0-12 8z\" fill=\"#212121\"/> <circle cx=\"124\" cy=\"40\" r=\"1.4\" fill=\"#212121\"/><path d=\"M121 45 q3 2 5 0\" stroke=\"#212121\" stroke-width=\"1.4\" fill=\"none\" stroke-linecap=\"round\"/> <path d=\"M114 70 q-8 2-12 -2\" stroke=\"#1565c0\" stroke-width=\"8\" stroke-linecap=\"round\" fill=\"none\"/> <circle cx=\"101\" cy=\"67\" r=\"4.5\" fill=\"#c68b62\"/> </svg>";
+    const KB_ILLU_PREPA = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 110\"> <ellipse cx=\"80\" cy=\"102\" rx=\"70\" ry=\"5\" fill=\"#000\" opacity=\".08\"/> <rect x=\"84\" y=\"14\" width=\"56\" height=\"80\" rx=\"3\" fill=\"none\" stroke=\"#78909c\" stroke-width=\"3\"/> <g fill=\"#e8f5e9\" stroke=\"#90a4ae\" stroke-width=\"1.5\"> <rect x=\"88\" y=\"18\" width=\"23\" height=\"16\" rx=\"2\"/><rect x=\"113\" y=\"18\" width=\"23\" height=\"16\" rx=\"2\"/> <rect x=\"88\" y=\"37\" width=\"23\" height=\"16\" rx=\"2\" fill=\"#fff3e0\"/><rect x=\"113\" y=\"37\" width=\"23\" height=\"16\" rx=\"2\"/> <rect x=\"88\" y=\"56\" width=\"23\" height=\"16\" rx=\"2\"/><rect x=\"113\" y=\"56\" width=\"23\" height=\"16\" rx=\"2\" fill=\"#e3f2fd\"/> <rect x=\"88\" y=\"75\" width=\"23\" height=\"16\" rx=\"2\"/><rect x=\"113\" y=\"75\" width=\"23\" height=\"16\" rx=\"2\"/> </g> <g font-family=\"Arial\" font-size=\"8\" font-weight=\"700\" fill=\"#546e7a\" text-anchor=\"middle\"> <text x=\"99.5\" y=\"29\">1</text><text x=\"124.5\" y=\"29\">2</text><text x=\"124.5\" y=\"48\">4</text><text x=\"99.5\" y=\"67\">5</text><text x=\"124.5\" y=\"67\">6</text><text x=\"99.5\" y=\"86\">7</text><text x=\"124.5\" y=\"86\">8</text> </g> <ellipse cx=\"99\" cy=\"46\" rx=\"7\" ry=\"4\" fill=\"#7cb342\"/><circle cx=\"106\" cy=\"47\" r=\"3.5\" fill=\"#e53935\"/> <circle cx=\"90\" cy=\"98\" r=\"4\" fill=\"#455a64\"/><circle cx=\"134\" cy=\"98\" r=\"4\" fill=\"#455a64\"/> <path d=\"M24 100 V64 q0-14 14-14 h8 q14 0 14 14 V100 Z\" fill=\"#ef6c00\"/> <rect x=\"34\" y=\"60\" width=\"16\" height=\"40\" fill=\"#fb8c00\"/> <circle cx=\"42\" cy=\"36\" r=\"12\" fill=\"#f1c19b\"/> <path d=\"M30 34 q1-14 12-14 q12 0 12 13 q-4-8-12-8 q-8 0-12 9z\" fill=\"#6d4c41\"/> <path d=\"M30 30 q12-10 24 0 v-3 q-12-9-24 0z\" fill=\"#2e7d32\"/> <circle cx=\"46\" cy=\"37\" r=\"1.4\" fill=\"#3e2723\"/><path d=\"M44 42 q3 2 5 0\" stroke=\"#3e2723\" stroke-width=\"1.4\" fill=\"none\" stroke-linecap=\"round\"/> <path d=\"M54 62 q14-6 24-14\" stroke=\"#ef6c00\" stroke-width=\"8\" stroke-linecap=\"round\" fill=\"none\"/> <circle cx=\"80\" cy=\"47\" r=\"4.5\" fill=\"#f1c19b\"/> <path d=\"M80 45 l14-4 -2 5z\" fill=\"#fb8c00\"/><path d=\"M94 41 l4-3 M94 42 l5 0\" stroke=\"#43a047\" stroke-width=\"1.8\" stroke-linecap=\"round\"/> </svg>";
+    const KB_ILLU_TRUCK = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 90\"> <ellipse cx=\"80\" cy=\"82\" rx=\"72\" ry=\"5\" fill=\"#000\" opacity=\".08\"/> <rect x=\"8\" y=\"14\" width=\"96\" height=\"54\" rx=\"5\" fill=\"#1565c0\"/> <rect x=\"8\" y=\"14\" width=\"96\" height=\"10\" rx=\"5\" fill=\"#1e88e5\"/> <text x=\"56\" y=\"52\" font-family=\"Arial Black,Arial\" font-weight=\"900\" font-size=\"17\" fill=\"#fff\" text-anchor=\"middle\" letter-spacing=\"1\">RUNGIS</text> <path d=\"M104 30 h26 q6 0 9 5 l10 15 v18 h-45 z\" fill=\"#0d47a1\"/> <path d=\"M110 35 h18 q3 0 5 3 l7 11 h-30 z\" fill=\"#bbdefb\"/> <rect x=\"146\" y=\"58\" width=\"6\" height=\"6\" rx=\"1\" fill=\"#ffca28\"/> <rect x=\"4\" y=\"64\" width=\"150\" height=\"6\" rx=\"3\" fill=\"#37474f\"/> <circle cx=\"34\" cy=\"72\" r=\"10\" fill=\"#263238\"/><circle cx=\"34\" cy=\"72\" r=\"4\" fill=\"#b0bec5\"/> <circle cx=\"124\" cy=\"72\" r=\"10\" fill=\"#263238\"/><circle cx=\"124\" cy=\"72\" r=\"4\" fill=\"#b0bec5\"/> <path d=\"M14 30 l10 0 M14 36 l6 0\" stroke=\"#90caf9\" stroke-width=\"2\" stroke-linecap=\"round\"/> </svg>";
+    function KbIllu({ svg, h }) { return <span aria-hidden="true" style={{ display: 'block', height: h || 84, lineHeight: 0 }} dangerouslySetInnerHTML={{ __html: svg.replace('<svg ', '<svg style="height:100%;width:auto;max-width:100%" ') }} />; }
     const KB_RG_MOTIFS = [
       { k: 'place', l: '🚛 Pas de place dans le camion' },
       { k: 'introuvable', l: '🔍 Palette introuvable' },
       { k: 'pas_prete', l: '⏳ Pas prête' },
       { k: 'autre', l: '✏️ Autre' },
     ];
+    // V10.16 — master / chauffeur (jeton prépa) : via kbgProxy (cible FL, déjà en place) ; Espace Rungis bureau : kbgRungis
     async function kbRungisCall(action, data) {
+      const c = window.__kbClaims || {};
+      if (c.admin === true || c.kbRole === 'prep') return await flPost({ action, ...(data || {}) });
       const r = await kbCallable('kbgRungis')({ action, ...(data || {}) });
       return r.data;
     }
+    const kbRgCanWrite = () => { const c = window.__kbClaims || {}; return c.admin === true || c.kbRole === 'pdp' || c.kbRole === 'prep'; };
     // Espace Rungis : Google (popup) → liste blanche serveur (kbgRungisLogin) → rôle rungis (ou master déjà admin)
     async function kbRungisGoogleLogin() {
       const { GoogleAuthProvider, signInWithPopup } = window.__firebase;
@@ -21768,8 +21826,8 @@
       React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
       React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
       const from = addDays(todayKey(), -1), to = addDays(todayKey(), 1);
-      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to), [enl.list, runs, from, to]);
       const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
+      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, from, to, pk]);
       const livTodo = lines.filter(l => !l.info && !l.refused && !(pk[l.id] && pk[l.id].status)).length;
       const prenom = String(session.name || '').trim().split(/\s+/)[0] || 'toi';
       React.useEffect(() => { try { window.scrollTo({ top: 0 }); } catch (e) {} }, [view]);
@@ -21792,7 +21850,7 @@
       return (
         <div className="stack" style={{ marginTop: 12 }}>
           <div style={{ background: 'linear-gradient(135deg,#1a4d2e,#2e7d32)', color: '#fff', borderRadius: 20, padding: '18px 18px' }}>
-            <div style={{ fontSize: 30, fontWeight: 900 }}>👋 Bonjour {prenom} !</div>
+            <div style={{ fontSize: 30, fontWeight: 900 }}>👋 Bonjour {prenom} !</div>
             <div style={{ fontSize: 16, marginTop: 4, opacity: .92, textTransform: 'capitalize' }}>{formatDateFR()} · tournée Rungis 🚚</div>
           </div>
           <Tile ic="📦" title="À livrer aux boutiques" sub="À prendre à PDP : palettes validées + rolls Kelbongoo" n={enl.raw === undefined ? null : livTodo} color="#1565c0" onClick={() => setView('livraison')} />
@@ -21925,13 +21983,15 @@
                     const open = openOrder[pid] !== undefined ? openOrder[pid] : !x.on;
                     return (
                       <div key={pid} style={{ border: '3px solid ' + (x.on ? '#2e7d32' : '#8d6e63'), borderRadius: 14, background: x.on ? '#e8f5e9' : '#fffaf5' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px' }}>
-                          <span style={{ fontSize: 34 }}>🧺</span>
-                          <span style={{ flex: 1, minWidth: 0 }} onClick={() => setOpenOrder(o => ({ ...o, [pid]: !open }))}>
-                            <span style={{ display: 'block', fontSize: 20, fontWeight: 900 }}>Cagette entière · {f.consumer_name || '(client)'}</span>
-                            <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{f.storedCasier ? 'Casier ' + f.storedCasier + ' · ' : ''}{nOn}/{items.length} produit(s) cochés · {open ? 'replier ▴' : 'voir le détail ▾'}</span>
-                          </span>
-                          <button disabled={busy} onClick={() => wholeOrder(f)} style={{ minHeight: 52, padding: '6px 12px', borderRadius: 12, border: 'none', fontSize: 15, fontWeight: 900, cursor: 'pointer', background: x.on ? '#9e9e9e' : '#2e7d32', color: '#fff' }}>{x.on ? '↩️ Annuler' : '✓ Toute la cagette'}</button>
+                        <div style={{ padding: '10px 12px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setOpenOrder(o => ({ ...o, [pid]: !open }))}>
+                            <span style={{ fontSize: 34 }}>🧺</span>
+                            <span style={{ flex: 1, minWidth: 0 }}>
+                              <span style={{ display: 'block', fontSize: 20, fontWeight: 900 }}>Cagette entière · {f.consumer_name || '(client)'}</span>
+                              <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{f.storedCasier ? 'Casier ' + f.storedCasier + ' · ' : ''}{nOn}/{items.length} produit(s) cochés · {open ? 'replier ▴' : 'voir le détail ▾'}</span>
+                            </span>
+                          </div>
+                          <button disabled={busy} onClick={() => wholeOrder(f)} style={{ width: '100%', marginTop: 8, minHeight: 54, padding: '6px 12px', borderRadius: 12, border: 'none', fontSize: 17, fontWeight: 900, cursor: 'pointer', background: x.on ? '#9e9e9e' : '#2e7d32', color: '#fff' }}>{x.on ? '↩️ Annuler' : '✓ J\'ai toute la cagette'}</button>
                         </div>
                         {open && (
                           <div className="stack" style={{ gap: 6, padding: '0 10px 10px' }}>
@@ -21961,7 +22021,7 @@
       const showToast = React.useContext(ToastContext);
       const [ask, setAsk] = React.useState(null); // { line, motif, note }
       const [busy, setBusy] = React.useState(false);
-      const canWrite = !!(session && (kbIsPdpDriver() || (window.__kbClaims && window.__kbClaims.admin === true)));
+      const canWrite = !!(session && kbRgCanWrite());
       const save = async (l, data) => {
         await storage.setDoc('rungis_picks', l.id, { id: l.id, kind: l.kind, ref: l.id, site: l.site, label: l.label, day: l.when, by: session.name, at: new Date().toISOString(), motif: '', note: '', alertOk: false, ...data });
       };
@@ -21980,7 +22040,7 @@
         try {
           await save(l, { status: 'missed', motif, note: String(note || '').slice(0, 600) });
           let ok = false;
-          try { const r = await kbRungisCall('rungis_alert', { alert: { kind: l.kind, site: l.site, siteLabel: siteLabel(l.site), label: l.label, motif, note, day: l.when, ref: l.id } }); ok = !!(r && r.ok); } catch (e) { ok = false; }
+          try { const r = await kbRungisCall('rungis_alert', { by: session.name, alert: { kind: l.kind, site: l.site, siteLabel: siteLabel(l.site), label: l.label, motif, note, day: l.when, ref: l.id } }); ok = !!(r && r.ok); } catch (e) { ok = false; }
           await save(l, { status: 'missed', motif, note: String(note || '').slice(0, 600), alertOk: ok });
           showToast(ok ? '📧 Alerte envoyée à Raimbaud, gestion et Henry' : '⚠️ Noté, mais le mail d\'alerte n\'est pas parti : préviens le bureau');
           setAsk(null);
@@ -22004,7 +22064,11 @@
         <div className="stack">
           <div>
             <h1 style={{ margin: 0, fontSize: 28 }}>📦 À livrer aux boutiques</h1>
-            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>À prendre à PDP. Pour chaque ligne : <b style={{ color: '#2e7d32' }}>✅ Pris</b> ou <b style={{ color: '#c62828' }}>❌ Pas pris</b> (une alerte part au bureau).</div>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>Pour chaque ligne : <b style={{ color: '#2e7d32' }}>✅ Pris</b> ou <b style={{ color: '#c62828' }}>❌ Pas pris</b> (une alerte part au bureau).</div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#1a4d2e', color: '#fff', borderRadius: 16, padding: '12px 16px' }}>
+            <span style={{ fontSize: 34 }}>🏭</span>
+            <span><b style={{ fontSize: 19, display: 'block' }}>Tout se prend à l'entrepôt PDP</b><span style={{ fontSize: 14, opacity: .9 }}>Porte de Pantin · puis livré à chaque boutique ci-dessous</span></span>
           </div>
           {enl.raw === undefined && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
           {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 800 }}>⚠️ Enlèvements illisibles ({enl.err}) <button className="btn-secondary" onClick={enl.reload}>↻</button></div>}
@@ -22018,7 +22082,8 @@
           {sites.map(s => (
             <div key={s} style={{ border: '3px solid ' + (SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b'), borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b', color: '#fff' }}>
-                <span style={{ fontSize: 28, fontWeight: 900 }}>📍 {s}</span>
+                <span style={{ fontSize: 15, fontWeight: 800, opacity: .9 }}>Livrer à</span>
+                <span style={{ fontSize: 28, fontWeight: 900 }}>{s}</span>
                 <span style={{ fontSize: 16, fontWeight: 700, flex: 1, minWidth: 0 }}>{siteLabel(s) !== s ? siteLabel(s) : (KB_ENL_STORE_LONG[s] || '')}</span>
               </div>
               <div className="stack" style={{ gap: 8, padding: 10 }}>
@@ -22053,8 +22118,8 @@
                           </div>)
                         : canWrite ? (
                           <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                            <button disabled={busy} onClick={() => taken(l)} style={{ flex: 2, minHeight: 64, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 900, cursor: 'pointer' }}>✅ Pris</button>
-                            <button disabled={busy} onClick={() => setAsk({ line: l, motif: '', note: '' })} style={{ flex: 1, minHeight: 64, borderRadius: 14, border: '3px solid #c62828', background: '#fff', color: '#c62828', fontSize: 18, fontWeight: 900, cursor: 'pointer' }}>❌ Pas pris</button>
+                            <button disabled={busy} onClick={() => taken(l)} style={{ flex: 1, minHeight: 64, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 900, cursor: 'pointer' }}>✅ Pris</button>
+                            <button disabled={busy} onClick={() => setAsk({ line: l, motif: '', note: '' })} style={{ flex: 1, minHeight: 64, borderRadius: 14, border: '3px solid #c62828', background: '#fff', color: '#c62828', fontSize: 18, fontWeight: 900, cursor: 'pointer', whiteSpace: 'nowrap' }}>❌ Pas pris</button>
                           </div>)
                         : <div style={{ fontSize: 14, color: 'var(--ink-mute)', marginTop: 8 }}>⏳ pas encore traité par le chauffeur</div>}
                     </div>
@@ -22100,7 +22165,7 @@
             <div className="kb-side-brand"><div className="kb-side-logo" style={{ background: 'linear-gradient(135deg,#1565c0,#0d3c78)' }}>R</div><div><b>Espace Rungis</b><small>Kelbongoo · {APP_VERSION}</small></div></div>
             <div className="kb-side-sec">Rungis</div>
             {KB_RG_NAV.map(n => <button key={n.k} className={page === n.k ? 'on' : ''} onClick={() => setPage(n.k)}><span className="kb-em">{n.ic}</span>{n.l}</button>)}
-            <div className="kb-side-foot"><div className="kb-side-av">{String(session.name || 'R').slice(0, 1).toUpperCase()}</div><div style={{ fontSize: 12, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{session.adminEmail || session.name}</div></div>
+            <div className="kb-side-foot"><div className="kb-side-av" style={{ flex: '0 0 30px' }}>{String(session.name || 'R').slice(0, 1).toUpperCase()}</div><div style={{ fontSize: 12, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{session.adminEmail || session.name}</div></div>
           </nav>
           <div className="topbar">
             <div className="topbar-title">
@@ -22109,7 +22174,7 @@
             </div>
             <div className="topbar-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>{switcher}<button className="btn-ghost" onClick={onLogout} style={{ fontSize: 13 }}>Sortir</button></div>
           </div>
-          <div className="tab-bar" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', margin: '6px 0 10px' }}>
+          <div className="kb-rg-mtabs">
             {KB_RG_NAV.map(n => <button key={n.k} onClick={() => setPage(n.k)} className={page === n.k ? 'btn-primary' : 'btn-secondary'} style={{ flex: '1 1 30%', fontSize: 15, padding: '10px 6px', fontWeight: 800 }}>{n.ic} {n.l}</button>)}
           </div>
           {page === 'cmd' && <RungisCommandePage />}
@@ -22119,8 +22184,12 @@
       );
     }
 
+    // Commande du jour = commande pour la PRÉPA du jour (livrée le matin), donc la DISTRIBUTION du lendemain.
+    //   ➊ Commande envoyée à 5h (ventes à 5h + 15 %, en colis)   ➋ Ajouts Rungis demandés la veille au soir après la
+    //   clôture de prépa, à livrer avec cette commande (rien le mardi : pas de prépa le lundi).  + Commande en cours (direct).
     function RungisCommandePage() {
       const [day, setDay] = React.useState(todayKey());
+      const [mode, setMode] = React.useState('sent'); // 'sent' | 'live'
       const [data, setData] = React.useState(undefined);
       const [err, setErr] = React.useState('');
       const [tick, setTick] = React.useState(0);
@@ -22131,91 +22200,97 @@
         return () => { stop = true; };
       }, [day, tick]);
       React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 5 * 60000); return () => clearInterval(t); }, []);
-      const cmd = data && data.cmd, raj = (data && data.rajouts) || [];
-      const rows = (cmd && cmd.rows) || [];
+      const today = todayKey();
+      const sent = data && data.cmd, live = data && data.live, aj = (data && data.rajouts) || [];
+      const cur = mode === 'live' ? live : sent;
+      const rows = (cur && cur.rows) || [];
       const n1 = (v) => String(Math.round((Number(v) || 0) * 10) / 10).replace('.', ',');
       const eur = (v) => (Number(v) || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR' });
-      const totC = rows.reduce((a, r) => a + (Number(r.colis) || 0), 0), totHt = rows.reduce((a, r) => a + (Number(r.totalHt) || 0), 0);
-      const totR = raj.reduce((a, r) => a + (Number(r.colis) || 0), 0);
+      const totC = rows.reduce((a, r) => a + (Number(r.colis) || 0), 0), totA = aj.reduce((a, r) => a + (Number(r.colis) || 0), 0);
+      const longDay = (d) => { const x = kbCmDate(d); return x.charAt(0).toUpperCase() + x.slice(1); };
       const exportXlsx = () => {
         if (typeof XLSX === 'undefined') { alert('Librairie Excel non chargée'); return; }
         const wb = XLSX.utils.book_new();
         const h1 = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS À COMMANDER', 'COLISAGE', 'UNITÉ DE VENTE KBG', 'TYPE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'VENTES À 5H', 'ESTIMATION MU (+15 %)', 'STOCK MU', 'STOCK CAGETTE', 'BESOIN (uv)', 'ID SITE KBG'];
-        const a1 = [h1, ...rows.map(r => [r.code, r.producteur, r.designation, Number(r.colis) || 0, r.col, r.uv, r.type, r.pa, r.totalHt, r.cmd5h, r.estim, r.stockMu, r.stockCag, r.besoinUv, r.id]), ['', '', 'TOTAL', Math.round(totC * 10) / 10, '', '', '', '', Math.round(totHt * 100) / 100]];
-        const ws1 = XLSX.utils.aoa_to_sheet(a1); ws1['!cols'] = [10, 28, 36, 12, 10, 18, 9, 12, 13, 10, 12, 9, 11, 10, 26].map(w => ({ wch: w }));
-        XLSX.utils.book_append_sheet(wb, ws1, 'Commande 5h');
-        const h2 = ['ENVOYÉ À', 'DISTRIBUTION', 'PAR', 'CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'MANQUE (uv)', 'COLIS RAJOUTÉS', 'COLISAGE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ'];
-        const ws2 = XLSX.utils.aoa_to_sheet([h2, ...raj.map(r => [r.at, r.distrib, r.by, r.code, r.producteur, r.designation, r.manque, r.colis, r.col, r.pa, r.totalHt])]);
-        ws2['!cols'] = [17, 12, 12, 10, 28, 36, 10, 12, 10, 12, 13].map(w => ({ wch: w }));
-        XLSX.utils.book_append_sheet(wb, ws2, 'Rajouts derniere minute');
-        const info = XLSX.utils.aoa_to_sheet([['Commande KBG', kbCmDate(day)], ['Distribution du', cmd ? kbCmDate(cmd.distrib) : ''], ['Envoyée à', cmd && cmd.sentAt ? cmd.sentAt : 'pas encore envoyée (aperçu)'], ['Fin des commandes clients', '10h'], ['Produits', rows.length], ['Colis', Math.round(totC * 10) / 10], ['Rajouts (colis)', Math.round(totR * 10) / 10]]);
-        XLSX.utils.book_append_sheet(wb, info, 'Infos');
-        XLSX.writeFile(wb, `Commande KBG ${day.split('-').reverse().join('-')}.xlsx`);
+        const ws1 = XLSX.utils.aoa_to_sheet([h1, ...rows.map(r => [r.code, r.producteur, r.designation, Number(r.colis) || 0, r.col, r.uv, r.type, r.pa, r.totalHt, r.cmd5h, r.estim, r.stockMu, r.stockCag, r.besoinUv, r.id]), ['', '', 'TOTAL', Math.round(totC * 10) / 10]]);
+        ws1['!cols'] = [10, 28, 36, 12, 10, 18, 9, 12, 13, 10, 12, 9, 11, 10, 26].map(w => ({ wch: w }));
+        XLSX.utils.book_append_sheet(wb, ws1, mode === 'live' ? 'Commande en cours' : 'Commande 5h');
+        const h2 = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS AJOUTÉS', 'COLISAGE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'MANQUE (uv)', 'DEMANDÉ LE', 'PAR'];
+        const ws2 = XLSX.utils.aoa_to_sheet([h2, ...aj.map(r => [r.code, r.producteur, r.designation, r.colis, r.col, r.pa, r.totalHt, r.manque, r.at, r.by]), ['', '', 'TOTAL', Math.round(totA * 10) / 10]]);
+        ws2['!cols'] = [10, 28, 36, 12, 10, 12, 13, 10, 17, 12].map(w => ({ wch: w }));
+        XLSX.utils.book_append_sheet(wb, ws2, 'Ajouts Rungis');
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['Commande pour la prépa du', longDay(day)], ['Distribution du', longDay(addDays(day, 1))], ['Commande', mode === 'live' ? 'en cours (export ' + new Date().toLocaleString('fr-FR') + ')' : (sent && sent.sentAt ? 'envoyée le ' + sent.sentAt : '—')], ['Colis commande', Math.round(totC * 10) / 10], ['Colis ajouts Rungis', Math.round(totA * 10) / 10]]), 'Infos');
+        XLSX.writeFile(wb, `Commande KBG ${day.split('-').reverse().join('-')}${mode === 'live' ? ' en cours' : ''}.xlsx`);
       };
-      const Big = ({ l, v, c }) => <div style={{ flex: '1 1 160px', background: c + '14', borderLeft: '8px solid ' + c, borderRadius: 14, padding: '12px 14px' }}><div style={{ fontSize: 14, color: 'var(--ink-soft)', fontWeight: 700 }}>{l}</div><div style={{ fontSize: 36, fontWeight: 900, color: c, lineHeight: 1.1 }}>{v}</div></div>;
-      const th = { textAlign: 'left', padding: '10px 10px', fontSize: 13, fontWeight: 800, color: '#1a4d2e', background: '#e8f5e9', position: 'sticky', top: 0 };
+      const Big = ({ l, v, c }) => <div style={{ flex: '1 1 180px', background: c + '14', borderLeft: '8px solid ' + c, borderRadius: 14, padding: '12px 16px' }}><div style={{ fontSize: 14, color: 'var(--ink-soft)', fontWeight: 700 }}>{l}</div><div style={{ fontSize: 38, fontWeight: 900, color: c, lineHeight: 1.1 }}>{v}</div></div>;
+      const th = (bg, col) => ({ textAlign: 'left', padding: '10px 12px', fontSize: 13, fontWeight: 800, color: col, background: bg, position: 'sticky', top: 0 });
+      const Seg = ({ k, l }) => <button onClick={() => setMode(k)} style={{ flex: 1, minHeight: 46, border: 'none', borderRadius: 10, cursor: 'pointer', fontSize: 15, fontWeight: 800, background: mode === k ? '#1a4d2e' : 'transparent', color: mode === k ? '#fff' : 'var(--ink-soft)' }}>{l}</button>;
+      const Table = ({ list, color, bg, colorTxt, empty }) => (
+        <div style={{ overflow: 'auto', maxHeight: '64vh' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr><th style={th(bg, colorTxt)}>CODE PROBON</th><th style={th(bg, colorTxt)}>PRODUCTEUR</th><th style={th(bg, colorTxt)}>DÉSIGNATION</th><th style={{ ...th(bg, colorTxt), textAlign: 'right' }}>COLIS</th><th style={{ ...th(bg, colorTxt), textAlign: 'right' }}>COLISAGE</th><th style={{ ...th(bg, colorTxt), textAlign: 'right' }}>PA HT</th></tr></thead>
+            <tbody>
+              {list.map((r, i) => (
+                <tr key={i} style={{ background: i % 2 ? '#fafaf7' : '#fff', borderTop: '1px solid var(--line)' }}>
+                  <td style={{ padding: '10px 12px', fontSize: 21, fontWeight: 900, color: colorTxt, whiteSpace: 'nowrap' }}>{r.code || '—'}</td>
+                  <td style={{ padding: '10px 12px', fontSize: 14, color: 'var(--ink-soft)' }}>{r.producteur}</td>
+                  <td style={{ padding: '10px 12px', fontSize: 17, fontWeight: 700 }}>{r.designation}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right' }}><span style={{ display: 'inline-block', minWidth: 62, textAlign: 'center', background: color, color: '#fff', borderRadius: 10, padding: '4px 10px', fontSize: 23, fontWeight: 900 }}>{n1(r.colis)}</span></td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontSize: 14 }}>{r.col || ''}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontSize: 14, whiteSpace: 'nowrap' }}>{r.pa ? eur(r.pa) : ''}</td>
+                </tr>))}
+              {!list.length && <tr><td colSpan={6} style={{ padding: 18, fontSize: 16, color: 'var(--ink-soft)' }}>{empty}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      );
       return (
         <div className="stack">
-          <div className="card" style={{ padding: '14px 16px', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <div style={{ flex: 1, minWidth: 220 }}>
-              <h2 style={{ margin: 0, fontSize: 24 }}>🥬 Commande du jour</h2>
-              <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 2, textTransform: 'capitalize' }}>{kbCmDate(day)}{cmd ? ' → distribution du ' + kbCmDate(cmd.distrib) : ''}</div>
+          <div className="card" style={{ padding: '16px 18px' }}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <h2 style={{ margin: 0, fontSize: 26, flex: '1 1 260px' }}>🥬 Commande du jour</h2>
+              <button className={day === today ? 'btn-primary' : 'btn-secondary'} onClick={() => setDay(today)} style={{ fontWeight: 800 }}>Aujourd'hui</button>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 14, fontWeight: 700, margin: 0 }}>Autre date
+                <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ width: 'auto', padding: '7px 8px', borderRadius: 10, border: '1px solid var(--line)', fontSize: 14 }} /></label>
+              <button className="btn-secondary" onClick={() => setTick(t => t + 1)} title="Actualiser" style={{ width: 'auto' }}>↻</button>
+              <button className="btn-primary" disabled={!cur} onClick={exportXlsx} style={{ width: 'auto', background: '#1d6f42', borderColor: '#1d6f42', fontWeight: 800 }}>⬇️ Excel</button>
             </div>
-            <button className={day === todayKey() ? 'btn-primary' : 'btn-secondary'} onClick={() => setDay(todayKey())}>Aujourd'hui</button>
-            <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ padding: 8, borderRadius: 10, border: '1px solid var(--line)', fontSize: 14 }} />
-            <button className="btn-secondary" onClick={() => setTick(t => t + 1)}>↻</button>
-            <button className="btn-primary" disabled={!cmd} onClick={exportXlsx} style={{ background: '#1d6f42', borderColor: '#1d6f42', fontSize: 15, fontWeight: 800 }}>⬇️ Excel complet</button>
-          </div>
-          <div style={{ background: '#fff3e0', border: '3px solid #ef6c00', borderRadius: 14, padding: '12px 16px', fontSize: 19, fontWeight: 900, color: '#a64b00' }}>
-            ⏰ Fin des commandes clients à 10h
-            <div style={{ fontSize: 14, fontWeight: 600, marginTop: 2 }}>Vers 10h les commandes exactes sont chargées et la MU se met à jour : les rajouts de dernière minute apparaissent en bas de cette page.</div>
+            <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 12, background: '#f1f8e9', border: '1px solid #c5e1a5', fontSize: 16, lineHeight: 1.5 }}>
+              <div>📅 Aujourd'hui nous sommes le <b>{longDay(today)}</b>.</div>
+              <div>🥬 Commande pour la <b>prépa du {longDay(day)}</b> → distribution du <b>{longDay(addDays(day, 1))}</b> (lendemain).{day !== today && <span style={{ color: '#ef6c00', fontWeight: 800 }}> · date choisie</span>}</div>
+            </div>
+            <div style={{ display: 'flex', gap: 4, marginTop: 12, padding: 4, background: 'var(--bg-muted)', borderRadius: 12 }}>
+              <Seg k="sent" l="📨 Commande envoyée à 5h" />
+              <Seg k="live" l="⏳ Commande en cours (direct)" />
+            </div>
           </div>
           {data === undefined && <div className="card" style={{ padding: 18, fontSize: 18 }}>Chargement de la commande…</div>}
           {data === null && <div className="card" style={{ padding: 16, border: '2px solid var(--danger)' }}><div style={{ fontWeight: 900, color: 'var(--danger)', fontSize: 17 }}>⚠️ Commande illisible</div><div style={{ fontSize: 14, marginTop: 4 }}>{err}</div></div>}
-          {cmd && (
+          {data && (
             <>
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <Big l="Produits" v={rows.length} c="#1565c0" />
-                <Big l="Colis à commander" v={n1(totC)} c="#2e7d32" />
-                <Big l="Rajouts dernière minute" v={raj.length ? n1(totR) + ' colis' : '—'} c="#e65100" />
+                <Big l={mode === 'live' ? 'Colis — commande en cours' : 'Colis — commande 5h'} v={cur ? n1(totC) : '—'} c="#2e7d32" />
+                <Big l="Produits" v={cur ? rows.length : '—'} c="#1565c0" />
+                <Big l="➕ Colis ajouts Rungis" v={aj.length ? n1(totA) : '0'} c="#e65100" />
               </div>
-              <div style={{ fontSize: 15, fontWeight: 800, color: cmd.live ? '#ef6c00' : '#2e7d32' }}>
-                {cmd.live ? '⏳ Pas encore envoyée : aperçu en direct du fichier (le mail part à 5h).' : `✅ Reçue par mail à ${String(cmd.sentAt).slice(-5).replace(':', 'h')}`}
-                {cmd.fileUrl ? <> · <a href={cmd.fileUrl} target="_blank" rel="noreferrer" style={{ color: '#1565c0' }}>ouvrir le Google Sheet</a></> : null}
-              </div>
-              {cmd.warn && <div style={{ background: '#fdecea', border: '2px solid #c62828', borderRadius: 12, padding: '10px 14px', fontWeight: 800, color: '#c62828' }}>⚠️ {cmd.warn}</div>}
-              <div className="card" style={{ padding: 0, overflow: 'auto', maxHeight: '70vh' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                  <thead><tr><th style={th}>CODE PROBON</th><th style={th}>PRODUCTEUR</th><th style={th}>DÉSIGNATION</th><th style={{ ...th, textAlign: 'right' }}>COLIS</th><th style={{ ...th, textAlign: 'right' }}>COLISAGE</th><th style={{ ...th, textAlign: 'right' }}>PA HT</th></tr></thead>
-                  <tbody>
-                    {rows.map((r, i) => (
-                      <tr key={i} style={{ background: i % 2 ? '#f6faf6' : '#fff', borderTop: '1px solid var(--line)' }}>
-                        <td style={{ padding: '10px', fontSize: 20, fontWeight: 900, color: '#1a4d2e', whiteSpace: 'nowrap' }}>{r.code || '—'}</td>
-                        <td style={{ padding: '10px', fontSize: 14, color: 'var(--ink-soft)' }}>{r.producteur}</td>
-                        <td style={{ padding: '10px', fontSize: 17, fontWeight: 700 }}>{r.designation}</td>
-                        <td style={{ padding: '10px', textAlign: 'right' }}><span style={{ display: 'inline-block', minWidth: 60, textAlign: 'center', background: '#2e7d32', color: '#fff', borderRadius: 10, padding: '4px 10px', fontSize: 22, fontWeight: 900 }}>{n1(r.colis)}</span></td>
-                        <td style={{ padding: '10px', textAlign: 'right', fontSize: 14 }}>{r.col || ''}</td>
-                        <td style={{ padding: '10px', textAlign: 'right', fontSize: 14, whiteSpace: 'nowrap' }}>{r.pa ? eur(r.pa) : ''}</td>
-                      </tr>))}
-                    {!rows.length && <tr><td colSpan={6} style={{ padding: 18, fontSize: 17, textAlign: 'center' }}>Aucun colis à commander.</td></tr>}
-                  </tbody>
-                </table>
+              <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #2e7d32' }}>
+                <div style={{ background: '#2e7d32', color: '#fff', padding: '12px 16px' }}>
+                  <div style={{ fontSize: 20, fontWeight: 900 }}>{mode === 'live' ? '⏳ Commande en cours' : '📨 Commande envoyée à 5h'}</div>
+                  <div style={{ fontSize: 13.5, opacity: .95 }}>{mode === 'live'
+                    ? `État du fichier COMMANDE FL maintenant (${live ? live.at : ''}) — ce qui partirait si on envoyait.`
+                    : sent ? `Ventes à 5h + 15 %, en colis · reçue par mail le ${sent.sentAt}` : 'Aucune commande envoyée ce jour-là.'}
+                    {mode === 'sent' && sent && sent.fileUrl ? <> · <a href={sent.fileUrl} target="_blank" rel="noreferrer" style={{ color: '#fff', fontWeight: 800 }}>ouvrir le fichier</a></> : null}</div>
+                </div>
+                {mode === 'sent' && sent && sent.warn && <div style={{ background: '#fdecea', color: '#c62828', fontWeight: 800, padding: '8px 16px' }}>⚠️ {sent.warn}</div>}
+                <Table list={rows} color="#2e7d32" bg="#e8f5e9" colorTxt="#1a4d2e" empty={mode === 'sent' && !sent ? 'Pas de commande à 5h ce jour-là. Regarde « Commande en cours » ou choisis une autre date.' : 'Aucun colis à commander.'} />
               </div>
               <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #e65100' }}>
-                <div style={{ background: '#e65100', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>⚡ Rajouts de dernière minute {raj.length ? '· ' + raj.length + ' ligne(s)' : ''}</div>
-                {!raj.length ? <div style={{ padding: 16, fontSize: 16, color: 'var(--ink-soft)' }}>Aucun rajout pour l'instant. Ils apparaissent ici dès que Kelbongoo les envoie (après la prépa).</div> : (
-                  <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                    <thead><tr><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>HEURE</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>CODE PROBON</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>PRODUCTEUR</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00' }}>DÉSIGNATION</th><th style={{ ...th, background: '#fff3e0', color: '#a64b00', textAlign: 'right' }}>COLIS</th></tr></thead>
-                    <tbody>{raj.map((r, i) => (
-                      <tr key={i} style={{ borderTop: '1px solid var(--line)' }}>
-                        <td style={{ padding: 10, fontSize: 14, whiteSpace: 'nowrap' }}>{String(r.at).slice(11, 16).replace(':', 'h')}<div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{r.by}</div></td>
-                        <td style={{ padding: 10, fontSize: 20, fontWeight: 900, color: '#a64b00' }}>{r.code || '—'}</td>
-                        <td style={{ padding: 10, fontSize: 14, color: 'var(--ink-soft)' }}>{r.producteur}</td>
-                        <td style={{ padding: 10, fontSize: 17, fontWeight: 700 }}>{r.designation}<div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 500 }}>distribution du {r.distrib ? formatDateShort(r.distrib) : '—'} · manque {r.manque}</div></td>
-                        <td style={{ padding: 10, textAlign: 'right' }}><span style={{ display: 'inline-block', minWidth: 54, textAlign: 'center', background: '#e65100', color: '#fff', borderRadius: 10, padding: '4px 10px', fontSize: 22, fontWeight: 900 }}>{n1(r.colis)}</span></td>
-                      </tr>))}</tbody>
-                  </table></div>
-                )}
+                <div style={{ background: '#e65100', color: '#fff', padding: '12px 16px' }}>
+                  <div style={{ fontSize: 20, fontWeight: 900 }}>➕ Ajouts Rungis · à livrer avec cette commande</div>
+                  <div style={{ fontSize: 13.5, opacity: .95 }}>Demandés la veille au soir ({longDay(addDays(day, -1))}) après la clôture de la prépa, pour compléter les commandes clients qui n'ont pas eu leurs produits.</div>
+                </div>
+                <Table list={aj} color="#e65100" bg="#fff3e0" colorTxt="#a64b00" empty={`Aucun ajout pour cette commande${new Date(day + 'T12:00:00').getDay() === 2 ? ' (mardi : pas de prépa la veille)' : ''}.`} />
+                {aj.length > 0 && <div style={{ padding: '8px 16px', fontSize: 13, color: 'var(--ink-soft)' }}>Envoyé par {[...new Set(aj.map(r => r.by).filter(Boolean))].join(', ') || '—'} le {(() => { const t = String(aj[0].at); return t.slice(8, 10) + '/' + t.slice(5, 7) + ' à ' + t.slice(11, 16).replace(':', 'h'); })()}</div>}
               </div>
             </>
           )}
@@ -22233,69 +22308,81 @@
       );
     }
 
-    // Enlèvements, version lisible : 4 blocs (à valider · aujourd'hui · à venir · passés), une ligne par boutique
+    // Enlèvements, version lisible : tout part de l'entrepôt PDP ; une ligne = quoi, pour quelle boutique, quand.
     function RungisEnlClearPage() {
+      const showToast = React.useContext(ToastContext);
       const enl = useKbEnlevements();
       const [runs, setRuns] = React.useState([]);
       const [picks, setPicks] = React.useState([]);
       React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
       React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
+      const isAdmin = !!(window.__kbClaims && window.__kbClaims.admin === true);
       const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
       const today = todayKey();
-      const all = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, addDays(today, -7), addDays(today, 30)), [enl.list, runs, today]);
+      const all = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, addDays(today, -7), addDays(today, 30)).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, today, pk]);
       const pending = enl.list.filter(r => r.status === 'envoye' || r.status === 'attente-23h59');
+      const hide = async (l) => {
+        if (!confirm(`Supprimer cette ligne ?\n\n${l.site} · ${l.label}\n\nElle disparaît aussi de l'écran du chauffeur.`)) return;
+        try { await storage.setDoc('rungis_picks', l.id, { id: l.id, kind: l.kind, ref: l.id, site: l.site, label: l.label, day: l.when, status: 'hidden', by: 'master', at: new Date().toISOString(), motif: '', note: '', alertOk: false }); showToast('🗑️ Ligne supprimée'); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
       const groups = [
-        { k: 'today', t: "📅 Aujourd'hui", c: '#1565c0', f: l => l.when === today },
+        { k: 'today', t: "📅 À prendre aujourd'hui", c: '#1565c0', f: l => l.when === today },
         { k: 'next', t: '🔜 À venir', c: '#2e7d32', f: l => l.when > today },
         { k: 'past', t: '✔️ Passés (7 jours)', c: '#607d8b', f: l => l.when < today },
       ];
       const stateOf = (l) => {
-        if (l.info) return ['🥬 via rolls Kelbongoo', 'var(--ink-mute)'];
+        if (l.info) return ['🥬 dans les rolls Kelbongoo', 'var(--ink-mute)'];
         if (l.refused) return ['❌ non récupérée (' + (KB_ENL_MOTIFS[l.refused.motif] || l.refused.motif) + ')', '#c62828'];
         const p = pk[l.id];
-        if (p && p.status === 'ok') return ['✅ pris' + (p.at ? ' ' + kbHhmm(p.at) : '') + (p.by ? ' · ' + p.by : ''), '#2e7d32'];
+        if (p && p.status === 'ok') return ['✅ pris' + (p.at ? ' à ' + kbHhmm(p.at) : '') + (p.by ? ' · ' + p.by : ''), '#2e7d32'];
         if (p && p.status === 'missed') return ['❌ pas pris — ' + ((KB_RG_MOTIFS.find(m => m.k === p.motif) || {}).l || p.motif) + (p.note ? ' « ' + p.note + ' »' : ''), '#c62828'];
-        return ['⏳ à prendre', '#ef6c00'];
+        return ['⏳ pas encore pris', '#ef6c00'];
       };
-      const th = { textAlign: 'left', padding: '9px 10px', fontSize: 13, fontWeight: 800, background: 'var(--bg-muted)' };
+      const th = { textAlign: 'left', padding: '10px 12px', fontSize: 13, fontWeight: 800, background: 'var(--bg-muted)' };
       const Table = ({ lines }) => (
         <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead><tr><th style={th}>BOUTIQUE</th><th style={th}>QUOI</th><th style={th}>À PRENDRE</th><th style={th}>LIVRAISON</th><th style={th}>ÉTAT CHAUFFEUR</th></tr></thead>
-          <tbody>{lines.map(l => { const [s, c] = stateOf(l); return (
+          <thead><tr><th style={th}>LIVRER À</th><th style={th}>QUOI (à prendre à PDP)</th><th style={th}>PRENDRE À PDP</th><th style={th}>LIVRER</th><th style={th}>CHAUFFEUR</th>{isAdmin && <th style={th}></th>}</tr></thead>
+          <tbody>{lines.map(l => { const [st, c] = stateOf(l); return (
             <tr key={l.id} style={{ borderTop: '1px solid var(--line)' }}>
-              <td style={{ padding: 10, whiteSpace: 'nowrap' }}><span style={{ display: 'inline-block', background: SITE_NAMES[l.site] ? kbSiteColor(l.site) : '#607d8b', color: '#fff', borderRadius: 8, padding: '3px 10px', fontSize: 18, fontWeight: 900 }}>{l.site}</span><div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>{siteLabel(l.site) !== l.site ? siteLabel(l.site) : (KB_ENL_STORE_LONG[l.site] || '')}</div></td>
-              <td style={{ padding: 10 }}><div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><KbPhoto src={l.photo} size={56} /><div><div style={{ fontSize: 16, fontWeight: 800 }}>{l.label}</div>{l.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</div>}{l.note && <div style={{ fontSize: 13, color: '#8d6e00' }}>ℹ️ {l.note}</div>}</div></div></td>
-              <td style={{ padding: 10, fontSize: 15, fontWeight: 700, whiteSpace: 'nowrap' }}>{l.kind === 'roll' ? '—' : kbRgDayLbl(l.when)}</td>
-              <td style={{ padding: 10, fontSize: 15, fontWeight: 700, whiteSpace: 'nowrap', color: '#1565c0' }}>{kbRgDayLbl(l.liv)}</td>
-              <td style={{ padding: 10, fontSize: 14, fontWeight: 800, color: c }}>{s}</td>
+              <td style={{ padding: 12, whiteSpace: 'nowrap' }}><span style={{ display: 'inline-block', background: SITE_NAMES[l.site] ? kbSiteColor(l.site) : '#607d8b', color: '#fff', borderRadius: 8, padding: '4px 12px', fontSize: 19, fontWeight: 900 }}>{l.site}</span><div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 3 }}>{siteLabel(l.site) !== l.site ? siteLabel(l.site) : (KB_ENL_STORE_LONG[l.site] || '')}</div></td>
+              <td style={{ padding: 12 }}><div style={{ display: 'flex', gap: 10, alignItems: 'center' }}><KbPhoto src={l.photo} size={56} /><div><div style={{ fontSize: 17, fontWeight: 800 }}>{l.label}</div>{l.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</div>}{l.note && <div style={{ fontSize: 13, color: '#8d6e00' }}>ℹ️ {l.note}</div>}</div></div></td>
+              <td style={{ padding: 12, fontSize: 15, fontWeight: 800, whiteSpace: 'nowrap' }}>{kbRgDayLbl(l.when)}</td>
+              <td style={{ padding: 12, fontSize: 15, fontWeight: 800, whiteSpace: 'nowrap', color: '#1565c0' }}>{kbRgDayLbl(l.liv)}</td>
+              <td style={{ padding: 12, fontSize: 14, fontWeight: 800, color: c }}>{st}</td>
+              {isAdmin && <td style={{ padding: 12, textAlign: 'right' }}><button className="btn-ghost" title="Supprimer cette ligne (master)" onClick={() => hide(l)} style={{ fontSize: 18 }}>🗑️</button></td>}
             </tr>); })}</tbody>
         </table></div>
       );
       return (
         <div className="stack">
-          <div className="card" style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <div style={{ flex: 1, minWidth: 220 }}>
+          <div className="card" style={{ padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <div style={{ flex: '1 1 260px' }}>
               <h2 style={{ margin: 0, fontSize: 24 }}>📦 Enlèvements Rungis</h2>
-              <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 2 }}>Ce que le camion prend à PDP pour chaque boutique, et ce que le chauffeur a réellement chargé.</div>
+              <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 2 }}>Ce que le camion prend à l'entrepôt PDP pour chaque boutique, et ce que le chauffeur a vraiment chargé.</div>
             </div>
-            <button className="btn-secondary" onClick={enl.reload}>↻ Actualiser</button>
+            <button className="btn-secondary" onClick={enl.reload} style={{ width: 'auto' }}>↻ Actualiser</button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, background: '#1a4d2e', color: '#fff', borderRadius: 16, padding: '14px 18px' }}>
+            <span style={{ fontSize: 38 }}>🏭</span>
+            <span><b style={{ fontSize: 20, display: 'block' }}>Tout se récupère à l'entrepôt PDP — Porte de Pantin</b><span style={{ fontSize: 14, opacity: .9 }}>Palettes Dispatch / Picking, dollies fromage et rolls Kelbongoo, puis livraison à la boutique indiquée.</span></span>
           </div>
           {enl.raw === undefined && <div className="card" style={{ padding: 16 }}>Chargement…</div>}
           {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 800 }}>⚠️ Centrale PDP injoignable ({enl.err})</div>}
           {pending.length > 0 && (
             <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #ef6c00' }}>
-              <div style={{ background: '#ef6c00', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>🟠 À valider par Rungis · {pending.length}</div>
+              <div style={{ background: '#ef6c00', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 900 }}>🟠 Demandes en attente de validation Rungis · {pending.length}</div>
               {pending.map(r => {
                 const items = kbEnlItems(r);
                 const stores = [...new Set(items.map(it => String(it.code || '?').toUpperCase()))].sort();
-                return <div key={r.id} style={{ padding: '10px 16px', borderTop: '1px solid var(--line)', fontSize: 16 }}><b>Demande du {r.date || formatDateShort(new Date(r.at || r.receivedAt || Date.now()))}</b> · {stores.join(' · ')} · {items.length} ligne(s) <span style={{ color: '#ef6c00', fontWeight: 800 }}>{(KB_ENL_STATUS[r.status] || [r.status])[0]}</span></div>;
+                return <div key={r.id} style={{ padding: '12px 16px', borderTop: '1px solid var(--line)', fontSize: 16 }}><b>Demande du {r.date || formatDateShort(new Date(r.at || r.receivedAt || Date.now()))}</b> · livrer à {stores.join(', ')} · {items.length} ligne(s) · <span style={{ color: '#ef6c00', fontWeight: 800 }}>{(KB_ENL_STATUS[r.status] || [r.status])[0]}</span></div>;
               })}
             </div>
           )}
           {groups.map(g => {
             const ls = all.filter(g.f).sort((a, b) => (g.k === 'past' ? b.when.localeCompare(a.when) : a.when.localeCompare(b.when)) || a.site.localeCompare(b.site));
             if (!ls.length && g.k !== 'today') return null;
-            const body = ls.length ? <Table lines={ls} /> : <div style={{ padding: 16, fontSize: 16, color: 'var(--ink-soft)' }}>Rien de prévu aujourd'hui.</div>;
+            const body = ls.length ? <Table lines={ls} /> : <div style={{ padding: 16, fontSize: 16, color: 'var(--ink-soft)' }}>Rien à prendre aujourd'hui.</div>;
             if (g.k === 'past') return <details key={g.k} className="card" style={{ padding: 0, overflow: 'hidden' }}><summary style={{ padding: '12px 16px', fontSize: 18, fontWeight: 900, cursor: 'pointer', color: g.c }}>{g.t} · {ls.length}</summary>{body}</details>;
             return (
               <div key={g.k} className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid ' + g.c }}>
@@ -22304,7 +22391,7 @@
               </div>
             );
           })}
-          <div className="card" style={{ padding: '8px 12px', fontSize: 12, color: 'var(--ink-mute)' }}>🏭 Dispatch = palette fournisseur éclatée · 📦 Picking = préparée depuis le stock · 🥬 Kelbongoo = rolls de commandes clients (nombre envoyé à la clôture de prépa). État chauffeur = ce qu'il a coché dans l'appli.</div>
+          <div className="card" style={{ padding: '8px 12px', fontSize: 12, color: 'var(--ink-mute)' }}>🏭 Dispatch = palette fournisseur éclatée · 📦 Picking = préparée depuis le stock · 🥬 Kelbongoo = rolls des commandes clients (nombre envoyé à la clôture de prépa).{isAdmin ? ' · 🗑️ = supprimer une ligne inutile (master).' : ''}</div>
         </div>
       );
     }
