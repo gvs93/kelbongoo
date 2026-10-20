@@ -764,7 +764,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.23';
+    const APP_VERSION = 'V10.24';
+    // V10.24 — Inventaire « disparu » : les comptages sont rangés par date ET par mode (matin/soir) ; après 10h le mardi l'appli
+    //   rouvrait en « soir » → liste vide. Mode mémorisé par date + bascule automatique vers le mode qui a des comptages,
+    //   bandeau « inventaire retrouvé ». Historique master : lisait inventory_<date> (toujours vide) → lit _matin/_soir, détail produit par produit, « Ouvrir ».
     // V10.23 — Inventaire tournant : périmètre « 🧀 Fromage » (catégorie/famille fromage, repli sur le nom).
     // V10.22 — Inventaire : recherche aussi dans tout le catalogue (producerproducts), pas seulement la feuille de stock ; « bœuf » = « boeuf » ; recherche par mots.
     // V10.21 — « MAJ inventaire F&L » déplacé dans Pilotage (bouton), retiré de la page Fruits & légumes.
@@ -6199,7 +6202,7 @@
     // ============================================================
     // HISTORIQUE INVENTAIRE (réservé master) — qui a compté / appris quoi
     // ============================================================
-    function InventoryHistory() {
+    function InventoryHistory({ onOpen }) {
       const [metas, setMetas] = React.useState(null);
       const [flMetas, setFlMetas] = React.useState(null);
       const [learn, setLearn] = React.useState(null);
@@ -6247,16 +6250,23 @@
         setExpanded(date);
         if (!detail[date]) {
           try {
-            const arr = await storage.getAll(`inventory_${date}`);
-            const byPerson = {}; let units = 0, lastAt = '';
-            for (const it of arr) {
+            // V10.24 — les comptages sont dans inventory_<date>_matin / _soir (+ ancien format inventory_<date>).
+            const sets = [];
+            for (const md of ['matin', 'soir', '']) {
+              try { const a = await storage.getAll(md ? `inventory_${date}_${md}` : `inventory_${date}`); if (a && a.length) sets.push({ mode: md || 'ancien', items: a }); } catch(e){}
+            }
+            const byPerson = {}; let units = 0, lastAt = ''; const items = [];
+            for (const st of sets) for (const it of st.items) {
               const who = it.countedBy || '—';
               byPerson[who] = (byPerson[who]||0) + 1;
               units += (it.qty||0);
               if (it.countedAt && it.countedAt > lastAt) lastAt = it.countedAt;
+              const pr = prodById[it.id] || {};
+              items.push({ id: it.id, mode: st.mode, name: it.produit || pr.name || it.id, producer: pr.producer || '', qty: it.qty || 0, by: who, at: it.countedAt || '' });
             }
-            setDetail(d => ({ ...d, [date]: { byPerson, totalProducts: arr.length, totalUnits: units, lastAt } }));
-          } catch(e){ setDetail(d => ({ ...d, [date]: { byPerson:{}, totalProducts:0, totalUnits:0, lastAt:'' } })); }
+            items.sort((a,b) => (b.at||'').localeCompare(a.at||''));
+            setDetail(d => ({ ...d, [date]: { byPerson, totalProducts: items.length, totalUnits: units, lastAt, items, modes: sets.map(x => ({ mode: x.mode, n: x.items.length })) } }));
+          } catch(e){ setDetail(d => ({ ...d, [date]: { byPerson:{}, totalProducts:0, totalUnits:0, lastAt:'', items:[], modes:[] } })); }
         }
       };
 
@@ -6308,13 +6318,38 @@
                   </div>
                   {expanded===m.id && detail[m.id] && (
                     <div style={{padding:'8px 10px',borderTop:'1px solid var(--border)',background:'var(--bg2,#f7f7f7)',fontSize:13}}>
-                      <div style={{marginBottom:6}}>{detail[m.id].totalProducts} produit(s) compté(s) · {detail[m.id].totalUnits} unité(s) au total</div>
+                      <div style={{marginBottom:6}}>{detail[m.id].totalProducts} produit(s) compté(s) · {detail[m.id].totalUnits} unité(s) au total{detail[m.id].lastAt ? ` · dernier comptage ${fmt(detail[m.id].lastAt)}` : ''}</div>
+                      {(detail[m.id].modes||[]).length > 0 && onOpen && (
+                        <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:8}}>
+                          {detail[m.id].modes.filter(x=>x.mode!=='ancien').map(x => (
+                            <button key={x.mode} className="btn-primary" style={{fontSize:13,padding:'7px 12px'}} onClick={()=>onOpen(m.id, x.mode)}>↩️ Ouvrir ({x.mode==='matin'?'🌅 matin':'🌙 soir'} · {x.n} prod.)</button>
+                          ))}
+                        </div>
+                      )}
                       <div style={{fontWeight:600,fontSize:12,marginBottom:3}}>Participants</div>
                       {Object.keys(detail[m.id].byPerson).length===0 ? <div style={{color:'var(--ink-mute)'}}>—</div> :
                         Object.entries(detail[m.id].byPerson).sort((a,b)=>b[1]-a[1]).map(([who,n]) => (
                           <div key={who} style={{display:'flex',justifyContent:'space-between',padding:'2px 0'}}><span>{who}</span><span>{n} produit(s)</span></div>
                         ))
                       }
+                      {(detail[m.id].items||[]).length > 0 && (
+                        <details style={{marginTop:8}} open={detail[m.id].items.length <= 40}>
+                          <summary style={{fontWeight:600,fontSize:12,cursor:'pointer'}}>📋 Ce qui a été compté ({detail[m.id].items.length})</summary>
+                          <div style={{maxHeight:'45vh',overflowY:'auto',marginTop:4}}>
+                            <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                              <thead><tr style={{textAlign:'left',color:'var(--ink-mute)'}}><th style={{padding:'3px 4px'}}>Produit</th><th style={{padding:'3px 4px',textAlign:'right'}}>Qté</th><th style={{padding:'3px 4px'}}>Par</th><th style={{padding:'3px 4px'}}>Quand</th><th style={{padding:'3px 4px'}}>Mode</th></tr></thead>
+                              <tbody>{detail[m.id].items.map((it,i) => (
+                                <tr key={it.mode+'_'+it.id+'_'+i} style={{borderTop:'1px solid var(--border)'}}>
+                                  <td style={{padding:'3px 4px'}}><b>{it.name}</b>{it.producer?<span style={{color:'var(--ink-mute)'}}> · {it.producer}</span>:null}</td>
+                                  <td style={{padding:'3px 4px',textAlign:'right',fontWeight:800}}>{it.qty}</td>
+                                  <td style={{padding:'3px 4px'}}>{it.by}</td>
+                                  <td style={{padding:'3px 4px',whiteSpace:'nowrap'}}>{fmt(it.at)}</td>
+                                  <td style={{padding:'3px 4px'}}>{it.mode==='matin'?'🌅':it.mode==='soir'?'🌙':'—'}</td>
+                                </tr>))}</tbody>
+                            </table>
+                          </div>
+                        </details>
+                      )}
                     </div>
                   )}
                 </div>
@@ -7270,6 +7305,26 @@
           }
         })();
       }, []);
+      // V10.24 — combien de produits comptés dans chaque mode pour la date (pour retrouver un inventaire « disparu »).
+      const [modeCounts, setModeCounts] = React.useState({ matin: 0, soir: 0 });
+      const [modeAuto, setModeAuto] = React.useState('');
+      React.useEffect(() => {
+        setModeAuto(''); setModeCounts({ matin: -1, soir: -1 }); // -1 = pas encore lu pour cette date
+        const subs = ['matin', 'soir'].map(md => storage.subscribe(`inventory_${invDate}_${md}`, (arr) => {
+          setModeCounts(prev => ({ ...prev, [md]: (arr || []).length }));
+        }));
+        return () => { subs.forEach(u => { try { u && u(); } catch(e){} }); };
+      }, [invDate]);
+      // Mode vide alors que l'autre mode a des comptages pour cette date → on bascule (une fois par date).
+      const modeAutoDone = React.useRef('');
+      React.useEffect(() => {
+        const other = mode === 'matin' ? 'soir' : 'matin';
+        if (modeAutoDone.current === invDate) return;
+        if (modeCounts.matin < 0 || modeCounts.soir < 0) return;
+        if (modeCounts[mode] === 0 && modeCounts[other] > 0) {
+          modeAutoDone.current = invDate; setModeAuto(other); setMode(other);
+        }
+      }, [modeCounts, mode, invDate]);
       React.useEffect(() => {
         setCounts({});
         const u = storage.subscribe(`inventory_${invDate}_${mode}`, (arr) => {
@@ -7417,7 +7472,7 @@
         // Indexe la date (fusion : ne touche pas au type/périmètre éventuellement déjà posés)
         try {
           await storage.setDoc('inventory_meta', invDate, {
-            date: invDate, type: invType, scopeKind, scopeValue,
+            date: invDate, type: invType, scopeKind, scopeValue, mode,
             lastBy: session.name, lastAt: new Date().toISOString(),
           });
         } catch(e){}
@@ -7761,7 +7816,24 @@
                 <div style={{fontWeight:600}}>📜 Historique des inventaires <span style={{fontWeight:400,fontSize:12,color:'var(--ink-mute)'}}>(master)</span></div>
                 <span style={{fontSize:13,color:'var(--master)'}}>{showHistory ? 'Masquer ▲' : 'Ouvrir ▼'}</span>
               </div>
-              {showHistory && <InventoryHistory />}
+              {showHistory && <InventoryHistory onOpen={(date, md) => { modeAutoDone.current = date; setModeAuto(''); setInvDate(date); setMode(md); try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e){} showToast(`↩️ Inventaire du ${date} (${md}) ouvert`); }} />}
+            </div>
+          )}
+
+          {(modeCounts.matin > 0 || modeCounts.soir > 0) && (
+            <div className="card" style={{borderLeft:`3px solid ${modeAuto ? 'var(--warn)' : 'var(--info)'}`,padding:'10px 12px'}}>
+              {modeAuto && <div style={{fontWeight:800,color:'var(--warn)',marginBottom:4}}>↩️ Inventaire retrouvé : il avait été compté en mode {modeAuto==='matin'?'🌅 matin':'🌙 soir'}.</div>}
+              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',fontSize:13}}>
+                <span>Comptages du {invDate} :</span>
+                {['matin','soir'].map(md => (
+                  <button key={md} onClick={()=>{ modeAutoDone.current = invDate; setModeAuto(''); setMode(md); }}
+                    className={mode===md ? 'btn-primary' : ''}
+                    style={{fontSize:13,padding:'6px 10px',borderRadius:8,border:mode===md?'none':'1px solid var(--border)',background:mode===md?undefined:'transparent',cursor:'pointer'}}>
+                    {md==='matin'?'🌅 Matin':'🌙 Soir'} · {Math.max(0, modeCounts[md]||0)} prod.
+                  </button>
+                ))}
+                {modeCounts.matin > 0 && modeCounts.soir > 0 && <span style={{fontSize:12,color:'var(--warn)'}}>⚠️ deux comptages ce jour-là — vérifie lequel clôturer</span>}
+              </div>
             </div>
           )}
 
