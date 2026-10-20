@@ -764,7 +764,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.24';
+    const APP_VERSION = 'V10.25';
+    // V10.25 — Inventaire tournant 🧀 Fromage : catégorie producerproducts uniquement (plus de repli sur le nom), tri A→Z ; tri mémorisé.
+    // V10.25 — Master : « 📋 Inventaires » dans Historique (qui a compté quoi, quand) + « Ouvrir » → page Inventaire en master
+    //   (nouvelle entrée « 📋 Inventaire » dans Opérations).
     // V10.24 — Inventaire « disparu » : les comptages sont rangés par date ET par mode (matin/soir) ; après 10h le mardi l'appli
     //   rouvrait en « soir » → liste vide. Mode mémorisé par date + bascule automatique vers le mode qui a des comptages,
     //   bandeau « inventaire retrouvé ». Historique master : lisait inventory_<date> (toujours vide) → lit _matin/_soir, détail produit par produit, « Ouvrir ».
@@ -3051,16 +3054,11 @@
       return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
         .replace(/œ/g, 'oe').replace(/æ/g, 'ae').replace(/ß/g, 'ss').replace(/[’‘`]/g, "'");
     }
-    // V10.23 — fromage pour l'inventaire tournant : catégorie / famille « fromage » du catalogue,
-    // sinon nom de fromage connu (KB_CHEESE_RX) en excluant yaourts, beurre, crème, lait.
+    // V10.23/V10.25 — fromage pour l'inventaire tournant : UNIQUEMENT la catégorie du catalogue producerproducts
+    // (category_name) contenant « fromage ». Pas de repli sur le nom ni la famille (ex. « Halloumi à griller » hors fromage).
     function kbInvIsCheese(p) {
       if (!p) return false;
-      const cf = normalizeText((p.category || '') + ' ' + (p.family || p.famille || ''));
-      if (/fromage/.test(cf)) return true;
-      if (cf.trim() && !/cremerie|produits? laitiers?|laitage|cremer/.test(cf)) return false;
-      const n = normalizeText(p.name || '');
-      if (/\b(yaourt|yogourt|yoghourt|beurre|creme|lait (entier|demi|ecreme|cru|frais)|dessert|kefir|skyr)\b/.test(n)) return false;
-      try { return KB_CHEESE_RX.test(n); } catch (e) { return /fromage/.test(n); }
+      return /\bfromages?\b/.test(normalizeText(p.category || ''));
     }
     // V10.22 — recherche par mots : « saucisson boeuf 220 » trouve « Saucisson de bœuf nature 220g Bio ».
     function kbSearchMatch(text, q) {
@@ -6202,12 +6200,12 @@
     // ============================================================
     // HISTORIQUE INVENTAIRE (réservé master) — qui a compté / appris quoi
     // ============================================================
-    function InventoryHistory({ onOpen }) {
+    function InventoryHistory({ onOpen, defaultTab }) {
       const [metas, setMetas] = React.useState(null);
       const [flMetas, setFlMetas] = React.useState(null);
       const [learn, setLearn] = React.useState(null);
       const [prodById, setProdById] = React.useState({});
-      const [tab, setTab] = React.useState('fl'); // 'fl' | 'inv' | 'learn' — FL en premier
+      const [tab, setTab] = React.useState(defaultTab || 'fl'); // 'fl' | 'inv' | 'learn' — FL en premier
       const [expanded, setExpanded] = React.useState(null);
       const [detail, setDetail] = React.useState({});
       const [logs, setLogs] = React.useState(null); // journal des clôtures (inventory_log)
@@ -7197,7 +7195,9 @@
       const [counts, setCounts] = React.useState({});
       const [countMeta, setCountMeta] = React.useState({}); // {id: {by, at}} — qui a compté (multi-utilisateur)
       const [search, setSearch] = React.useState('');
-      const [invSort, setInvSort] = React.useState('fournisseur'); // 'nom' | 'famille' | 'fournisseur'
+      // V10.25 — tri mémorisé sur l'appareil ; le périmètre 🧀 Fromage passe en ordre alphabétique.
+      const [invSort, setInvSortRaw] = React.useState(() => { try { return localStorage.getItem('kbg_inv_sort') || 'fournisseur'; } catch (e) { return 'fournisseur'; } }); // 'nom' | 'famille' | 'fournisseur'
+      const setInvSort = (v) => { setInvSortRaw(v); try { localStorage.setItem('kbg_inv_sort', v); } catch (e) {} };
       const [scanMode, setScanMode] = React.useState(false);
       const [scanInput, setScanInput] = React.useState('');
       const [pendingEan, setPendingEan] = React.useState(null);
@@ -7206,11 +7206,14 @@
       const [lastUnknownCode, setLastUnknownCode] = React.useState(null); // dernier code non trouvé
       const [dlcInputs, setDlcInputs] = React.useState({}); // {productId: 'YYYY-MM-DD'} — DLC saisie pendant l'inventaire
       const [dlcExpandedId, setDlcExpandedId] = React.useState(null); // produit dont le champ DLC est ouvert
-      const [invDate, setInvDate] = React.useState(() => todayKey()); // date d'inventaire libre, par défaut aujourd'hui
+      // V10.25 — ouverture demandée depuis Historique (master) : { date, mode } mémorisé avant la navigation.
+      const kbInvOpenReq = (() => { try { const r = JSON.parse(localStorage.getItem('kbg_inv_open') || 'null'); if (r && r.date && (Date.now() - (r.at||0)) < 120000) { localStorage.removeItem('kbg_inv_open'); return r; } } catch (e) {} return null; })();
+      const kbInvOpenRef = React.useRef(kbInvOpenReq);
+      const [invDate, setInvDate] = React.useState(() => (kbInvOpenRef.current && kbInvOpenRef.current.date) || todayKey()); // date d'inventaire libre, par défaut aujourd'hui
       // Mode d'inventaire :
       //   'matin' → mardi avant 10h uniquement → écrit "Inventaire soir" de la feuille de la VEILLE (vendredi), écrase
       //   'soir'  → tous les jours après prépa → écrit "Inventaire soir" de la feuille DU JOUR, n'écrase pas (signale conflits)
-      const [mode, setMode] = React.useState(() => (new Date().getDay() === 2 && new Date().getHours() < 10) ? 'matin' : 'soir');
+      const [mode, setMode] = React.useState(() => (kbInvOpenRef.current && kbInvOpenRef.current.mode) || ((new Date().getDay() === 2 && new Date().getHours() < 10) ? 'matin' : 'soir'));
       const [closingInv, setClosingInv] = React.useState(false); // état d'envoi à la clôture
       const [invType, setInvType] = React.useState('complet'); // 'complet' | 'tournant'
       // Clôture d'inventaire (complet/tournant) : verrou + réutilisation du MÊME
@@ -7316,7 +7319,7 @@
         return () => { subs.forEach(u => { try { u && u(); } catch(e){} }); };
       }, [invDate]);
       // Mode vide alors que l'autre mode a des comptages pour cette date → on bascule (une fois par date).
-      const modeAutoDone = React.useRef('');
+      const modeAutoDone = React.useRef(kbInvOpenRef.current ? kbInvOpenRef.current.date : '');
       React.useEffect(() => {
         const other = mode === 'matin' ? 'soir' : 'matin';
         if (modeAutoDone.current === invDate) return;
@@ -7356,6 +7359,7 @@
               // On le remappe vers « category » pour conserver le comportement.
               setScopeKind(meta.scopeKind === 'family' && meta.scopeValueLevel !== 'family' ? 'category' : (meta.scopeKind || 'producer'));
               setScopeValue(meta.scopeValue || '');
+              if (meta.scopeKind === 'fromage') setInvSortRaw('nom'); // V10.25 — fromages par ordre alphabétique
             } else {
               setInvType('complet'); setScopeValue('');
             }
@@ -7880,7 +7884,7 @@
               <div>
                 <div className="filter-row" style={{marginBottom:6}}>
                   <div className={`chip ${scopeKind==='fromage'?'selected':''}`} style={{fontWeight:800}}
-                    onClick={()=>{ setScopeKind('fromage'); setScopeValue('fromage'); saveMeta({scopeKind:'fromage', scopeValue:'fromage'}); }}>🧀 Fromage</div>
+                    onClick={()=>{ setScopeKind('fromage'); setScopeValue('fromage'); setInvSortRaw('nom'); saveMeta({scopeKind:'fromage', scopeValue:'fromage'}); }}>🧀 Fromage</div>
                   <div className={`chip ${scopeKind==='producer'?'selected':''}`}
                     onClick={()=>{ setScopeKind('producer'); setScopeValue(''); saveMeta({scopeKind:'producer', scopeValue:''}); }}>Par producteur</div>
                   <div className={`chip ${scopeKind==='type'?'selected':''}`}
@@ -8024,7 +8028,7 @@
               </div>
               <div className="filter-row" style={{marginBottom:8}}>
                 <span style={{fontSize:12,color:'var(--ink-mute)',alignSelf:'center',marginRight:2}}>Trier :</span>
-                <div className={`chip ${invSort==='nom'?'selected':''}`} onClick={()=>setInvSort('nom')}>🔤 Nom</div>
+                <div className={`chip ${invSort==='nom'?'selected':''}`} onClick={()=>setInvSort('nom')}>🔤 Nom (A→Z)</div>
                 <div className={`chip ${invSort==='fournisseur'?'selected':''}`} onClick={()=>setInvSort('fournisseur')}>🧺 Fournisseur</div>
                 {hasFamilies && <div className={`chip ${invSort==='famille'?'selected':''}`} onClick={()=>setInvSort('famille')}>🗂️ Famille</div>}
               </div>
@@ -25225,6 +25229,7 @@
             <div className={`chip ${histTab==='dlc'?'selected':''}`} onClick={()=>setHistTab('dlc')}>🟠 DLC</div>
             <div className={`chip ${histTab==='pdp'?'selected':''}`} onClick={()=>setHistTab('pdp')}>↩️ Retours PDP</div>
             <div className={`chip ${histTab==='temp'?'selected':''}`} onClick={()=>setHistTab('temp')}>🌡️ Température</div>
+            <div className={`chip ${histTab==='inv'?'selected':''}`} onClick={()=>setHistTab('inv')}>📋 Inventaires</div>
           </div>
           {histTab === 'prep' && <PrepHistoryView />}
           {histTab === 'nd' && <NdHistoryPage session={session} />}
@@ -25232,6 +25237,15 @@
           {histTab === 'dlc' && <HistoryDlcView />}
           {histTab === 'pdp' && <HistoryPdpView />}
           {histTab === 'temp' && <HistoryTempView />}
+          {histTab === 'inv' && (
+            <div className="card">
+              <div style={{fontSize:13,color:'var(--ink-soft)',marginBottom:6}}>Clique une date pour voir <b>ce qui a été compté</b> (produit, quantité, qui, quand, matin/soir), puis « ↩️ Ouvrir » pour le reprendre.</div>
+              <InventoryHistory defaultTab="inv" onOpen={(date, md) => {
+                try { localStorage.setItem('kbg_inv_open', JSON.stringify({ date, mode: md, at: Date.now() })); } catch (e) {}
+                try { window.dispatchEvent(new CustomEvent('kb-go-tab', { detail: session && session.isMaster ? 'minv' : 'inventory' })); } catch (e) {}
+              }} />
+            </div>
+          )}
         </div>
       );
     }
@@ -26467,6 +26481,7 @@
           {tab === 'casuivi' && effSession.isMaster && <CaSuiviPage session={effSession} />}
           {tab === 'manqhist' && effSession.isMaster && <ManquantsHistoryPage session={effSession} />}
           {tab === 'histo' && effSession.isMaster && <HistoryPage session={effSession} />}
+          {tab === 'minv' && effSession.isMaster && <InventoryPage session={effSession} />}
           {tab === 'tempmaster' && effSession.isMaster && <TempMasterPage session={effSession} />}
           {tab === 'stats' && effSession.isMaster && <StatsPage session={effSession} />}
           {tab === 'admin' && effSession.isMaster && <AdminPage session={effSession} adminEmail={effSession.adminEmail || ''} ordersMeta={ordersMeta} productsMeta={productsMeta} consumersMeta={consumersMeta} catalogueMeta={catalogueMeta} />}
@@ -26583,6 +26598,7 @@
           <Item k="fl" em="🥬" label="Fruits & légumes" on={tab === 'fl'} onClick={() => goTab('fl')} dot={kbFlAutoDot()} />
           <Item k="pain" em="🍞" label="Commande pain" on={tab === 'mpain'} onClick={() => goTab('mpain')} />
           <Item k="dom" em="🏷️" label="Étiquettes livraison DOM" on={tab === 'mdom'} onClick={() => goTab('mdom')} />
+          <Item k="inv" em="📋" label="Inventaire" on={tab === 'minv'} onClick={() => goTab('minv')} />
           <Item k="load" em="📥" label="Chargement" on={tab === 'admin'} onClick={() => goTab('admin')} />
           <div className="kb-side-sec">Outils</div>
           {P('temp', 'Température', '🌡️')}{P('codes', 'Codes-barres', '🏷️')}{P('dromy', 'Dromy', '🛵')}{P('lieux', 'Lieux & horaires', '📍')}{P('cmails', 'Mails clients', '📧', !!mailErr)}{P('ancien', 'Ancien site', '🔁')}
