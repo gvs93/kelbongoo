@@ -764,7 +764,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.31';
+    const APP_VERSION = 'V10.32';
     // V10.31 — 📍 Lieux = source unique : Master › Pilotage › Lieux & horaires pilote la liste des lieux partout
     //   (choix du lieu à la connexion distrib, sélecteur master, calendrier des distributions, boutiques à casiers, noms).
     //   Chaque lieu : jours de distribution cliquables (Lun→Dim) + horaires ; nouveau lieu entièrement réglable ;
@@ -8983,7 +8983,7 @@
         for (const it of (o.items || [])) {
           const produit = it.produit || '(produit)';
           const k = site + '||' + client + '||' + produit;
-          const base = { site, client, email: o.email || '', casier: cas[0] || '', orderId: o.orderId || '', produit, producteur: it.producteur || '', qty: it.qty || 1, prix: it.consumer_price || 0 };
+          const base = { site, client, email: o.email || '', casier: cas[0] || '', casiers: cas, orderId: o.orderId || '', produit, producteur: it.producteur || '', qty: it.qty || 1, prix: it.consumer_price || 0 };
           if (!ps && !o._test) { const pk = (it.producteur || '') + '||' + produit; ordered[pk] = (ordered[pk] || 0) + (it.qty || 1); }
           if (prep.status[k] === 'rupture') {
             if (ps) { psRupt++; continue; }
@@ -9388,7 +9388,7 @@
         const r = bp.find(x => x.producteur === p.producteur && x.produit === p.produit);
         return { key: p.produit + (p.producteur ? ' ' + p.producteur : ''), produit: p.produit, producteur: p.producteur, ordered: p.ordered, cat: p.cat,
           done: p.lines > 0 && p.fin === p.lines, rupture: r ? r.qty : 0, full: !!(r && r.full),
-          cas: r ? r.clients.map(c => ({ loc: c.site, num: String(c.casier || '?'), n: c.qty || 1, lab: c.site + ' ' + String(c.casier || '?') })) : [],
+          cas: r ? r.clients.map(c => ({ loc: c.site, num: String(c.casier || '?'), n: c.qty || 1, lab: c.site + ' ' + String(c.casier || '?'), alts: (c.casiers || []).map(x => c.site + ' ' + String(x)), client: c.client })) : [], // V10.32 (+) alts = tous les casiers du client
           sig: kbHashLive(p.sig.sort().join('|')) };
       }).sort((a, b) => a.produit.localeCompare(b.produit));
       const _anyStatus = Object.keys(d._prep.status || {}).some(k => !!d._prep.status[k]);
@@ -9400,16 +9400,32 @@
     // Publie l'état toutes les 2 min dans window.__kbAncienLive (lu par le script Tampermonkey v2
     // sur l'onglet de l'ancien admin, même navigateur). Tant que le mode est actif ET que cette page
     // est ouverte, la déconnexion auto pour inactivité est suspendue sur CE poste.
-    function AncienSyncPosteCard() {
-      const [on, setOn] = React.useState(() => { try { return localStorage.getItem('kb_sync_poste') === '1'; } catch (_) { return false; } });
-      const [last, setLast] = React.useState(null);
-      const [err, setErr] = React.useState('');
-      const [ack, setAck] = React.useState(null);
+    // V10.32 — MOTEUR GLOBAL du poste synchro. Avant : la publication vivait DANS la carte de Pilotage › Ancien site ;
+    //   dès que l'appli rechargeait (mise à jour, onglet réveillé) elle repartait sur « Aujourd'hui » → carte démontée →
+    //   plus rien publié, déconnexion auto réactivée, Tampermonkey bloqué en « appli muette ».
+    //   Désormais : monté à la racine de l'appli pour le master, actif dès que kb_sync_poste = 1 sur ce PC, quelle que soit la page.
+    //   + l'état (publication + retour du script) est écrit dans Firestore app_config/ancien_sync → visible depuis le téléphone.
+    const kbSyncBus = { last: null, err: '', ack: null, subs: new Set(), emit() { this.subs.forEach(f => { try { f(); } catch (_) {} }); } };
+    const kbSyncPosteOn = () => { try { return localStorage.getItem('kb_sync_poste') === '1'; } catch (_) { return false; } };
+    function kbSetSyncPoste(v) { try { localStorage.setItem('kb_sync_poste', v ? '1' : '0'); } catch (_) {} window.dispatchEvent(new CustomEvent('kb-sync-poste-change')); }
+    function useKbSyncBus() { const [, f] = React.useState(0); React.useEffect(() => { const s = () => f(x => x + 1); kbSyncBus.subs.add(s); return () => { kbSyncBus.subs.delete(s); }; }, []); return kbSyncBus; }
+    function KbAncienSyncRunner({ who }) {
+      const [on, setOn] = React.useState(kbSyncPosteOn);
+      React.useEffect(() => { const h = () => setOn(kbSyncPosteOn()); window.addEventListener('kb-sync-poste-change', h); window.addEventListener('storage', h); return () => { window.removeEventListener('kb-sync-poste-change', h); window.removeEventListener('storage', h); }; }, []);
       React.useEffect(() => {
-        try { localStorage.setItem('kb_sync_poste', on ? '1' : '0'); } catch (_) {}
         window.__kbSyncPoste = on;
-        if (!on) return;
-        let stop = false;
+        if (!on) { kbSyncBus.last = null; kbSyncBus.ack = null; kbSyncBus.emit(); return; }
+        let stop = false, lastSave = 0, lastSig = '';
+        const save = async (force) => {
+          const L = kbSyncBus.last, A = kbSyncBus.ack;
+          const sig = JSON.stringify([L && L.at, A && A.at, A && A.state, A && A.warn, kbSyncBus.err]);
+          if (!force && (sig === lastSig || Date.now() - lastSave < 60000)) return;
+          lastSig = sig; lastSave = Date.now();
+          const doc = { poste: who || '?', publishedAt: L ? L.at : 0, day: (L && L.day) || '', started: !!(L && L.started), closed: !!(L && L.closed),
+            nProducts: L ? L.products.length : 0, nDone: L ? L.products.filter(p => p.done).length : 0, nRupt: L ? L.products.filter(p => p.done && p.rupture > 0).length : 0,
+            err: kbSyncBus.err || '', ack: A ? { at: A.at || 0, day: A.day || '', applied: A.applied || 0, warn: A.warn || 0, nd: A.nd || 0, todo: A.todo == null ? null : A.todo, state: String(A.state || '').slice(0, 200), script: A.script || '', warns: (A.warns || []).slice(-15).map(w => ({ at: w.at || 0, msg: String(w.msg || '').slice(0, 180) })) } : null };
+          try { await storage.setDoc('app_config', 'ancien_sync', doc, { replace: true }); } catch (_) {}
+        };
         const tick = async () => {
           try {
             // V9.98 — jour de PRÉPA (distribution suivante), jamais activeDay() (= distribution du jour sur le poste master)
@@ -9417,7 +9433,7 @@
             if (stop) return;
             if (!pd || pd <= todayKey()) {
               const r0 = { v: 2, day: pd || '', at: Date.now(), started: false, closed: false, nAncien: 0, products: [], recapText: '', idle: 'aucune distribution future avec commandes' };
-              window.__kbAncienLive = r0; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r0); setErr(''); return;
+              window.__kbAncienLive = r0; window.dispatchEvent(new CustomEvent('kb-ancien-live')); kbSyncBus.last = r0; kbSyncBus.err = ''; kbSyncBus.emit(); save(true); return;
             }
             const r = await kbAncienLive(pd); if (stop) return;
             r.v = 2;
@@ -9425,36 +9441,77 @@
             r.started = r.products.some(p => p.done) || !!(r._anyStatus);
             if (!r.started) { r.products = r.products.map(p => Object.assign({}, p, { done: false })); r.closed = false; }
             delete r._anyStatus;
-            window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); setLast(r); setErr('');
+            window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); kbSyncBus.last = r; kbSyncBus.err = ''; kbSyncBus.emit(); save(true);
           }
-          catch (e) { if (!stop) setErr(e.message || String(e)); }
+          catch (e) { if (!stop) { kbSyncBus.err = e.message || String(e); kbSyncBus.emit(); save(false); } }
         };
         tick();
         const t = setInterval(tick, 2 * 60 * 1000);
-        const a = setInterval(() => setAck(window.__kbSyncAck || null), 5000);
-        return () => { stop = true; clearInterval(t); clearInterval(a); window.__kbSyncPoste = false; };
+        const a = setInterval(() => { const A = window.__kbSyncAck || null; if (JSON.stringify(A) !== JSON.stringify(kbSyncBus.ack)) { kbSyncBus.ack = A; kbSyncBus.emit(); } save(false); }, 5000);
+        // onglet réveillé (veille du PC, onglet en arrière-plan) → republication immédiate
+        const vis = () => { if (document.visibilityState === 'visible') tick(); };
+        document.addEventListener('visibilitychange', vis);
+        return () => { stop = true; clearInterval(t); clearInterval(a); document.removeEventListener('visibilitychange', vis); window.__kbSyncPoste = false; };
+      }, [on, who]);
+      return null;
+    }
+
+    // Carte « 📡 Poste synchro ancien site » (Master › Pilotage › Ancien site).
+    // V10.32 : la carte ne fait plus que piloter / afficher. Sur le poste synchro : état local en direct.
+    // Sur un autre appareil (téléphone) : état lu dans Firestore app_config/ancien_sync (rafraîchi toutes les 30 s).
+    function AncienSyncPosteCard() {
+      const bus = useKbSyncBus();
+      const [on, setOn] = React.useState(kbSyncPosteOn);
+      React.useEffect(() => { const h = () => setOn(kbSyncPosteOn()); window.addEventListener('kb-sync-poste-change', h); return () => window.removeEventListener('kb-sync-poste-change', h); }, []);
+      const [remote, setRemote] = React.useState(null);
+      React.useEffect(() => {
+        if (on) { setRemote(null); return; }
+        let stop = false;
+        const ld = () => storage.getDoc('app_config', 'ancien_sync').then(d => { if (!stop) setRemote(d || null); }).catch(() => {});
+        ld(); const t = setInterval(ld, 30000);
+        return () => { stop = true; clearInterval(t); };
       }, [on]);
-      const nDone = last ? last.products.filter(p => p.done).length : 0;
       const hm = (ts) => ts ? new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—';
+      const dayLbl = (k) => k ? new Date(k + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+      // vue commune (local ou distante)
+      const v = on
+        ? (bus.last ? { publishedAt: bus.last.at, day: bus.last.day, started: bus.last.started, closed: bus.last.closed, nProducts: bus.last.products.length, nDone: bus.last.products.filter(p => p.done).length, err: bus.err, ack: bus.ack } : (bus.err ? { err: bus.err } : null))
+        : remote;
+      const mins = (ts) => ts ? Math.round((Date.now() - ts) / 60000) : null;
+      const pubAge = v ? mins(v.publishedAt) : null, ackAge = v && v.ack ? mins(v.ack.at) : null;
+      const pubOk = pubAge != null && pubAge <= 5, ackOk = ackAge != null && ackAge <= 5;
+      const A = v && v.ack;
+      const big = { padding: '10px 12px', borderRadius: 10, fontSize: 15, fontWeight: 700, marginTop: 8 };
       return (
         <div className="card">
           <h3 style={{ marginBottom: 6 }}>📡 Poste synchro ancien site (toute la journée)</h3>
-          <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>À activer sur <b>le PC qui garde l'ancien admin ouvert</b> (avec le script Tampermonkey v2). Chaque produit terminé en prépa est reporté automatiquement sur l'ancien site, au fil de l'eau. Laisser <b>cette page ouverte</b> sur ce PC.</div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>À activer sur <b>le PC qui garde l'ancien admin ouvert</b> (script Tampermonkey v3.3). La synchro continue même si l'appli revient sur « Aujourd'hui » ou se recharge. Depuis ton téléphone, cette carte montre où en est le PC.</div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-            <button className={on ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => setOn(v => !v)}>{on ? '🟢 Synchro active — arrêter' : '▶️ Activer la synchro sur ce poste'}</button>
-            {on && <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Dernière publication {hm(last && last.at)} · {nDone}/{last ? last.products.length : 0} produits terminés en prépa{last && last.closed ? ' · 🔒 prépa clôturée' : ''}</span>}
+            <button className={on ? 'btn-primary' : 'btn-secondary'} style={kbBtnSm} onClick={() => kbSetSyncPoste(!on)}>{on ? '🟢 Ce PC est le poste synchro — arrêter' : '▶️ Faire de ce PC le poste synchro'}</button>
+            {!on && <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Vue à distance · rafraîchie toutes les 30 s</span>}
           </div>
-          {on && last && (
-            <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, fontSize: 15, fontWeight: 700,
-              background: last.day && last.started ? '#eaf1e6' : '#fff4e5', color: last.day && last.started ? '#2f5326' : '#8a4b00' }}>
-              {last.day
-                ? <>🗓️ Publié pour la prépa de la distribution du <span style={{ textTransform: 'capitalize' }}>{new Date(last.day + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })}</span>{last.started ? '' : ' — ⏸️ prépa pas commencée : rien n\'est reporté'}</>
-                : <>⏸️ Aucune distribution future avec commandes — rien n'est reporté</>}
+          {!v && !on && <div style={{ ...big, background: '#fff4e5', color: '#8a4b00' }}>Aucun poste synchro n'a encore publié.</div>}
+          {v && <>
+            <div style={{ ...big, background: pubOk ? '#eaf1e6' : '#fdecea', color: pubOk ? '#2f5326' : '#a12622' }}>
+              {pubOk ? '🟢' : '🔴'} Appli (poste {on ? 'ce PC' : (v.poste || '?')}) : {pubOk ? `publie · dernière fois ${hm(v.publishedAt)}` : `muette depuis ${hm(v.publishedAt)}${pubAge != null ? ` (${pubAge} min)` : ''} — PC éteint / en veille / onglet fermé ?`}
+              {v.day ? <div style={{ fontSize: 14, marginTop: 4 }}>🗓️ Prépa de la distribution du <span style={{ textTransform: 'capitalize' }}>{dayLbl(v.day)}</span> · {v.nDone || 0}/{v.nProducts || 0} produits terminés{v.closed ? ' · 🔒 clôturée' : ''}{v.started ? '' : ' · ⏸️ pas commencée'}</div>
+                : <div style={{ fontSize: 14, marginTop: 4 }}>⏸️ Aucune distribution future avec commandes</div>}
             </div>
-          )}
-          {on && ack && <div style={{ fontSize: 12, marginTop: 6, color: ack.warn ? 'var(--warn)' : 'var(--accent-dark,#2e7d32)' }}>Ancien admin : {ack.applied || 0} produit(s) reporté(s) · {ack.warn || 0} à vérifier · dernier passage {hm(ack.at)}{ack.state ? ' · ' + ack.state : ''}</div>}
-          {on && !ack && <div style={{ fontSize: 12, marginTop: 6, color: 'var(--warn)' }}>⚠️ Pas encore de signal du script sur l'ancien admin (onglet ouvert ? script v2 installé ? mode auto activé ?).</div>}
-          {err && <div className="alert-red" style={{ fontSize: 12, marginTop: 6 }}>Erreur : {err}</div>}
+            <div style={{ ...big, background: !A ? '#fff4e5' : ackOk ? (A.warn ? '#fff4e5' : '#eaf1e6') : '#fdecea', color: !A ? '#8a4b00' : ackOk ? (A.warn ? '#8a4b00' : '#2f5326') : '#a12622' }}>
+              {!A ? '⚠️ Aucun signal du script Tampermonkey (onglet ancien admin ouvert ? script v3.3 ? mode auto ?)'
+                : <>{ackOk ? (A.warn ? '🟠' : '🟢') : '🔴'} Ancien admin ({A.script || 'script'}) : <b>{A.applied || 0}</b> reporté(s) · <b>{A.warn || 0}</b> à vérifier{A.todo != null ? <> · <b>{A.todo}</b> restant(s)</> : null}
+                  <div style={{ fontSize: 13, fontWeight: 600, marginTop: 4 }}>{ackOk ? '' : `⛔ script muet depuis ${hm(A.at)} — `}{A.state || ''}</div></>}
+            </div>
+            {A && A.warns && A.warns.length > 0 && (
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ cursor: 'pointer', fontWeight: 700, fontSize: 14 }}>⚠️ {A.warns.length} point(s) à vérifier à la main</summary>
+                <div style={{ maxHeight: '40vh', overflowY: 'auto', fontSize: 13 }}>
+                  {A.warns.slice().reverse().map((w, i) => <div key={i} style={{ padding: '6px 0', borderBottom: '1px solid var(--line)' }}><span style={{ color: 'var(--ink-mute)' }}>{hm(w.at)}</span> {w.msg}</div>)}
+                </div>
+              </details>
+            )}
+          </>}
+          {v && v.err && <div className="alert-red" style={{ fontSize: 12, marginTop: 6 }}>Erreur : {v.err}</div>}
         </div>
       );
     }
@@ -27240,6 +27297,7 @@
           {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
           {tab === 'suivi' && effSession.isMaster && <SuiviGeneralPage session={effSession} />}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
+          {session && (session.isMaster || session.role === 'master') && <KbAncienSyncRunner who={session.name} />}{/* V10.32 — poste synchro ancien site, quelle que soit la page */}
           {tab === 'today' && effSession.isMaster && <KbTodayPage session={effSession} setTab={setTab} />}
           {tab === 'mpain' && effSession.isMaster && <PrintPainPage session={effSession} master />}
           {tab === 'mdom' && effSession.isMaster && <PrintLabelsPage session={effSession} embedded />}
