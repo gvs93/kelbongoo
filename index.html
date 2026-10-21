@@ -764,7 +764,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.36';
+    const APP_VERSION = 'V10.38';
+    // V10.38 — (21/10/2026) Distrib › Ranger la dernière minute : TOUS les casiers du client sur chaque ligne (plus besoin d'ouvrir le client).
+    // V10.37 — (21/10/2026) Distrib : casiers regroupés en UN bloc compact (7 · 8 · 25) ; client ARRIVÉ → PARTI
+    //   (bloc « En cours » en haut, partagé entre les téléphones du lieu) ; recherche par n° de casier ;
+    //   produits par ordre alphabétique dans la commande ; NOUVEAU CLIENT = 1re commande (first_order_date) bien visible
+    //   + aide « à lui expliquer » ; bandeau dispatch dernière minute retiré quand tout est rangé / fait ;
+    //   badge « Oublis casier » ne compte plus les oublis déjà traités.
     // V10.36 — (21/10/2026) Journal synchro : message « modifié après report » corrigé (le script ne refait PAS un produit
     //   déjà reporté → correction à la main). À utiliser avec Tampermonkey v3.4 (statut produit par produit + produit en cours).
     // V10.35 — (21/10/2026) Stats prépa : 🥕 prépa casier et ⚖️ MU séparées (MU lue dans mu_<veille>) ; vitesse comparée
@@ -2155,6 +2161,7 @@
           tel: (c.telephone || c.phone || '').replace(/\s+/g, ''),
           addr: kbAddrFrom(c),   // V9.59 — adresse (livraison domicile → fichier Dromy) ; V10.29 address_street/zip/city lus
           depotPorte: kbDepotPorte(c),
+          firstOrder: kbConsDay(c.first_order_date), // V10.37 — date de 1re commande (Paris) → « nouveau client »
         };
         // V10.29 — dernier créneau de livraison à domicile choisi par le client (dates UTC → heure de Paris à l'usage)
         const _lr = c.livdomDeliveryRange;
@@ -2187,6 +2194,7 @@
       // Index secondaire du fichier clients par e-mail (repli quand l'id ne matche pas).
       const consByEmail = {};
       for (const _k in consById) { const _e = consById[_k] && consById[_k].email; if (_e) consByEmail[_e] = consById[_k]; }
+      const _consLoaded = Object.keys(consById || {}).length > 0; // V10.37 — sans fichier clients, personne n'est « nouveau »
 
       for (const o of arr) {
         const status = o.status;
@@ -2229,7 +2237,11 @@
           status,
           site: (o.locale || '').trim().toUpperCase(),
           consumerId: cid,
-          newClient: !cons,   // absent du fichier consumers chargé → « nouveau client »
+          // V10.37 — nouveau client = c'est SA 1re commande : absent du fichier clients, ou 1re commande (first_order_date)
+          //   au plus tôt la veille de la création de cette commande
+          newClient: _consLoaded && (() => { if (!cons) return true; if (!cons.firstOrder) return true;
+            const _ts = kbOrderTs(o); const _od = _ts ? kbParisParts(_ts).ymd : null;
+            return _od ? cons.firstOrder >= addDays(_od, -1) : false; })(),
           name: cons ? cons.nom : (`${o.firstname||''} ${o.lastname||''}`.trim() || String(o.consumer_name||o.name||'').trim() || String(o.consumer_email||o.email||'').trim() || '(client inconnu)'),
           email: cons ? cons.email : String(o.consumer_email||o.email||'').trim().toLowerCase(),
           tel: cons ? cons.tel : String(o.tel||o.telephone||o.phone||'').replace(/\s+/g,''),
@@ -3041,6 +3053,7 @@
         reduced: sorted.flatMap(o => o.reduced || []),
         _subOrderIds: sorted.map(o => o.orderId),
         _mergedCount: sorted.length,
+        newClient: sorted.some(o => o.newClient), // V10.37
       };
     }
 
@@ -4404,6 +4417,9 @@
       );
     }
 
+    // V10.37 — produits d'une commande par ordre alphabétique (nom affiché, sans tenir compte des accents/majuscules)
+    function kbAlpha(arr) { return [...(arr || [])].sort((a, b) => kbProdName(a.produit || '').localeCompare(kbProdName(b.produit || ''), 'fr', { sensitivity: 'base', numeric: true })); }
+
     function ClientsPage({ session, currentSite, orders, isClosed, dispatch, lastminute }) {
       const [statuses, setStatuses] = React.useState([]);
       const [refunds, setRefunds] = React.useState([]);
@@ -4491,6 +4507,24 @@
         kbPresence(session, { task: 'Distribution', site: currentSite, done: visible.filter(isPassed).length, total: visible.length, unit: 'retraits', taskAt: Date.now() });
       }, [visible, statusMap, currentSite]);
 
+      // V10.37 — client ARRIVÉ (au comptoir, en cours de service) → PARTI (= passé). Partagé entre les téléphones du lieu.
+      const isArrived = (o) => !isPassed(o) && (o._subOrderIds || [o.orderId]).some(id => statusMap[id]?.arrived);
+      const arrivedAt = (o) => (o._subOrderIds || [o.orderId]).map(id => statusMap[id]?.arrivedAt).filter(Boolean).sort()[0] || '';
+      const setArrived = async (order, on) => {
+        if (isClosed) return;
+        const ids = order._subOrderIds || [order.orderId];
+        const at = new Date().toISOString();
+        try {
+          for (const id of ids) {
+            await storage.setDoc(`day_${activeDay()}_statuses`, id, on
+              ? { orderId: id, site: currentSite, passed: false, arrived: true, arrivedAt: at, arrivedBy: session.name, consumer_name: displayName(order) }
+              : { orderId: id, site: currentSite, arrived: false, arrivedAt: '', arrivedBy: '' });
+          }
+        } catch (e) { alert('Enregistrement impossible : ' + (e.message || e)); }
+      };
+      const [, kbTick] = React.useState(0); // rafraîchit « depuis X min »
+      React.useEffect(() => { const t = setInterval(() => kbTick(x => x + 1), 30000); return () => clearInterval(t); }, []);
+
       const togglePassed = async (order) => {
         if (isClosed) return;
         const newPassed = !isPassed(order);
@@ -4499,6 +4533,7 @@
           await storage.setDoc(`day_${activeDay()}_statuses`, id, {
             orderId: id, site: currentSite,
             passed: newPassed,
+            arrived: false, ...(newPassed ? { leftAt: new Date().toISOString() } : { arrivedAt: '', leftAt: '' }),
             consumer_name: displayName(order),
             email: order.email,
             telephone: order.telephone || '',
@@ -4509,11 +4544,16 @@
         }
       };
 
+      const casierHit = (o, q) => [...(o.casiersFrais || []), ...(o.casiersSec || [])].some(c => String(c).trim().replace(/^0+/, '') === q);
+      const searchNum = /^\s*\d+\s*$/.test(search) ? search.trim().replace(/^0+/, '') : '';
       const filtered = visible.filter(o => {
         const passed = isPassed(o);
-        if (filter === 'passed' && !passed) return false;
-        if (filter === 'not_passed' && passed) return false;
+        if (!search.trim()) { // V10.37 — une recherche cherche dans TOUS les clients (passés compris)
+          if (filter === 'passed' && !passed) return false;
+          if (filter === 'not_passed' && passed) return false;
+        }
         if (search) {
+          if (searchNum) return casierHit(o, searchNum); // V10.37 — n° de casier : correspondance exacte
           const s = normalizeText(search);
           if (!s) return true;
           const inName = normalizeText(displayName(o)).includes(s);
@@ -4523,6 +4563,8 @@
         }
         return true;
       }).sort((a, b) => displayName(a).localeCompare(displayName(b)));
+      const enCours = visible.filter(isArrived).sort((a, b) => arrivedAt(a).localeCompare(arrivedAt(b)));
+      const minSince = (iso) => { const ms = Date.parse(iso); return ms ? Math.max(0, Math.floor((Date.now() - ms) / 60000)) : 0; };
 
       const stats = {
         total: visible.length,
@@ -4566,6 +4608,10 @@
 
           {lmAttr.lines.length > 0 && (() => {
             const nbTodo = Object.entries(lmAttr.byClient).reduce((t, [k, arr]) => t + arr.filter(x => !lmDone[kbLmDoneId(x.lmId, k)]).length, 0);
+            // V10.37 — tout est rangé : le bandeau disparaît (petit lien discret pour revoir / corriger)
+            if (nbTodo === 0) return (
+              <button className="btn-ghost" onClick={() => setLmOpen(true)} style={{ alignSelf: 'flex-start', fontSize: 12, padding: '2px 8px', color: 'var(--ink-mute)' }}>✅ Dernière minute rangée · revoir</button>
+            );
             return (
               <button onClick={() => setLmOpen(true)} style={{ display:'block', width:'100%', textAlign:'left', cursor:'pointer', border:'4px solid var(--danger)', borderRadius:14, background:'#fff5f5', padding:'12px 14px', boxShadow:'var(--shadow-sm)' }}>
                 <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
@@ -4602,9 +4648,35 @@
             </div>
           ) : (
             <>
+              {/* V10.37 — clients ARRIVÉS, en cours de service : en haut, en gros, pour gérer 3-4 clients à la fois */}
+              {enCours.length > 0 && (
+                <div style={{ border: '4px solid #f9a825', borderRadius: 14, background: '#fffde7', padding: '10px 12px', boxShadow: 'var(--shadow-sm)' }}>
+                  <div style={{ fontSize: 15, fontWeight: 900, color: '#a66f00', textTransform: 'uppercase', letterSpacing: '.03em', marginBottom: 6 }}>🙋 Au comptoir · {enCours.length} client{enCours.length > 1 ? 's' : ''}</div>
+                  {enCours.map((o, i) => {
+                    const cf = o.casiersFrais || [], cs = o.casiersSec || [], m = minSince(arrivedAt(o));
+                    return (
+                      <div key={o.orderId} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: i ? '2px dashed #f3d77a' : 'none' }}>
+                        <div onClick={() => setSelectedClient(o)} style={{ flex: 1, minWidth: 0, cursor: 'pointer' }}>
+                          <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.1, wordBreak: 'break-word' }}>{displayName(o)}{o.newClient && <span style={{ marginLeft: 6, fontSize: 13, fontWeight: 900, background: '#2C5CC5', color: '#fff', borderRadius: 6, padding: '1px 6px', verticalAlign: 'middle' }}>🆕 NOUVEAU</span>}</div>
+                          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginTop: 2 }}>
+                            {cf.length > 0 && <span style={{ fontSize: 26, fontWeight: 900, color: 'var(--accent-dark)' }}>🧊 {cf.join(' · ')}</span>}
+                            {cs.length > 0 && <span style={{ fontSize: 22, fontWeight: 900, color: 'var(--warn)' }}>🍞 {cs.join(' · ')}</span>}
+                            <span style={{ fontSize: 12, fontWeight: 700, color: m >= 10 ? 'var(--danger)' : 'var(--ink-mute)' }}>depuis {m} min</span>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: '0 0 auto' }}>
+                          <button className="btn-primary" disabled={isClosed} onClick={() => togglePassed(o)} style={{ padding: '12px 14px', fontSize: 16, fontWeight: 900, minWidth: 100 }}>✓ Parti</button>
+                          <button className="btn-ghost" disabled={isClosed} onClick={() => setArrived(o, false)} style={{ fontSize: 11, padding: '2px 6px' }}>↩ pas arrivé</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               <div className="search-box">
-                <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Rechercher…" />
+                <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Nom ou n° de casier…" />
               </div>
+              {searchNum && <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-soft)', marginTop: -4 }}>🔢 Casier n°{searchNum} · {filtered.length ? filtered.length + ' client' + (filtered.length > 1 ? 's' : '') : 'aucun client'} (passés compris)</div>}
               <div className="filter-row">
                 <div className={`chip ${filter==='not_passed'?'selected':''}`} onClick={()=>setFilter('not_passed')}>Non passés ({stats.notPassed})</div>
                 <div className={`chip ${filter==='passed'?'selected':''}`} onClick={()=>setFilter('passed')}>Passés ({stats.passed})</div>
@@ -4630,9 +4702,9 @@
                     const casiersFrais = isV4 ? (o.casiersFrais || []) : (cd ? cd.frais.map(f => f.casier) : []);
                     const casiersSec   = isV4 ? (o.casiersSec || [])   : (cd ? cd.sec.map(s => s.casier) : []);
                     // Pain / ND / frais
-                    const pains      = isV4 ? (o.pains || []) : (cd ? cd.sec.flatMap(s => s.produits) : []);
+                    const pains      = kbAlpha(isV4 ? (o.pains || []) : (cd ? cd.sec.flatMap(s => s.produits) : []));
                     // V10.00 — ND en dernière minute (🟣) : affiché UNE fois, dans l'encadré rouge (plus de doublon)
-                    const ndItems    = isV4 ? (o.nds || []).filter(p => !p._lm) : [];
+                    const ndItems    = isV4 ? kbAlpha((o.nds || []).filter(p => !p._lm)) : [];
                     const fraisItems = isV4 ? (o.frais || []) : (cd ? cd.frais.flatMap(f => f.produits) : []);
                     // Dispatch dernière minute pour les casiers de ce client (inchangé)
                     const lmItems = lmAttr.byClient[kbClientKey(o)] || [];
@@ -4650,8 +4722,9 @@
                               <span title="Nombre d'articles réellement livrés (hors ruptures)" style={{marginLeft:8,display:'inline-block',fontSize:15,fontWeight:900,color:'#fff',background:'var(--ink)',borderRadius:8,padding:'1px 8px',verticalAlign:'middle'}}>🛒 {nbArt} art.</span>
                             )}
                             {o.newClient && (
-                              <span className="badge" style={{marginLeft:6,background:'#EAF1FC',color:'#2C5CC5',fontSize:10,fontWeight:700}} title="Client absent de la dernière liste consumers chargée">🆕 nouveau</span>
+                              <span title="1re commande : lui expliquer le fonctionnement" style={{marginLeft:8,display:'inline-block',fontSize:14,fontWeight:900,color:'#fff',background:'#2C5CC5',borderRadius:8,padding:'2px 8px',verticalAlign:'middle'}}>🆕 NOUVEAU CLIENT</span>
                             )}
+                            {isArrived(o) && <span style={{marginLeft:8,display:'inline-block',fontSize:13,fontWeight:900,color:'#a66f00',background:'#fff3c4',border:'2px solid #f9a825',borderRadius:8,padding:'1px 8px',verticalAlign:'middle'}}>🙋 au comptoir</span>}
                             {o._mergedCount > 1 && (
                               <span className="badge" style={{marginLeft:6,background:'var(--info-soft)',color:'var(--info)',fontSize:10}}>🔗 fusionné ×{o._mergedCount}</span>
                             )}
@@ -4679,7 +4752,6 @@
                               ))}
                             </div>
                           )}
-                          {(() => { const ko = (o.removed || []).filter(r => r._lmKo), a = ko.length ? kbAckOk(lmDone, 'ko', kbClientKey(o), ko) : null; return a ? <KbAckDone a={a} txt="rupture finalement retirée dans l'ancienne appli" onUndo={() => kbAckSet('ko', kbClientKey(o), ko, false, session.name)} /> : null; })()}
                           {(o.removed || []).some(r => r._lmKo) && !kbAckOk(lmDone, 'ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo)) && (
                             <div style={{marginTop:8,color:'#fff',fontWeight:800,fontSize:15,background:'#e65100',borderRadius:8,padding:'8px 10px'}}>
                               <div style={{fontSize:13,textTransform:'uppercase',letterSpacing:'.03em',marginBottom:4}}>❌ Rupture finalement (prévu en dernière minute) — à RETIRER dans l'ancienne appli</div>
@@ -4692,7 +4764,6 @@
                               <KbAckBtn label="✅ C'est fait : retiré dans l'ancienne appli" onClick={() => kbAckSet('ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo), true, session.name)} />
                             </div>
                           )}
-                          {lmItems.length > 0 && kbAckOk(lmDone, 'lm', kbClientKey(o), lmItems) && <KbAckDone a={kbAckOk(lmDone, 'lm', kbClientKey(o), lmItems)} txt={lmItems.every(p => p.certain) ? 'dernière minute donnée' : 'dernière minute faite (rajoutée dans l\'ancienne appli)'} onUndo={() => kbAckSet('lm', kbClientKey(o), lmItems, false, session.name)} />}
                           {lmItems.length > 0 && !kbAckOk(lmDone, 'lm', kbClientKey(o), lmItems) && (
                             <div style={{marginTop:8,color:'#fff',fontWeight:800,fontSize:15,background:'var(--danger)',borderRadius:8,padding:'8px 10px'}}>
                               <div style={{fontSize:13,textTransform:'uppercase',letterSpacing:'.03em',marginBottom:4}}>{lmItems.every(p => p.certain) ? '🚚 Dernière minute — à donner · déjà facturé : NE PAS rajouter dans l\'ancienne appli' : '🚚 Dispatch dernière minute — à rajouter dans l\'ancienne appli (sinon non facturé)'}</div>
@@ -4725,17 +4796,23 @@
                           </div>
                         </div>
                         <div style={{display:'flex',flexDirection:'column',alignItems:'stretch',gap:6,flex:'0 0 auto',minWidth:96}}>
-                          {/* V9.99 — numéros de casier EN GROS à droite */}
-                          {allCasiers.map((x,i) => (
-                            <div key={i} onClick={() => clickable && setSelectedClient(o)} style={{textAlign:'center',cursor:clickable?'pointer':'default',borderRadius:12,padding:'4px 8px',lineHeight:1,
-                              border:'3px solid '+(x.t==='S'?'var(--warn)':'var(--accent-dark)'),background:x.t==='S'?'var(--warn-soft)':'var(--accent-soft)',color:x.t==='S'?'var(--warn)':'var(--accent-dark)'}}>
-                              <div style={{fontSize:11,fontWeight:800}}>{x.t==='S'?'🍞 pain':'🧊 casier'}</div>
-                              <div style={{fontSize:34,fontWeight:900}}>{x.c}</div>
+                          {/* V10.37 — casiers regroupés dans UN bloc compact (plus de pile de 3 cases) */}
+                          {[['F', casiersFrais], ['S', casiersSec]].filter(([, l]) => l.length).map(([t, l]) => (
+                            <div key={t} onClick={() => clickable && setSelectedClient(o)} style={{textAlign:'center',cursor:clickable?'pointer':'default',borderRadius:12,padding:'3px 6px 4px',lineHeight:1,maxWidth:120,
+                              border:'3px solid '+(t==='S'?'var(--warn)':'var(--accent-dark)'),background:t==='S'?'var(--warn-soft)':'var(--accent-soft)',color:t==='S'?'var(--warn)':'var(--accent-dark)'}}>
+                              <div style={{fontSize:11,fontWeight:800}}>{t==='S'?'🍞 pain':(l.length>1?'🧊 casiers':'🧊 casier')}</div>
+                              <div style={{fontSize:l.length===1?34:l.length===2?27:23,fontWeight:900,display:'flex',flexWrap:'wrap',justifyContent:'center',columnGap:4,rowGap:2,alignItems:'center'}}>
+                                {l.map((c, i) => <React.Fragment key={i}>{i > 0 && <span style={{opacity:.45,fontSize:'.6em'}}>·</span>}<span>{c}</span></React.Fragment>)}
+                              </div>
                             </div>
                           ))}
-                          <button className={passed ? 'btn-secondary' : 'btn-primary'} onClick={() => togglePassed(o)} disabled={isClosed} style={{padding:'8px 12px',fontSize:13,minWidth:90}}>
-                            {passed ? '↩ Annuler' : '✓ Passé'}
-                          </button>
+                          {passed ? (
+                            <button className="btn-secondary" onClick={() => togglePassed(o)} disabled={isClosed} style={{padding:'8px 12px',fontSize:13,minWidth:90}}>↩ Annuler</button>
+                          ) : isArrived(o) ? (
+                            <button className="btn-primary" onClick={() => togglePassed(o)} disabled={isClosed} style={{padding:'10px 12px',fontSize:15,fontWeight:900,minWidth:90}}>✓ Parti</button>
+                          ) : (
+                            <button onClick={() => setArrived(o, true)} disabled={isClosed} style={{padding:'10px 12px',fontSize:15,fontWeight:900,minWidth:90,borderRadius:10,border:'3px solid #f9a825',background:'#fff3c4',color:'#7a5200',cursor:'pointer'}}>🙋 Arrivé</button>
+                          )}
                         </div>
                       </div>
                     );
@@ -4951,7 +5028,20 @@
                       return (
                         <button key={r.k} disabled={isClosed} onClick={() => toggle(l.id, r.k, !ok)}
                           style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '12px 12px', border: 'none', borderTop: '1px solid var(--line)', background: ok ? '#e8f5e9' : '#fff', cursor: 'pointer' }}>
-                          <span style={{ minWidth: 92, textAlign: 'center', fontSize: 26, fontWeight: 900, border: '3px solid var(--ink)', borderRadius: 10, padding: '2px 6px', background: ok ? '#c8e6c9' : 'var(--accent-soft)' }}>🧊 {r.casier || '?'}</span>
+                          {(() => { // V10.38 — tous les casiers du client (frais, ou pain si le produit va en casier pain)
+                            const isND = r.casier === 'ND', o = r.o || {};
+                            const isSec = !isND && (o.casiersSec || []).map(String).includes(String(r.casier)) && !(o.casiersFrais || []).map(String).includes(String(r.casier));
+                            const all = isND ? [] : ((isSec ? o.casiersSec : o.casiersFrais) || []).map(String);
+                            const list = all.length ? all : (r.casier && !isND ? [String(r.casier)] : []);
+                            return (
+                              <span style={{ minWidth: 92, maxWidth: 140, textAlign: 'center', fontWeight: 900, border: '3px solid var(--ink)', borderRadius: 10, padding: '2px 6px', lineHeight: 1.05, background: ok ? '#c8e6c9' : (isSec ? 'var(--warn-soft)' : 'var(--accent-soft)'), flex: '0 0 auto' }}>
+                                <span style={{ display: 'block', fontSize: 11, fontWeight: 800 }}>{isND ? '🥬 cagette' : isSec ? '🍞 pain' : (list.length > 1 ? '🧊 casiers' : '🧊 casier')}</span>
+                                <span style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', columnGap: 4, fontSize: isND ? 24 : list.length === 1 ? 28 : list.length === 2 ? 24 : 21 }}>
+                                  {isND ? 'ND' : list.length ? list.map((c, i) => <React.Fragment key={i}>{i > 0 && <span style={{ opacity: .45, fontSize: '.6em' }}>·</span>}<span>{c}</span></React.Fragment>) : '?'}
+                                </span>
+                              </span>
+                            );
+                          })()}
                           <span style={{ flex: 1, minWidth: 0 }}>
                             <span style={{ display: 'block', fontSize: 17, fontWeight: 800, textDecoration: ok ? 'line-through' : 'none' }}>{r.o ? displayName(r.o) : 'Client'}</span>
                             <span style={{ fontSize: 15, fontWeight: 900, color: 'var(--danger)' }}>{r.qty} × {kbProdName(l.produit)}</span>
@@ -5009,7 +5099,7 @@
           <div style={{ marginBottom: 12 }}>
             <h4 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 900, color }}>{emoji} {titre}</h4>
             <div className="stack" style={{ gap: 3 }}>
-              {items.map((p, i) => {
+              {kbAlpha(items).map((p, i) => {
                 const pct = reducedByKey[p.id || p.produit] || 0;
                 const rf = refundByProd[p.id || p.produit];
                 return (
@@ -5063,6 +5153,18 @@
             <div style={{ marginBottom: 10 }}>
               {o.tel && <div style={{ fontSize: 13 }}>📞 <a href={`tel:${o.tel}`}>{o.tel}</a></div>}
             </div>
+            {o.newClient && (
+              <div style={{ marginBottom: 12, border: '3px solid #2C5CC5', borderRadius: 12, background: '#EAF1FC', padding: '10px 12px' }}>
+                <div style={{ fontSize: 18, fontWeight: 900, color: '#2C5CC5', marginBottom: 4 }}>🆕 Nouveau client — 1re commande</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink)', lineHeight: 1.45 }}>
+                  À lui expliquer :<br/>
+                  • ses produits frais l'attendent dans son casier (n° ci-dessus), le pain et les produits hors casier sont donnés à la main<br/>
+                  • commande en ligne jusqu'à 10h la veille, retrait ici aux horaires du lieu<br/>
+                  • un produit manquant n'est pas facturé (débit le jour du retrait)<br/>
+                  • une réclamation ? par mail, sous 48 h
+                </div>
+              </div>
+            )}
             <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginBottom: 8 }}>Touche ⚠️ sur un produit pour appliquer une remise / remboursement (œuf cassé, poids manquant…).</div>
             <Section emoji="🥬" titre="Non-dispatch (à remettre à la main)" items={o.nds} color="var(--accent-dark)" />
             <Section emoji="🍞" titre="Pain" items={o.pains} color="var(--warn)" />
@@ -5101,7 +5203,7 @@
               <div style={{ marginTop: 8, marginBottom: 4 }}>
                 <h4 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 900, color: 'var(--danger)' }}>❌ Ruptures (non livré, non facturé) <span style={{fontSize:12,fontWeight:400,color:'var(--ink-mute)'}}>— ➕ Rajouter si finalement présent</span></h4>
                 <div className="stack" style={{ gap: 3 }}>
-                  {o.removed.map((r, i) => (
+                  {kbAlpha(o.removed).map((r, i) => (
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 13, padding: '3px 0', borderBottom: '1px dashed var(--border)', color: 'var(--ink-soft)' }}>
                       <span style={{ minWidth: 0, display:'flex', alignItems:'center', gap:8, fontSize:15, fontWeight:700, color:'var(--ink)' }}><KbQty q={r.qty} /><span>{kbProdName(r.produit)}{r.producteur ? ` · ${r.producteur}` : ''}{lm.some(x => kbLmMatch(x, r)) && <span style={{ color:'var(--danger)', fontWeight:900 }}> · 🚚 arrivé en dernière minute</span>}</span></span>
                       <span style={{ whiteSpace: 'nowrap', display:'flex', alignItems:'center', gap:8 }}><span style={{ color: 'var(--ink-mute)', textDecoration:'line-through' }}>{lineEuro(r)}</span>{(r.reason === 'rupture_prepa' || r.reason === 'rupture_prepa_partielle') && <button className="btn-secondary" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => restoreItem(r)}>➕ Rajouter</button>}</span>
@@ -5495,7 +5597,7 @@
         return unsub;
       }, []);
       const forgottensOpen = forgottens.filter(f =>
-        f.site === currentSite && f.status !== 'returned' && f.status !== 'picked_up'
+        f.site === currentSite && f.status !== 'done' && f.status !== 'returned' && f.status !== 'picked_up' // V10.37 — « traité » = réglé
       );
       const alertOublis = forgottensOpen.filter(f => daysSince(f.day || f.createdAt) >= 3).length;
 
