@@ -764,7 +764,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.28';
+    const APP_VERSION = 'V10.29';
+    // V10.29 — 🛵 DOM / Dromy : l'adresse du fichier CONSOMMATEURS (address_street / address_zip / address_city) n'était
+    //   jamais lue → CSV Dromy sans adresse. Lue maintenant + compléments (étage, porte, interphone = address_instructions,
+    //   code = address_code), dépôt porte (champ door) et créneau (livdomDeliveryRange, heure de Paris). Recharger le JSON
+    //   consommateurs une fois (Master › Chargement) pour que le cache contienne les adresses.
+    //   Nouveau : Pilotage › 🛵 Dromy › 🧾 Facturation — contrôle des factures Dromy (Excel + PDF) contre le théorique
+    //   (zone du contrat × cartons de la prépa + navettes + hub mobile), calendrier des quinzaines, historique.
     // V10.28 — 🧀 Fromage : avertissement si le cache produits a été mémorisé avant la V10.27 (sans famille) → recharger le JSON.
     // V10.27 — 🧀 Fromage : le JSON producerproducts n'a ni catégorie ni famille, seulement reference_id (= famille du site).
     //   On garde reference_id au chargement et on reconnaît les 4 familles fromage (vache pressée, vache molle, chèvre, brebis).
@@ -2089,9 +2095,17 @@
           firstname: String(c.firstname || '').trim(), lastname: String(c.lastname || '').trim(),
           email: (c.email || '').trim().toLowerCase(),
           tel: (c.telephone || c.phone || '').replace(/\s+/g, ''),
-          addr: kbAddrFrom(c),   // V9.59 — adresse (livraison domicile → fichier Dromy), si présente dans l'export
+          addr: kbAddrFrom(c),   // V9.59 — adresse (livraison domicile → fichier Dromy) ; V10.29 address_street/zip/city lus
           depotPorte: kbDepotPorte(c),
         };
+        // V10.29 — dernier créneau de livraison à domicile choisi par le client (dates UTC → heure de Paris à l'usage)
+        const _lr = c.livdomDeliveryRange;
+        if (_lr && _lr.start && _lr.end) {
+          const _s = oid(_lr.start) || _lr.start.$date || _lr.start, _e = oid(_lr.end) || _lr.end.$date || _lr.end;
+          if (_s && _e) byId[id].livdom = { s: String(_s), e: String(_e) };
+        }
+        if (!byId[id].addr) delete byId[id].addr;
+        if (byId[id].depotPorte == null) delete byId[id].depotPorte;
       }
       return byId;
     }
@@ -2165,7 +2179,7 @@
           firstname: cons ? (cons.firstname || '') : String(o.firstname || '').trim(),
           lastname: cons ? (cons.lastname || '') : String(o.lastname || '').trim(),
           addr: kbAddrBest(kbAddrFrom(o), cons ? cons.addr : null), // V10.02 (+) : l'adresse COMPLÈTE du fichier clients gagne sur un bout d'adresse de la commande
-          slot: String(o.delivery_slot || o.slot || o.delivery_time || o.creneau || ((o.delivery_window && o.delivery_window.start) ? (o.delivery_window.start + '-' + (o.delivery_window.end || '')) : '') || ''),
+          slot: String(o.delivery_slot || o.slot || o.delivery_time || o.creneau || ((o.delivery_window && o.delivery_window.start) ? (o.delivery_window.start + '-' + (o.delivery_window.end || '')) : '') || kbLivdomSlot(o.livdomDeliveryRange || o.livdom_delivery_range || o.delivery_range, null) || ''),
           depotPorte: (kbDepotPorte(o) != null ? kbDepotPorte(o) : (cons ? (cons.depotPorte != null ? cons.depotPorte : null) : null)),
           casiersFrais: (o.bacs_frais || []).map(String),
           casiersSec: (o.bacs_sec || []).map(String),
@@ -11271,8 +11285,24 @@
       const m = t.match(/^(.*?)[,\s]+(\d{5})\s+(.+)$/);
       return m ? { line1: m[1].replace(/[,\s]+$/, ''), line2: '', cp: m[2], city: m[3].trim() } : { line1: t, line2: '', cp: '', city: '' };
     }
+    // V10.29 — format CONSOMMATEURS Mongo : address_street / address_zip / address_city + address_instructions (étage,
+    //   porte, interphone…) + address_code (digicode). C'était la cause du CSV Dromy sans adresse.
+    function kbOneLine(v) { return String(v == null ? '' : v).replace(/[\r\n]+/g, ' · ').replace(/\s*·\s*(·\s*)+/g, ' · ').replace(/[ \t]+/g, ' ').replace(/^[\s·]+|[\s·]+$/g, '').trim(); }
+    function kbConsAddr(c) {
+      if (!c || typeof c !== 'object') return null;
+      const street = kbOneLine(c.address_street), cp = String(c.address_zip || '').replace(/\s+/g, '').trim();
+      let city = kbOneLine(c.address_city);
+      if (!street && !cp && !city) return null;
+      if (/^75\d{3}$/.test(cp) && (!city || city.length < 4)) city = 'Paris';
+      const instr = kbOneLine(c.address_instructions), code = kbOneLine(c.address_code);
+      const parts = [];
+      if (code && !normalizeText(instr).includes(normalizeText(code))) parts.push('Code : ' + code);
+      if (instr) parts.push(instr);
+      return { line1: street, line2: parts.join(' · '), cp, city };
+    }
     function kbAddrFrom(src) {
       if (!src || typeof src !== 'object') return null;
+      if (src.address_street || src.address_zip || src.address_city) { const ca = kbConsAddr(src); if (ca) return ca; }
       const pick = (o, ks) => { for (const k of ks) { const v = o && o[k]; if (v != null && typeof v !== 'object' && String(v).trim() !== '') return String(v).trim(); } return ''; };
       const cands = [src.address_detail, src.delivery_address, src.deliveryAddress, src.shipping_address,
         (src.address && typeof src.address === 'object' && !Array.isArray(src.address)) ? src.address : null,
@@ -11311,12 +11341,36 @@
       const sc = (x) => x ? (x.line1 ? 2 : 0) + (x.cp ? 1 : 0) + (x.city ? 0.5 : 0) : -1;
       if (!a) return b || null; if (!b) return a;
       const best = sc(b) > sc(a) ? b : a, other = best === a ? b : a;
-      return { line1: best.line1 || other.line1 || '', line2: best.line2 || other.line2 || '', cp: best.cp || other.cp || '', city: best.city || other.city || '' };
+      const l2 = [best.line2, other.line2].filter(Boolean).sort((x, y) => String(y).length - String(x).length)[0] || ''; // V10.29 — compléments les plus complets
+      return { line1: best.line1 || other.line1 || '', line2: l2, cp: best.cp || other.cp || '', city: best.city || other.city || '' };
     }
     // V10.02 (+) — Dromy / étiquettes DOM : complète adresse, téléphone, prénom/nom depuis le fichier CONSOMMATEURS en mémoire
     //   (cas : commandes chargées avant les consommateurs, ou ancien cache sans adresse). Par id client puis par e-mail.
-    async function kbDomEnrich(orders) {
-      const dom = (orders || []).filter(o => String(o.site || '').toUpperCase() === 'DOM' && (!(o.addr && o.addr.line1 && o.addr.cp) || !o.tel));
+    // V10.29 — heure de Paris d'une date ISO (UTC) → { day:'AAAA-MM-JJ', hm:'HH:MM' }
+    function kbParisDT(iso) {
+      const d = new Date(iso); if (isNaN(d)) return null;
+      try {
+        const f = new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+        const g = (t) => (f.find(x => x.type === t) || {}).value || '';
+        return { day: `${g('year')}-${g('month')}-${g('day')}`, hm: `${g('hour').replace('24', '00')}:${g('minute')}` };
+      } catch (e) { return null; }
+    }
+    // Créneau livdom {start,end} (Mongo) ou {s,e} (cache) → « 15:00-18:00 » ; si day donné, seulement si c'est ce jour-là.
+    function kbLivdomSlot(r, day) {
+      if (!r || typeof r !== 'object') return '';
+      const s0 = r.s || r.start, e0 = r.e || r.end;
+      const si = s0 && (oid(s0) || s0.$date || s0), ei = e0 && (oid(e0) || e0.$date || e0);
+      if (!si || !ei) return '';
+      const a = kbParisDT(si), b = kbParisDT(ei);
+      if (!a || !b) return '';
+      if (day && a.day !== day) return '';
+      return `${a.hm}-${b.hm}`;
+    }
+    // V10.02 (+) / V10.29 — Dromy / étiquettes DOM : complète adresse (+ étage, porte, code), téléphone, prénom/nom,
+    //   dépôt porte et créneau depuis le fichier CONSOMMATEURS en mémoire. Par id client puis par e-mail. Toujours (pas
+    //   seulement si l'adresse manque) : un ancien cache de commandes n'avait ni compléments ni créneau.
+    async function kbDomEnrich(orders, day) {
+      const dom = (orders || []).filter(o => String(o.site || '').toUpperCase() === 'DOM');
       if (!dom.length) return orders;
       let cons = null; try { cons = await readCache('consumers'); } catch (_) {}
       if (!cons) return orders;
@@ -11325,14 +11379,15 @@
         if (!dom.includes(o)) return o;
         const c = (o.consumerId && cons[o.consumerId]) || (o.email && byEmail[String(o.email).toLowerCase()]) || null;
         if (!c) return o;
-        return { ...o, addr: kbAddrBest(o.addr, c.addr), tel: o.tel || c.tel || '', firstname: o.firstname || c.firstname || '', lastname: o.lastname || c.lastname || '', email: o.email || c.email || '',
-          depotPorte: o.depotPorte != null ? o.depotPorte : (c.depotPorte != null ? c.depotPorte : null) };
+        const slot = (o.psSlot || o.slot) ? o.slot : (kbLivdomSlot(c.livdom, day) || o.slot || '');
+        return { ...o, addr: kbAddrBest(c.addr, o.addr), tel: o.tel || c.tel || '', firstname: o.firstname || c.firstname || '', lastname: o.lastname || c.lastname || '', email: o.email || c.email || '',
+          slot, depotPorte: o.depotPorte != null ? o.depotPorte : (c.depotPorte != null ? c.depotPorte : null) };
       });
     }
     // Dépôt porte : champ explicite si présent, sinon détection dans le complément d'adresse ; null = inconnu.
     function kbDepotPorte(o) {
       if (!o || typeof o !== 'object') return null;
-      for (const k of ['depot_porte', 'depotPorte', 'door_drop', 'leave_at_door', 'deposit_door']) {
+      for (const k of ['depot_porte', 'depotPorte', 'door_drop', 'leave_at_door', 'deposit_door', 'door']) { // V10.29 — door (consommateurs)
         if (o[k] != null && o[k] !== '') { const v = o[k]; return v === true || v === 1 || /^(1|true|oui|yes|y|vrai)$/i.test(String(v)); }
       }
       const a = o.addr || o.address_detail || null;
@@ -11364,7 +11419,7 @@
         else if (String(d.id).startsWith('cs|')) prep.casiers[decodeURIComponent(d.id.slice(3))] = d.nums || [];
       });
       let orders = (od && od.orders) || [];
-      try { orders = await kbDomEnrich(orders); } catch (_) {} // V10.02 (+) adresses DOM depuis consumers
+      try { orders = await kbDomEnrich(orders, day); } catch (_) {} // V10.02 (+) / V10.29 adresses + créneau DOM depuis consumers
       return { ordersDoc: od, orders, prep };
     }
     // Casiers/cartons d'un client : même règle que « Prépa du jour » (casier d'origine + « Casier plein → +1 »)
@@ -11436,8 +11491,8 @@
       const lines = [DROMY_HEADERS.join(',')];
       rows.forEach(r => {
         const sl = r.slot || def;
-        const task = `bacs sec : [${r.cartons.join(', ')}] / ${r.tel} / ${r.depot ? 'Dépôt porte' : 'Pas dépôt porte'}`;
         const a = r.addr || {};
+        const task = `bacs sec : [${r.cartons.join(', ')}] / ${r.tel} / ${r.depot ? 'Dépôt porte' : 'Pas dépôt porte'}` + (a.line2 ? ` / ${a.line2}` : ''); // V10.29 — étage, porte, code
         const vals = [
           `${r.prenom} ${String(r.nom || '').toUpperCase()}`.trim(), // Recipient_Name
           r.tel,                       // Recipient_Phone
@@ -12037,6 +12092,580 @@
             </div>
           </div>
           <PrintLabelsPage session={session} embedded />
+        </div>
+      );
+    }
+
+
+    // ============================================================
+    // V10.29 — 🧾 FACTURATION DROMY : contrôle des factures (Excel + PDF Dromy) contre le théorique.
+    //   Théorique = contrat Dromy (zones par code postal, 2 cartons inclus puis X €/carton) × cartons de la prépa
+    //   (casiers DOM) + navettes (jeudi matin pour jeudi, vendredi soir pour samedi) + hub mobile (camion jeu/sam).
+    //   Stockage (aucune nouvelle collection) :
+    //     app_config/dromy_tarifs           tarifs du contrat (modifiables)
+    //     app_config/dromy_factures         index { items:{ <n°>: résumé } } → calendrier des quinzaines
+    //     app_config/dromy_fact_<n°>        détail du contrôle (lignes, écarts, lignes acceptées, statut, note)
+    //     v4_cache/dromyfile_<n°>_pdf|_xlsx fichiers d'origine (re-téléchargeables, recalcul possible)
+    // ============================================================
+    const DROMY_TARIF_DEF = {
+      z1: 9.5, z2: 11, z3: 15, inclus: 2, sup: 2,
+      navette: 35, hub: 137.5, attente: 35,
+      // Zone 1 du contrat : Paris 1-4, 8-11, 16-20 + Saint-Ouen, Neuilly, Clichy, Saint-Denis, Courbevoie, Pantin,
+      // Aubervilliers, Asnières, Les Lilas, L'Île-Saint-Denis, Le Pré-Saint-Gervais, Gennevilliers. Zone 2 : Paris 5-7,
+      // 12-15 + reste 92/93/94. Zone 3 : 77 (liste du contrat) + 78/91/95.
+      z1cp: '75001 75002 75003 75004 75008 75009 75010 75011 75016 75116 75017 75018 75019 75020 93400 92200 92110 93200 93210 92400 93500 93300 92600 93260 93450 93310 92230',
+      z3dep: '77 78 91 95',
+      livDays: [4, 6], hubDays: [4, 6], hubSites: '', // vide = tous les lieux camion (ni boutique, ni DOM)
+      start: '2026-10',
+      compta: 'probon-03qzasx3@suppliers.pennylane.com', // V10.29 — facture validée → envoyée au comptable (Pennylane)
+    };
+        const KBD_JOURS = ['dim', 'lun', 'mar', 'mer', 'jeu', 'ven', 'sam'];
+    function kbEuro(v) { return (v == null || isNaN(v)) ? '—' : Number(v).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €'; }
+    function kbR2(v) { return Math.round((Number(v) || 0) * 100) / 100; }
+    function kbDayAdd(day, n) { const d = new Date(day + 'T12:00:00'); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+    function kbWd(day) { return new Date(day + 'T12:00:00').getDay(); }
+    function kbDayLbl(day) { const [y, m, d] = day.split('-'); return `${KBD_JOURS[kbWd(day)]} ${d}/${m}`; }
+    function kbLastDay(ym) { const [y, m] = ym.split('-').map(Number); return new Date(y, m, 0).getDate(); }
+    function kbPerOf(day) { return day.slice(0, 7) + (parseInt(day.slice(8), 10) <= 15 ? '-Q1' : '-Q2'); }
+    function kbPerRange(per) { const ym = per.slice(0, 7); return per.endsWith('Q1') ? { du: ym + '-01', au: ym + '-15' } : { du: ym + '-16', au: ym + '-' + String(kbLastDay(ym)).padStart(2, '0') }; }
+    function kbFactId(num) { return 'dromy_fact_' + String(num || '').replace(/[^A-Za-z0-9_-]/g, '_'); }
+    function kbNameKey(s) { return normalizeText(String(s || '').replace(/^\[TEST\]\s*/, '')).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean).sort().join(' '); }
+
+    // Zone du contrat d'après le code postal
+    function kbDromyZone(cp, T) {
+      const c = String(cp || '').replace(/\s+/g, '');
+      if (!/^\d{5}$/.test(c)) return null;
+      const z1 = String(T.z1cp || '').split(/[\s,;]+/).filter(Boolean);
+      if (z1.includes(c)) return 1;
+      if (c.startsWith('75')) return 2;
+      if (['92', '93', '94'].includes(c.slice(0, 2))) return 2;
+      if (String(T.z3dep || '').split(/[\s,;]+/).includes(c.slice(0, 2))) return 3;
+      return null;
+    }
+    function kbDromyPrice(z, q, T) {
+      if (!z || !q) return null;
+      const base = Number(T['z' + z]); if (isNaN(base)) return null;
+      return kbR2(base + Number(T.sup || 0) * Math.max(0, q - Number(T.inclus || 0)));
+    }
+
+    // --- Lecture de l'Excel Dromy (colonnes repérées par leur titre, jamais par position) ---
+    function kbXlDay(v) {
+      if (typeof v === 'number' && v > 20000) { const ms = Math.round((v - 25569) * 86400000); const d = new Date(ms); return { day: d.toISOString().slice(0, 10), hm: d.toISOString().slice(11, 16) }; }
+      const t = String(v || '');
+      let m = t.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+      if (m) return { day: `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`, hm: m[4] ? `${m[4].padStart(2, '0')}:${m[5]}` : '' };
+      m = t.match(/(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2}))?/);
+      if (m) return { day: `${m[1]}-${m[2]}-${m[3]}`, hm: m[4] ? `${m[4]}:${m[5]}` : '' };
+      return null;
+    }
+    function kbNum(v) { if (typeof v === 'number') return v; const t = String(v == null ? '' : v).replace(/[\s  €]/g, '').replace(',', '.'); const n = parseFloat(t); return isNaN(n) ? null : n; }
+    function kbDromyParseXlsx(buf) {
+      if (!window.XLSX) throw new Error('Lecteur Excel non chargé : recharge la page');
+      const wb = XLSX.read(buf, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const A = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+      let h = -1;
+      for (let i = 0; i < Math.min(A.length, 40); i++) {
+        const r = (A[i] || []).map(x => normalizeText(String(x == null ? '' : x)));
+        if (r.some(x => x === 'reference' || x === 'ref') && r.some(x => x.startsWith('quantite')) && r.some(x => x.startsWith('tarif'))) { h = i; break; }
+      }
+      if (h < 0) throw new Error('Excel Dromy non reconnu : il faut une ligne de titres avec « Référence », « Quantité », « Tarif »');
+      const H = (A[h] || []).map(x => normalizeText(String(x == null ? '' : x)));
+      const idx = (...names) => { for (const n of names) { const i = H.findIndex(x => x === n); if (i >= 0) return i; } for (const n of names) { const i = H.findIndex(x => x.startsWith(n)); if (i >= 0) return i; } return -1; };
+      const C = { ref: idx('reference', 'ref'), st: idx('echec', 'statut'), name: idx('livre', 'nom', 'client', 'destinataire'), deb: idx('debut'), fin: idx('fin'),
+        adr: idx('ville cp', 'adresse'), cp: idx('cp', 'code postal'), zone: idx('zone'), qty: idx('quantite'), tarif: idx('tarif') };
+      const lastCol = Math.max(...Object.values(C)) + 1;
+      // Colonnes mal titrées chez Dromy (« Echec » = vrai/faux, « Livré » = nom) : on vérifie sur les données
+      const sample = A.slice(h + 1, h + 40).filter(r => r && r[C.ref]);
+      if (C.st >= 0 && C.name >= 0 && sample.length && sample.filter(r => typeof r[C.st] === 'string' && /[a-z]/i.test(r[C.st])).length > sample.length / 2) { const t = C.st; C.st = C.name; C.name = t; }
+      const lines = [];
+      for (let i = h + 1; i < A.length; i++) {
+        const r = A[i] || [];
+        if (!r.slice(0, lastCol).some(v => v != null && String(v).trim() !== '')) continue;
+        const ref = C.ref >= 0 && r[C.ref] != null ? String(r[C.ref]).trim() : '';
+        const adr = C.adr >= 0 && r[C.adr] != null ? String(r[C.adr]).trim() : '';
+        if (!ref && !adr) continue;
+        const d1 = kbXlDay(C.deb >= 0 ? r[C.deb] : null), d2 = kbXlDay(C.fin >= 0 ? r[C.fin] : null);
+        const day = (d1 && d1.day) || (d2 && d2.day) || '';
+        const hms = [d1 && d1.hm, d2 && d2.hm].filter(x => x && x !== '00:00').sort();
+        const qty = kbNum(C.qty >= 0 ? r[C.qty] : null);
+        const tarif = kbNum(C.tarif >= 0 ? r[C.tarif] : null);
+        const nAdr = normalizeText(adr);
+        let type = 'client';
+        if (!ref) type = /attente/.test(nAdr) ? 'attente' : /navette/.test(nAdr) ? 'navette' : /hub/.test(nAdr) ? 'hub' : 'autre';
+        let cp = C.cp >= 0 && r[C.cp] != null ? String(r[C.cp]).trim() : '';
+        if (!/^\d{5}$/.test(cp)) { const mm = adr.match(/(\d{5})(?!.*\d{5})/); cp = mm ? mm[1] : ''; }
+        const stv = C.st >= 0 ? r[C.st] : null;
+        const ok = stv == null || stv === '' ? null : (stv === true || /^(true|vrai|1|oui|ok|livre)$/i.test(String(stv).trim()));
+        lines.push({ i: lines.length, type, ref, day, slot: hms.length ? hms[0] + '-' + hms[hms.length - 1] : '', name: type === 'client' ? String((C.name >= 0 && r[C.name]) || '').trim() : adr,
+          adr: type === 'client' ? adr : '', cp: type === 'client' ? cp : '', zone: C.zone >= 0 && r[C.zone] != null && !/N\/A/.test(String(r[C.zone])) ? String(r[C.zone]).trim() : '',
+          qty: qty == null ? 1 : qty, tarif, ok });
+      }
+      if (!lines.length) throw new Error('Aucune ligne trouvée dans l\'Excel Dromy');
+      return lines;
+    }
+
+    // --- Lecture de la facture PDF Dromy ---
+    async function kbDromyParsePdf(buf) {
+      if (!window.pdfjsLib) throw new Error('PDF.js non chargé : recharge la page');
+      const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+      let txt = '';
+      for (let p = 1; p <= pdf.numPages; p++) { const pg = await pdf.getPage(p); const c = await pg.getTextContent(); txt += ' ' + c.items.map(i => i.str).join(' '); }
+      txt = txt.replace(/[  ]/g, ' ').replace(/\s+/g, ' ');
+      const money = (re) => { const m = txt.match(re); if (!m) return null; return kbNum(m[1].replace(/\s/g, '')); };
+      const num = (txt.match(/\b(FA-\d{4,}-\d+)\b/) || txt.match(/Facture\s+(?:n°\s*)?([A-Z]{1,4}[-\d]{6,})/) || [])[1] || '';
+      const dm = txt.match(/En date du\s*:?\s*(\d{2})\/(\d{2})\/(\d{4})/);
+      const ht = money(/Total net HT\s*([\d\s.,]+?)\s*€/i) ?? money(/Total HT\s*([\d\s.,]+?)\s*€/i);
+      const tva = money(/Total TVA\s*([\d\s.,]+?)\s*€/i);
+      const ttc = money(/Montant total TTC\s*([\d\s.,]+?)\s*€/i) ?? money(/Total à régler\s*([\d\s.,]+?)\s*€/i);
+      let du = '', au = '';
+      const pm = txt.match(/du\s+(\d{1,2})\s+au\s+(\d{1,2})\s+([A-Za-zéûÉÛ]+)\s+(\d{4})/i);
+      if (pm) { const mi = KB_MOIS.findIndex(x => normalizeText(x) === normalizeText(pm[3])); if (mi >= 0) { const ym = `${pm[4]}-${String(mi + 1).padStart(2, '0')}`; du = `${ym}-${pm[1].padStart(2, '0')}`; au = `${ym}-${pm[2].padStart(2, '0')}`; } }
+      const objet = (txt.match(/Objet\s*:\s*(.+?)\s+Nom \/ Code/) || [])[1] || '';
+      return { num, date: dm ? `${dm[3]}-${dm[2]}-${dm[1]}` : '', ht, tva, ttc, du, au, objet: objet.trim() };
+    }
+
+    // --- Rapprochement Dromy ↔ appli (cartons de la prépa) ---
+    function kbMatchName(dName, pool) {
+      const k = kbNameKey(dName); if (!k) return null;
+      let hit = pool.find(p => !p.used && p.key === k);
+      if (hit) return hit;
+      const tk = k.split(' ');
+      let best = null, bs = 0;
+      for (const p of pool) {
+        if (p.used) continue;
+        const pt = p.key.split(' '); const com = tk.filter(t => pt.includes(t));
+        const sc = com.length + (com.some(t => t.length >= 4) ? 0.5 : 0);
+        if ((com.length >= 2 || (com.length === 1 && com[0].length >= 4 && (tk.length === 1 || pt.length === 1 || com[0] === tk[tk.length - 1] || com[0] === pt[pt.length - 1]))) && sc > bs) { best = p; bs = sc; }
+      }
+      return best;
+    }
+    async function kbDromyControl(xl, du, au, T, onStep) {
+      const inP = (d) => d && d >= du && d <= au;
+      const days = new Set(xl.filter(l => l.type === 'client' && inP(l.day)).map(l => l.day));
+      for (let d = du; d <= au; d = kbDayAdd(d, 1)) if ((T.livDays || []).includes(kbWd(d)) || (T.hubDays || []).includes(kbWd(d))) days.add(d);
+      const hubSites = String(T.hubSites || '').toUpperCase().split(/[\s,;]+/).filter(Boolean);
+      const out = { clients: [], extras: [], days: [], nonFact: [] };
+      const sorted = [...days].sort();
+      for (const day of sorted) {
+        if (onStep) onStep(day);
+        let data = null; try { data = await kbLoadDayData(day); } catch (_) {}
+        const has = !!(data && data.ordersDoc && (data.orders || []).length);
+        const ours = has ? kbDomRows(data, { includeTest: false }) : [];
+        const prepOk = has && !!(data.prep && (data.prep.meta || Object.keys(data.prep.casiers || {}).length));
+        const isHub = (site) => hubSites.length ? hubSites.includes(site) : (site && site !== 'DOM' && !BOUTIQUES.includes(site));
+        const hubOrders = has ? (data.orders || []).filter(o => !o._test && isHub(String(o.site || '').toUpperCase())).length : null;
+        const pool = ours.map(r => ({ r, key: kbNameKey(`${r.prenom} ${r.nom}`) || kbNameKey(r.client), used: false }));
+        const dl = xl.filter(l => l.type === 'client' && l.day === day);
+        for (const l of dl) {
+          const m = has ? kbMatchName(l.name, pool) : null;
+          if (m) m.used = true;
+          const r = m && m.r;
+          const qK = r && r.cartons.length ? r.cartons.length : null;
+          const cpK = (r && r.addr && r.addr.cp) || '';
+          const zT = kbDromyZone(cpK || l.cp, T);
+          const zDc = kbDromyZone(l.cp, T);
+          const qT = qK || l.qty;
+          const pD = l.tarif;
+          let pT = kbDromyPrice(zT, qT, T);
+          const flags = [];
+          if (!has) flags.push({ k: 'nodata', t: 'Pas de commandes dans l\'appli ce jour : seuls zone et calcul vérifiés' });
+          else if (!r) { flags.push({ k: 'inconnu', t: 'Client absent de nos livraisons à domicile ce jour' }); pT = 0; }
+          else if (!qK) flags.push({ k: 'nocarton', t: 'Pas de cartons dans la prépa : quantité Dromy reprise' });
+          if (r && qK && qK !== l.qty) flags.push({ k: 'cartons', t: `Cartons : Dromy ${l.qty} · prépa ${qK}` });
+          if (l.zone && zDc && String(zDc) !== String(l.zone)) flags.push({ k: 'zone', t: `Zone : Dromy ${l.zone} · contrat ${zDc} (CP ${l.cp})` });
+          if (!zT) flags.push({ k: 'horszone', t: `Code postal ${cpK || l.cp || '?'} hors grille du contrat` });
+          if (cpK && l.cp && cpK !== l.cp) flags.push({ k: 'cp', t: `CP différent : Dromy ${l.cp} · client ${cpK}` });
+          if (pD == null) flags.push({ k: 'tarif', t: 'Tarif illisible dans l\'Excel (#N/A ?)' });
+          if (l.ok === false) flags.push({ k: 'echec', t: 'Livraison en échec mais facturée' });
+          if (pT == null) pT = pD;
+          out.clients.push({ key: `c|${day}|${l.i}`, day, name: l.name, ref: l.ref, cp: l.cp, cpK, zD: l.zone, zT, qD: l.qty, qK, pD, pT: kbR2(pT), slot: l.slot, flags,
+            ecart: kbR2((pD || 0) - (pT || 0)), cartons: r ? r.cartons : [] });
+        }
+        pool.filter(p => !p.used).forEach(p => out.nonFact.push({ day, name: `${p.r.prenom} ${String(p.r.nom || '').toUpperCase()}`.trim(), cartons: p.r.cartons.length, cp: (p.r.addr && p.r.addr.cp) || '',
+          pT: kbDromyPrice(kbDromyZone(p.r.addr && p.r.addr.cp, T), p.r.cartons.length || 1, T) }));
+        out.days.push({ day, has, prepOk, nD: dl.length, nK: ours.length, qD: dl.reduce((s, l) => s + (l.qty || 0), 0), qK: ours.reduce((s, r) => s + r.cartons.length, 0),
+          pD: kbR2(dl.reduce((s, l) => s + (l.tarif || 0), 0)), hubOrders });
+      }
+      // Navettes : une par jour de livraison (jeudi → jeudi matin ; samedi → vendredi soir)
+      const livDays = out.days.filter(d => d.nD > 0 || d.nK > 0).map(d => d.day);
+      const navExp = {}; livDays.forEach(d => { const n = kbWd(d) === 6 ? kbDayAdd(d, -1) : d; navExp[n] = (navExp[n] || 0) + 1; });
+      const hubExp = {}; out.days.forEach(d => { if ((T.hubDays || []).includes(kbWd(d.day)) && (d.hubOrders == null || d.hubOrders > 0)) hubExp[d.day] = 1; });
+      const ext = xl.filter(l => l.type !== 'client' && inP(l.day));
+      const take = (type, exp, price, label) => {
+        const used = {};
+        ext.filter(l => l.type === type).forEach(l => {
+          const flags = []; let pT = 0;
+          if ((exp[l.day] || 0) > (used[l.day] || 0)) { used[l.day] = (used[l.day] || 0) + 1; pT = price; if (l.tarif != null && kbR2(l.tarif) !== kbR2(price)) flags.push({ k: 'prix', t: `${label} facturé ${kbEuro(l.tarif)} au lieu de ${kbEuro(price)}` }); }
+          else flags.push({ k: 'enplus', t: type === 'navette' ? 'Navette facturée sans livraison à domicile ce jour (ou en double)' : 'Hub mobile facturé mais aucune commande camion dans l\'appli ce jour (ou en double)' });
+          out.extras.push({ key: `${type}|${l.day}|${l.i}`, type, day: l.day, label: l.name || label, qD: l.qty, pD: l.tarif, pT, flags, ecart: kbR2((l.tarif || 0) - pT) });
+        });
+        Object.keys(exp).forEach(d => { const miss = exp[d] - (used[d] || 0); for (let k = 0; k < miss; k++) out.extras.push({ key: `${type}|${d}|manque${k}`, type, day: d, label, qD: 0, pD: 0, pT: 0, missing: true, flags: [{ k: 'absent', t: `${label} attendu(e) mais pas facturé(e) (info)` }], ecart: 0 }); });
+      };
+      take('navette', navExp, Number(T.navette), 'Navette');
+      take('hub', hubExp, Number(T.hub), 'Hub mobile');
+      ext.filter(l => l.type === 'attente' || l.type === 'autre').forEach(l => out.extras.push({ key: `${l.type}|${l.day}|${l.i}`, type: l.type, day: l.day, label: l.name, qD: l.qty, pD: l.tarif, pT: 0,
+        flags: [{ k: 'horscontrat', t: l.type === 'attente' ? `Attente navette : hors contrat, à justifier (réf. ${kbEuro(T.attente)}/h)` : 'Ligne hors contrat, à justifier' }], ecart: kbR2(l.tarif || 0) }));
+      const outP = xl.filter(l => l.day && !inP(l.day));
+      if (outP.length) out.horsPeriode = outP.length;
+      out.extras.sort((a, b) => a.day.localeCompare(b.day) || a.type.localeCompare(b.type));
+      return out;
+    }
+    // Totaux en tenant compte des lignes acceptées (« OK, on accepte ») : théorique = montant Dromy pour ces lignes
+    function kbDromyTotals(f) {
+      const acc = f.accepted || {};
+      const all = [...(f.res.clients || []), ...(f.res.extras || [])];
+      const totD = kbR2(all.reduce((s, l) => s + (l.pD || 0), 0));
+      const totT = kbR2(all.reduce((s, l) => s + (acc[l.key] ? (l.pD || 0) : (l.pT || 0)), 0));
+      const open = all.filter(l => l.flags && l.flags.some(x => !['nodata', 'absent'].includes(x.k)) && !acc[l.key] && (l.ecart !== 0 || l.flags.some(x => ['cartons', 'zone', 'echec', 'tarif', 'horszone', 'inconnu', 'enplus', 'horscontrat', 'prix'].includes(x.k))));
+      const ht = f.pdf && f.pdf.ht != null ? f.pdf.ht : null;
+      return { totD, totT, ecart: kbR2((ht != null ? ht : totD) - totT), ht, pdfVsXl: ht != null ? kbR2(ht - totD) : null, open,
+        ttcOk: f.pdf && f.pdf.ht != null && f.pdf.ttc != null ? Math.abs(kbR2(f.pdf.ht * 1.2) - f.pdf.ttc) < 0.02 : null,
+        cartD: (f.res.clients || []).reduce((s, l) => s + (l.qD || 0), 0), cartK: (f.res.clients || []).reduce((s, l) => s + (l.qK || 0), 0) };
+    }
+    function kbDromyStatus(f, t) {
+      if (f.status === 'validee') return { k: 'validee', lb: '✅ Validée', c: '#1b5e20', bg: '#e3f4e4' };
+      if (f.status === 'contestee') return { k: 'contestee', lb: '⚠️ Contestée', c: '#a32a2a', bg: '#fde6e6' };
+      if (Math.abs(t.ecart) < 0.01 && !t.open.length) return { k: 'conforme', lb: '✓ Conforme', c: '#2e7d32', bg: '#eef8ee' };
+      return { k: 'ecart', lb: `🔎 Écart ${kbEuro(t.ecart)}`, c: '#b85820', bg: '#fff3e6' };
+    }
+    function kbB64(buf) { let s = ''; const b = new Uint8Array(buf); for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); }
+    function kbB64Buf(b64) { const s = atob(b64); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i); return b.buffer; }
+    function kbDownloadB64(b64, name, mime) { const blob = new Blob([kbB64Buf(b64)], { type: mime }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); }
+    function kbDromyMailText(f, t) {
+      const per = `du ${formatDateShort(f.du)} au ${formatDateShort(f.au)}`;
+      const lines = t.open.filter(l => (l.ecart || 0) > 0.009).map(l => `- ${kbDayLbl(l.day)} · ${l.name || l.label} : facturé ${kbEuro(l.pD)}, attendu ${kbEuro(l.pT)} — ${l.flags.filter(x => x.k !== 'nodata').map(x => x.t).join(' ; ')}`);
+      return `Bonjour,\n\nNous avons contrôlé la facture ${f.num} (${per}) : ${kbEuro(t.ht != null ? t.ht : t.totD)} HT facturés, ${kbEuro(t.totT)} HT attendus d'après le contrat et nos fichiers de livraison, soit un écart de ${kbEuro(t.ecart)} HT.\n\nLignes à revoir :\n${lines.join('\n') || '- (aucune)'}\n\nPouvez-vous nous envoyer un avoir ou une facture corrigée ?\n\nMerci,\nKelbongoo — Probon`;
+    }
+
+    function DromyFacturationPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [T, setT] = React.useState(null);
+      const [idx, setIdx] = React.useState({});
+      const [per, setPer] = React.useState(() => { const t = todayKey(); const p = kbPerOf(t); const pr = p.endsWith('Q2') ? p.slice(0, 7) + '-Q1' : (() => { const d = new Date(t.slice(0, 7) + '-01T12:00:00'); d.setMonth(d.getMonth() - 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-Q2`; })(); return pr; });
+      const [fact, setFact] = React.useState(null);      // détail chargé
+      const [loadingF, setLoadingF] = React.useState(false);
+      const [xf, setXf] = React.useState(null), [pf, setPf] = React.useState(null);
+      const [busy, setBusy] = React.useState('');
+      const [showT, setShowT] = React.useState(false);
+      const [showAll, setShowAll] = React.useState(false);
+      const [note, setNote] = React.useState('');
+      const reloadIdx = React.useCallback(() => storage.getDoc('app_config', 'dromy_factures').then(d => setIdx((d && d.items) || {})).catch(() => setIdx({})), []);
+      React.useEffect(() => {
+        storage.getDoc('app_config', 'dromy_tarifs').then(d => setT({ ...DROMY_TARIF_DEF, ...(d || {}) })).catch(() => setT({ ...DROMY_TARIF_DEF }));
+        reloadIdx();
+      }, []);
+      const inPer = Object.values(idx).filter(x => x && x.per === per).sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+      const openFact = async (num) => {
+        setLoadingF(true); setFact(null);
+        try { const d = await storage.getDoc('app_config', kbFactId(num)); if (d && d.json) { const f = JSON.parse(d.json); setFact(f); setNote(f.note || ''); } else showToast('Facture introuvable'); }
+        catch (e) { showToast('Erreur : ' + e.message); } finally { setLoadingF(false); }
+      };
+      React.useEffect(() => { setFact(null); setXf(null); setPf(null); if (inPer[0]) openFact(inPer[0].num); }, [per, Object.keys(idx).length]);
+      if (!T) return <div className="card"><p style={{ margin: 0 }}>Chargement…</p></div>;
+
+      const saveFact = async (f) => {
+        const t = kbDromyTotals(f), st = kbDromyStatus(f, t);
+        const json = JSON.stringify(f);
+        if (json.length > 900000) throw new Error('Contrôle trop volumineux pour être enregistré');
+        await storage.setDoc('app_config', kbFactId(f.num), { json, num: f.num, per: f.per, at: f.at }, { replace: true });
+        const cur = (await storage.getDoc('app_config', 'dromy_factures').catch(() => null)) || {};
+        const items = { ...((cur && cur.items) || {}) };
+        items[f.num] = { num: f.num, per: f.per, du: f.du, au: f.au, date: f.pdf ? f.pdf.date : '', ht: t.ht, totD: t.totD, totT: t.totT, ecart: t.ecart, status: st.k, open: t.open.length, at: f.at, by: f.by, upd: new Date().toISOString() };
+        await storage.setDoc('app_config', 'dromy_factures', { items }, { replace: true });
+        setIdx(items);
+      };
+      const runControl = async (xlLines, pdfInfo, base) => {
+        const du = (pdfInfo && pdfInfo.du) || (base && base.du) || kbPerRange(per).du;
+        const au = (pdfInfo && pdfInfo.au) || (base && base.au) || kbPerRange(per).au;
+        const res = await kbDromyControl(xlLines, du, au, T, (d) => setBusy('Contrôle du ' + kbDayLbl(d) + '…'));
+        return { num: (pdfInfo && pdfInfo.num) || (base && base.num) || ('SANS-N-' + du), per: kbPerOf(du), du, au, pdf: pdfInfo || (base && base.pdf) || null, res,
+          tarifs: T, accepted: (base && base.accepted) || {}, status: (base && base.status) || '', note: (base && base.note) || '',
+          files: (base && base.files) || {}, at: (base && base.at) || new Date().toISOString(), by: (base && base.by) || session.name, recalcAt: new Date().toISOString() };
+      };
+      const doControl = async () => {
+        if (!xf) { showToast('Charge l\'Excel Dromy'); return; }
+        setBusy('Lecture des fichiers…');
+        try {
+          const xbuf = await xf.arrayBuffer();
+          const lines = kbDromyParseXlsx(xbuf);
+          let pdfInfo = null, pbuf = null;
+          if (pf) { pbuf = await pf.arrayBuffer(); pdfInfo = await kbDromyParsePdf(pbuf.slice(0)); }
+          if (!pdfInfo || !pdfInfo.du) {
+            const ds = lines.map(l => l.day).filter(Boolean).sort();
+            pdfInfo = { ...(pdfInfo || {}), du: (pdfInfo && pdfInfo.du) || (ds.length ? kbPerRange(kbPerOf(ds[0])).du : kbPerRange(per).du), au: (pdfInfo && pdfInfo.au) || (ds.length ? kbPerRange(kbPerOf(ds[0])).au : kbPerRange(per).au) };
+          }
+          if (!pdfInfo.num) pdfInfo.num = 'SANS-N-' + pdfInfo.du;
+          const prev = idx[pdfInfo.num] ? JSON.parse(((await storage.getDoc('app_config', kbFactId(pdfInfo.num))) || {}).json || 'null') : null;
+          if (prev && !confirm(`La facture ${pdfInfo.num} est déjà enregistrée. La remplacer par ce nouveau contrôle ?`)) { setBusy(''); return; }
+          const f = await runControl(lines, pdfInfo, prev ? { accepted: prev.accepted, status: prev.status, note: prev.note } : null);
+          setBusy('Enregistrement…');
+          const files = {};
+          try { await writeCache(`dromyfile_${kbFactId(f.num)}_xlsx`, { name: xf.name, b64: kbB64(xbuf) }); files.xlsx = xf.name; } catch (e) { console.warn('xlsx', e); }
+          if (pf && pbuf) { try { await writeCache(`dromyfile_${kbFactId(f.num)}_pdf`, { name: pf.name, b64: kbB64(pbuf) }); files.pdf = pf.name; } catch (e) { console.warn('pdf', e); } }
+          f.files = files;
+          await saveFact(f);
+          setPer(f.per); setFact(f); setNote(f.note || ''); setXf(null); setPf(null);
+          const t = kbDromyTotals(f);
+          showToast(Math.abs(t.ecart) < 0.01 && !t.open.length ? `✅ Facture ${f.num} conforme` : `🔎 Facture ${f.num} : écart ${kbEuro(t.ecart)}`);
+        } catch (e) { showToast('⚠️ ' + e.message); }
+        finally { setBusy(''); }
+      };
+      const recalc = async () => {
+        if (!fact) return;
+        setBusy('Relecture de l\'Excel enregistré…');
+        try {
+          const st = await readCache(`dromyfile_${kbFactId(fact.num)}_xlsx`);
+          if (!st || !st.b64) throw new Error('Excel d\'origine non enregistré : recharge-le');
+          const lines = kbDromyParseXlsx(kbB64Buf(st.b64));
+          const f = await runControl(lines, fact.pdf, fact);
+          await saveFact(f); setFact(f); showToast('🔄 Recalculé');
+        } catch (e) { showToast('⚠️ ' + e.message); } finally { setBusy(''); }
+      };
+      const patchFact = async (patch, msg) => { const f = { ...fact, ...patch }; setFact(f); try { await saveFact(f); if (msg) showToast(msg); } catch (e) { showToast('Erreur : ' + e.message); } };
+      // V10.29 — contrôle validé → facture PDF envoyée au comptable (Pennylane)
+      const validate = async () => {
+        if (!fact) return;
+        const to = String(T.compta || DROMY_TARIF_DEF.compta).trim();
+        const tt = kbDromyTotals(fact);
+        if (!confirm(`Contrôle validé pour la facture ${fact.num} (${kbEuro(tt.ht != null ? tt.ht : tt.totD)} HT) ?\n\nLa facture PDF part au comptable :\n${to}`)) return;
+        setBusy('Envoi au comptable…');
+        let mail;
+        try {
+          const st = await readCache(`dromyfile_${kbFactId(fact.num)}_pdf`);
+          if (!st || !st.b64) throw new Error('PDF de la facture non enregistré : recharge la facture avec son PDF');
+          const subject = `Facture Dromy ${fact.num} — contrôle validé — ${kbEuro(tt.ht != null ? tt.ht : tt.totD)} HT`;
+          const body = `Bonjour,\n\nCi-joint la facture Dromy ${fact.num}${fact.pdf && fact.pdf.date ? ' du ' + formatDateShort(fact.pdf.date) : ''} (livraisons du ${formatDateShort(fact.du)} au ${formatDateShort(fact.au)}).\n\nMontant : ${kbEuro(fact.pdf && fact.pdf.ht)} HT · ${kbEuro(fact.pdf && fact.pdf.ttc)} TTC.\nContrôle Kelbongoo validé par ${session.name} le ${new Date().toLocaleDateString('fr-FR')}${Math.abs(tt.ecart) >= 0.01 ? ` (écart accepté : ${kbEuro(tt.ecart)} HT)` : ' : facture conforme au contrat'}.${note ? '\nNote : ' + note : ''}\n\nBonne journée,\nKelbongoo — Probon`;
+          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to, subject, body, attachment: { dataB64: st.b64, mimeType: 'application/pdf', name: st.name || `${fact.num}.pdf` } });
+          mail = { at: new Date().toISOString(), by: session.name, to, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue') };
+        } catch (e) { mail = { at: new Date().toISOString(), by: session.name, to, ok: false, error: e.message }; }
+        finally { setBusy(''); }
+        await patchFact({ status: 'validee', note, validatedBy: session.name, validatedAt: new Date().toISOString(), mail },
+          mail.ok ? `✅ Contrôle validé · facture envoyée au comptable` : `✅ Contrôle validé · ⚠️ mail non parti : ${mail.error}`);
+      };
+      const toggleAcc = (k) => { const a = { ...(fact.accepted || {}) }; if (a[k]) delete a[k]; else a[k] = session.name + ' · ' + new Date().toLocaleDateString('fr-FR'); patchFact({ accepted: a }); };
+      const delFact = async () => {
+        if (!fact || !confirm(`Supprimer le contrôle de la facture ${fact.num} ?`)) return;
+        try {
+          await storage.deleteDoc('app_config', kbFactId(fact.num));
+          const cur = (await storage.getDoc('app_config', 'dromy_factures').catch(() => null)) || {};
+          const items = { ...((cur && cur.items) || {}) }; delete items[fact.num];
+          await storage.setDoc('app_config', 'dromy_factures', { items }, { replace: true });
+          setIdx(items); setFact(null); showToast('🗑️ Supprimé');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const dl = async (kind) => {
+        try { const st = await readCache(`dromyfile_${kbFactId(fact.num)}_${kind}`); if (!st || !st.b64) { showToast('Fichier non enregistré'); return; }
+          kbDownloadB64(st.b64, st.name || `${fact.num}.${kind}`, kind === 'pdf' ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const saveT = async (next) => {
+        try { await storage.setDoc('app_config', 'dromy_tarifs', { ...next, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true }); setT(next); showToast('✓ Tarifs enregistrés'); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
+
+      // ---------- Calendrier des quinzaines ----------
+      const months = (() => {
+        const set = new Set(); const st = String(T.start || '2026-10');
+        let d = new Date(st + '-01T12:00:00'); const end = new Date(todayKey().slice(0, 7) + '-01T12:00:00');
+        while (d <= end) { set.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`); d.setMonth(d.getMonth() + 1); }
+        Object.values(idx).forEach(x => x && x.per && set.add(x.per.slice(0, 7)));
+        return [...set].sort().reverse();
+      })();
+      const tileOf = (p) => {
+        const fs = Object.values(idx).filter(x => x && x.per === p);
+        const r = kbPerRange(p); const today = todayKey();
+        if (!fs.length) return r.au >= today ? { lb: r.du > today ? 'À venir' : '⏳ En cours', c: 'var(--ink-mute)', bg: 'var(--bg-soft,#f6f6f4)' } : { lb: '📥 À charger', c: '#6b6b6b', bg: '#f1f1ef', todo: true };
+        const x = fs[0];
+        const m = { validee: ['✅ Validée', '#1b5e20', '#e3f4e4'], contestee: ['⚠️ Contestée', '#a32a2a', '#fde6e6'], conforme: ['✓ Conforme', '#2e7d32', '#eef8ee'], ecart: [`🔎 ${kbEuro(x.ecart)}`, '#b85820', '#fff3e6'] }[x.status] || ['?', '#666', '#eee'];
+        return { lb: m[0], c: m[1], bg: m[2], x, n: fs.length };
+      };
+      const t = fact ? kbDromyTotals(fact) : null;
+      const st = fact ? kbDromyStatus(fact, t) : null;
+      const big = (lb, v, c, sub) => <div style={{ flex: '1 1 150px', background: '#fff', border: '1px solid var(--line,#e5e5e5)', borderRadius: 12, padding: '10px 12px' }}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 700 }}>{lb}</div><div style={{ fontSize: 26, fontWeight: 900, color: c || 'var(--ink)' }}>{v}</div>{sub && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{sub}</div>}</div>;
+      const FlagLine = ({ l }) => {
+        const acc = fact.accepted && fact.accepted[l.key];
+        const real = l.flags.filter(x => !['nodata'].includes(x.k));
+        return (
+          <div className="card" style={{ padding: '10px 12px', borderLeft: '4px solid ' + (acc ? '#2e7d32' : l.ecart > 0 ? '#c62828' : l.ecart < 0 ? '#2c4a8c' : '#b85820'), opacity: acc ? 0.7 : 1 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+              <div style={{ minWidth: 0, flex: '1 1 260px' }}>
+                <div style={{ fontSize: 15, fontWeight: 800 }}>{kbDayLbl(l.day)} · {l.name || l.label}</div>
+                {real.map((x, i) => <div key={i} style={{ fontSize: 13, color: x.k === 'absent' ? 'var(--ink-mute)' : '#7a3b00' }}>• {x.t}</div>)}
+                {l.cp && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>CP {l.cp}{l.zD ? ` · zone Dromy ${l.zD}` : ''}{l.zT ? ` · zone contrat ${l.zT}` : ''}{l.cartons && l.cartons.length ? ` · cartons prépa [${l.cartons.join(', ')}]` : ''}</div>}
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Dromy {kbEuro(l.pD)} · attendu {kbEuro(l.pT)}</div>
+                <div style={{ fontSize: 22, fontWeight: 900, color: l.ecart > 0 ? '#c62828' : l.ecart < 0 ? '#2c4a8c' : 'var(--ink)' }}>{l.ecart > 0 ? '+' : ''}{kbEuro(l.ecart)}</div>
+                {(l.ecart !== 0 || real.length > 0) && !l.missing && <button className={acc ? 'btn-secondary' : 'btn-ghost'} style={{ fontSize: 12, padding: '5px 10px', marginTop: 4, border: '1px solid var(--line,#ddd)' }} onClick={() => toggleAcc(l.key)}>{acc ? `✓ Accepté (${acc}) · annuler` : '👍 Accepter cette ligne'}</button>}
+              </div>
+            </div>
+          </div>
+        );
+      };
+      const anomalies = fact ? [...fact.res.clients, ...fact.res.extras].filter(l => l.flags.some(x => !['nodata'].includes(x.k))) : [];
+
+      return (
+        <div className="stack">
+          <div className="card" style={{ borderLeft: '4px solid #2c4a8c' }}>
+            <h2 style={{ margin: 0 }}>🧾 Factures Dromy</h2>
+            <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '4px 0 0' }}>Charge l'Excel et la facture PDF de Dromy : l'appli recalcule ce qu'on devait payer (zone du contrat × cartons de la prépa, navettes, hub mobile) et montre chaque écart.</p>
+            <button className="btn-ghost" style={{ fontSize: 12, padding: '4px 0', marginTop: 4 }} onClick={() => setShowT(v => !v)}>⚙️ Tarifs du contrat {showT ? '▲' : '▼'} <span style={{ color: 'var(--ink-mute)' }}>· Z1 {kbEuro(T.z1)} · Z2 {kbEuro(T.z2)} · Z3 {kbEuro(T.z3)} · {T.inclus} cartons inclus puis {kbEuro(T.sup)} · navette {kbEuro(T.navette)} · hub {kbEuro(T.hub)}</span></button>
+            {showT && <DromyTarifsForm T={T} onSave={saveT} />}
+          </div>
+
+          {/* Calendrier */}
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>📅 Quinzaines</h3>
+            <div style={{ display: 'grid', gap: 8 }}>
+              {months.map(ym => {
+                const [y, m] = ym.split('-');
+                return (
+                  <div key={ym} style={{ display: 'grid', gridTemplateColumns: 'minmax(90px,130px) 1fr 1fr', gap: 8, alignItems: 'stretch' }}>
+                    <div style={{ fontWeight: 900, fontSize: 15, alignSelf: 'center', textTransform: 'capitalize' }}>{KB_MOIS[parseInt(m, 10) - 1]} {y}</div>
+                    {['Q1', 'Q2'].map(q => {
+                      const p = `${ym}-${q}`, tl = tileOf(p), r = kbPerRange(p), sel = p === per;
+                      return (
+                        <button key={q} onClick={() => setPer(p)} style={{ display: 'block', width: '100%', textAlign: 'left', background: tl.bg, color: tl.c, border: sel ? '3px solid #2c4a8c' : '1px solid var(--line,#e2e2e2)', borderRadius: 12, padding: '8px 10px', cursor: 'pointer', minHeight: 58 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--ink-soft)' }}>{q === 'Q1' ? '1 → 15' : `16 → ${r.au.slice(8)}`}</div>
+                          <div style={{ fontSize: 15, fontWeight: 900 }}>{tl.lb}</div>
+                          {tl.x && <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{tl.x.num} · {kbEuro(tl.x.ht != null ? tl.x.ht : tl.x.totD)} HT{tl.n > 1 ? ` · ${tl.n} factures` : ''}</div>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Quinzaine sélectionnée */}
+          <div className="card" style={{ borderTop: '4px solid #2c4a8c' }}>
+            <h3 style={{ marginTop: 0 }}>Quinzaine du {formatDateShort(kbPerRange(per).du)} au {formatDateShort(kbPerRange(per).au)}</h3>
+            {inPer.length > 1 && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>{inPer.map(x => <button key={x.num} className={fact && fact.num === x.num ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 12 }} onClick={() => openFact(x.num)}>{x.num}</button>)}</div>}
+            <div style={{ background: 'var(--bg-soft,#f7f7f5)', borderRadius: 12, padding: 12 }}>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>📥 {fact ? 'Recharger / nouvelle facture' : 'Charger la facture Dromy'}</div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <label className={`upload-zone ${xf ? 'has-file' : ''}`} style={{ flex: '1 1 220px' }}>
+                  <input type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" onChange={e => setXf(e.target.files[0] || null)} />
+                  <div className="upload-icon">{xf ? '✓' : '📊'}</div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{xf ? xf.name : 'Excel Dromy (détail des livraisons)'}</div>
+                </label>
+                <label className={`upload-zone ${pf ? 'has-file' : ''}`} style={{ flex: '1 1 220px' }}>
+                  <input type="file" accept=".pdf,application/pdf" onChange={e => setPf(e.target.files[0] || null)} />
+                  <div className="upload-icon">{pf ? '✓' : '🧾'}</div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{pf ? pf.name : 'Facture PDF (FA-…)'}</div>
+                </label>
+              </div>
+              <button className="btn-primary btn-lg btn-block" style={{ marginTop: 10, fontSize: 16 }} disabled={!xf || !!busy} onClick={doControl}>{busy || '🔍 Contrôler la facture'}</button>
+              <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>La période est lue sur la facture (« Livraisons du … au … »). Les cartons viennent de la prépa de chaque jour (casiers DOM).</div>
+            </div>
+
+            {loadingF && <p style={{ fontSize: 13 }}>Chargement…</p>}
+            {fact && t && (
+              <div className="stack" style={{ marginTop: 14 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <div>
+                    <div style={{ fontSize: 20, fontWeight: 900 }}>Facture {fact.num}</div>
+                    <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{fact.pdf && fact.pdf.date ? `du ${formatDateShort(fact.pdf.date)} · ` : ''}livraisons du {formatDateShort(fact.du)} au {formatDateShort(fact.au)} · contrôlée par {fact.by}{fact.recalcAt ? ` · calcul ${new Date(fact.recalcAt).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })}` : ''}</div>
+                  </div>
+                  <span style={{ background: st.bg, color: st.c, fontWeight: 900, borderRadius: 20, padding: '6px 14px', fontSize: 15 }}>{st.lb}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {big('Facturé HT', kbEuro(t.ht != null ? t.ht : t.totD), null, t.ht != null ? (Math.abs(t.pdfVsXl) < 0.01 ? '= total de l\'Excel ✓' : `⚠️ Excel = ${kbEuro(t.totD)}`) : 'total de l\'Excel (pas de PDF)')}
+                  {big('Attendu (théorique) HT', kbEuro(t.totT), '#2c4a8c', 'contrat × nos livraisons')}
+                  {big('Écart HT', (t.ecart > 0 ? '+' : '') + kbEuro(t.ecart), Math.abs(t.ecart) < 0.01 ? '#2e7d32' : t.ecart > 0 ? '#c62828' : '#2c4a8c', t.ecart > 0.009 ? 'payé en trop' : t.ecart < -0.009 ? 'en notre faveur' : 'facture juste 🎉')}
+                  {big('Cartons', `${t.cartD} / ${t.cartK || '—'}`, null, 'Dromy / prépa')}
+                </div>
+                {fact.pdf && fact.pdf.ttc != null && <div style={{ fontSize: 12, color: t.ttcOk ? '#2e7d32' : '#c62828' }}>{t.ttcOk ? '✓' : '⚠️'} TTC {kbEuro(fact.pdf.ttc)} {t.ttcOk ? '= HT + TVA 20 %' : `≠ HT × 1,20 (${kbEuro(kbR2(fact.pdf.ht * 1.2))})`}</div>}
+                {fact.res.horsPeriode > 0 && <div className="alert-warning" style={{ fontSize: 13 }}>⚠️ {fact.res.horsPeriode} ligne(s) de l'Excel hors de la période de la facture (non comptées).</div>}
+
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {fact.status !== 'validee'
+                    ? <button className="btn-primary btn-lg" style={{ background: '#2e7d32', fontSize: 16 }} disabled={!!busy} onClick={validate}>✅ Facture validée (contrôle validé)</button>
+                    : <button className="btn-secondary" onClick={() => patchFact({ status: '' }, 'Statut retiré')}>↩️ Retirer « validée »</button>}
+                  {fact.status === 'validee' && fact.mail && !fact.mail.ok && <button className="btn-primary" disabled={!!busy} onClick={validate}>✉️ Renvoyer au comptable</button>}
+                  <button className="btn-secondary" style={{ color: '#a32a2a', borderColor: '#f0c4c4' }} onClick={() => patchFact({ status: fact.status === 'contestee' ? '' : 'contestee', note }, fact.status === 'contestee' ? 'Statut retiré' : '⚠️ Marquée contestée')}>{fact.status === 'contestee' ? '↩️ Retirer « contestée »' : '⚠️ Contester'}</button>
+                  <button className="btn-secondary" onClick={() => { const txt = kbDromyMailText(fact, t); try { navigator.clipboard.writeText(txt); showToast('📋 Message copié (à envoyer à farid@dromy.fr)'); } catch (e) { prompt('Copier :', txt); } }}>📋 Copier le message pour Dromy</button>
+                  <button className="btn-secondary" disabled={!!busy} onClick={recalc}>🔄 Recalculer</button>
+                  {fact.files && fact.files.pdf && <button className="btn-ghost" onClick={() => dl('pdf')}>⬇️ PDF</button>}
+                  {fact.files && fact.files.xlsx && <button className="btn-ghost" onClick={() => dl('xlsx')}>⬇️ Excel</button>}
+                  <button className="btn-ghost" style={{ color: 'var(--danger)' }} onClick={delFact}>🗑️</button>
+                </div>
+                {fact.mail && <div className={fact.mail.ok ? 'alert-success' : 'alert-warning'} style={{ fontSize: 13 }}>{fact.mail.ok ? '✉️ Envoyée au comptable' : '⚠️ Mail au comptable non parti'} ({fact.mail.to}) le {new Date(fact.mail.at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })} par {fact.mail.by}{fact.mail.ok ? '' : ` — ${fact.mail.error}`}</div>}
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input value={note} onChange={e => setNote(e.target.value)} placeholder="Note (ex. avoir demandé le 20/10)" style={{ flex: 1, fontSize: 13 }} />
+                  <button className="btn-secondary" disabled={note === (fact.note || '')} onClick={() => patchFact({ note }, '✓ Note enregistrée')}>💾</button>
+                </div>
+
+                <h3 style={{ margin: '8px 0 0' }}>🔎 À vérifier ({t.open.length} ouverte{t.open.length > 1 ? 's' : ''}{anomalies.length > t.open.length ? ` · ${anomalies.length - t.open.length} acceptée(s)/info` : ''})</h3>
+                {anomalies.length === 0 && <div className="alert-success" style={{ fontSize: 15, fontWeight: 800 }}>🎉 Aucune anomalie : chaque ligne correspond au contrat.</div>}
+                {anomalies.map(l => <FlagLine key={l.key} l={l} />)}
+
+                <h3 style={{ margin: '8px 0 0' }}>📆 Par jour</h3>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead><tr style={{ textAlign: 'left', borderBottom: '2px solid var(--line,#ddd)' }}><th style={{ padding: 6 }}>Jour</th><th>Livraisons<br /><small>Dromy / nous</small></th><th>Cartons<br /><small>Dromy / prépa</small></th><th>Livraisons €<br /><small>Dromy / attendu</small></th><th>Navette / Hub</th></tr></thead>
+                    <tbody>
+                      {[...new Set([...fact.res.days.map(d => d.day), ...fact.res.extras.map(e => e.day)])].sort().map(day => {
+                        const d = fact.res.days.find(x => x.day === day) || { nD: 0, nK: 0, qD: 0, qK: 0, pD: 0 };
+                        const cl = fact.res.clients.filter(c => c.day === day); const ex = fact.res.extras.filter(e => e.day === day && !e.missing);
+                        if (!cl.length && !ex.length && !d.nK) return null;
+                        const pT = kbR2(cl.reduce((s, c) => s + ((fact.accepted || {})[c.key] ? (c.pD || 0) : (c.pT || 0)), 0));
+                        const warn = (a, b) => a !== b ? { color: '#c62828', fontWeight: 800 } : {};
+                        return (
+                          <tr key={day} style={{ borderBottom: '1px solid var(--line,#eee)' }}>
+                            <td style={{ padding: 6, fontWeight: 800 }}>{kbDayLbl(day)}{d.has === false && d.nD > 0 && <div style={{ fontSize: 10, color: 'var(--ink-mute)', fontWeight: 400 }}>pas de données appli</div>}</td>
+                            <td style={warn(d.nD, d.has ? d.nK : d.nD)}>{d.nD} / {d.has ? d.nK : '—'}</td>
+                            <td style={warn(d.qD, d.has ? d.qK : d.qD)}>{d.qD} / {d.has ? d.qK : '—'}</td>
+                            <td style={warn(kbR2(d.pD), pT)}>{kbEuro(d.pD)} / {kbEuro(pT)}</td>
+                            <td>{ex.map(e => <div key={e.key} style={{ color: e.flags.length ? '#b85820' : 'inherit' }}>{e.type === 'hub' ? '🚚' : e.type === 'navette' ? '🔁' : '⏱️'} {e.label} {kbEuro(e.pD)}</div>)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {fact.res.nonFact.length > 0 && <details className="card" style={{ padding: '8px 12px' }}><summary style={{ fontWeight: 800, cursor: 'pointer' }}>ℹ️ Livrés selon l'appli mais pas facturés par Dromy ({fact.res.nonFact.length})</summary>
+                  {fact.res.nonFact.map((n, i) => <div key={i} style={{ fontSize: 13, padding: '3px 0' }}>{kbDayLbl(n.day)} · {n.name} · {n.cartons} carton(s){n.cp ? ` · ${n.cp}` : ''}</div>)}
+                  <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>Pas d'impact sur la facture : à vérifier seulement si le client dit ne pas avoir été livré.</div>
+                </details>}
+
+                <button className="btn-ghost" onClick={() => setShowAll(v => !v)}>{showAll ? '▲ Masquer' : '▼ Voir'} toutes les lignes ({fact.res.clients.length} livraisons)</button>
+                {showAll && <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead><tr style={{ textAlign: 'left', borderBottom: '2px solid var(--line,#ddd)' }}><th style={{ padding: 4 }}>Jour</th><th>Client</th><th>CP</th><th>Zone D/C</th><th>Cartons D/P</th><th>Dromy</th><th>Attendu</th></tr></thead>
+                  <tbody>{fact.res.clients.map(c => <tr key={c.key} style={{ borderBottom: '1px solid var(--line,#f0f0f0)', background: c.ecart ? '#fff6ee' : undefined }}><td style={{ padding: 4 }}>{kbDayLbl(c.day)}</td><td>{c.name}</td><td>{c.cp}</td><td>{c.zD || '—'} / {c.zT || '—'}</td><td>{c.qD} / {c.qK || '—'}</td><td>{kbEuro(c.pD)}</td><td>{kbEuro(c.pT)}</td></tr>)}</tbody>
+                </table></div>}
+              </div>
+            )}
+            {!fact && !loadingF && inPer.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)', marginBottom: 0 }}>Aucune facture enregistrée pour cette quinzaine.</p>}
+          </div>
+        </div>
+      );
+    }
+    function DromyTarifsForm({ T, onSave }) {
+      const [f, setF] = React.useState({ ...T, livDays: (T.livDays || []).join(','), hubDays: (T.hubDays || []).join(',') });
+      const num = (k, lb) => <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>{lb}</div><input type="number" step="0.5" value={f[k]} onChange={e => setF({ ...f, [k]: e.target.value })} style={{ width: 90 }} /></label>;
+      const save = () => {
+        const out = { ...f }; ['z1', 'z2', 'z3', 'inclus', 'sup', 'navette', 'hub', 'attente'].forEach(k => { out[k] = Number(out[k]); });
+        out.livDays = String(f.livDays).split(/[\s,;]+/).map(Number).filter(n => n >= 0 && n <= 6);
+        out.hubDays = String(f.hubDays).split(/[\s,;]+/).map(Number).filter(n => n >= 0 && n <= 6);
+        onSave(out);
+      };
+      return (
+        <div style={{ marginTop: 8, display: 'grid', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>{num('z1', 'Zone 1 €')}{num('z2', 'Zone 2 €')}{num('z3', 'Zone 3 €')}{num('inclus', 'Cartons inclus')}{num('sup', '€ / carton en +')}{num('navette', 'Navette €')}{num('hub', 'Hub mobile €')}{num('attente', 'Attente €/h')}</div>
+          <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Codes postaux zone 1 (le reste de Paris et du 92/93/94 = zone 2)</div><textarea value={f.z1cp} onChange={e => setF({ ...f, z1cp: e.target.value })} rows={3} style={{ width: '100%', fontSize: 12 }} /></label>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Mail du comptable (facture validée)</div><input value={f.compta || ''} onChange={e => setF({ ...f, compta: e.target.value })} style={{ width: 300 }} /></label>
+            <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Départements zone 3</div><input value={f.z3dep} onChange={e => setF({ ...f, z3dep: e.target.value })} style={{ width: 140 }} /></label>
+            <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Jours de livraison (4=jeu, 6=sam)</div><input value={f.livDays} onChange={e => setF({ ...f, livDays: e.target.value })} style={{ width: 100 }} /></label>
+            <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Jours hub mobile</div><input value={f.hubDays} onChange={e => setF({ ...f, hubDays: e.target.value })} style={{ width: 100 }} /></label>
+            <label style={{ fontSize: 12 }}><div style={{ fontWeight: 700 }}>Lieux camion du hub (vide = tous)</div><input value={f.hubSites} placeholder="tous les camions" onChange={e => setF({ ...f, hubSites: e.target.value })} style={{ width: 160 }} /></label>
+          </div>
+          <button className="btn-primary" style={{ justifySelf: 'start' }} onClick={save}>💾 Enregistrer les tarifs</button>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>Navette : jeudi matin pour la livraison du jeudi, vendredi soir pour celle du samedi. Hub mobile : distribution camion du jeudi et du samedi. L'attente navette n'est pas au contrat → toujours signalée.</div>
         </div>
       );
     }
@@ -18909,10 +19538,13 @@
         { k: 'divers', label: 'Divers',     icon: '🧰', subs: [
           { k: 'temp',   label: 'Température',      icon: '🌡️' },
           { k: 'codes',  label: 'Codes-barres',     icon: '🏷️' },
-          { k: 'dromy',  label: 'Dromy',            icon: '🚚' },
           { k: 'lieux',  label: 'Lieux & horaires', icon: '📍' },
           { k: 'cmails', label: 'Mails clients',    icon: '📧' },
           { k: 'ancien', label: 'Ancien site',      icon: '🔁' },
+        ] },
+        { k: 'dromyg', label: 'Dromy', icon: '🛵', subs: [
+          { k: 'dromyfact', label: 'Facturation', icon: '🧾' },
+          { k: 'dromy',     label: 'Envoi & étiquettes', icon: '🚚' },
         ] },
         { k: 'rungis', label: 'Enlèvement camion Rungis', icon: '🚚' },
         { k: 'invfl',  label: 'MAJ inventaire F&L', icon: '🥬' },
@@ -18960,6 +19592,7 @@
           {sub === 'temp'  && <TempMasterPage session={session} />}
           {sub === 'codes' && <BarcodesManagerPage session={session} />}
           {sub === 'dromy' && <DromyPilotagePage session={session} />}
+          {sub === 'dromyfact' && <DromyFacturationPage session={session} />}
           {sub === 'lieux' && <KbLieuxPage session={session} />}
           {sub === 'cmails' && <KbClientMailsPage session={session} />}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
@@ -26615,7 +27248,7 @@
           <div className="kb-side-brand"><div className="kb-side-logo">K</div><div><b>Kelbongoo</b><small>Master · {APP_VERSION}</small></div></div>
           <Item k="today" em="🏠" label="Aujourd'hui" on={tab === 'today'} onClick={() => goTab('today')} />
           <div className="kb-side-sec">Pilotage</div>
-          {P('ca', 'Suivi CA', '💶')}{P('stats', 'Statistiques', '📊')}{P('manq', 'Manquants & remises', '💸')}{P('pertes', 'Pertes ROB', '♻️')}{P('rungis', 'Enlèvement camion Rungis', '🚚')}{P('invfl', 'MAJ inventaire F&L', '🥬')}{P('live', 'Qui fait quoi', '🟢')}{P('histo', 'Historique', '📜')}
+          {P('ca', 'Suivi CA', '💶')}{P('stats', 'Statistiques', '📊')}{P('manq', 'Manquants & remises', '💸')}{P('pertes', 'Pertes ROB', '♻️')}{P('rungis', 'Enlèvement camion Rungis', '🚚')}{P('dromyfact', 'Factures Dromy', '🧾')}{P('invfl', 'MAJ inventaire F&L', '🥬')}{P('live', 'Qui fait quoi', '🟢')}{P('histo', 'Historique', '📜')}
           <div className="kb-side-sec">Opérations</div>
           <Item k="push" em="📣" label="Push équipes" on={tab === 'push'} onClick={() => goTab('push')} />
           <Item k="recap" em="🧾" label="Récap du jour" on={tab === 'masterrecap'} onClick={() => goTab('masterrecap')} />
