@@ -764,7 +764,14 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.29';
+    const APP_VERSION = 'V10.31';
+    // V10.31 — 📍 Lieux = source unique : Master › Pilotage › Lieux & horaires pilote la liste des lieux partout
+    //   (choix du lieu à la connexion distrib, sélecteur master, calendrier des distributions, boutiques à casiers, noms).
+    //   Chaque lieu : jours de distribution cliquables (Lun→Dim) + horaires ; nouveau lieu entièrement réglable ;
+    //   suppression d'un lieu (🗑). Liste mise en cache sur le téléphone pour l'écran de connexion.
+    // V10.30 — 🥕 Prépa › Par produit : le nom du produit (+ producteur, compteur x/y) reste collé juste sous la
+    //   bannière du haut pendant qu'on descend dans la liste des casiers (avant : il passait derrière la bannière et,
+    //   arrivé au dernier casier, le préparateur ne savait plus quel produit déposer). Hauteur des bandeaux mesurée en direct.
     // V10.29 — 🛵 DOM / Dromy : l'adresse du fichier CONSOMMATEURS (address_street / address_zip / address_city) n'était
     //   jamais lue → CSV Dromy sans adresse. Lue maintenant + compléments (étage, porte, interphone = address_instructions,
     //   code = address_code), dépôt porte (champ door) et créneau (livdomDeliveryRange, heure de Paris). Recharger le JSON
@@ -1115,6 +1122,45 @@
       STB: { 3: 20, 5: 20, 6: 14 },
       PDC: { 4: 20 },
     };
+    // V10.31 — LIEUX = SOURCE UNIQUE (Master › Pilotage › 📍 Lieux & horaires → app_config/lieux).
+    // Les tables ci-dessus restent les valeurs par défaut ; dès qu'une config lieux existe, SITES, BOUTIQUES,
+    // DISTRIB_SCHEDULE et SITE_NAMES sont réécrits EN PLACE (mêmes objets → tout le code existant suit).
+    const KB_SITES_DEFAULT = SITES.slice();
+    const KB_BOUTIQUES_DEFAULT = BOUTIQUES.slice();
+    const KB_SCHEDULE_DEFAULT = JSON.parse(JSON.stringify(DISTRIB_SCHEDULE));
+    const KB_LIEUX_CACHE = 'kb_lieux_cache_v1';
+    // Jours de distribution d'un lieu (0=dim … 6=sam). Ancienne config sans « days » → calendrier par défaut + jours avec horaire.
+    function kbLieuDays(code, L) {
+      if (L && Array.isArray(L.days)) return [...new Set(L.days.map(Number).filter(d => d >= 0 && d <= 6))].sort();
+      const ds = new Set();
+      for (let d = 0; d < 7; d++) if ((KB_SCHEDULE_DEFAULT[d] || []).includes(code)) ds.add(d);
+      const h = (L && L.hours) || {};
+      Object.keys(h).forEach(d => { if (String(h[d] || '').trim()) ds.add(+d); });
+      return [...ds].sort();
+    }
+    let __kbLieuxSig = '';
+    function kbApplyLieux(lx) {
+      if (!lx || !lx.sites || !Object.keys(lx.sites).length) return false;
+      const codes = Object.keys(lx.sites).sort();
+      const sched = {}; for (let d = 0; d < 7; d++) sched[d] = [];
+      codes.forEach(c => kbLieuDays(c, lx.sites[c]).forEach(d => sched[d].push(c)));
+      const bout = codes.filter(c => (lx.sites[c] || {}).type === 'boutique');
+      const names = codes.map(c => String((lx.sites[c] || {}).name || '').trim());
+      const sig = JSON.stringify([codes, sched, bout, names]);
+      if (sig === __kbLieuxSig) return false;
+      __kbLieuxSig = sig;
+      SITES.splice(0, SITES.length, ...codes);
+      BOUTIQUES.splice(0, BOUTIQUES.length, ...bout);
+      for (let d = 0; d < 7; d++) DISTRIB_SCHEDULE[d] = sched[d];
+      codes.forEach((c, i) => { if (names[i] && names[i] !== c) SITE_NAMES[c] = names[i]; });
+      return true;
+    }
+    function kbLieuxPublish(lx) {
+      const changed = kbApplyLieux(lx);
+      try { localStorage.setItem(KB_LIEUX_CACHE, JSON.stringify(lx)); } catch (e) {}
+      if (changed) { try { window.dispatchEvent(new Event('kb-lieux')); } catch (e) {} }
+      return changed;
+    }
     // Locaux distribuant à une dayKey donnée
     function sitesForDate(dayKey) {
       const d = new Date(dayKey + 'T12:00:00');
@@ -3427,26 +3473,18 @@
                 <label>Lieu de distribution</label>
                 <select value={site} onChange={e => setSite(e.target.value)}>
                   <option value="">— Choisir —</option>
-                  {sitesOfDay.length > 0 && (
-                    <optgroup label="Distribution aujourd'hui">
-                      {sitesOfDay.map(s => <option key={s} value={s}>{s}</option>)}
-                    </optgroup>
-                  )}
                   {(() => {
-                    // Sites avec non-récup en attente mais SANS distrib aujourd'hui
-                    const pendingOnly = sitesWithPending.filter(s => !sitesOfDay.includes(s));
-                    if (pendingOnly.length === 0) return null;
-                    return (
-                      <optgroup label="Clients en retard à récupérer">
-                        {pendingOnly.map(s => <option key={s} value={s}>{s} (retards)</option>)}
-                      </optgroup>
-                    );
+                    // V10.31 — lieux issus de Master › Lieux & horaires (+ lieux présents dans les commandes du jour)
+                    const opt = (s, suf) => <option key={s} value={s}>{s}{siteLabel(s) !== s ? ' · ' + siteLabel(s) : ''}{suf || ''}</option>;
+                    const today = [...new Set([...sitesOfDay, ...sitesForDate(activeDay())])].sort();
+                    const pendingOnly = sitesWithPending.filter(s => !today.includes(s));
+                    const others = SITES.filter(s => !today.includes(s) && !pendingOnly.includes(s));
+                    return (<>
+                      {today.length > 0 && <optgroup label="Distribution aujourd'hui">{today.map(s => opt(s))}</optgroup>}
+                      {pendingOnly.length > 0 && <optgroup label="Clients en retard à récupérer">{pendingOnly.map(s => opt(s, ' (retards)'))}</optgroup>}
+                      {others.length > 0 && <optgroup label={today.length ? 'Autres lieux' : 'Tous les lieux'}>{others.map(s => opt(s))}</optgroup>}
+                    </>);
                   })()}
-                  {sitesOfDay.length === 0 && sitesWithPending.length === 0 && (
-                    <optgroup label="Tous les sites">
-                      {SITES.map(s => <option key={s} value={s}>{s}</option>)}
-                    </optgroup>
-                  )}
                 </select>
                 {sitesOfDay.length === 0 && sitesWithPending.length === 0 && (
                   <div style={{fontSize:11,color:'var(--warn)',marginTop:6}}>
@@ -13335,29 +13373,44 @@
     // Jours JS : 3=mer, 4=jeu, 5=ven, 6=sam. Les mails clients (rappel J-60 min) lisent ces horaires.
     // ============================================================
     const KB_LIEUX_DOW = [[3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam']];
+    const KB_LIEUX_DOW_ALL = [[1, 'Lun'], [2, 'Mar'], [3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam'], [0, 'Dim']]; // V10.31
     const KB_JOURS = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
     const KB_MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
     function kbCmDate(dayKey) { const d = new Date(dayKey + 'T12:00:00'); return `${KB_JOURS[d.getDay()]} ${d.getDate()} ${KB_MOIS[d.getMonth()]}`; }
     function kbLieuxDefault() {
       const sites = {};
-      SITES.forEach(c => {
+      KB_SITES_DEFAULT.forEach(c => {
         const hours = {};
         if (c === 'BIC') { hours[3] = '14:00-20:00'; hours[4] = '14:00-20:00'; hours[5] = '14:00-20:00'; hours[6] = '10:00-20:00'; }
-        sites[c] = { name: SITE_NAMES[c] || c, type: c === 'DOM' ? 'domicile' : (BOUTIQUES.includes(c) ? 'boutique' : 'camion'), adresse: '', hours };
+        sites[c] = { name: SITE_NAMES[c] || c, type: c === 'DOM' ? 'domicile' : (KB_BOUTIQUES_DEFAULT.includes(c) ? 'boutique' : 'camion'), adresse: '', hours };
+        sites[c].days = kbLieuDays(c, sites[c]);
       });
       return { sites };
     }
+    // V10.31 — une config enregistrée fait foi (plus de réinjection des lieux codés en dur → suppression possible)
     function kbLieuxMerge(saved) {
-      const def = kbLieuxDefault();
-      const s = (saved && saved.sites) || {};
-      Object.keys(s).forEach(c => { def.sites[c] = { ...(def.sites[c] || { name: c, type: 'camion', adresse: '', hours: {} }), ...s[c], hours: { ...((def.sites[c] || {}).hours || {}), ...((s[c] && s[c].hours) || {}) } }; });
-      return def;
+      const s = saved && saved.sites;
+      if (!s || !Object.keys(s).length) return kbLieuxDefault();
+      const out = {};
+      Object.keys(s).forEach(c => {
+        const L = s[c] || {};
+        out[c] = { ...L, name: L.name || SITE_NAMES[c] || c, type: L.type || 'camion', adresse: L.adresse || '', hours: { ...(L.hours || {}) }, days: kbLieuDays(c, L) };
+      });
+      return { sites: out };
     }
-    async function kbLieuxLoad() { try { return kbLieuxMerge(await storage.getDoc('app_config', 'lieux')); } catch (e) { return kbLieuxDefault(); } }
+    async function kbLieuxLoad() {
+      let saved;
+      try { saved = await storage.getDoc('app_config', 'lieux'); } catch (e) { return kbLieuxMerge(kbLieuxCached()) ; }
+      const lx = kbLieuxMerge(saved);
+      if (saved && saved.sites && Object.keys(saved.sites).length) kbLieuxPublish(lx);
+      return lx;
+    }
+    function kbLieuxCached() { try { return JSON.parse(localStorage.getItem(KB_LIEUX_CACHE) || 'null'); } catch (e) { return null; } }
     // Horaires d'un lieu pour un jour donné → { start:'14:00', end:'20:00' } ou null
     function kbLieuHours(lieux, site, dayKey) {
       const L = lieux && lieux.sites && lieux.sites[site]; if (!L) return null;
       const dow = new Date(dayKey + 'T12:00:00').getDay();
+      if (Array.isArray(L.days) && !L.days.includes(dow)) return null; // V10.31 — jour non distribué
       return kbSlotParse((L.hours || {})[dow] || '');
     }
 
@@ -13365,22 +13418,33 @@
       const showToast = React.useContext(ToastContext);
       const [lieux, setLieux] = React.useState(null);
       const [saving, setSaving] = React.useState(false);
+      const [dirty, setDirty] = React.useState(false);
       const [newCode, setNewCode] = React.useState('');
+      const [delAsk, setDelAsk] = React.useState(null); // code à confirmer
       React.useEffect(() => { kbLieuxLoad().then(setLieux); }, []);
       if (!lieux) return <div className="card"><p style={{ margin: 0, fontSize: 13 }}>Chargement…</p></div>;
       const codes = Object.keys(lieux.sites).sort((a, b) => { const t = x => ({ boutique: 0, camion: 1, domicile: 2 })[lieux.sites[x].type] ?? 3; return t(a) - t(b) || a.localeCompare(b); });
-      const upd = (c, patch) => setLieux(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], ...patch } } }));
-      const updH = (c, dow, v) => setLieux(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], hours: { ...(l.sites[c].hours || {}), [dow]: v } } } }));
+      const edit = (fn) => { setLieux(fn); setDirty(true); };
+      const upd = (c, patch) => edit(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], ...patch } } }));
+      const updH = (c, dow, v) => edit(l => ({ sites: { ...l.sites, [c]: { ...l.sites[c], hours: { ...(l.sites[c].hours || {}), [dow]: v } } } }));
+      const togDay = (c, dow) => edit(l => { const L = l.sites[c]; const ds = new Set(L.days || []); if (ds.has(dow)) ds.delete(dow); else ds.add(dow); return { sites: { ...l.sites, [c]: { ...L, days: [...ds].sort() } } }; });
       const save = async () => {
         const bad = [];
-        codes.forEach(c => KB_LIEUX_DOW.forEach(([d, lb]) => { const v = String((lieux.sites[c].hours || {})[d] || '').trim(); if (v && !kbSlotParse(v)) bad.push(`${c} ${lb} « ${v} »`); }));
+        codes.forEach(c => { const L = lieux.sites[c]; (L.days || []).forEach(d => { const v = String((L.hours || {})[d] || '').trim(); if (v && !kbSlotParse(v)) bad.push(`${c} ${KB_LIEUX_DOW_ALL.find(x => x[0] === d)[1]} « ${v} »`); }); });
         if (bad.length) { showToast('Horaire invalide (ex : 14:00-20:00) : ' + bad.slice(0, 3).join(', ')); return; }
+        if (!codes.length) { showToast('Il faut au moins un lieu'); return; }
         setSaving(true);
         try {
           const sites = {};
-          codes.forEach(c => { const L = lieux.sites[c]; const h = {}; KB_LIEUX_DOW.forEach(([d]) => { const p = kbSlotParse((L.hours || {})[d] || ''); if (p) h[d] = p.start + '-' + p.end; }); sites[c] = { name: String(L.name || c).trim(), type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h }; });
+          codes.forEach(c => {
+            const L = lieux.sites[c]; const days = [...new Set(L.days || [])].sort(); const h = {};
+            days.forEach(d => { const p = kbSlotParse((L.hours || {})[d] || ''); if (p) h[d] = p.start + '-' + p.end; });
+            sites[c] = { name: String(L.name || c).trim() || c, type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h, days };
+          });
           await storage.setDoc('app_config', 'lieux', { sites, updatedBy: session.name, updatedAt: new Date().toISOString() }, { replace: true });
-          setLieux({ sites }); showToast('✓ Lieux & horaires enregistrés');
+          const lx = kbLieuxMerge({ sites });
+          setLieux(lx); setDirty(false); kbLieuxPublish(lx);
+          showToast('✓ Lieux & horaires enregistrés — appliqués partout');
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setSaving(false); }
       };
@@ -13388,38 +13452,48 @@
         const c = newCode.trim().toUpperCase();
         if (!/^[A-Z0-9]{2,5}$/.test(c)) { showToast('Code lieu : 2 à 5 lettres/chiffres (ex : BIC)'); return; }
         if (lieux.sites[c]) { showToast('Ce code existe déjà'); return; }
-        setLieux(l => ({ sites: { ...l.sites, [c]: { name: c, type: 'camion', adresse: '', hours: {} } } })); setNewCode('');
+        edit(l => ({ sites: { ...l.sites, [c]: { name: '', type: 'boutique', adresse: '', hours: {}, days: [], _new: true } } })); setNewCode('');
+        showToast(`Lieu ${c} ajouté : nom, type, jours et horaires puis 💾 Enregistrer`);
       };
+      const delLieu = (c) => { edit(l => { const s = { ...l.sites }; delete s[c]; return { sites: s }; }); setDelAsk(null); showToast(`${c} retiré — 💾 Enregistrer pour valider`); };
       const inp = { width: '100%', padding: '7px 8px', border: '1px solid var(--line)', borderRadius: 8, fontSize: 14, boxSizing: 'border-box' };
       return (
         <div className="stack">
           <div className="card" style={{ padding: '12px 14px' }}>
             <strong style={{ fontSize: 15 }}>📍 Lieux &amp; horaires de distribution</strong>
-            <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0 0' }}>Horaires au format <b>14:00-20:00</b>. Case vide = pas de distribution ce jour-là. Les mails clients (récap à la clôture + rappel 60 min avant l'ouverture) utilisent ces horaires et ce nom. Le point vert = jour de distribution prévu au calendrier.</p>
+            <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0 0' }}>Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format <b>14:00-20:00</b> (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.</p>
           </div>
           {codes.map(c => {
-            const L = lieux.sites[c];
+            const L = lieux.sites[c]; const days = L.days || [];
             return (
-              <div key={c} className="card" style={{ padding: '10px 12px' }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 120px', gap: 8, alignItems: 'center' }}>
+              <div key={c} className="card" style={{ padding: '10px 12px', borderLeft: L._new ? '4px solid var(--accent, #2e7d32)' : undefined }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '64px 1fr 116px 40px', gap: 8, alignItems: 'center' }}>
                   <span style={{ fontWeight: 900, fontSize: 18 }}>{c}</span>
-                  <input style={inp} value={L.name || ''} onChange={e => upd(c, { name: e.target.value })} placeholder="Nom affiché au client" />
+                  <input style={inp} value={L.name || ''} onChange={e => upd(c, { name: e.target.value })} placeholder="Nom affiché (ex : Bichat)" />
                   <select style={inp} value={L.type || 'camion'} onChange={e => upd(c, { type: e.target.value })}>
                     <option value="boutique">🏪 Boutique</option><option value="camion">🚚 Camion</option><option value="domicile">🏠 Domicile</option>
                   </select>
+                  <button title={'Supprimer ' + c} aria-label={'Supprimer ' + c} onClick={() => setDelAsk(c)} style={{ height: 36, border: '1px solid var(--line)', borderRadius: 8, background: 'var(--bg-card)', cursor: 'pointer', fontSize: 16 }}>🗑</button>
                 </div>
+                {delAsk === c && (
+                  <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: '#fdecea', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 13 }}>
+                    <span style={{ flex: 1 }}>Retirer <b>{c}</b> de la liste des lieux ? (l'historique et les commandes déjà chargées ne sont pas touchés)</span>
+                    <button className="btn-secondary" onClick={() => setDelAsk(null)}>Annuler</button>
+                    <button className="btn-primary" style={{ background: 'var(--danger, #c62828)' }} onClick={() => delLieu(c)}>🗑 Retirer</button>
+                  </div>
+                )}
                 <input style={{ ...inp, marginTop: 6 }} value={L.adresse || ''} onChange={e => upd(c, { adresse: e.target.value })} placeholder="Adresse (affichée dans le mail client)" />
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginTop: 6 }}>
-                  {KB_LIEUX_DOW.map(([d, lb]) => {
-                    const planned = (DISTRIB_SCHEDULE[d] || []).includes(c);
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(118px, 1fr))', gap: 6, marginTop: 6 }}>
+                  {KB_LIEUX_DOW_ALL.map(([d, lb]) => {
+                    const on = days.includes(d);
                     const v = (L.hours || {})[d] || '';
                     const ok = !v || kbSlotParse(v);
-                    const endHint = DISTRIB_END[c] && DISTRIB_END[c][d] ? `fin ${DISTRIB_END[c][d]}h` : '';
+                    const endHint = DISTRIB_END[c] && DISTRIB_END[c][d] ? `fin ${DISTRIB_END[c][d]}h` : 'hh:mm-hh:mm';
                     return (
-                      <label key={d} style={{ fontSize: 12, fontWeight: 700 }}>
-                        <span>{planned ? '🟢' : '⚪'} {lb}</span>
-                        <input style={{ ...inp, fontSize: 13, borderColor: ok ? 'var(--line)' : 'var(--danger)' }} value={v} onChange={e => updH(c, d, e.target.value)} placeholder={planned ? (endHint || 'hh:mm-hh:mm') : '—'} />
-                      </label>
+                      <div key={d} style={{ border: '1px solid ' + (on ? 'var(--accent, #2e7d32)' : 'var(--line)'), borderRadius: 8, padding: 4, background: on ? 'rgba(46,125,50,.06)' : 'transparent' }}>
+                        <button onClick={() => togDay(c, d)} aria-pressed={on} style={{ width: '100%', border: 'none', background: 'none', textAlign: 'left', fontSize: 13, fontWeight: 800, cursor: 'pointer', padding: '2px 2px 4px', color: on ? 'var(--ink)' : 'var(--ink-mute)' }}>{on ? '🟢' : '⚪'} {lb}</button>
+                        {on && <input style={{ ...inp, fontSize: 13, padding: '5px 6px', borderColor: ok ? 'var(--line)' : 'var(--danger)' }} value={v} onChange={e => updH(c, d, e.target.value)} placeholder={endHint} />}
+                      </div>
                     );
                   })}
                 </div>
@@ -13427,10 +13501,10 @@
             );
           })}
           <div className="card" style={{ padding: '10px 12px', display: 'flex', gap: 8 }}>
-            <input style={{ ...inp, flex: 1 }} value={newCode} onChange={e => setNewCode(e.target.value)} placeholder="Nouveau code lieu (ex : NEW)" />
+            <input style={{ ...inp, flex: 1 }} value={newCode} onChange={e => setNewCode(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addLieu(); }} placeholder="Nouveau code lieu (ex : NEW)" />
             <button className="btn-secondary" onClick={addLieu}>➕ Ajouter</button>
           </div>
-          <button className="btn-primary" disabled={saving} onClick={save} style={{ position: 'sticky', bottom: 8 }}>{saving ? 'Enregistrement…' : '💾 Enregistrer les lieux & horaires'}</button>
+          <button className="btn-primary" disabled={saving} onClick={save} style={{ position: 'sticky', bottom: 8 }}>{saving ? 'Enregistrement…' : (dirty ? '💾 Enregistrer les lieux & horaires (modifié)' : '💾 Enregistrer les lieux & horaires')}</button>
         </div>
       );
     }
@@ -13847,6 +13921,32 @@
         return KB_CHEESE_RX.test(muStrip(String(r.product).toLowerCase()));
       }, [catalog, catByName]);
       React.useEffect(() => { try { window.scrollTo(0, 0); } catch (e) {} }, [openProd]);
+      // V10.30 — en-tête produit collant : mesure la hauteur réelle des bandeaux collés en haut (.topbar appli + .pdj-topbar)
+      React.useEffect(() => {
+        if (!openProd) return;
+        let raf = 0;
+        const measure = () => {
+          raf = 0;
+          try {
+            const wrap = document.querySelector('.pdj-wrap'); if (!wrap) return;
+            let stick = 0;
+            document.querySelectorAll('.topbar, .pdj-topbar').forEach(el => {
+              const cs = getComputedStyle(el);
+              if (cs.display === 'none' || (cs.position !== 'sticky' && cs.position !== 'fixed')) return;
+              stick = Math.max(stick, (parseFloat(cs.top) || 0) + el.offsetHeight);
+            });
+            wrap.style.setProperty('--pdj-stick', Math.round(stick) + 'px');
+            const h = wrap.querySelector('.pdj-dhead');
+            if (h) h.classList.toggle('stuck', window.scrollY > 4 && h.getBoundingClientRect().top <= stick + 1);
+          } catch (e) {}
+        };
+        const onEv = () => { if (!raf) raf = requestAnimationFrame(measure); };
+        measure();
+        window.addEventListener('scroll', onEv, { passive: true });
+        window.addEventListener('resize', onEv);
+        const t = setTimeout(measure, 300);
+        return () => { window.removeEventListener('scroll', onEv); window.removeEventListener('resize', onEv); clearTimeout(t); if (raf) cancelAnimationFrame(raf); };
+      }, [openProd]);
 
       // ---- helpers (scopés) ----
       const K = (r) => r.site + '||' + r.client + '||' + r.product;
@@ -14842,6 +14942,13 @@
 /* fiche produit : liste des casiers */
 .pdj-detail{max-width:900px;margin:0 auto}
 .pdj-dhead{display:flex;align-items:center;gap:12px;background:#fff;border:2px solid #e8e3da;border-radius:14px;padding:12px}
+.pdj-detail .pdj-dhead{position:sticky;top:var(--pdj-stick,0px);z-index:8;transition:padding .12s}
+.pdj-detail .pdj-dhead.stuck{padding:6px 10px;border-color:var(--acc);box-shadow:0 4px 10px rgba(0,0,0,.14)}
+.pdj-detail .pdj-dhead.stuck .pdj-back{flex-basis:48px;height:48px;font-size:26px}
+.pdj-detail .pdj-dhead.stuck .pdj-dname{font-size:23px}
+.pdj-detail .pdj-dhead.stuck .pdj-dprod{font-size:16px}
+.pdj-detail .pdj-dhead.stuck .pdj-pres{display:none}
+.pdj-detail .pdj-dhead.stuck .pdj-dcount{font-size:28px}
 .pdj-back{flex:0 0 64px;height:64px;border-radius:14px;border:2px solid var(--blue);background:#fff;color:var(--blue);font-size:32px;font-weight:900;cursor:pointer}
 .pdj-dname{font-size:26px;font-weight:900;line-height:1.15;color:#111}
 .pdj-dprod{font-size:19px;font-style:italic;color:#444;margin-top:2px}
@@ -26428,6 +26535,8 @@
     }
 
     function App() {
+      const [, setLieuxRev] = React.useState(0); // V10.31 — re-rendu quand la liste des lieux change
+      React.useEffect(() => { const f = () => setLieuxRev(x => x + 1); window.addEventListener('kb-lieux', f); return () => window.removeEventListener('kb-lieux', f); }, []);
       const [session, setSession] = React.useState(() => {
         // V9.6 : session persistée dans localStorage (reste connecté entre fermetures
         // de l'app). On garde sessionStorage en repli pour les anciennes sessions.
@@ -27101,7 +27210,7 @@
                     </optgroup>
                   )}
                   <optgroup label="○ Autres sites">
-                    {SITES.filter(s => !sitesOfDay.includes(s)).map(s => <option key={s} value={s}>{s}</option>)}
+                    {SITES.filter(s => !sitesOfDay.includes(s)).map(s => <option key={s} value={s}>{s}{siteLabel(s) !== s ? ' · ' + siteLabel(s) : ''}</option>)}
                   </optgroup>
                 </select>
               )}
@@ -27416,6 +27525,9 @@
       } else {
         try { startLocalMode(); } catch (_) {}
       }
+      // V10.31 — lieux : dernière liste connue (cache) appliquée avant le 1er rendu, puis rafraîchie depuis Firestore
+      try { const c = kbLieuxCached(); if (c && c.sites) kbApplyLieux(kbLieuxMerge(c)); } catch (_) {}
+      try { kbLieuxLoad().catch(() => {}); } catch (_) {}
       try {
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<ErrorBoundary><ToastProvider><App /></ToastProvider></ErrorBoundary>);
