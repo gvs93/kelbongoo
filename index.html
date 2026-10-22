@@ -764,7 +764,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.39';
+    const APP_VERSION = 'V10.40';
+    // V10.40 — (22/10/2026) Rungis : ① 🥬 Rajout F&L à Rungis envoyé AUTOMATIQUEMENT à la clôture de la prépa (plus de clic dans
+    //   Master › F&L ; la carte affiche « envoyé automatiquement », ↻ Renvoyer reste possible ; produits « à rapprocher » → mail hg@ + rr@).
+    //   ② Mail commande Rungis dès 4h30 (KBG_Rungis v1.4 : commande totale + détail 4h30 +15 % + rajout « uniquement si livraison avant 10h »).
+    //   ③ Espace Rungis › 📄 Contrôle BL : chargement du BL PDF du jour (ou automatique depuis la boîte achat@, script relais),
+    //   comparaison kg/pièces livrés ↔ colis commandés × colisage (+ rajouts de la veille), rapprochement code BL ↔ code Probon
+    //   mémorisé, alerte mail rr@pribon.org + hg@probon.fr si incohérence (KBG_BL v1.0).
     // V10.39 — (22/10/2026) Chauffeur Rungis › 🟫 Retour palettes EPAL : une grosse carte par boutique (ROB, TOL, BIC), un appui = +1 palette,
     //   « − 1 » pour corriger, ✅ Valider → registre Firebase Centrale « epal/mvts » (type retour). Chaque carte montre ce que la boutique doit
     //   (palettes EPAL envoyées par Rungis − rendues, depuis le JJ/MM). Même calcul que la Console et le mail BL magasin.
@@ -14607,6 +14613,13 @@
             showToast(lg.ok ? `🚚 Mail Rungis envoyé : ${rungisList.reduce((a,x)=>a+x.rolls,0)} roll(s) · ${rungisList.reduce((a,x)=>a+x.dolly,0)} dolly` : '⚠️ Mail Rungis non envoyé : ' + lg.error);
           } catch (e) { showToast('⚠️ Mail Rungis : ' + e.message); }
         }
+        // V10.40 — 🥬 Rajout F&L à Rungis AUTOMATIQUE (avant : clic dans Master › Fruits & légumes)
+        try {
+          const rj = await kbAutoRajoutRungis(day, user);
+          if (rj.skipped) showToast('🥬 Rajout F&L Rungis : déjà envoyé pour ce jour');
+          else if (rj.empty) showToast('🥬 Aucun rajout F&L à demander à Rungis' + (rj.todo ? ` (${rj.todo} produit(s) à rapprocher — Henry/Raimbaud prévenus)` : ''));
+          else showToast(rj.ok ? `🥬 Rajout F&L envoyé à Rungis : ${rj.count} produit(s) · ${rj.colis} colis${rj.todo ? ` · ${rj.todo} à rapprocher (Master › F&L)` : ''}` : '⚠️ Rajout F&L Rungis non envoyé : ' + rj.error + ' — Master › Fruits & légumes');
+        } catch (e) { showToast('⚠️ Rajout F&L Rungis non envoyé : ' + e.message + ' — Master › Fruits & légumes'); }
         // V9.59 — Livraison à domicile : fichier Dromy envoyé automatiquement si activé (Pilotage › Dromy)
         try {
           const cfgD = await storage.getDoc('app_config', 'dromy');
@@ -21877,6 +21890,7 @@
       (manquants || []).forEach(m => {
         const manque = Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0;
         if (manque <= 0) return;
+        if (/panier solidaire/i.test(String(m.produit || ''))) return;   // V10.40 — panier solidaire : pas un produit Rungis
         const res = _flResolve(flIdx, m.produit, aliasMap);
         if (res.source === 'ignore') return;                         // marqué « pas un FL »
         if (res.source === 'exact' || res.source === 'alias') {
@@ -21910,6 +21924,49 @@
         return out;
       }, [flIdx]);
       return opts.map(o => <option key={o.value} value={o.value}>{o.label}</option>);
+    }
+
+    // V10.40 — RAJOUT F&L À RUNGIS AUTOMATIQUE à la clôture de la prépa (même calcul que la carte Master › F&L) :
+    //   manquants du jour (+ 🟣 dispatch dernière minute) → rapprochement SÛR au Sheet FL (nom exact ou rapprochement mémorisé)
+    //   → mail Rungis + journal DEMANDES RAJOUT FL (proxy mail_fl_rupture). Les rapprochements incertains ne partent pas :
+    //   mail à hg@ + rr@ pour les valider dans Master › F&L (↻ Renvoyer). Un 2e passage le même jour ne renvoie pas.
+    async function kbAutoRajoutRungis(day, by) {
+      const prev = await storage.getDoc('fl_rupture_sent', day).catch(() => null);
+      if (prev && prev.sentAt) return { ok: true, skipped: true };
+      const [rawM, prepArr, od, flRes, aliases] = await Promise.all([
+        storage.getAll(`day_${day}_manquants`).catch(() => []),
+        storage.getAll(`day_${day}_prep`).catch(() => []),
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() }),
+        storage.getAll('fl_aliases').catch(() => []),
+      ]);
+      if (!flRes || !flRes.ok || !flRes.rows) return { ok: false, error: 'Sheet COMMANDE FL illisible' };
+      const flIdx = parseFLSheetIndex(flRes.rows);
+      const aliasMap = {};
+      for (const a of (aliases || [])) { if (a && a.key) aliasMap[a.key] = a.ignore ? '__ignore__' : (a.fl || undefined); }
+      const base = rawM || [];
+      const lm = kbLmManquantsFromPrep(prepArr, (od && od.orders) || []);
+      const have = new Set(base.filter(m => (Number(m.manque != null ? m.manque : (m.total != null ? m.total : m.qty)) || 0) > 0).map(m => normalizeText(kbProdName(m.produit))));
+      const manquants = [...base, ...lm.filter(m => !have.has(normalizeText(kbProdName(m.produit))))];
+      const b = computeFlBuckets(flIdx, manquants, aliasMap);
+      const notPanier = (x) => !/panier solidaire/i.test(String(x.produit || x.manquant || ''));
+      const rows = b.rows.filter(notPanier), warn = b.warn.filter(notPanier), todo = b.todo.filter(notPanier);
+      if (todo.length) {
+        try {
+          await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'hg@probon.fr, rr@pribon.org',
+            subject: `🥬 Rajout F&L Rungis : ${todo.length} produit(s) à rapprocher (${formatDateShort(day)})`,
+            body: `Bonjour,\n\nÀ la clôture de la prépa (${by}), le rajout F&L est parti automatiquement à Rungis pour les produits sûrs.\n`
+              + `Ces manquants n'ont PAS pu être reliés avec certitude au Sheet COMMANDE FL, ils ne sont pas dans la demande :\n\n`
+              + todo.map(t => `• ${t.manquant}${t.producteur ? ' (' + t.producteur + ')' : ''} — manque ${t.manque}${t.guessLabel ? ' · suggestion : ' + t.guessLabel : ''}`).join('\n')
+              + `\n\n→ Master › Fruits & légumes › Rajout F&L à Rungis : choisir la correspondance puis « ↻ Renvoyer ».\n\n— Appli Kelbongoo` });
+        } catch (_) {}
+      }
+      if (!rows.length && !warn.length) return { ok: true, empty: true, todo: todo.length };
+      const res = await sendFlRuptureMail(rows, warn, day, by);
+      if (!res || res.ok === false) return { ok: false, error: (res && res.error) || 'réponse invalide' };
+      const colis = rows.reduce((a, x) => a + (x.colis || 0), 0);
+      try { await storage.setDoc('fl_rupture_sent', day, { day, sentAt: new Date().toISOString(), sentBy: by, count: rows.length, colis, auto: true, todo: todo.length }); } catch (_) {}
+      return { ok: true, count: rows.length + warn.length, colis, todo: todo.length };
     }
 
     // Bloc réutilisable (Admin + Manquants & ND).
@@ -22020,7 +22077,7 @@
             sentInfo ? (
               <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <button className="btn-secondary" disabled style={{ fontSize: 13, flex: '1 1 auto', opacity: 0.75, cursor: 'default' }}>
-                  ✓ Envoyé le {formatDateShort((sentInfo.sentAt || '').slice(0, 10))} à {new Date(sentInfo.sentAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}{sentInfo.sentBy ? ` par ${sentInfo.sentBy}` : ''}
+                  ✓ Envoyé{sentInfo.auto ? ' automatiquement à la clôture de la prépa' : ''} le {formatDateShort((sentInfo.sentAt || '').slice(0, 10))} à {new Date(sentInfo.sentAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}{sentInfo.sentBy ? ` par ${sentInfo.sentBy}` : ''}
                 </button>
                 <button className="btn-primary" style={{ fontSize: 13, padding: '8px 14px' }} disabled={sending} onClick={send}>{sending ? 'Envoi…' : '↻ Renvoyer'}</button>
               </div>
@@ -23730,6 +23787,7 @@
     // ───────── 🔐 ESPACE RUNGIS (achat@ · hg@ · gestion@) ─────────
     const KB_RG_NAV = [
       { k: 'cmd', ic: '🥬', l: 'Commande du jour' },
+      { k: 'bl', ic: '📄', l: 'Contrôle BL' },        // V10.40
       { k: 'enl', ic: '📦', l: 'Enlèvements' },
       { k: 'trucks', ic: '🚚', l: 'Suivi camions' },
     ];
@@ -23756,6 +23814,7 @@
             {KB_RG_NAV.map(n => <button key={n.k} onClick={() => setPage(n.k)} className={page === n.k ? 'btn-primary' : 'btn-secondary'} style={{ flex: '1 1 30%', fontSize: 15, padding: '10px 6px', fontWeight: 800 }}>{n.ic} {n.l}</button>)}
           </div>
           {page === 'cmd' && <RungisCommandePage />}
+          {page === 'bl' && <RungisBlPage />}
           {page === 'enl' && <RungisEnlClearPage />}
           {page === 'trucks' && <RungisTrucksPage />}
         </div>
@@ -23792,7 +23851,7 @@
         const h1 = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS À COMMANDER', 'COLISAGE', 'UNITÉ DE VENTE KBG', 'TYPE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'VENTES À 5H', 'ESTIMATION MU (+15 %)', 'STOCK MU', 'STOCK CAGETTE', 'BESOIN (uv)', 'ID SITE KBG'];
         const ws1 = XLSX.utils.aoa_to_sheet([h1, ...rows.map(r => [r.code, r.producteur, r.designation, Number(r.colis) || 0, r.col, r.uv, r.type, r.pa, r.totalHt, r.cmd5h, r.estim, r.stockMu, r.stockCag, r.besoinUv, r.id]), ['', '', 'TOTAL', Math.round(totC * 10) / 10]]);
         ws1['!cols'] = [10, 28, 36, 12, 10, 18, 9, 12, 13, 10, 12, 9, 11, 10, 26].map(w => ({ wch: w }));
-        XLSX.utils.book_append_sheet(wb, ws1, mode === 'live' ? 'Commande en cours' : 'Commande 5h');
+        XLSX.utils.book_append_sheet(wb, ws1, mode === 'live' ? 'Commande en cours' : 'Commande 4h30');
         const h2 = ['CODE PROBON', 'PRODUCTEUR', 'DÉSIGNATION', 'COLIS AJOUTÉS', 'COLISAGE', 'PRIX ACHAT HT', 'TOTAL HT ESTIMÉ', 'MANQUE (uv)', 'DEMANDÉ LE', 'PAR'];
         const ws2 = XLSX.utils.aoa_to_sheet([h2, ...aj.map(r => [r.code, r.producteur, r.designation, r.colis, r.col, r.pa, r.totalHt, r.manque, r.at, r.by]), ['', '', 'TOTAL', Math.round(totA * 10) / 10]]);
         ws2['!cols'] = [10, 28, 36, 12, 10, 12, 13, 10, 17, 12].map(w => ({ wch: w }));
@@ -23838,7 +23897,7 @@
               <div>🥬 Commande pour la <b>prépa du {longDay(day)}</b> → distribution du <b>{longDay(addDays(day, 1))}</b> (lendemain).{day !== today && <span style={{ color: '#ef6c00', fontWeight: 800 }}> · date choisie</span>}</div>
             </div>
             <div style={{ display: 'flex', gap: 4, marginTop: 12, padding: 4, background: 'var(--bg-muted)', borderRadius: 12 }}>
-              <Seg k="sent" l="📨 Commande envoyée à 5h" />
+              <Seg k="sent" l="📨 Commande envoyée à 4h30" />
               <Seg k="live" l="⏳ Commande en cours (direct)" />
             </div>
           </div>
@@ -23847,29 +23906,235 @@
           {data && (
             <>
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <Big l={mode === 'live' ? 'Colis — commande en cours' : 'Colis — commande 5h'} v={cur ? n1(totC) : '—'} c="#2e7d32" />
+                <Big l={mode === 'live' ? 'Colis — commande en cours' : 'Colis — commande 4h30'} v={cur ? n1(totC) : '—'} c="#2e7d32" />
                 <Big l="Produits" v={cur ? rows.length : '—'} c="#1565c0" />
                 <Big l="➕ Colis ajouts Rungis" v={aj.length ? n1(totA) : '0'} c="#e65100" />
               </div>
               <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #2e7d32' }}>
                 <div style={{ background: '#2e7d32', color: '#fff', padding: '12px 16px' }}>
-                  <div style={{ fontSize: 20, fontWeight: 900 }}>{mode === 'live' ? '⏳ Commande en cours' : '📨 Commande envoyée à 5h'}</div>
+                  <div style={{ fontSize: 20, fontWeight: 900 }}>{mode === 'live' ? '⏳ Commande en cours' : '📨 Commande envoyée à 4h30'}</div>
                   <div style={{ fontSize: 13.5, opacity: .95 }}>{mode === 'live'
                     ? `État du fichier COMMANDE FL maintenant (${live ? live.at : ''}) — ce qui partirait si on envoyait.`
-                    : sent ? `Ventes à 5h + 15 %, en colis · reçue par mail le ${sent.sentAt}` : 'Aucune commande envoyée ce jour-là.'}
+                    : sent ? `Ventes à 4h30 + 15 %, en colis · reçue par mail le ${sent.sentAt}` : 'Aucune commande envoyée ce jour-là.'}
                     {mode === 'sent' && sent && sent.fileUrl ? <> · <a href={sent.fileUrl} target="_blank" rel="noreferrer" style={{ color: '#fff', fontWeight: 800 }}>ouvrir le fichier</a></> : null}</div>
                 </div>
                 {mode === 'sent' && sent && sent.warn && <div style={{ background: '#fdecea', color: '#c62828', fontWeight: 800, padding: '8px 16px' }}>⚠️ {sent.warn}</div>}
-                <Table list={rows} color="#2e7d32" bg="#e8f5e9" colorTxt="#1a4d2e" empty={mode === 'sent' && !sent ? 'Pas de commande à 5h ce jour-là. Regarde « Commande en cours » ou choisis une autre date.' : 'Aucun colis à commander.'} />
+                <Table list={rows} color="#2e7d32" bg="#e8f5e9" colorTxt="#1a4d2e" empty={mode === 'sent' && !sent ? 'Pas de commande à 4h30 ce jour-là. Regarde « Commande en cours » ou choisis une autre date.' : 'Aucun colis à commander.'} />
               </div>
               <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #e65100' }}>
                 <div style={{ background: '#e65100', color: '#fff', padding: '12px 16px' }}>
-                  <div style={{ fontSize: 20, fontWeight: 900 }}>➕ Ajouts Rungis · à livrer avec cette commande</div>
+                  <div style={{ fontSize: 20, fontWeight: 900 }}>➕ Rajout F&L · à livrer avec cette commande — uniquement si livraison avant 10h</div>
                   <div style={{ fontSize: 13.5, opacity: .95 }}>Demandés la veille au soir ({longDay(addDays(day, -1))}) après la clôture de la prépa, pour compléter les commandes clients qui n'ont pas eu leurs produits.</div>
                 </div>
                 <Table list={aj} color="#e65100" bg="#fff3e0" colorTxt="#a64b00" empty={`Aucun ajout pour cette commande${new Date(day + 'T12:00:00').getDay() === 2 ? ' (mardi : pas de prépa la veille)' : ''}.`} />
                 {aj.length > 0 && <div style={{ padding: '8px 16px', fontSize: 13, color: 'var(--ink-soft)' }}>Envoyé par {[...new Set(aj.map(r => r.by).filter(Boolean))].join(', ') || '—'} le {(() => { const t = String(aj[0].at); return t.slice(8, 10) + '/' + t.slice(5, 7) + ' à ' + t.slice(11, 16).replace(':', 'h'); })()}</div>}
               </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // ───────── V10.40 — 📄 CONTRÔLE DU BL RUNGIS (Espace Rungis / Master) ─────────
+    //   BL PDF (kg ou pièces livrés) ↔ commande 4h30 (colis × colisage) + rajouts F&L de la veille — calcul serveur KBG_BL.gs.
+    //   Automatique dès que le BL arrive sur achat@probon.fr (script relais) ; sinon chargement ici. Alerte rr@ + hg@ si incohérence.
+    const KB_BL_ST = {
+      manquant:       { c: '#c62828', bg: '#fdecea', l: '❌ Non livré' },
+      absent:         { c: '#c62828', bg: '#fdecea', l: '❌ Absent du BL' },
+      moins:          { c: '#e65100', bg: '#fff3e0', l: '⬇️ En moins' },
+      plus:           { c: '#6a1b9a', bg: '#f3e5f5', l: '⬆️ En plus' },
+      nonCommande:    { c: '#6a1b9a', bg: '#f3e5f5', l: '➕ Non commandé' },
+      rapprocher:     { c: '#1565c0', bg: '#e3f2fd', l: '🔗 À rapprocher' },
+      absentProbable: { c: '#1565c0', bg: '#e3f2fd', l: '🔗 Probable' },
+      aConfirmer:     { c: '#616161', bg: '#f5f5f5', l: '❔ À vérifier' },
+      ok:             { c: '#2e7d32', bg: '#e8f5e9', l: '✅ OK' },
+      ok0:            { c: '#9e9e9e', bg: '#fafafa', l: '— 0' },
+    };
+    function RungisBlPage() {
+      const showToast = React.useContext(ToastContext);
+      const [list, setList] = React.useState(undefined);
+      const [cur, setCur] = React.useState(null);
+      const [busy, setBusy] = React.useState('');
+      const [err, setErr] = React.useState('');
+      const [pick, setPick] = React.useState({});   // blCode → codes choisis
+      const fileRef = React.useRef(null);
+      const n2 = (v) => v == null || v === '' ? '—' : String(Math.round((Number(v) || 0) * 100) / 100).replace('.', ',');
+      const dLong = (d) => { try { const x = kbCmDate(d); return x.charAt(0).toUpperCase() + x.slice(1); } catch (_) { return d; } };
+      const load = React.useCallback((keepKey) => {
+        kbRungisCall('rungis_bl_list', { n: 20 }).then(r => {
+          if (!r || !r.ok) { setList([]); setErr((r && r.error) || 'liste illisible'); return; }
+          setList(r.list || []);
+          setCur(c => { const k = keepKey || (c && (c.num || c.day)); return (r.list || []).find(x => (x.num || x.day) === k) || (c && (c.num || c.day) === k ? c : null) || (r.list || [])[0] || c || null; });
+        }).catch(e => { setList([]); setErr(kbErrMsg(e)); });
+      }, []);
+      React.useEffect(() => { load(); }, [load]);
+      const upload = (f) => {
+        if (!f) return;
+        if (!/pdf$/i.test(f.type) && !/\.pdf$/i.test(f.name)) { showToast('Choisis le BL en PDF'); return; }
+        if (f.size > 6 * 1024 * 1024) { showToast('PDF trop lourd (6 Mo max)'); return; }
+        const rd = new FileReader();
+        rd.onload = async () => {
+          setBusy('check'); setErr('');
+          try {
+            const b64 = String(rd.result).split(',')[1] || '';
+            const r = await kbRungisCall('rungis_bl_check', { pdf: b64, name: f.name });
+            if (!r || !r.ok) { setErr((r && r.error) || 'contrôle impossible'); return; }
+            setCur(r.result); load(r.result.num || r.result.day);
+            if (!r.result.alert) kbCelebrate({ title: 'BL conforme 🎉', sub: `${r.result.counts.ok} ligne(s) OK` });
+          } catch (e) { setErr(kbErrMsg(e)); } finally { setBusy(''); if (fileRef.current) fileRef.current.value = ''; }
+        };
+        rd.readAsDataURL(f);
+      };
+      const concord = async (l, val) => {
+        const codes = String(val || '').trim();
+        if (!codes) { showToast('Choisis le produit KBG'); return; }
+        setBusy('c_' + l.blCode);
+        try {
+          const r = await kbRungisCall('rungis_bl_concord', { blCode: l.blCode, blDes: l.des, codes, key: cur.num || cur.day });
+          if (r && r.ok && r.result) { setCur(r.result); showToast('✓ Relié — mémorisé pour les prochains BL'); load(r.result.num || r.result.day); }
+          else showToast('Erreur : ' + ((r && r.error) || 'inconnue'));
+        } catch (e) { showToast('Erreur : ' + kbErrMsg(e)); } finally { setBusy(''); }
+      };
+      const resend = async () => {
+        if (!cur || !confirm('Renvoyer le mail d\'alerte à rr@pribon.org et hg@probon.fr ?')) return;
+        setBusy('mail');
+        try { const r = await kbRungisCall('rungis_bl_recheck', { key: cur.num || cur.day, force: true }); if (r && r.ok) { setCur(r.result); showToast('📧 Alerte renvoyée'); } else showToast('Erreur : ' + ((r && r.error) || '')); }
+        catch (e) { showToast('Erreur : ' + kbErrMsg(e)); } finally { setBusy(''); }
+      };
+      const d = cur;
+      const lines = (d && d.lines) || [], miss = (d && d.missing) || [];
+      const bad = [...lines.filter(l => ['manquant', 'moins', 'plus', 'nonCommande'].includes(l.status)), ...miss.filter(m => m.status === 'absent')];
+      const toLink = lines.filter(l => l.status === 'rapprocher');
+      const toCheck = lines.filter(l => l.status === 'aConfirmer');
+      const okL = lines.filter(l => l.status === 'ok' || l.status === 'ok0');
+      const prix = lines.filter(l => l.prixEcart);
+      const probable = (bc) => miss.filter(m => m.status === 'absentProbable' && m.blCode === bc);
+      const Num = ({ v, c, l }) => <div style={{ textAlign: 'right', minWidth: 74 }}><div style={{ fontSize: 11, color: 'var(--ink-soft)', fontWeight: 700 }}>{l}</div><div style={{ fontSize: 26, fontWeight: 900, color: c || 'var(--ink)', lineHeight: 1.1 }}>{v}</div></div>;
+      const Badge = ({ st }) => { const x = KB_BL_ST[st] || KB_BL_ST.ok; return <span style={{ display: 'inline-block', background: x.c, color: '#fff', borderRadius: 9, padding: '4px 10px', fontSize: 14, fontWeight: 900, whiteSpace: 'nowrap' }}>{x.l}</span>; };
+      const Row = ({ l }) => {
+        const x = KB_BL_ST[l.status] || KB_BL_ST.ok;
+        return (
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', padding: '12px 14px', borderTop: '1px solid var(--line)', background: x.bg }}>
+            <Badge st={l.status} />
+            <div style={{ flex: '1 1 240px', minWidth: 0 }}>
+              <div style={{ fontSize: 18, fontWeight: 800 }}>{l.des}</div>
+              <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>
+                {[l.blCode ? 'BL ' + l.blCode : '', (l.codes && l.codes.length) ? 'code ' + l.codes.join('+') : (l.code ? 'code ' + l.code : ''), l.kbg && l.status !== 'absent' ? 'KBG : ' + l.kbg : ''].filter(Boolean).join(' · ')}
+              </div>
+              {l.msg && <div style={{ fontSize: 14, fontWeight: 800, color: x.c, marginTop: 2 }}>{l.msg}</div>}
+            </div>
+            <div style={{ display: 'flex', gap: 14, marginLeft: 'auto' }}>
+              <Num l="ATTENDU" v={n2(l.attendu)} />
+              <Num l="LIVRÉ (BL)" v={l.status === 'absent' ? '0' : n2(l.qte)} c={x.c} />
+            </div>
+            {l.colis != null && <div style={{ flex: '1 0 100%', fontSize: 13, color: 'var(--ink-soft)', textAlign: 'right' }}>{n2(l.colis)} colis × {n2(l.col)}{l.rajColis ? ` (dont rajout ${n2(l.rajColis)} colis)` : ''} — en kg ou pièces</div>}
+          </div>
+        );
+      };
+      return (
+        <div className="stack">
+          <div className="card" style={{ padding: '16px 18px' }}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <h2 style={{ margin: 0, fontSize: 26, flex: '1 1 260px' }}>📄 Contrôle du BL Rungis</h2>
+              <label className="btn-primary" style={{ width: 'auto', minHeight: 54, fontSize: 18, fontWeight: 900, padding: '12px 18px', cursor: busy ? 'wait' : 'pointer', margin: 0, opacity: busy ? .6 : 1 }}>
+                {busy === 'check' ? '⏳ Lecture du BL…' : '📥 Charger le BL du jour (PDF)'}
+                <input ref={fileRef} type="file" accept="application/pdf,.pdf" disabled={!!busy} style={{ display: 'none' }} onChange={e => upload(e.target.files && e.target.files[0])} />
+              </label>
+              <button className="btn-secondary" onClick={() => load()} title="Actualiser" style={{ width: 'auto' }}>↻</button>
+            </div>
+            <div style={{ marginTop: 10, padding: '10px 14px', borderRadius: 12, background: '#e3f2fd', border: '1px solid #90caf9', fontSize: 15, lineHeight: 1.5 }}>
+              🤖 Le BL envoyé chaque matin par gestion@probon.fr à achat@probon.fr est contrôlé <b>tout seul</b> dès réception. Si besoin, charge-le ici : la date est lue sur le BL.<br />
+              Le BL est en <b>kg ou pièces</b> : on compare à <b>colis commandés × colisage</b> (commande 4h30 + rajout F&L de la veille). Incohérence → mail à rr@pribon.org et hg@probon.fr.
+            </div>
+            {err && <div className="alert-error" style={{ marginTop: 10, fontSize: 15, fontWeight: 700 }}>⚠️ {err}</div>}
+            {list && list.length > 0 && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>
+                {list.map(x => {
+                  const k = x.num || x.day, on = d && (d.num || d.day) === k;
+                  return <button key={k} onClick={() => setCur(x)} className={on ? 'btn-primary' : 'btn-secondary'} style={{ width: 'auto', fontWeight: 800, fontSize: 14, padding: '8px 12px' }}>
+                    {formatDateShort(x.day)} {x.alert ? `⚠️ ${x.nEcarts || ''}` : '✅'}</button>;
+                })}
+              </div>
+            )}
+          </div>
+          {list === undefined && <div className="card" style={{ padding: 18, fontSize: 18 }}>Chargement des contrôles…</div>}
+          {list && !list.length && !d && <div className="card" style={{ padding: 18, fontSize: 17 }}>Aucun BL contrôlé pour l'instant. Charge le BL du jour (PDF) avec le gros bouton ci-dessus.</div>}
+          {d && (
+            <>
+              <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid ' + (d.alert ? '#c62828' : '#2e7d32') }}>
+                <div style={{ background: d.alert ? '#c62828' : '#2e7d32', color: '#fff', padding: '14px 18px' }}>
+                  <div style={{ fontSize: 24, fontWeight: 900 }}>{d.noCmd ? '⚠️ Pas de commande KBG enregistrée ce jour' : d.alert ? `⚠️ ${d.nEcarts} écart(s) avec la commande` : '✅ BL conforme à la commande'}</div>
+                  <div style={{ fontSize: 15, opacity: .95 }}>BL du <b>{dLong(d.day)}</b>{d.num ? ` · n° ${d.num}` : ''} · {d.nLines} ligne(s) · contrôlé le {d.at} ({d.source}{d.by ? ' · ' + d.by : ''})</div>
+                  <div style={{ fontSize: 14, opacity: .95 }}>{d.snapFound ? `Commande 4h30 envoyée le ${d.sentAt}` : 'Aucune commande 4h30 trouvée pour cette date'}{d.nRaj ? ` + ${d.nRaj} rajout(s) F&L de la veille` : ' · pas de rajout F&L'}{d.mailed ? ` · 📧 alerte envoyée le ${d.mailed}` : ''}</div>
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', padding: 12 }}>
+                  {[['✅ Conformes', d.counts.ok, '#2e7d32'], ['⚠️ Écarts', d.nEcarts, '#c62828'], ['🔗 À rapprocher', toLink.length, '#1565c0'], ['❔ À vérifier', toCheck.length, '#616161']].map(([l, v, c]) =>
+                    <div key={l} style={{ flex: '1 1 140px', background: c + '14', borderLeft: '8px solid ' + c, borderRadius: 12, padding: '10px 14px' }}><div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink-soft)' }}>{l}</div><div style={{ fontSize: 34, fontWeight: 900, color: c, lineHeight: 1.1 }}>{v}</div></div>)}
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', padding: '0 12px 12px' }}>
+                  {d.fileUrl && <button className="btn-secondary" onClick={() => window.open(d.fileUrl, '_blank', 'noopener')} style={{ width: 'auto', fontWeight: 800 }}>📄 Ouvrir le BL</button>}
+                  {d.alert && <button className="btn-secondary" disabled={!!busy} onClick={resend} style={{ width: 'auto', fontWeight: 800 }}>{busy === 'mail' ? 'Envoi…' : '📧 Renvoyer l\'alerte'}</button>}
+                </div>
+              </div>
+              {bad.length > 0 && (
+                <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #c62828' }}>
+                  <div style={{ background: '#c62828', color: '#fff', padding: '10px 16px', fontSize: 20, fontWeight: 900 }}>⚠️ Écarts · {bad.length}</div>
+                  {bad.map((l, i) => <Row key={'b' + i} l={l} />)}
+                </div>
+              )}
+              {toLink.length > 0 && (
+                <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #1565c0' }}>
+                  <div style={{ background: '#1565c0', color: '#fff', padding: '10px 16px' }}>
+                    <div style={{ fontSize: 20, fontWeight: 900 }}>🔗 À rapprocher · {toLink.length}</div>
+                    <div style={{ fontSize: 13.5, opacity: .95 }}>Le code du BL (A00…) n'est pas le code Probon. Relie-le UNE fois : c'est mémorisé pour tous les prochains BL.</div>
+                  </div>
+                  {toLink.map(l => {
+                    const pr = probable(l.blCode);
+                    const val = pick[l.blCode] != null ? pick[l.blCode] : (pr.length ? pr.map(m => m.code).join(',') : '');
+                    return (
+                      <div key={l.blCode} style={{ padding: '12px 14px', borderTop: '1px solid var(--line)' }}>
+                        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                          <div style={{ flex: '1 1 260px' }}>
+                            <div style={{ fontSize: 18, fontWeight: 800 }}>{l.des}</div>
+                            <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>BL {l.blCode} · livré {n2(l.qte)} · {n2(l.prix)} €</div>
+                            {pr.length > 0 && <div style={{ fontSize: 14, fontWeight: 800, color: '#1565c0', marginTop: 2 }}>Probablement : {pr.map(m => `${m.des} (attendu ${n2(m.attendu)})`).join(' + ')}</div>}
+                          </div>
+                          <Num l="LIVRÉ (BL)" v={n2(l.qte)} c="#1565c0" />
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                          <select value={(l.top || []).some(t => String(t.code) === val) ? val : ''} onChange={e => setPick(p => ({ ...p, [l.blCode]: e.target.value }))} style={{ flex: '1 1 260px', fontSize: 16, padding: '10px 8px', borderRadius: 10 }}>
+                            <option value="">— choisir le produit KBG —</option>
+                            {(l.top || []).map(t => <option key={t.code} value={String(t.code)}>{t.exp ? '★ ' : ''}{t.code} · {t.des}{t.exp ? ' (commandé)' : ''}</option>)}
+                          </select>
+                          <input value={val} onChange={e => setPick(p => ({ ...p, [l.blCode]: e.target.value }))} placeholder="code(s) Probon, ex. 1550 ou 1,2,3,4" style={{ flex: '1 1 180px', fontSize: 16, padding: '10px 8px', borderRadius: 10, border: '1px solid var(--line)' }} />
+                          <button className="btn-primary" disabled={!!busy || !val} onClick={() => concord(l, val)} style={{ width: 'auto', fontWeight: 900, minHeight: 46 }}>{busy === 'c_' + l.blCode ? '…' : '✓ Relier'}</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {toCheck.length > 0 && (
+                <div className="card" style={{ padding: 0, overflow: 'hidden', border: '2px solid #9e9e9e' }}>
+                  <div style={{ background: '#616161', color: '#fff', padding: '10px 16px', fontSize: 19, fontWeight: 900 }}>❔ À vérifier · {toCheck.length}</div>
+                  {toCheck.map((l, i) => <Row key={'c' + i} l={l} />)}
+                </div>
+              )}
+              {okL.length > 0 && (
+                <details className="card" style={{ padding: '10px 14px' }}>
+                  <summary style={{ fontSize: 17, fontWeight: 900, color: '#2e7d32', cursor: 'pointer' }}>✅ {okL.length} ligne(s) conforme(s)</summary>
+                  <div style={{ overflowX: 'auto', marginTop: 8 }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+                    <thead><tr style={{ background: '#e8f5e9' }}><th style={{ textAlign: 'left', padding: 6 }}>BL</th><th style={{ textAlign: 'left', padding: 6 }}>Produit</th><th style={{ textAlign: 'right', padding: 6 }}>Attendu</th><th style={{ textAlign: 'right', padding: 6 }}>Livré</th></tr></thead>
+                    <tbody>{okL.map(l => <tr key={l.blCode} style={{ borderTop: '1px solid var(--line)' }}><td style={{ padding: 6, fontWeight: 800 }}>{l.blCode}</td><td style={{ padding: 6 }}>{l.des}<div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{l.kbg}</div></td><td style={{ padding: 6, textAlign: 'right' }}>{n2(l.attendu)}</td><td style={{ padding: 6, textAlign: 'right', fontWeight: 900 }}>{n2(l.qte)}</td></tr>)}</tbody>
+                  </table></div>
+                </details>
+              )}
+              {prix.length > 0 && (
+                <details className="card" style={{ padding: '10px 14px' }}>
+                  <summary style={{ fontSize: 16, fontWeight: 800, cursor: 'pointer' }}>💶 {prix.length} écart(s) de prix (info) — prix BL vs prix d'achat COMMANDE FL</summary>
+                  <div style={{ marginTop: 8, fontSize: 14, lineHeight: 1.7 }}>{prix.map(l => <div key={l.blCode}><b>{l.des}</b> : BL {n2(l.prix)} € · KBG {n2(l.prixKbg)} € <span style={{ color: l.prixEcart > 0 ? '#c62828' : '#2e7d32', fontWeight: 800 }}>({l.prixEcart > 0 ? '+' : ''}{n2(l.prixEcart)} €)</span></div>)}</div>
+                </details>
+              )}
             </>
           )}
         </div>
