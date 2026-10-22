@@ -1,7 +1,13 @@
 /**
- * KBG_Rungis.gs — v1.3 (19/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_Rungis.gs — v1.4 (22/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
  * ---------------------------------------------------------------------------------------------
- * 1. 5h00 : mail « Commande KBG <date> » à gestion@probon.fr
+ * v1.4 : • le mail part DÈS QUE la colonne COMMANDE A 5H est remplie (≈4h30, appelé par flAuto5h — KBG_FL_Auto v1.4) ;
+ *          le déclencheur 5h reste en filet de sécurité et ne renvoie pas si le mail est déjà parti.
+ *        • mail : ① COMMANDE TOTALE (commande 4h30 + rajout F&L, en colis, par produit)
+ *                 ② détail commande à 4h30 + 15 % (vendus · +15 % · colis × colisage = kg/pce à livrer)
+ *                 ③ rajout F&L (manquants de fin de prépa) — UNIQUEMENT si livraison avant 10h.
+ *        • actions rungis_bl_* (contrôle du BL Rungis) → KBG_BL.gs.
+ * 1. ≈4h30 : mail « Commande KBG <date> » à gestion@probon.fr
  *      - corps : CODE PROBON · PRODUCTEUR · DÉSIGNATION · COLIS (gros, lisible)
  *      - pièce jointe : Sheet complet « Commande KBG JJ-MM-AAAA » (.xlsx) + lien Google Sheet
  *      - + ajouts Rungis demandés la veille au soir (après la prépa), à livrer avec cette commande
@@ -201,62 +207,102 @@ function rgHorsHtml_(rows) {
     + 'Ils sont quand même dans la liste ci-dessous (ligne orange). <b>Demander à Raimbaud de mettre à jour le Sheet.</b></div>';
 }
 
-// ───────────────────────── Mail 5h ─────────────────────────
+// ───────────────────────── Mail commande (≈4h30) ─────────────────────────
+/** v1.4 — Commande totale par produit = commande 4h30 + rajout F&L (clé : code Probon, sinon désignation). */
+function rgTotal_(rows, ajouts) {
+  var m = {}, order = [];
+  var key = function (r) { return r.code ? 'c:' + String(r.code) : 'd:' + rgNorm_(String(r.designation || '').replace(/\s*⚠️.*$/, '')); };
+  var get = function (r) {
+    var k = key(r);
+    if (!m[k]) { m[k] = { code: r.code || '', producteur: r.producteur || '', designation: String(r.designation || '').replace(/\s*⚠️.*$/, ''), cmd: 0, raj: 0, col: Number(r.col) || 0, hors: false, unknown: false }; order.push(k); }
+    if (!m[k].col && r.col) m[k].col = Number(r.col);
+    return m[k];
+  };
+  (rows || []).forEach(function (r) { var t = get(r); t.cmd += Number(r.colis) || 0; if (r.hors) { t.hors = true; if (!r.colis) t.unknown = true; } });
+  (ajouts || []).forEach(function (r) { get(r).raj += Number(r.colis) || 0; });
+  return order.map(function (k) { var t = m[k]; t.total = Math.round((t.cmd + t.raj) * 10) / 10; return t; })
+    .sort(function (a, b) { return a.producteur.localeCompare(b.producteur, 'fr') || a.designation.localeCompare(b.designation, 'fr'); });
+}
+function rgPlus15_(r) { var e = Number(r.estim) || 0; return e > 0 ? e : Math.round((Number(r.cmd5h) || 0) * 1.15); }
 function rgMailHtml_(day, distrib, rows, url, warn, ajouts) {
-  var tot = rows.reduce(function (a, r) { return a + r.colis; }, 0);
-  var box = function (lbl, val, col) { return '<td style="padding:5px"><div style="background:' + col + '14;border-left:8px solid ' + col + ';border-radius:12px;padding:10px 14px"><div style="font-size:13px;color:#555">' + lbl + '</div><div style="font-size:34px;font-weight:900;color:' + col + ';line-height:1.1">' + val + '</div></div></td>'; };
-  var lines = rows.map(function (r, i) {
-    return '<tr style="background:' + (r.hors ? '#fff3e0' : (i % 2 ? '#f6faf6' : '#ffffff')) + '">'
-      + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:18px;font-weight:900;color:#1a4d2e;white-space:nowrap">' + rgEsc_(r.code || '—') + '</td>'
-      + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:13px;color:#555">' + rgEsc_(r.producteur) + '</td>'
-      + '<td style="padding:10px 10px;border-bottom:1px solid #e3ebe3;font-size:16px;font-weight:700">' + rgEsc_(r.designation) + '</td>'
-      + '<td style="padding:10px 12px;border-bottom:1px solid #e3ebe3;text-align:right;white-space:nowrap"><span style="display:inline-block;min-width:54px;text-align:center;background:' + (r.hors ? '#ef6c00' : '#2e7d32') + ';color:#fff;border-radius:10px;padding:4px 10px;font-size:22px;font-weight:900">' + (r.hors && !r.colis ? '?' : rgFmt_(r.colis, 1)) + '</span></td></tr>';
+  var tot = rgTotal_(rows, ajouts);
+  var totCmd = rows.reduce(function (a, r) { return a + (Number(r.colis) || 0); }, 0), totRaj = (ajouts || []).reduce(function (a, r) { return a + (Number(r.colis) || 0); }, 0);
+  var F = 'font-family:Arial,Helvetica,sans-serif;';
+  var box = function (lbl, val, col) { return '<td style="padding:5px"><div style="background:' + col + '14;border-left:8px solid ' + col + ';border-radius:12px;padding:10px 14px"><div style="font-size:13px;color:#555">' + lbl + '</div><div style="font-size:32px;font-weight:900;color:' + col + ';line-height:1.1">' + val + '</div></div></td>'; };
+  var pill = function (v, bg, fs) { return '<span style="display:inline-block;min-width:50px;text-align:center;background:' + bg + ';color:#fff;border-radius:10px;padding:4px 10px;font-size:' + (fs || 22) + 'px;font-weight:900">' + v + '</span>'; };
+  var td = 'padding:9px 10px;border-bottom:1px solid #e3ebe3;';
+  var th = function (t, right) { return '<th style="padding:8px 10px;text-align:' + (right ? 'right' : 'left') + ';font-size:12px">' + t + '</th>'; };
+  var codeTd = function (c, col) { return '<td style="' + td + 'font-size:18px;font-weight:900;color:' + col + ';white-space:nowrap">' + rgEsc_(c || '—') + '</td>'; };
+  var desTd = function (r) { return '<td style="' + td + '"><div style="font-size:16px;font-weight:700">' + rgEsc_(r.designation) + '</div><div style="font-size:12px;color:#777">' + rgEsc_(r.producteur || '') + '</div></td>'; };
+  // ① COMMANDE TOTALE
+  var t1 = tot.map(function (t, i) {
+    return '<tr style="background:' + (t.hors ? '#fff3e0' : (i % 2 ? '#f6faf6' : '#ffffff')) + '">' + codeTd(t.code, '#1a4d2e') + desTd(t)
+      + '<td style="' + td + 'text-align:right;white-space:nowrap">' + pill(t.unknown && !t.total ? '?' : rgFmt_(t.total, 1), t.hors ? '#ef6c00' : '#2e7d32')
+      + (t.raj ? '<div style="font-size:12px;color:#a64b00;font-weight:700;margin-top:3px">dont ➕ ' + rgFmt_(t.raj, 1) + ' rajout</div>' : '') + '</td></tr>';
   }).join('');
-  return '<div style="font-family:Arial,Helvetica,sans-serif;max-width:680px;color:#1b1b1b">'
+  // ② DÉTAIL COMMANDE 4H30 + 15 %
+  var t2 = rows.map(function (r, i) {
+    var col = Number(r.col) || 0, liv = col ? Math.round((Number(r.colis) || 0) * col * 100) / 100 : null;
+    return '<tr style="background:' + (r.hors ? '#fff3e0' : (i % 2 ? '#f7f9fc' : '#ffffff')) + '">' + codeTd(r.code, '#0d3c78') + desTd({ designation: String(r.designation || '').replace(/\s*⚠️.*$/, ''), producteur: r.producteur })
+      + '<td style="' + td + 'text-align:right;font-size:17px;font-weight:800">' + rgFmt_(r.cmd5h || r.n || 0, 0) + '</td>'
+      + '<td style="' + td + 'text-align:right;font-size:17px;font-weight:800;color:#0d3c78">' + rgFmt_(rgPlus15_(r), 0) + '</td>'
+      + '<td style="' + td + 'text-align:right;white-space:nowrap">' + pill(r.hors && !r.colis ? '?' : rgFmt_(r.colis, 1), r.hors ? '#ef6c00' : '#1565c0', 19)
+      + '<div style="font-size:12px;color:#555;margin-top:3px">' + (col ? '× ' + rgFmt_(col, 2) + ' = <b>' + rgFmt_(liv, 2) + '</b>' : 'colisage ?') + '</div></td></tr>';
+  }).join('');
+  // ③ RAJOUT F&L (avant 10h)
+  var t3 = (ajouts || []).map(function (r) {
+    var col = Number(r.col) || 0;
+    return '<tr>' + codeTd(r.code, '#a64b00') + desTd(r)
+      + '<td style="' + td + 'text-align:right;font-size:16px;font-weight:700">' + rgFmt_(r.manque, 1) + '</td>'
+      + '<td style="' + td + 'text-align:right;white-space:nowrap">' + pill(rgFmt_(r.colis, 1), '#e65100', 19)
+      + '<div style="font-size:12px;color:#555;margin-top:3px">' + (col ? '× ' + rgFmt_(col, 2) + ' = <b>' + rgFmt_(Math.round(r.colis * col * 100) / 100, 2) + '</b>' : '') + '</div></td></tr>';
+  }).join('');
+  var sec = function (bg, title, sub) { return '<div style="margin-top:18px;background:' + bg + ';color:#fff;border-radius:12px 12px 0 0;padding:11px 14px"><div style="font-size:19px;font-weight:900">' + title + '</div>' + (sub ? '<div style="font-size:13px;font-weight:600;opacity:.95">' + sub + '</div>' : '') + '</div>'; };
+  return '<div style="' + F + 'max-width:700px;color:#1b1b1b">'
     + '<div style="background:#1a4d2e;color:#fff;border-radius:14px;padding:16px 20px">'
     + '<div style="font-size:24px;font-weight:900">🥬 Commande KBG — prépa du ' + rgEsc_(rgLong_(day)) + '</div>'
-    + '<div style="font-size:16px;margin-top:2px">Distribution du <b>' + rgEsc_(rgLong_(distrib)) + '</b> · ventes à 5h + 15 %, en colis</div></div>'
+    + '<div style="font-size:16px;margin-top:2px">Distribution du <b>' + rgEsc_(rgLong_(distrib)) + '</b> · en colis</div></div>'
     + (warn ? '<div style="margin-top:10px;background:#fdecea;border:2px solid #c62828;border-radius:12px;padding:10px 14px;font-size:14px;font-weight:700;color:#c62828">⚠️ ' + rgEsc_(warn) + '</div>' : '')
     + rgHorsHtml_(rows)
-    + '<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>' + box('Produits', rows.length, '#1565c0') + box('Colis à commander', rgFmt_(tot, 1), '#2e7d32') + '</tr></table>'
-    + '<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px;border:1px solid #d7e3d7;border-radius:10px">'
-    + '<tr style="background:#e8f5e9"><th style="padding:8px 10px;text-align:left;font-size:12px">CODE PROBON</th><th style="padding:8px 10px;text-align:left;font-size:12px">PRODUCTEUR</th><th style="padding:8px 10px;text-align:left;font-size:12px">DÉSIGNATION</th><th style="padding:8px 12px;text-align:right;font-size:12px">COLIS</th></tr>'
-    + lines + '</table>'
-    + rgAjoutsHtml_(ajouts)
+    + '<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>'
+    + box('📦 Commande totale', rgFmt_(totCmd + totRaj, 1) + ' <span style="font-size:15px">colis</span>', '#2e7d32') + box('🕓 Commande 4h30', rgFmt_(totCmd, 1), '#1565c0') + box('➕ Rajout F&amp;L', rgFmt_(totRaj, 1), '#e65100') + '</tr></table>'
+    // ①
+    + sec('#2e7d32', '① 📦 COMMANDE TOTALE · ' + rgFmt_(totCmd + totRaj, 1) + ' colis', 'Commande 4h30 + rajout F&amp;L, par produit')
+    + '<table role="presentation" width="100%" style="border-collapse:collapse;border:2px solid #2e7d32"><tr style="background:#e8f5e9">' + th('CODE PROBON') + th('DÉSIGNATION') + th('COLIS', 1) + '</tr>' + t1 + '</table>'
+    // ②
+    + sec('#1565c0', '② 🕓 Détail · commande à 4h30 + 15 % · ' + rgFmt_(totCmd, 1) + ' colis', 'Vendus à 4h30 → +15 % (commandes jusqu\'à 10h) → colis × colisage = kg ou pièces à livrer')
+    + '<table role="presentation" width="100%" style="border-collapse:collapse;border:2px solid #1565c0"><tr style="background:#e3f2fd">' + th('CODE') + th('DÉSIGNATION') + th('VENDUS 4H30', 1) + th('+15 %', 1) + th('COLIS · À LIVRER', 1) + '</tr>' + (t2 || '<tr><td colspan="5" style="padding:12px">Aucun produit.</td></tr>') + '</table>'
+    // ③
+    + (ajouts && ajouts.length
+      ? sec('#e65100', '③ ➕ Rajout F&amp;L · ' + rgFmt_(totRaj, 1) + ' colis', '⏰ UNIQUEMENT si livraison AVANT 10h — manquants à la fin de la prépa d\'hier soir')
+        + '<table role="presentation" width="100%" style="border-collapse:collapse;border:2px solid #e65100"><tr style="background:#fff3e0">' + th('CODE') + th('DÉSIGNATION') + th('MANQUE', 1) + th('COLIS · À LIVRER', 1) + '</tr>' + t3 + '</table>'
+      : '<div style="margin-top:16px;padding:10px 14px;border:2px dashed #ffb74d;border-radius:12px;color:#7a4100;font-size:14px">➕ Pas de rajout F&amp;L avec cette commande (pas de prépa hier ou rien à rajouter).</div>')
     + '<p style="font-size:15px;margin-top:14px">📎 Fichier complet en pièce jointe (colisage, prix d\'achat, total HT, ventes, stock).<br>'
     + (url ? '<a href="' + url + '" style="color:#1565c0;font-weight:700">Ouvrir la commande dans Google Sheets</a>' : '') + '</p>'
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Envoi automatique Kelbongoo · 5h · source : COMMANDE FL KBG x PROBON (colonne COMMANDE PROBON (colis), produits actifs)</p></div>';
-}
-function rgAjoutsHtml_(ajouts) {
-  if (!ajouts || !ajouts.length) return '<div style="margin-top:14px;padding:10px 14px;border:2px dashed #ffb74d;border-radius:12px;color:#7a4100;font-size:14px">➕ Pas d\'ajout Rungis avec cette commande (pas de prépa la veille ou rien à rajouter).</div>';
-  var tot = ajouts.reduce(function (a, r) { return a + (r.colis || 0); }, 0);
-  return '<div style="margin-top:16px;background:#e65100;color:#fff;border-radius:12px 12px 0 0;padding:10px 14px;font-size:19px;font-weight:900">➕ Ajouts Rungis · ' + rgFmt_(tot, 1) + ' colis'
-    + '<div style="font-size:13px;font-weight:600">Demandés hier soir après la prépa, à livrer avec cette commande (rappel)</div></div>'
-    + '<table role="presentation" width="100%" style="border-collapse:collapse;border:2px solid #e65100">'
-    + ajouts.map(function (r) {
-      return '<tr><td style="padding:9px 10px;border-bottom:1px solid #f3d3b8;font-size:18px;font-weight:900;color:#a64b00;white-space:nowrap">' + rgEsc_(r.code || '—') + '</td>'
-        + '<td style="padding:9px 10px;border-bottom:1px solid #f3d3b8;font-size:13px;color:#555">' + rgEsc_(r.producteur) + '</td>'
-        + '<td style="padding:9px 10px;border-bottom:1px solid #f3d3b8;font-size:16px;font-weight:700">' + rgEsc_(r.designation) + '</td>'
-        + '<td style="padding:9px 12px;border-bottom:1px solid #f3d3b8;text-align:right"><span style="display:inline-block;min-width:48px;text-align:center;background:#e65100;color:#fff;border-radius:10px;padding:3px 10px;font-size:20px;font-weight:900">' + rgFmt_(r.colis, 1) + '</span></td></tr>';
-    }).join('') + '</table>';
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Envoi automatique Kelbongoo dès le relevé des ventes (≈4h30) · source : COMMANDE FL KBG x PROBON (colonne COMMANDE PROBON (colis), produits actifs) + DEMANDES RAJOUT FL</p></div>';
 }
 function rgMailText_(day, distrib, rows, url, warn, ajouts) {
+  var tot = rgTotal_(rows, ajouts);
   var out = ['Commande KBG — prépa du ' + rgLong_(day), 'Distribution du ' + rgLong_(distrib), ''];
   if (warn) out.push('ATTENTION : ' + warn, '');
   if (rows.some(function (r) { return r.hors; })) out.push('ATTENTION : produit(s) vendu(s) mais pas dans le Sheet COMMANDE FL (marqués ⚠️) — demander à Raimbaud de mettre à jour.', '');
-  out.push('CODE PROBON | PRODUCTEUR | DÉSIGNATION | COLIS');
-  rows.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1)); });
-  if (ajouts && ajouts.length) { out.push('', 'AJOUTS RUNGIS (demandés hier soir, à livrer avec cette commande) :'); ajouts.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1)); }); }
+  out.push('1) COMMANDE TOTALE (commande 4h30 + rajout F&L) — CODE | DÉSIGNATION | COLIS');
+  tot.forEach(function (t) { out.push((t.code || '—') + ' | ' + t.designation + ' | ' + (t.unknown && !t.total ? '?' : rgFmt_(t.total, 1)) + (t.raj ? ' (dont rajout ' + rgFmt_(t.raj, 1) + ')' : '')); });
+  out.push('', '2) DÉTAIL COMMANDE À 4H30 + 15 % — CODE | DÉSIGNATION | VENDUS 4H30 | +15 % | COLIS × COLISAGE = À LIVRER');
+  rows.forEach(function (r) { var col = Number(r.col) || 0; out.push((r.code || '—') + ' | ' + String(r.designation).replace(/\s*⚠️.*$/, '') + ' | ' + rgFmt_(r.cmd5h || r.n || 0, 0) + ' | ' + rgFmt_(rgPlus15_(r), 0) + ' | ' + rgFmt_(r.colis, 1) + (col ? ' × ' + rgFmt_(col, 2) + ' = ' + rgFmt_(r.colis * col, 2) : '')); });
+  if (ajouts && ajouts.length) { out.push('', '3) RAJOUT F&L — UNIQUEMENT SI LIVRAISON AVANT 10H (manquants fin de prépa d\'hier soir) :'); ajouts.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1) + ' colis'); }); }
   out.push('', 'Fichier complet en pièce jointe.' + (url ? ' Google Sheets : ' + url : ''));
   return out.join('\n');
 }
 
-/** Déclencheur 5h (installé par rungisInstall). force=true : envoi même hors jours prévus. testTo : envoi d'essai. */
+/** Envoi de la commande : appelé par flAuto5h dès la colonne D remplie (≈4h30), et par le déclencheur 5h (filet).
+ *  force=true : envoi même hors jours prévus / déjà envoyé. testTo : envoi d'essai. */
 function kbRungisCmd5h(force, testTo, dayOverride) {
   var day = dayOverride || rgIso_(new Date());
   var isTest = !!testTo;
   try {
     if (force !== true && RG_DAYS.indexOf(rgDow_(day)) < 0) return { ok: true, skipped: 'jour sans commande' };
+    if (force !== true && !isTest && rgAlreadySent_(day)) return { ok: true, skipped: 'déjà envoyé ce matin' };   // v1.4 : filet 5h
     var distrib = rgAddDays_(day, 1);
     var fl = rgReadFL_();
     var rows = rgBuildOrder_(fl);
@@ -268,7 +314,8 @@ function kbRungisCmd5h(force, testTo, dayOverride) {
     var stamp = 'le ' + Utilities.formatDate(new Date(), RG_TZ, 'dd/MM') + ' ';
     if (fl.note5h.indexOf(stamp) < 0) warn = 'La colonne COMMANDE A 5H n\'a pas été remplie automatiquement ce matin (ventes peut-être pas à jour) — vérifier avec Kelbongoo.';
     var to = isTest ? testTo : RG_TO;
-    var subject = (isTest ? '[ESSAI] ' : '') + '🥬 Commande KBG ' + rgFr_(day) + ' · ' + rows.length + ' produit(s)' + (ajouts.length ? ' + ' + ajouts.length + ' ajout(s) Rungis' : '');
+    var totCmd = rows.reduce(function (a, r) { return a + (Number(r.colis) || 0); }, 0), totRaj = ajouts.reduce(function (a, r) { return a + (Number(r.colis) || 0); }, 0);
+    var subject = (isTest ? '[ESSAI] ' : '') + '🥬 Commande KBG ' + rgFr_(day) + ' · ' + rgFmt_(totCmd + totRaj, 1) + ' colis' + (ajouts.length ? ' (dont rajout F&L ' + rgFmt_(totRaj, 1) + ')' : '');
     if (!rows.length && !ajouts.length) {
       MailApp.sendEmail({ to: to, subject: (isTest ? '[ESSAI] ' : '') + '🥬 Commande KBG ' + rgFr_(day) + ' · rien à commander',
         htmlBody: '<div style="font-family:Arial;font-size:16px"><b>Aucun colis F&L à commander ce matin</b> (prépa du ' + rgEsc_(rgLong_(day)) + ', distribution du ' + rgEsc_(rgLong_(distrib)) + ').' + (warn ? '<br><br><b style="color:#c62828">⚠️ ' + rgEsc_(warn) + '</b>' : '') + '</div>',
@@ -283,11 +330,17 @@ function kbRungisCmd5h(force, testTo, dayOverride) {
     if (!isTest) rgSnapSave_(day, distrib, rows, url, warn);
     return { ok: true, rows: rows.length, url: url };
   } catch (e) {
-    try { MailApp.sendEmail(RG_FAIL_TO, '⚠️ Commande KBG 5h NON envoyée (' + rgFr_(day) + ')', 'Erreur : ' + (e && e.message ? e.message : e) + '\n\nLancer kbRungisCmd5h(true) depuis le projet FL_Probon_Proxy après correction.'); } catch (e2) {}
+    try { MailApp.sendEmail(RG_FAIL_TO, '⚠️ Commande KBG (4h30) NON envoyée (' + rgFr_(day) + ')', 'Erreur : ' + (e && e.message ? e.message : e) + '\n\nLancer kbRungisCmd5h(true) depuis le projet FL_Probon_Proxy après correction.'); } catch (e2) {}
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
 }
 
+/** v1.4 — la commande du jour est-elle déjà partie (ligne dans COMMANDES 5H) ? */
+function rgAlreadySent_(day) {
+  var v = rgSnapSheet_().getDataRange().getValues();
+  for (var i = v.length - 1; i >= 1; i--) { var d = v[i][0] instanceof Date ? rgIso_(v[i][0]) : String(v[i][0]).slice(0, 10); if (d === day) return true; }
+  return false;
+}
 function rgSnapSheet_() {
   var ss = SpreadsheetApp.openById(RG_SHEET_ID);
   var sh = ss.getSheetByName(RG_SNAP_TAB);
@@ -308,6 +361,7 @@ function kbRungisRoute_(p) {
     if (p.action === 'rungis_cmd_get') return rgJson_(rgCmdGet_(String(p.day || '')));
     if (p.action === 'rungis_alert') return rgJson_(rgAlert_(p.alert || {}, String(p._by || p.by || '')));
     if (p.action === 'rungis_driver_check') return rgJson_(rgDriverCheck_(String(p.code || '')));
+    if (String(p.action).indexOf('rungis_bl_') === 0) return rgJson_(kbBlRoute_(p));   // v1.4 — contrôle BL (KBG_BL.gs)
     return rgJson_({ ok: false, error: 'action inconnue' });
   } catch (e) { return rgJson_({ ok: false, error: String(e && e.message ? e.message : e) }); }
 }
@@ -358,6 +412,7 @@ function rgAjouts_(day, fl) {
     if (!(dist === day || (!dist && atIso.slice(0, 10) === veille))) continue;
     if (atIso > lastAt) lastAt = atIso;
     var prod = String(rv[k][cProd] || ''), des = String(rv[k][cDes] || '');
+    if (/panier solidaire/i.test(des)) continue;   // v1.4 — pas un produit Rungis
     var m = idx[rgNorm_(prod) + '|' + rgNorm_(des)] || idxDes[rgNorm_(des)] || null;
     var colis = rgNum_(rv[k][cCol]);
     byKey[atIso + '|' + rgNorm_(prod) + '|' + rgNorm_(des) + '|' + k] = { at: atIso, distrib: dist, by: String(rv[k][cBy] || ''),

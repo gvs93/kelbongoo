@@ -1,5 +1,5 @@
 /**
- * KBG_FL_Auto.gs — v1.3 (19/10/2026) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
+ * KBG_FL_Auto.gs — v1.4 (22/10/2026 — mail Rungis dès 4h30 ; v1.3 du 19/10) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
  *
  * Deux automatismes sur le Sheet « COMMANDE FL KBG x PROBON » (onglet COMMANDE FL) :
  *
@@ -92,13 +92,19 @@ function flAutoInstall() {
   Logger.log('Déclencheurs créés : flAuto5h (≈4h30) + flAutoControle (≈14h) + flAutoVeille (toutes les heures, 7h→22h), fuseau Europe/Paris.');
 }
 
-/** ≈4h30 : contrôle complet (répare les ID site), puis ventes du lendemain → colonne D. */
+/** ≈4h30 : contrôle complet (répare les ID site), puis ventes du lendemain → colonne D,
+ *  puis v1.4 : mail de commande à Rungis TOUT DE SUITE (kbRungisCmd5h, KBG_Rungis.gs) — plus d'attente jusqu'à 5h.
+ *  Si les ventes n'ont pas pu être écrites, le déclencheur de 5h envoie quand même (avec l'avertissement). */
 function flAuto5h() {
   var ventes = null;
   try { flAutoControle(); }
   catch (e2) { flAutoMeta_({ controleErr: String(e2 && e2.message || e2), controleErrAt: new Date().toISOString() }); }
   try { ventes = flAutoVentes(); }
   catch (e) { flAutoMeta_({ ventesErr: String(e && e.message || e), ventesErrAt: new Date().toISOString() }); flAutoAlert_('Ventes 5h NON écrites', String(e && e.message || e)); }
+  if (ventes && !ventes.none && typeof kbRungisCmd5h === 'function') {
+    try { SpreadsheetApp.flush(); var m = kbRungisCmd5h(false); flAutoMeta_({ mailRungis: { at: new Date().toISOString(), res: m } }); }
+    catch (e3) { flAutoMeta_({ mailRungisErr: String(e3 && e3.message || e3) }); }
+  }
   return ventes;
 }
 

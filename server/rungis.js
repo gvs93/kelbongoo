@@ -1,14 +1,16 @@
 /**
- * rungis — Cloud Functions Kelbongoo V10.17 (v1.2, base de code séparée « rungis ») (19/10/2026) — projet Firebase distribkbg, région europe-west1
+ * rungis — Cloud Functions Kelbongoo V10.40 (v1.3, base de code séparée « rungis ») (22/10/2026) — projet Firebase distribkbg, région europe-west1
  * ---------------------------------------------------------------------------------------------
  * Fichier AUTONOME : ne modifie aucune fonction existante (kbgLogin, kbgClaimAdmin, kbgProxy…).
  *
  *  kbgRungisLogin : Espace Rungis. Connexion Google uniquement, adresse dans la liste blanche
  *                   (achat@probon.fr, gestion@probon.fr, hg@probon.fr). Pose le rôle kbRole:'rungis'
  *                   (sauf compte déjà master/admin : on n'y touche pas).
- *  kbgRungis      : passerelle vers l'Apps Script FL_Probon_Proxy pour 2 actions seulement :
- *                     rungis_cmd_get (commande 5h + rajouts)  → rôles rungis, admin
- *                     rungis_alert   (palette non récupérée)  → rôles pdp (chauffeur), rungis, admin
+ *  kbgRungis      : passerelle vers l'Apps Script FL_Probon_Proxy pour ces actions seulement :
+ *                     rungis_cmd_get (commande 4h30 + rajouts)  → rôles rungis, admin
+ *                     rungis_alert   (palette non récupérée)    → rôles pdp (chauffeur), rungis, admin
+ *                     v1.3 — contrôle du BL Rungis (KBG_BL.gs) → rôles rungis, admin :
+ *                       rungis_bl_check (PDF base64 ≤ 6 Mo), rungis_bl_list, rungis_bl_concord, rungis_bl_recheck
  *                   Le secret et l'URL /exec restent côté serveur (Secret Manager).
  *
  * Installation : dans Cloud Shell (compte hg@probon.fr), une seule ligne :
@@ -26,9 +28,10 @@ const REGION = 'europe-west1';
 // Règle d'organisation probon.fr : le déploiement ne peut pas poser « allUsers » (message « Failed to set the IAM Policy »,
 // sans gravité) ; l'accès est ouvert par gcloud run … --no-invoker-iam-check (comme kbgLogin, kbgProxy…).
 
+const BL_ACTIONS = ['rungis_bl_check', 'rungis_bl_list', 'rungis_bl_concord', 'rungis_bl_recheck'];
 const ALLOWED = {
-  admin: ['rungis_cmd_get', 'rungis_alert'],
-  rungis: ['rungis_cmd_get', 'rungis_alert'],
+  admin: ['rungis_cmd_get', 'rungis_alert', ...BL_ACTIONS],
+  rungis: ['rungis_cmd_get', 'rungis_alert', ...BL_ACTIONS],
   pdp: ['rungis_alert'],
 };
 const cut = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -67,6 +70,14 @@ exports.kbgRungis = onCall({ region: REGION, secrets: [KBG_FL_EXEC_URL, KBG_FL_S
       motif: cut(a.motif, 40), note: cut(a.note, 600), day: cut(a.day, 10), ref: cut(a.ref, 120),
     } : undefined,
   };
+  if (BL_ACTIONS.includes(action)) {   // v1.3 — contrôle BL : champs bornés, le PDF n'est jamais stocké ici
+    const pdf = String(d.pdf || '');
+    if (action === 'rungis_bl_check' && (!pdf || pdf.length > 8 * 1024 * 1024 || !/^[A-Za-z0-9+/=]+$/.test(pdf))) throw new HttpsError('invalid-argument', 'PDF invalide ou trop lourd (6 Mo max).');
+    Object.assign(payload, {
+      pdf: action === 'rungis_bl_check' ? pdf : undefined, name: cut(d.name, 120), subject: cut(d.subject, 200), source: 'appli Espace Rungis',
+      blCode: cut(d.blCode, 10), blDes: cut(d.blDes, 120), codes: cut(d.codes, 80), key: cut(d.key, 40), n: Math.min(50, Number(d.n) || 20), force: d.force === true,
+    });
+  }
   let res;
   try {
     res = await fetch(KBG_FL_EXEC_URL.value(), { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload), redirect: 'follow' });
