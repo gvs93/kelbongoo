@@ -1,5 +1,5 @@
 /**
- * KBG_BL.gs — v1.0 (22/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_BL.gs — v1.1 (22/10/2026) — v1.1 : si le CODE PROBON du Sheet est le code article du BL (ex. œufs A00900), rapprochement direct — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
  * ---------------------------------------------------------------------------------------------
  * CONTRÔLE DU BON DE LIVRAISON RUNGIS (BL) contre la commande KBG du jour.
  *
@@ -470,7 +470,9 @@ function kbBlCheck_(p) {
   }
   var PV = { list: [], byCode: {} }; try { PV = flAutoReadPvttc_(); } catch (e) {}
   var E = blExpected_(bl.date, PV);
-  var conc = blConcRead_(), guesses = blAutoConc_(bl, PV, E.exp, conc);
+  var conc = blConcRead_();
+  bl.lines.forEach(function (l) { if (E.exp[l.code]) conc[l.code] = [l.code]; });   // v1.1 : même code des deux côtés (A00900…)
+  var guesses = blAutoConc_(bl, PV, E.exp, conc);
   Object.keys(guesses).forEach(function (bc) {
     var g = guesses[bc]; if (!g.sure) return;
     var l = bl.lines.filter(function (x) { return x.code === bc; })[0];

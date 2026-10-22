@@ -1,5 +1,5 @@
 /**
- * KBG_FL_Auto.gs — v1.4 (22/10/2026 — mail Rungis dès 4h30 ; v1.3 du 19/10) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
+ * KBG_FL_Auto.gs — v1.5 (22/10/2026 — codes article Rungis « A00900 » acceptés ; v1.4 : mail Rungis dès 4h30) — à AJOUTER au projet Apps Script FL_Probon_Proxy (ne rien remplacer).
  *
  * Deux automatismes sur le Sheet « COMMANDE FL KBG x PROBON » (onglet COMMANDE FL) :
  *
@@ -322,7 +322,7 @@ function flAutoControle() {
         var best = flAutoBestRungis_(r.des, PV, codeUsed);
         if (best.sure) { set(r, 'code', best.sure.code, 'code Rungis (désignation identique) : ' + best.sure.des); r.code = best.sure.code; codeUsed[r.code] = r.row; g = best.sure; }
         else issue('concord', r, 'quel produit Rungis ?', { suggestions: best.top });
-      } else if (r.code && !g) {
+      } else if (r.code && !g && !/^[A-Z]/.test(String(r.code))) {   // v1.5 : code article Rungis (A00900…) = hors PVTTC, normal
         issue('absentRungis', r, 'code ' + r.code + ' absent de PVTTC (' + PV.tab + ')', { code: r.code });
       }
       var ua = g ? String(g.ua || '').toUpperCase() : '';
@@ -492,9 +492,11 @@ function flAutoReadTable_(sh) {
     var v = all[i];
     var des = cols.des >= 0 ? String(v[cols.des] || '').trim() : '';
     var act = cols.actif >= 0 ? String(v[cols.actif] || '').trim() : '';
-    var code = cols.code >= 0 ? parseInt(v[cols.code], 10) : NaN;
+    // v1.5 — code article Rungis du BL (lettre + chiffres, ex. A00900 pour les œufs) accepté tel quel (hors PVTTC)
+    var rawCode = cols.code >= 0 ? String(v[cols.code] == null ? '' : v[cols.code]).trim().toUpperCase() : '';
+    var code = /^[A-Z]\d{4,6}$/.test(rawCode) ? rawCode : parseInt(rawCode, 10);
     rows.push({ row: i + 1, raw: v, des: des, actifOk: /^actif/i.test(act),
-                id: cols.id >= 0 ? String(v[cols.id] || '').trim() : '', code: code > 0 ? code : null });
+                id: cols.id >= 0 ? String(v[cols.id] || '').trim() : '', code: (typeof code === 'string' || code > 0) ? code : null });
   }
   return { cols: cols, rows: rows };
 }

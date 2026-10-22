@@ -1,6 +1,12 @@
 /**
- * KBG_Rungis.gs — v1.4 (22/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_Rungis.gs — v1.5 (22/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
  * ---------------------------------------------------------------------------------------------
+ * v1.5 : PLUSIEURS FORMATS KBG = UN SEUL ARTICLE RUNGIS (ex. œufs 6 / 12 / 18 / 24 = boîtes de 6, colis de 16) :
+ *        les lignes actives qui ont le MÊME CODE PROBON sont regroupées en UNE ligne de commande.
+ *        Besoin du groupe = Σ BESOIN (uv) (déjà en unité Rungis : +15 % × MU EN KILO, ex. 7 × 2 boîtes) − stock cagette,
+ *        arrondi UNE fois au colis supérieur. Ex. 22/10 : 14 + 9 + 8 + 18 = 49 boîtes → 4 colis de 16 (et non 1+1+1+2 = 5).
+ *        flOeufsRegrouper() (à lancer une fois) : œufs → CODE PROBON A00900 (code article Rungis du BL), COL 16,
+ *        formule « COMMANDE PROBON (colis) » regroupée par code dans le Sheet.
  * v1.4 : • le mail part DÈS QUE la colonne COMMANDE A 5H est remplie (≈4h30, appelé par flAuto5h — KBG_FL_Auto v1.4) ;
  *          le déclencheur 5h reste en filet de sécurité et ne renvoie pas si le mail est déjà parti.
  *        • mail : ① COMMANDE TOTALE (commande 4h30 + rajout F&L, en colis, par produit)
@@ -102,11 +108,44 @@ function rgReadFL_() {
   return { rows: rows, sheet: sh, head: C, note5h: note };
 }
 
-// Lignes à commander : produit Actif avec des colis > 0
+// Lignes à commander : produit Actif avec des colis > 0.
+// v1.5 — lignes actives au MÊME CODE PROBON (plusieurs formats KBG, un seul article Rungis) → UNE ligne :
+//   besoin en unité Rungis = Σ BESOIN (uv) ; colis = arrondi au supérieur (Σ besoin ÷ COL − Σ stock cagette), une seule fois.
 function rgBuildOrder_(fl) {
-  return fl.rows.filter(function (r) { return r.actif && r.colis > 0; })
-    .map(function (r) { r.colis = Math.round(r.colis * 10) / 10; r.totalHt = Math.round(r.colis * (r.col || 0) * (r.pa || 0) * 100) / 100; return r; })
-    .sort(function (a, b) { return a.producteur.localeCompare(b.producteur, 'fr') || a.designation.localeCompare(b.designation, 'fr'); });
+  var act = fl.rows.filter(function (r) { return r.actif; });
+  var byCode = {};
+  act.forEach(function (r) { if (r.code) (byCode[r.code] = byCode[r.code] || []).push(r); });
+  var out = [], done = {};
+  act.forEach(function (r) {
+    var g = r.code && byCode[r.code].length > 1 ? byCode[r.code] : null;
+    if (!g) {
+      if (r.colis > 0) { r.colis = Math.round(r.colis * 10) / 10; r.totalHt = Math.round(r.colis * (r.col || 0) * (r.pa || 0) * 100) / 100; out.push(r); }
+      return;
+    }
+    if (done[r.code]) return; done[r.code] = 1;
+    var col = 0, besoin = 0, cag = 0, sumColis = 0, vend = 0, plus = 0, pa = 0;
+    g.forEach(function (x) {
+      col = Math.max(col, x.col || 0); besoin += x.besoinUv || 0; cag += x.stockCag || 0; sumColis += x.colis || 0;
+      var mu = x.mu > 0 ? x.mu : 1; vend += (x.cmd5h || 0) * mu; plus += rgPlus15_(x) * mu; if (x.pa) pa = x.pa;
+    });
+    var colis = col > 0 ? Math.max(0, Math.ceil(besoin / col - cag - 1e-9)) : Math.round(sumColis * 10) / 10;
+    if (!(colis > 0)) return;
+    out.push({
+      line: r.line, code: r.code, producteur: r.producteur, designation: rgGroupName_(g), colis: colis, col: col, uv: 'unité Rungis', type: 'REGROUPÉ',
+      pa: pa, totalHt: Math.round(colis * col * pa * 100) / 100, cmd5h: vend, estim: plus, stockMu: 0, stockCag: cag, besoinUv: Math.round(besoin * 100) / 100,
+      id: g.map(function (x) { return x.id; }).join(' + '), actif: true, regroupe: true,
+      formats: g.map(function (x) { return { des: x.designation, cmd5h: x.cmd5h || 0, plus: rgPlus15_(x), mu: x.mu > 0 ? x.mu : 1 }; })
+    });
+  });
+  return out.sort(function (a, b) { return a.producteur.localeCompare(b.producteur, 'fr') || a.designation.localeCompare(b.designation, 'fr'); });
+}
+function rgGroupName_(g) {
+  if (g.every(function (x) { return /\boeufs?\b/i.test(rgNorm_(x.designation)); })) return 'Œufs BIO — boîtes de 6 (tous formats KBG regroupés)';
+  return g[0].designation + ' (+ ' + (g.length - 1) + ' autre(s) format(s) regroupé(s))';
+}
+/** Détail lisible d'une ligne regroupée : « 12 Oeufs : 7 × 2 = 14 · … » (en unité Rungis). */
+function rgFormatsTxt_(r) {
+  return (r.formats || []).map(function (f) { return f.des + ' : ' + rgFmt_(f.plus, 0) + (f.mu !== 1 ? ' × ' + rgFmt_(f.mu, 2) + ' = ' + rgFmt_(f.plus * f.mu, 2) : ''); }).join(' · ');
 }
 
 function rgFolder_() {
@@ -243,7 +282,10 @@ function rgMailHtml_(day, distrib, rows, url, warn, ajouts) {
   // ② DÉTAIL COMMANDE 4H30 + 15 %
   var t2 = rows.map(function (r, i) {
     var col = Number(r.col) || 0, liv = col ? Math.round((Number(r.colis) || 0) * col * 100) / 100 : null;
-    return '<tr style="background:' + (r.hors ? '#fff3e0' : (i % 2 ? '#f7f9fc' : '#ffffff')) + '">' + codeTd(r.code, '#0d3c78') + desTd({ designation: String(r.designation || '').replace(/\s*⚠️.*$/, ''), producteur: r.producteur })
+    return '<tr style="background:' + (r.hors ? '#fff3e0' : (i % 2 ? '#f7f9fc' : '#ffffff')) + '">' + codeTd(r.code, '#0d3c78')
+      + (r.regroupe
+        ? '<td style="' + td + '"><div style="font-size:16px;font-weight:700">' + rgEsc_(r.designation) + '</div><div style="font-size:12px;color:#0d3c78;font-weight:700">' + rgEsc_('+15 % en unité Rungis — ' + rgFormatsTxt_(r)) + '</div></td>'
+        : desTd({ designation: String(r.designation || '').replace(/\s*⚠️.*$/, ''), producteur: r.producteur }))
       + '<td style="' + td + 'text-align:right;font-size:17px;font-weight:800">' + rgFmt_(r.cmd5h || r.n || 0, 0) + '</td>'
       + '<td style="' + td + 'text-align:right;font-size:17px;font-weight:800;color:#0d3c78">' + rgFmt_(rgPlus15_(r), 0) + '</td>'
       + '<td style="' + td + 'text-align:right;white-space:nowrap">' + pill(r.hors && !r.colis ? '?' : rgFmt_(r.colis, 1), r.hors ? '#ef6c00' : '#1565c0', 19)
@@ -289,7 +331,7 @@ function rgMailText_(day, distrib, rows, url, warn, ajouts) {
   out.push('1) COMMANDE TOTALE (commande 4h30 + rajout F&L) — CODE | DÉSIGNATION | COLIS');
   tot.forEach(function (t) { out.push((t.code || '—') + ' | ' + t.designation + ' | ' + (t.unknown && !t.total ? '?' : rgFmt_(t.total, 1)) + (t.raj ? ' (dont rajout ' + rgFmt_(t.raj, 1) + ')' : '')); });
   out.push('', '2) DÉTAIL COMMANDE À 4H30 + 15 % — CODE | DÉSIGNATION | VENDUS 4H30 | +15 % | COLIS × COLISAGE = À LIVRER');
-  rows.forEach(function (r) { var col = Number(r.col) || 0; out.push((r.code || '—') + ' | ' + String(r.designation).replace(/\s*⚠️.*$/, '') + ' | ' + rgFmt_(r.cmd5h || r.n || 0, 0) + ' | ' + rgFmt_(rgPlus15_(r), 0) + ' | ' + rgFmt_(r.colis, 1) + (col ? ' × ' + rgFmt_(col, 2) + ' = ' + rgFmt_(r.colis * col, 2) : '')); });
+  rows.forEach(function (r) { var col = Number(r.col) || 0; out.push((r.code || '—') + ' | ' + String(r.designation).replace(/\s*⚠️.*$/, '') + ' | ' + rgFmt_(r.cmd5h || r.n || 0, 0) + ' | ' + rgFmt_(rgPlus15_(r), 0) + ' | ' + rgFmt_(r.colis, 1) + (col ? ' × ' + rgFmt_(col, 2) + ' = ' + rgFmt_(r.colis * col, 2) : '') + (r.regroupe ? '  [' + rgFormatsTxt_(r) + ']' : '')); });
   if (ajouts && ajouts.length) { out.push('', '3) RAJOUT F&L — UNIQUEMENT SI LIVRAISON AVANT 10H (manquants fin de prépa d\'hier soir) :'); ajouts.forEach(function (r) { out.push((r.code || '—') + ' | ' + r.producteur + ' | ' + r.designation + ' | ' + rgFmt_(r.colis, 1) + ' colis'); }); }
   out.push('', 'Fichier complet en pièce jointe.' + (url ? ' Google Sheets : ' + url : ''));
   return out.join('\n');
@@ -470,6 +512,44 @@ function rgAlert_(a, by) {
   if (!sh) { sh = ss.insertSheet(RG_ALERT_TAB); sh.appendRow(['DATE', 'PAR', 'TYPE', 'BOUTIQUE', 'QUOI', 'PRÉVU LE', 'MOTIF', 'NOTE']); sh.getRange(1, 1, 1, 8).setFontWeight('bold'); sh.setFrozenRows(1); }
   sh.appendRow([Utilities.formatDate(new Date(), RG_TZ, 'dd/MM/yyyy HH:mm'), by, kind, site, label, day, motif, note]);
   return { ok: true };
+}
+
+// ───────────────────────── v1.5 : regroupement des formats d'œufs dans le Sheet (à lancer UNE fois) ─────────────────────────
+var RG_OEUF_CODE = 'A00900';   // code article Rungis « BOITE 6 OEUFS (MA PETITE FERME) BIO 16PC » (celui du BL)
+var RG_OEUF_COL  = 16;         // 16 boîtes de 6 par colis
+/** Œufs 6 / 12 / 18 / 24 : même CODE PROBON (A00900), COL = 16 boîtes, MU EN KILO = nb de boîtes de 6 par unité vendue
+ *  (1 / 2 / 3 / 4, lu dans la désignation), et formule « COMMANDE PROBON (colis) » regroupée par code
+ *  (la 1re ligne active du code porte le total arrondi une fois, les autres 0). Journal dans FL_AUTO_LOG. */
+function flOeufsRegrouper() {
+  var sh = SpreadsheetApp.openById(RG_SHEET_ID).getSheetByName(RG_TAB);
+  var v = sh.getDataRange().getValues(), head = {};
+  v[0].forEach(function (h, i) { var k = rgNorm_(h); if (k && head[k] == null) head[k] = i; });
+  var c = function (n) { var i = head[rgNorm_(n)]; if (i == null) throw new Error('colonne ' + n + ' introuvable'); return i; };
+  var cDes = c('DESIGNATION'), cCode = c('CODE PROBON'), cCol = c('COL'), cMu = c('MU EN KILO'), cE = c('COMMANDE PROBON (colis)'),
+      cO = c('BESOIN (uv)'), cI = c('STOCK CAGETTE'), cQ = c('ACTIF ?');
+  var L = function (i) { var s = '', n = i + 1; while (n > 0) { var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+  var log = SpreadsheetApp.openById(RG_SHEET_ID).getSheetByName('FL_AUTO_LOG'), now = Utilities.formatDate(new Date(), RG_TZ, 'dd/MM/yyyy HH:mm'), done = [];
+  for (var i = 1; i < v.length; i++) {
+    var des = String(v[i][cDes] || ''), n = rgNorm_(des);
+    if (!/\bOEUFS?\b/.test(n)) continue;
+    var m = n.match(/\b(\d+)\s+BOITES?\s+DE\s+6\b/), mu = m ? Number(m[1]) : (/^6 OEUFS\b/.test(n) ? 1 : 0);
+    if (!mu) { Logger.log('⚠️ L' + (i + 1) + ' « ' + des + ' » : nombre de boîtes de 6 illisible, ligne laissée telle quelle'); continue; }
+    var row = i + 1, C = L(cCode), O = L(cO), I = L(cI), Q = L(cQ), F = L(cCol), P = L(c('BESOIN (colis)'));
+    var f = '=IF(' + C + row + '="",IFERROR(MAX(0,ROUNDUP(' + P + row + '-' + I + row + ',0)),""),IF(COUNTIFS(' + C + '$1:' + C + (row - 1) + ',' + C + row + ',' + Q + '$1:' + Q + (row - 1) + ',"Actif")>0,0,'
+          + 'IFERROR(MAX(0,ROUNDUP(SUMIFS(' + O + ':' + O + ',' + C + ':' + C + ',' + C + row + ',' + Q + ':' + Q + ',"Actif")/' + F + row + '-SUMIFS(' + I + ':' + I + ',' + C + ':' + C + ',' + C + row + ',' + Q + ':' + Q + ',"Actif"),0)),"")))';
+    var before = [v[i][cCode], v[i][cCol], v[i][cMu]];
+    sh.getRange(row, cCode + 1).setValue(RG_OEUF_CODE);
+    sh.getRange(row, cCol + 1).setValue(RG_OEUF_COL);
+    sh.getRange(row, cMu + 1).setValue(mu);
+    sh.getRange(row, cE + 1).setFormula(f).setNote('v1.5 — œufs regroupés : un seul article Rungis (boîte de 6, colis de 16). La 1re ligne active du code porte le total (arrondi une fois), les autres 0.');
+    if (log) [['CODE PROBON', before[0], RG_OEUF_CODE], ['COL', before[1], RG_OEUF_COL], ['MU EN KILO', before[2], mu], ['COMMANDE PROBON (colis)', '(formule ligne)', '(formule regroupée par code)']]
+      .forEach(function (x) { if (String(x[1]) !== String(x[2])) log.appendRow([now, row, des, x[0], x[1], x[2], 'flOeufsRegrouper (boîtes de 6, colis de 16)']); });
+    done.push('L' + row + ' ' + des + ' → ' + mu + ' boîte(s) de 6');
+  }
+  SpreadsheetApp.flush();
+  Logger.log(done.length ? '✅ ' + done.length + ' ligne(s) d\'œufs regroupées sous ' + RG_OEUF_CODE + ' :\n' + done.join('\n') : 'Aucune ligne d\'œufs trouvée.');
+  var o = rgBuildOrder_(rgReadFL_()).filter(function (r) { return String(r.code) === RG_OEUF_CODE; })[0];
+  Logger.log(o ? 'Commande œufs maintenant : ' + o.colis + ' colis de ' + o.col + ' (besoin ' + o.besoinUv + ' boîtes) — ' + rgFormatsTxt_(o) : 'Pas d\'œufs à commander avec les ventes actuelles.');
 }
 
 // ───────────────────────── installation / essai ─────────────────────────
