@@ -764,7 +764,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.38';
+    const APP_VERSION = 'V10.39';
+    // V10.39 — (22/10/2026) Chauffeur Rungis › 🟫 Retour palettes EPAL : une grosse carte par boutique (ROB, TOL, BIC), un appui = +1 palette,
+    //   « − 1 » pour corriger, ✅ Valider → registre Firebase Centrale « epal/mvts » (type retour). Chaque carte montre ce que la boutique doit
+    //   (palettes EPAL envoyées par Rungis − rendues, depuis le JJ/MM). Même calcul que la Console et le mail BL magasin.
     // V10.38 — (21/10/2026) Distrib › Ranger la dernière minute : TOUS les casiers du client sur chaque ligne (plus besoin d'ouvrir le client).
     // V10.37 — (21/10/2026) Distrib : casiers regroupés en UN bloc compact (7 · 8 · 25) ; client ARRIVÉ → PARTI
     //   (bloc « En cours » en haut, partagé entre les téléphones du lieu) ; recherche par n° de casier ;
@@ -23283,11 +23286,117 @@
     }
     const kbRgDayLbl = (iso) => iso === todayKey() ? "aujourd'hui" : iso === addDays(todayKey(), 1) ? 'demain' : iso === addDays(todayKey(), -1) ? 'hier' : formatDateShort(iso);
 
+    // ───────── V10.39 — Palettes EPAL (registre partagé avec la Centrale PDP / Console / mail BL) ─────────
+    const KB_EPAL_URL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/epal/mvts';
+    const KB_EPAL_STORES = ['ROB', 'TOL', 'BIC'];
+    const KB_EPAL_START = '2026-10-22';
+    function kbEpalBalance(mv, code) {
+      const deb = []; let cred = 0, sent = 0, back = 0, adj = 0, last = null;
+      Object.keys(mv || {}).forEach(k => { const m = mv[k]; if (!m || m.cancelled || String(m.code || '').toUpperCase() !== code || String(m.day || '') < KB_EPAL_START) return;
+        const n = Math.round(Number(m.n) || 0); if (!n) return;
+        if (m.type === 'envoi') { sent += n; deb.push({ day: m.day, at: m.at || 0, n }); }
+        else if (m.type === 'retour') { back += n; cred += n; if (!last || (m.at || 0) > last.at) last = { at: m.at || 0, day: m.day, n, by: m.by || '' }; }
+        else if (m.type === 'ajust') { adj += n; if (n > 0) deb.push({ day: m.day, at: m.at || 0, n }); else cred += -n; } });
+      deb.sort((a, b) => a.day < b.day ? -1 : a.day > b.day ? 1 : a.at - b.at);
+      let rest = cred, since = ''; for (const d of deb) { if (rest >= d.n) { rest -= d.n; continue; } since = d.day; break; }
+      const due = sent + adj - back;
+      return { sent, back, adj, due, since: due > 0 ? since : '', last };
+    }
+    function useKbEpal() {
+      const [raw, setRaw] = React.useState(undefined);
+      const [err, setErr] = React.useState('');
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const to = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, 20000);
+        fetch(KB_EPAL_URL + '.json?t=' + Date.now(), ctl ? { signal: ctl.signal } : {})
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(j => { if (!stop) { setRaw(j || {}); setErr(''); } })
+          .catch(e => { if (!stop) { setRaw(v => v === undefined ? null : v); setErr(e.message || String(e)); } })
+          .finally(() => clearTimeout(to));
+        return () => { stop = true; clearTimeout(to); try { ctl && ctl.abort(); } catch (e) {} };
+      }, [tick]);
+      React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 120000); return () => clearInterval(t); }, []);
+      const bal = React.useMemo(() => { const o = {}; KB_EPAL_STORES.forEach(c => { o[c] = kbEpalBalance(raw || {}, c); }); return o; }, [raw]);
+      const dueTotal = KB_EPAL_STORES.reduce((a, c) => a + Math.max(0, bal[c].due), 0);
+      return { raw, err, bal, dueTotal, reload: () => setTick(x => x + 1) };
+    }
+
+    // ───────── Chauffeur : 🟫 retour des palettes EPAL (un appui = +1) ─────────
+    function RungisEpalView({ session, E }) {
+      const showToast = React.useContext(ToastContext);
+      const [cnt, setCnt] = React.useState({});
+      const [busy, setBusy] = React.useState(false);
+      const canWrite = !!(session && kbRgCanWrite());
+      const total = KB_EPAL_STORES.reduce((a, c) => a + (cnt[c] || 0), 0);
+      const today = todayKey();
+      const add = (c, d) => { try { navigator.vibrate && navigator.vibrate(d > 0 ? 25 : 10); } catch (e) {} setCnt(m => ({ ...m, [c]: Math.max(0, (m[c] || 0) + d) })); };
+      const todayBack = (c) => { const o = E.raw || {}; let n = 0; Object.keys(o).forEach(k => { const m = o[k]; if (m && !m.cancelled && m.type === 'retour' && m.code === c && m.day === today) n += Number(m.n) || 0; }); return n; };
+      const valider = async () => {
+        if (!canWrite) { showToast('Lecture seule'); return; }
+        if (!total) { showToast('Touche une boutique pour compter les palettes'); return; }
+        const recap = KB_EPAL_STORES.filter(c => cnt[c]).map(c => c + ' : ' + cnt[c] + ' palette' + (cnt[c] > 1 ? 's' : '')).join('\n');
+        if (!window.confirm('Valider le retour des palettes EPAL ?\n\n' + recap)) return;
+        setBusy(true);
+        try {
+          for (const c of KB_EPAL_STORES) {
+            if (!cnt[c]) continue;
+            const r = await fetch(KB_EPAL_URL + '.json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ type: 'retour', code: c, n: cnt[c], day: today, at: Date.now(), by: String(session.name || 'Chauffeur Rungis').slice(0, 80), src: 'chauffeur' }) });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            setCnt(m => ({ ...m, [c]: 0 }));
+          }
+          kbCelebrate({ title: total + ' palette' + (total > 1 ? 's' : '') + ' EPAL récupérée' + (total > 1 ? 's' : '') + ' 🟫', sub: 'Enregistré pour PDP' });
+          E.reload();
+        } catch (e) { showToast('Erreur : ' + (e.message || e) + ' — rien n\'est perdu, réessaie'); }
+        finally { setBusy(false); }
+      };
+      return (
+        <div className="stack">
+          <div style={{ background: 'linear-gradient(135deg,#4e342e,#795548)', color: '#fff', borderRadius: 20, padding: '16px 18px' }}>
+            <div style={{ fontSize: 26, fontWeight: 900 }}>🟫 Retour palettes EPAL</div>
+            <div style={{ fontSize: 15, marginTop: 4, opacity: .92 }}>Dans chaque boutique : touche sa carte <b>une fois par palette</b> chargée, puis Valider.</div>
+          </div>
+          {E.raw === undefined && <div className="card" style={{ fontSize: 16 }}>Chargement des compteurs…</div>}
+          {E.raw === null && <div className="card" style={{ fontSize: 15, color: 'var(--danger)' }}>⚠️ Compteurs indisponibles ({E.err}). Tu peux compter quand même. <button className="btn-secondary" onClick={E.reload}>Réessayer</button></div>}
+          {KB_EPAL_STORES.map(c => {
+            const col = KB_SITE_COLORS[c] || '#5d4037'; const b = E.bal[c] || {}; const due = Math.max(0, b.due || 0); const n = cnt[c] || 0; const tb = todayBack(c);
+            return (
+              <div key={c} style={{ borderRadius: 20, border: '4px solid ' + col, background: n ? col + '1f' : 'var(--bg-card)', overflow: 'hidden' }}>
+                <button onClick={() => add(c, 1)} disabled={busy} style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '16px', minHeight: 130, border: 'none', background: 'transparent', cursor: 'pointer', color: 'var(--ink)' }}>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: 'inline-block', background: col, color: '#fff', borderRadius: 10, padding: '4px 12px', fontSize: 22, fontWeight: 900 }}>{c}</span>
+                    <span style={{ display: 'block', fontSize: 17, fontWeight: 800, marginTop: 8 }}>{KB_ENL_STORE_LONG[c] || c}</span>
+                    <span style={{ display: 'block', fontSize: 15, fontWeight: 700, marginTop: 4, color: due ? '#c62828' : '#2e7d32' }}>
+                      {E.raw === undefined ? '…' : due ? ('Doit ' + due + ' palette' + (due > 1 ? 's' : '') + (b.since ? ' depuis le ' + kbEnlDay(b.since) : '')) : 'Ne doit rien 👌'}
+                    </span>
+                    {tb > 0 && <span style={{ display: 'block', fontSize: 13, color: 'var(--ink-soft)', marginTop: 2 }}>Déjà {tb} rendue{tb > 1 ? 's' : ''} aujourd'hui</span>}
+                  </span>
+                  <span style={{ textAlign: 'center', minWidth: 96 }}>
+                    <span style={{ display: 'block', fontSize: 58, fontWeight: 900, lineHeight: 1, color: n ? col : '#bbb' }}>{n}</span>
+                    <span style={{ display: 'block', fontSize: 15, fontWeight: 900, color: col, marginTop: 4 }}>+1 👆</span>
+                  </span>
+                </button>
+                {n > 0 && <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '0 12px 12px' }}>
+                  <button onClick={() => add(c, -1)} disabled={busy} style={{ minWidth: 110, minHeight: 52, fontSize: 22, fontWeight: 900, borderRadius: 14, border: '3px solid ' + col, background: '#fff', color: col, cursor: 'pointer' }}>− 1</button>
+                </div>}
+              </div>
+            );
+          })}
+          <button onClick={valider} disabled={busy || !total} style={{ minHeight: 76, fontSize: 24, fontWeight: 900, borderRadius: 18, border: 'none', cursor: total ? 'pointer' : 'default', background: total ? '#2e7d32' : '#c8c8c8', color: '#fff' }}>
+            {busy ? 'Enregistrement…' : total ? '✅ Valider ' + total + ' palette' + (total > 1 ? 's' : '') : 'Touche une boutique pour compter'}
+          </button>
+        </div>
+      );
+    }
+
     // ───────── Chauffeur : écran d'accueil ─────────
     function RungisDriverHome({ session }) {
       const [view, setView] = React.useState('home');
       const B = useKbPdpBoard();
       const enl = useKbEnlevements();
+      const E = useKbEpal(); // V10.39
       const [runs, setRuns] = React.useState([]);
       const [picks, setPicks] = React.useState([]);
       React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
@@ -23301,6 +23410,7 @@
 
       const Back = () => <button onClick={() => setView('home')} style={{ alignSelf: 'flex-start', minHeight: 56, fontSize: 19, fontWeight: 900, padding: '8px 18px', borderRadius: 14, border: '2px solid var(--line)', background: 'var(--bg-card)', cursor: 'pointer' }}>← Accueil</button>;
       if (view === 'retours') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisRetoursView session={session} B={B} /></div>;
+      if (view === 'epal') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisEpalView session={session} E={E} /></div>;
       if (view === 'livraison') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisLivraisonView session={session} lines={lines} pk={pk} enl={enl} /></div>;
 
       const Tile = ({ ic, title, sub, n, color, onClick }) => (
@@ -23322,6 +23432,7 @@
           </div>
           <Tile ic="📦" title="À livrer aux boutiques" sub="À prendre à PDP : palettes validées + rolls Kelbongoo" n={enl.raw === undefined ? null : livTodo} color="#1565c0" onClick={() => setView('livraison')} />
           <Tile ic="↩️" title="À ramener à PDP" sub="Les cagettes « Retour PDP » de chaque boutique" n={B.ready ? B.toRecover : null} color="#e65100" onClick={() => setView('retours')} />
+          <Tile ic="🟫" title="Retour palettes EPAL" sub="Compter les palettes vides récupérées en boutique" n={E.raw === undefined ? null : E.dueTotal} color="#5d4037" onClick={() => setView('epal')} />
           <div style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'center', padding: '4px 10px' }}>Touche une grande carte. Tout ce que tu coches est enregistré tout de suite.</div>
         </div>
       );
