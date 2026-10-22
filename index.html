@@ -764,7 +764,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.41';
+    const APP_VERSION = 'V10.44';
+    // V10.44 — (22/10/2026) Prépa ND : le bouton « 🔴 Cagette ND » (déjà actif) repassait le ND en casier juste après « ✅ Les N sont dans la cagette » → tous les ND finissaient en casier en distrib. Libellé « 🧺 Repasser en casier », bloqué 5 s après validation + confirmation.
+    // V10.43 — (22/10/2026) Cagette ND comptée en dessous du total : le client servi en partie passe en rupture PARTIELLE (il garde ses ND posés en distrib) au lieu d'une rupture totale.
+    // V10.42 — (22/10/2026) Distrib : un produit passé en 🟣 dernière minute après une rupture (ex. ND céleri compté 0) n'était plus visible chez le client → il reste « à donner » ; la prépa efface ces ruptures au passage en dernière minute.
     // V10.41 — (22/10/2026) Rajout F&L Rungis : besoin = manque × MU EN KILO pour TOUS les types (comme le Sheet) →
     //   œufs comptés en boîtes de 6 (12 œufs = 2 boîtes), lots de pièces corrects. Œufs regroupés côté Rungis (KBG_Rungis v1.5).
     // V10.40 — (22/10/2026) Rungis : ① 🥬 Rajout F&L à Rungis envoyé AUTOMATIQUEMENT à la clôture de la prépa (plus de clic dans
@@ -3131,6 +3134,12 @@
       const items = [], removed = [...(o.removed || [])], reduced = [...(o.reduced || [])];
       for (let it of (o.items || [])) {
         const k = site + '||' + client + '||' + it.produit;
+        // V10.42 — produit passé en 🟣 dernière minute APRÈS une rupture (ex. ND céleri compté 0 puis « dernière minute ») :
+        //   la rupture d'avant ne compte plus, le produit reste dans la commande (_lm) → visible en distrib « à donner ».
+        //   Seule la rupture « dernière minute pas arrivée » (lmPasArrive) le retire.
+        const lmK = String(site || '').toUpperCase() + '||' + it.produit;
+        const lmWins = prep.lm && prep.lm[lmK] && !(prep.lmKo && prep.lmKo[k]) && (prep.status && (prep.status[k] === 'rupture' || prep.status[k] === 'partiel'));
+        if (lmWins) { items.push({ ...it, _lm: true, ...(it.cat === 'nd' || (prep.ndForce && prep.ndForce[lmK]) ? { cat: 'nd' } : {}) }); continue; }
         if (prep.status && prep.status[k] === 'rupture' && !(prep.overrides && prep.overrides[k])) { removed.push({ ...it, reason: 'rupture_prepa', ...(prep.lmKo && prep.lmKo[k] ? { _lmKo: true } : {}) }); continue; }
         // V9.79 — rupture partielle : on livre ce qui a été posé, le reste part en manquant
         const miss = (prep.overrides && prep.overrides[k]) ? 0 : kbPartMiss(prep, k, it.qty || 1);
@@ -14480,14 +14489,23 @@
       const ruptAll = (site, product) => { const po=rows.filter(r=>r.site===site&&r.product===product); const all=po.every(r=>st(r)==='rupture'); po.forEach(r=>wStatus(K(r), all?null:'rupture')); };
       const setPoids1 = (r) => { const cur=prep.poids[K(r)]||''; const v=prompt('Poids réel constaté ? (ex : 320g)', cur); if(v!==null) wPoids(K(r), v.trim()||null); };
       const setPoidsProd = (site, product) => { const v=prompt('Poids réel (s\'applique à ce produit) — ex : 320g',''); if(v && v.trim()) rows.filter(r=>r.site===site&&r.product===product).forEach(r=>wPoids(K(r), v.trim())); };
+      const ndSavedAt = React.useRef({}); // V10.44
       const toggleND = (pk) => {
         if (kbIsSolidaire(String(pk).split('||').pop())) { showToast('🧺 Panier solidaire : cagette à part, jamais en casier'); return; } // V10.05
-        if (ndOn(pk)) { if (prep.nd[pk]) wND(pk, null); if (ndAuto.has(pk)) wNdOff(pk, true); }
+        if (ndOn(pk)) {
+          // V10.44 — anti-clic : juste après « ✅ Les N sont dans la cagette » le bouton passait sous le doigt et
+          //   repassait TOUT le ND en casier (22/10 : céleri, salades, poireaux… de tous les lieux). Bloqué 5 s + confirmation.
+          if (Date.now() - (ndSavedAt.current[pk] || 0) < 5000) { showToast('🥬 Déjà en cagette ND ✓'); return; }
+          if (!window.confirm('Repasser « ' + String(pk).split('||').pop() + ' » EN CASIER ?\n\nIl ne sera plus dans la cagette ND : le distributeur le cherchera dans le casier du client.')) return;
+          if (prep.nd[pk]) wND(pk, null); if (ndAuto.has(pk)) wNdOff(pk, true);
+        }
         else { wNdOff(pk, false); wND(pk, { placed:null, alloc:[], shortage:[] }); wLM(pk, false); }
         setMoreOpen(m=>({...m,[pk]:false}));
       };
-      const toggleLM = (pk) => { if(prep.lm[pk]) wLM(pk, false); else { wLM(pk, true); wND(pk, null); } setMoreOpen(m=>({...m,[pk]:false})); };
+      // V10.42 — passer en dernière minute efface les ruptures déjà posées (ND compté 0, 🚫…) : le produit est attendu, pas en rupture
+      const toggleLM = (pk) => { if(prep.lm[pk]) wLM(pk, false); else { wLM(pk, true); wND(pk, null); rows.filter(r=>PK(r.site,r.product)===pk).forEach(r=>{ const x=prep.status[K(r)]; if(x==='rupture'||x==='partiel') wStatus(K(r), null); }); } setMoreOpen(m=>({...m,[pk]:false})); };
       const saveND = (site, product, val) => {
+        ndSavedAt.current[PK(site, product)] = Date.now(); // V10.44
         const po = rows.filter(r=>r.site===site&&r.product===product);
         const total = po.reduce((s,r)=>s+r.qty,0);
         let placed = parseInt(val,10); if(isNaN(placed)||placed<0) placed=0; if(placed>total) placed=total;
@@ -14496,7 +14514,7 @@
         let left=placed; const alloc=[], shortage=[];
         list.forEach(c=>{ const give=Math.min(c.need,left); left-=give;
           if(give>=c.need){ alloc.push({client:c.client,casier:c.casier,give}); wStatus(c.key,'done'); }
-          else if(give>0){ alloc.push({client:c.client,casier:c.casier,give}); shortage.push({client:c.client,casier:c.casier,need:c.need-give}); wStatus(c.key,'rupture'); }
+          else if(give>0){ alloc.push({client:c.client,casier:c.casier,give}); shortage.push({client:c.client,casier:c.casier,need:c.need-give}); wStatus(c.key,'partiel',{n:give}); } // V10.43 — servi en partie = rupture PARTIELLE (avant : rupture totale → le ND disparaissait en distrib)
           else { shortage.push({client:c.client,casier:c.casier,need:c.need}); wStatus(c.key,'rupture'); }
         });
         wND(PK(site,product), { placed, alloc, shortage });
@@ -14764,7 +14782,7 @@
             </div>}
 
             <div className="pdj-arow">
-              {site !== 'DOM' && <div className={"pdj-act nd"+(nd?" on":"")} onClick={()=>toggleND(pk)}>🔴 Cagette ND</div>}
+              {site !== 'DOM' && <div className={"pdj-act nd"+(nd?" on":"")} onClick={()=>toggleND(pk)}>{nd ? '🧺 Repasser en casier' : '🔴 Mettre en cagette ND'}</div>}
               <div className={"pdj-act lm"+(lm?" on":"")} onClick={()=>toggleLM(pk)}>🟣 Dispatch dern. min.</div>
               <div className="pdj-act rupt" onClick={()=>ruptAll(site,product)}>🚫 Rupture tout</div>
               <div className="pdj-act more" onClick={()=>setMoreOpen(m=>({...m,[pk]:!m[pk]}))}>⋯ Autre</div>
