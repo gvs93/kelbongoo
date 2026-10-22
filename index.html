@@ -764,8 +764,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.45';
-    // V10.45 — (22/10/2026) Master › Historique : petit lien discret « contrôle des stocks » en bas → coller le tableau brut du mail d'anomalies de Raimbaud ; pour chaque produit, comparaison avec la prépa exacte de l'appli (commandé / mis en casier / rupture) → ✅ NORMAL (manque réel, chercher l'erreur ailleurs) ou ⚠️ ANOMALIE (feuille de stock ≠ prépa), date de distribution détectée automatiquement, résultat copiable.
+    const APP_VERSION = 'V10.44';
     // V10.44 — (22/10/2026) Prépa ND : le bouton « 🔴 Cagette ND » (déjà actif) repassait le ND en casier juste après « ✅ Les N sont dans la cagette » → tous les ND finissaient en casier en distrib. Libellé « 🧺 Repasser en casier », bloqué 5 s après validation + confirmation.
     // V10.43 — (22/10/2026) Cagette ND comptée en dessous du total : le client servi en partie passe en rupture PARTIELLE (il garde ses ND posés en distrib) au lieu d'une rupture totale.
     // V10.42 — (22/10/2026) Distrib : un produit passé en 🟣 dernière minute après une rupture (ex. ND céleri compté 0) n'était plus visible chez le client → il reste « à donner » ; la prépa efface ces ruptures au passage en dernière minute.
@@ -27405,225 +27404,6 @@
       );
     }
 
-    // ============================================================
-    // V10.45 — 🔎 CONTRÔLE DES STOCKS (lien discret en bas de Master › Historique)
-    //   Henry colle le tableau brut du mail d'anomalies de Raimbaud (Produit · Producteur · Commandé · Préparé · Manque …).
-    //   Pour chaque produit, on compare à la prépa EXACTE de l'appli (état final day_<date>_prep) :
-    //   • même commandé + même préparé → ✅ NORMAL : la prépa a bien eu ce manque → l'erreur est ailleurs (stock, inventaire, réception)
-    //   • différent → ⚠️ ANOMALIE : la feuille de stock ne reflète pas ce que la prépa a fait (report ancien site / Tampermonkey, commande fusionnée…)
-    //   La date de distribution est détectée toute seule (celle dont les « Commandé » collent le mieux), modifiable.
-    // ============================================================
-    function kbScNum(v) { const s = String(v == null ? '' : v).replace(/\s/g, '').replace(',', '.'); if (!s || s === '—' || s === '-') return null; const n = Number(s.replace(/[^0-9.\-]/g, '')); return isFinite(n) && /\d/.test(s) ? n : null; }
-    // Colonnes du mail Raimbaud (ordre par défaut si pas d'en-tête collé)
-    const KB_SC_COLS = [['produit', /^produit/], ['producteur', /^producteur/], ['commande', /^command/], ['prepare', /^prepar/], ['manque', /^manq/], ['dejavu', /^deja/], ['affiche', /^affich/], ['reception', /^recept/], ['oubli', /oubli/], ['stock0', /stock\s*a\s*0|stock 0/]];
-    function kbScParse(txt) {
-      const lines = String(txt || '').replace(/\r/g, '').split('\n').map(l => l.replace(/ /g, ' ')).filter(l => l.trim());
-      if (!lines.length) return [];
-      const split = (l) => (l.includes('\t') ? l.split('\t') : l.split(/\s{2,}/)).map(c => c.trim());
-      let map = KB_SC_COLS.map(c => c[0]);
-      const out = [];
-      for (const l of lines) {
-        const cells = split(l);
-        const nc = cells.map(c => normalizeText(c));
-        if (nc.some(c => /^produit/.test(c)) && nc.some(c => /^command/.test(c))) { // ligne d'en-tête → on suit l'ordre réel
-          map = nc.map(c => { const f = KB_SC_COLS.find(([, rx]) => rx.test(c)); return f ? f[0] : ''; });
-          continue;
-        }
-        const r = {}; map.forEach((k, i) => { if (k) r[k] = cells[i] != null ? cells[i] : ''; });
-        if (!r.produit || kbScNum(r.commande) == null) continue; // ligne vide / sous-total
-        out.push({ produit: r.produit, producteur: r.producteur || '', commande: kbScNum(r.commande), prepare: kbScNum(r.prepare), manque: kbScNum(r.manque), dejavu: r.dejavu || '', affiche: kbScNum(r.affiche), reception: kbScNum(r.reception), oubli: kbScNum(r.oubli), stock0: kbScNum(r.stock0) });
-      }
-      return out;
-    }
-    // Prépa exacte, tous produits (même logique que kbPsProductRecap, sans filtre)
-    function kbScRecapAll(orders, prepArr) {
-      const idx = kbPsOrdersIndex(orders);
-      const res = {};
-      for (const [pr, p] of Object.entries(idx.prod)) {
-        res[pr] = { ...p, posO: 0, posU: 0, rupO: 0, rupU: 0, parO: 0, ndU: 0, lm: false, who: {}, rupWho: {}, bySite: {}, rupDetail: [] };
-        for (const [s, v] of Object.entries(p.sites)) res[pr].bySite[s] = { ...v, posU: 0, rupU: 0, ndU: 0 };
-      }
-      for (const d of (prepArr || [])) {
-        const k = kbPsKey(d.id); if (!k) continue;
-        const pr = k.seg[k.seg.length - 1]; const r = res[pr]; if (!r) continue;
-        const site = k.seg[0];
-        if (k.pfx === 'st' && k.seg.length === 3 && d.v) {
-          const o = idx.ob[site + '||' + k.seg[1]]; const q = (o && o.items[pr] && o.items[pr].q) || 1;
-          const bs = r.bySite[site] || (r.bySite[site] = { orders: 0, units: 0, posU: 0, rupU: 0, ndU: 0 });
-          if (d.v === 'done') { r.posO++; r.posU += q; bs.posU += q; }
-          else if (d.v === 'partiel') { const u = Math.min(q, Number(d.n) || 0); r.parO++; r.posU += u; r.rupU += q - u; bs.posU += u; bs.rupU += q - u; r.rupDetail.push({ site, client: k.seg[1], n: q - u, by: d.by || '', at: kbTsMs(d._ts) }); }
-          else if (d.v === 'rupture') { r.rupO++; r.rupU += q; bs.rupU += q; r.rupDetail.push({ site, client: k.seg[1], n: q, by: d.by || '', at: kbTsMs(d._ts), lmPasArrive: !!d.lmPasArrive }); }
-          if (d.by && (d.v === 'done' || d.v === 'partiel')) r.who[d.by] = (r.who[d.by] || 0) + 1;
-          if (d.by && (d.v === 'rupture' || d.v === 'partiel')) r.rupWho[d.by] = (r.rupWho[d.by] || 0) + 1;
-        } else if (k.pfx === 'nd' && d.v === 'done') { const bs = r.bySite[site]; if (bs) { bs.ndU = bs.units; r.ndU += bs.units; } }
-        else if (k.pfx === 'lm') r.lm = true;
-      }
-      return res;
-    }
-    // Rapprochement du nom collé avec un produit des commandes du jour : exact normalisé, sinon mots en commun
-    function kbScWords(s) { return normalizeText(kbProdName(s)).replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(w => w.length >= 2 && !['bio', 'de', 'du', 'la', 'le', 'les', 'des', 'et', 'en', 'au', 'aux'].includes(w)); }
-    function kbScMatch(name, recap) {
-      const nn = normalizeText(kbProdName(name)).replace(/\s+/g, ' ').trim();
-      const keys = Object.keys(recap);
-      const ex = keys.find(k => normalizeText(kbProdName(k)).replace(/\s+/g, ' ').trim() === nn);
-      if (ex) return { key: ex, exact: true };
-      const w = new Set(kbScWords(name)); if (!w.size) return null;
-      let best = null, bs = 0, second = 0;
-      for (const k of keys) {
-        const kw = new Set(kbScWords(k)); if (!kw.size) continue;
-        let inter = 0; w.forEach(x => { if (kw.has(x)) inter++; });
-        const sc = inter / (w.size + kw.size - inter);
-        if (sc > bs) { second = bs; bs = sc; best = k; } else if (sc > second) second = sc;
-      }
-      return best && bs >= 0.6 && bs - second >= 0.1 ? { key: best, exact: false, score: bs } : null;
-    }
-    function kbScCompare(rows, recap) {
-      return rows.map(r => {
-        const m = kbScMatch(r.produit, recap);
-        if (!m) return { r, st: 'absent' };
-        const a = recap[m.key];
-        const prep = a.posU + a.ndU;
-        const pend = Math.max(0, a.units - a.posU - a.rupU - a.ndU);
-        const okC = r.commande === a.units, okP = r.prepare == null || r.prepare === prep;
-        return { r, a, m, prep, pend, okC, okP, st: okC && okP ? 'normal' : 'anomalie' };
-      });
-    }
-    function KbStockControlView() {
-      const [txt, setTxt] = React.useState(() => { try { return localStorage.getItem('kb_sc_txt') || ''; } catch (_) { return ''; } });
-      const [day, setDay] = React.useState('');
-      const [auto, setAuto] = React.useState(true);
-      const [busy, setBusy] = React.useState('');
-      const [res, setRes] = React.useState(null);
-      const [copied, setCopied] = React.useState(false);
-      const cache = React.useRef({});
-      const rows = React.useMemo(() => kbScParse(txt), [txt]);
-      const saveTxt = (v) => { setTxt(v); setRes(null); try { localStorage.setItem('kb_sc_txt', v); } catch (_) {} };
-      const loadDay = async (d) => {
-        if (cache.current[d]) return cache.current[d];
-        const [od, prepArr] = await Promise.all([storage.getDoc(`day_${d}_orders`, 'data').catch(() => null), storage.getAll(`day_${d}_prep`).catch(() => [])]);
-        const orders = (od && od.orders) || [];
-        const v = { day: d, nOrders: orders.length, nPrep: (prepArr || []).length, recap: orders.length ? kbScRecapAll(orders, prepArr) : {} };
-        cache.current[d] = v; return v;
-      };
-      const run = async () => {
-        if (!rows.length) return;
-        setRes(null); setCopied(false);
-        try {
-          let chosen = null, tried = [];
-          if (auto || !day) {
-            // Mail du matin = feuille de stock d'hier/aujourd'hui → distribution du jour, de la veille ou du lendemain ; puis on remonte 10 jours
-            const t = todayKey(); const cands = [t, addDays(t, -1), addDays(t, 1)]; for (let i = 2; i <= 10; i++) cands.push(addDays(t, -i));
-            for (const d of cands) {
-              setBusy('Recherche de la bonne date… ' + formatDateShort(d));
-              const v = await loadDay(d); if (!v.nOrders) continue;
-              const cmp = kbScCompare(rows, v.recap);
-              const score = cmp.filter(c => c.st !== 'absent' && c.okC).length * 10 + cmp.filter(c => c.st !== 'absent').length;
-              tried.push({ day: d, score, nOrders: v.nOrders });
-              if (!chosen || score > chosen.score) chosen = { day: d, score };
-              if (cmp.every(c => c.st !== 'absent' && c.okC)) break; // tout colle → inutile de chercher plus loin
-            }
-            if (!chosen) { setBusy(''); setRes({ err: 'Aucune commande trouvée sur les 10 derniers jours.' }); return; }
-            setDay(chosen.day);
-          } else chosen = { day };
-          setBusy('Calcul…');
-          const v = await loadDay(chosen.day);
-          setRes({ day: chosen.day, nOrders: v.nOrders, nPrep: v.nPrep, cmp: kbScCompare(rows, v.recap), tried });
-        } catch (e) { setRes({ err: e.message || String(e) }); }
-        setBusy('');
-      };
-      const hm = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
-      const nAno = res && res.cmp ? res.cmp.filter(c => c.st === 'anomalie').length : 0;
-      const nOk = res && res.cmp ? res.cmp.filter(c => c.st === 'normal').length : 0;
-      const nAbs = res && res.cmp ? res.cmp.filter(c => c.st === 'absent').length : 0;
-      const why = (c) => {
-        const out = [];
-        if (c.st === 'absent') return ['Produit pas trouvé dans les commandes de cette distribution (nom différent ou produit pas commandé ce jour-là).'];
-        if (!c.okC) out.push(`Commandé : la feuille dit ${c.r.commande}, l'appli ${c.a.units} (${c.a.orders} cde) → ${c.r.commande > c.a.units ? 'commande fusionnée / annulée encore comptée dans la feuille' : 'commande pas encore remontée dans la feuille'} ?`);
-        if (!c.okP) out.push(c.prep > c.r.prepare
-          ? `Préparé : l'appli a mis ${c.prep} en casier mais la feuille dit ${c.r.prepare} → rupture reportée à tort sur l'ancien site (Tampermonkey / à la main) → stock faussé de ${c.prep - c.r.prepare}.`
-          : `Préparé : la feuille dit ${c.r.prepare} mais l'appli n'en a mis que ${c.prep} en casier → rupture de la prépa PAS reportée sur l'ancien site.`);
-        if (c.pend > 0) out.push(`${c.pend} pas encore traité(s) en prépa (ni posé ni rupture).`);
-        if (c.a.lm) out.push('🟣 Passé en dernière minute certain : compté présent côté ancien site.');
-        return out;
-      };
-      const normalWhy = (c) => {
-        const r = c.r, manq = c.a.rupU;
-        const out = [`La prépa a bien eu ${manq} rupture(s) → la feuille est juste, l'erreur est AILLEURS.`];
-        if (r.affiche != null && r.affiche >= (r.manque || manq) && r.affiche > 0) out.push(`Le stock affichait ${r.affiche} → produit introuvable à l'entrepôt / mal rangé, ou inventaire faux (compté mais pas là).`);
-        if (r.reception) out.push(`Réception du jour ${r.reception} → réception saisie mais pas arrivée / pas encore rangée au moment de la prépa ?`);
-        if (r.affiche === 0 && !r.reception) out.push('Stock à 0 et rien reçu → produit vendu sans stock : commande fournisseur / passage inactif.');
-        return out;
-      };
-      const copy = () => {
-        if (!res || !res.cmp) return;
-        const L = [`Contrôle des stocks — distribution du ${formatDateShort(res.day)} (prépa appli)`, ''];
-        res.cmp.forEach(c => {
-          const tag = c.st === 'normal' ? 'NORMAL' : c.st === 'anomalie' ? 'ANOMALIE' : 'INTROUVABLE';
-          L.push(`${tag} — ${c.r.produit} : feuille ${c.r.commande} commandé / ${c.r.prepare ?? '?'} préparé` + (c.a ? ` · appli ${c.a.units} commandé / ${c.prep} en casier / ${c.a.rupU} rupture` : ''));
-          (c.st === 'normal' ? normalWhy(c) : why(c)).forEach(x => L.push('   ' + x));
-        });
-        const t = L.join('\n');
-        try { navigator.clipboard.writeText(t).then(() => setCopied(true)).catch(() => {}); } catch (_) {}
-      };
-      const inp = { fontSize: 15, padding: '8px 10px', borderRadius: 10, border: '1px solid var(--line)' };
-      const Num = ({ v, l, c }) => <div style={{ textAlign: 'center', minWidth: 70 }}><div style={{ fontSize: 26, fontWeight: 900, color: c, lineHeight: 1 }}>{v}</div><div style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink-soft)' }}>{l}</div></div>;
-      return (
-        <div className="stack">
-          <div className="card" style={{ borderTop: '5px solid #6d4c41' }}>
-            <h2 style={{ fontSize: 18, margin: '0 0 4px' }}>🔎 Contrôle des stocks</h2>
-            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '0 0 8px' }}>Colle le tableau du mail d'anomalies (Produit · Producteur · Commandé · Préparé · Manque …). L'appli compare avec la prépa exacte : <b>✅ normal</b> = la prépa a bien eu ce manque, l'erreur est ailleurs · <b>⚠️ anomalie</b> = la feuille de stock ne correspond pas à la prépa.</p>
-            <textarea value={txt} onChange={e => saveTxt(e.target.value)} placeholder={'Produit\tProducteur\tCommandé\tPréparé\tManque\t…\nChipos de Mesenguy BIO (porc)\tFerme de Mésenguy\t1\t0\t1\t…'} rows={7} style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'monospace', fontSize: 13, padding: 10, borderRadius: 10, border: '1px solid var(--line)' }} />
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 700 }}>{rows.length} produit(s) lu(s)</span>
-              <label style={{ fontSize: 14 }}><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} /> date auto</label>
-              {!auto && <label style={{ fontSize: 14 }}>📅 Distribution du <input type="date" value={day} onChange={e => { setDay(e.target.value); setRes(null); }} style={inp} /></label>}
-              <button className="btn" disabled={!rows.length || !!busy} onClick={run} style={{ fontSize: 16, fontWeight: 900 }}>🔎 Contrôler</button>
-              {txt && <button className="btn-ghost" onClick={() => saveTxt('')}>Effacer</button>}
-              {busy && <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{busy}</span>}
-            </div>
-          </div>
-          {res && res.err && <div className="card" style={{ color: 'var(--danger)' }}>❌ {res.err}</div>}
-          {res && res.cmp && (
-            <div className="card">
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-                <div style={{ fontWeight: 900, fontSize: 16 }}>Distribution du {formatDateShort(res.day)} · {res.nOrders} commandes{auto ? ' (date trouvée automatiquement)' : ''}</div>
-                <button className="btn-secondary" style={{ marginLeft: 'auto' }} onClick={copy}>{copied ? '✅ Copié' : '📋 Copier le résultat'}</button>
-              </div>
-              {!res.nPrep && <div style={{ marginTop: 6, color: 'var(--warn)', fontWeight: 700 }}>⚠️ Aucune prépa enregistrée dans l'appli pour cette date → tout ressortira en anomalie. Vérifie la date (décoche « date auto »).</div>}
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '10px 0' }}>
-                {[['⚠️ Anomalies', nAno, '#c62828'], ['✅ Normal', nOk, '#2e7d32'], ['❓ Introuvables', nAbs, '#757575']].map(([l, v, c]) => <div key={l} style={{ borderRadius: 12, padding: '8px 14px', background: c, color: '#fff' }}><div style={{ fontSize: 12, fontWeight: 700 }}>{l}</div><div style={{ fontSize: 26, fontWeight: 900 }}>{v}</div></div>)}
-              </div>
-              {res.cmp.slice().sort((x, y) => ({ anomalie: 0, absent: 1, normal: 2 }[x.st] - { anomalie: 0, absent: 1, normal: 2 }[y.st])).map((c, i) => {
-                const col = c.st === 'anomalie' ? '#c62828' : c.st === 'normal' ? '#2e7d32' : '#757575';
-                return (
-                  <div key={i} style={{ border: '2px solid ' + col, borderRadius: 12, padding: '10px 12px', marginTop: 8, background: c.st === 'anomalie' ? '#fdecea' : c.st === 'normal' ? '#f1f8e9' : 'var(--bg-muted)' }}>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
-                      <span style={{ background: col, color: '#fff', fontWeight: 900, borderRadius: 8, padding: '2px 10px', fontSize: 15 }}>{c.st === 'anomalie' ? '⚠️ ANOMALIE' : c.st === 'normal' ? '✅ NORMAL' : '❓ INTROUVABLE'}</span>
-                      <span style={{ fontWeight: 900, fontSize: 17 }}>{c.r.produit}</span>
-                      {c.r.producteur && <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{c.r.producteur}</span>}
-                    </div>
-                    {c.m && !c.m.exact && <div style={{ fontSize: 12, color: '#ef6c00', marginTop: 2 }}>≈ rapproché de « {kbProdName(c.m.key)} »</div>}
-                    {c.a && (
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 8, alignItems: 'flex-end' }}>
-                        <div style={{ fontSize: 12, fontWeight: 800, alignSelf: 'center', width: 60 }}>📄 Feuille</div>
-                        <Num v={c.r.commande} l="commandé" c={c.okC ? '#1565c0' : '#c62828'} /><Num v={c.r.prepare ?? '—'} l="préparé" c={c.okP ? '#2e7d32' : '#c62828'} />
-                        <div style={{ width: 1, alignSelf: 'stretch', background: 'var(--line)' }} />
-                        <div style={{ fontSize: 12, fontWeight: 800, alignSelf: 'center', width: 60 }}>📱 Appli</div>
-                        <Num v={c.a.units} l={`commandé · ${c.a.orders} cde`} c={c.okC ? '#1565c0' : '#c62828'} /><Num v={c.prep} l="mis en casier" c={c.okP ? '#2e7d32' : '#c62828'} /><Num v={c.a.rupU} l="rupture(s)" c={c.a.rupU ? '#c62828' : '#9e9e9e'} />
-                        {c.pend > 0 && <Num v={c.pend} l="pas traité" c="#ef6c00" />}
-                      </div>)}
-                    <ul style={{ margin: '8px 0 0', paddingLeft: 18, fontSize: 14, fontWeight: 600 }}>{(c.st === 'normal' ? normalWhy(c) : why(c)).map((x, j) => <li key={j}>{x}</li>)}</ul>
-                    {c.a && c.a.rupDetail.length > 0 && (
-                      <div style={{ fontSize: 13, marginTop: 6, color: 'var(--ink-soft)' }}>❌ Rupture : {c.a.rupDetail.map((d, j) => <span key={j}>{j ? ' · ' : ''}<b>{d.site}</b> {d.client} ×{d.n}{d.by ? ' par ' + d.by : ''}{d.at ? ' à ' + hm(d.at) : ''}{d.lmPasArrive ? ' (dernière minute pas arrivée)' : ''}</span>)}</div>)}
-                    {c.a && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6, fontSize: 12 }}>{Object.entries(c.a.bySite).sort().map(([k, v]) => <span key={k} className="badge" style={{ background: v.rupU ? '#fdecea' : 'var(--bg-muted)', color: 'var(--ink)', fontWeight: 700 }}>{k} : {v.posU + v.ndU}/{v.units}{v.rupU ? ' · ❌' + v.rupU : ''}</span>)}</div>}
-                    {(c.r.affiche != null || c.r.reception != null) && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Mail : affiché {c.r.affiche ?? '—'} · réception {c.r.reception ?? '—'} · compte si oubli {c.r.oubli ?? '—'} · compte si stock à 0 {c.r.stock0 ?? '—'}{c.r.dejavu && c.r.dejavu !== '—' ? ' · déjà vu ' + c.r.dejavu : ''}</div>}
-                  </div>);
-              })}
-            </div>)}
-        </div>
-      );
-    }
-
     function HistoryPage({ session }) {
       const [histTab, setHistTab] = React.useState('prep'); // V10.02 : 'prep' | 'nd' | 'cmd' | 'dlc' | 'pdp' | 'temp'
       return (
@@ -27647,7 +27427,6 @@
           {histTab === 'dlc' && <HistoryDlcView />}
           {histTab === 'pdp' && <HistoryPdpView />}
           {histTab === 'temp' && <HistoryTempView />}
-          {histTab === 'stockctl' && <KbStockControlView />}
           {histTab === 'inv' && (
             <div className="card">
               <div style={{fontSize:13,color:'var(--ink-soft)',marginBottom:6}}>Clique une date pour voir <b>ce qui a été compté</b> (produit, quantité, qui, quand, matin/soir), puis « ↩️ Ouvrir » pour le reprendre.</div>
@@ -27657,9 +27436,6 @@
               }} />
             </div>
           )}
-          <div style={{textAlign:'right',marginTop:4}}>
-            <span onClick={()=>setHistTab(histTab==='stockctl'?'prep':'stockctl')} style={{fontSize:11,color:'var(--ink-mute)',cursor:'pointer',textDecoration:'underline',opacity:.7}}>{histTab==='stockctl'?'← retour':'contrôle des stocks'}</span>
-          </div>
         </div>
       );
     }
