@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.53) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.54) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -697,7 +697,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.53';
+const APP_VERSION = 'V10.54';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -1833,9 +1833,6 @@ function unpackCacheData(cached) {
   }
   return cached.data;
 }
-const CACHE_CHUNK = 700000;
-// V10.52 — Catalogue des pertes tiré du JSON producerproducts (chargé chaque semaine dans Admin › Produits)
-//   → plus besoin du CSV « catalogue complet ». Même forme que parseCatalogueCSV.
 function kbCatalogueFromProducts(byId) {
   const best = {};
   for (const p of Object.values(byId || {})) {
@@ -1857,6 +1854,7 @@ function kbCatalogueFromProducts(byId) {
   }
   return Object.values(best).sort((a, b) => a.produit.localeCompare(b.produit, 'fr'));
 }
+const CACHE_CHUNK = 700000;
 async function writeCache(name, obj) {
   const full = JSON.stringify(obj);
   const nParts = Math.max(1, Math.ceil(full.length / CACHE_CHUNK));
@@ -26635,7 +26633,11 @@ function PrepSuiviHub({
     key: it.key,
     onClick: () => {
       setTab(it.key);
-      try { window.scrollTo({ top: 0 }); } catch (_) {}
+      try {
+        window.scrollTo({
+          top: 0
+        });
+      } catch (_) {}
     },
     style: {
       display: 'flex',
@@ -40842,6 +40844,648 @@ function KbLivePage() {
     }
   }, "il y a ", ago(r.at))))));
 }
+function kbFwSnap(path, cb, whereArgs) {
+  if (!firebaseConfigured || !fb) {
+    cb({
+      rows: [],
+      err: 'hors ligne'
+    });
+    return () => {};
+  }
+  const coll = fb.collection(fb.db, path);
+  const q = whereArgs ? fb.query(coll, fb.where(...whereArgs)) : coll;
+  return fb.onSnapshot(q, snap => cb({
+    rows: snap.docs.map(d => ({
+      id: d.id,
+      ...d.data()
+    })),
+    err: ''
+  }), err => cb({
+    rows: [],
+    err: err && err.code || 'erreur'
+  }));
+}
+const KB_FW_ACTIONS = {
+  appliquer: 'Montant ajusté (serveur 98)',
+  appliquer_pdv: 'Montant ajusté (lu dans PDV)',
+  manuel: 'Montant ajusté (manuel)',
+  manuel_sim: 'Simulation',
+  capturer: 'Capture PayZen',
+  test: 'Test de liaison',
+  lire_pdv: 'Lecture PDV',
+  etat: 'Consultation',
+  extraction: 'Extraction 10h',
+  facturer_pdv: 'Facture PDV créée',
+  avoir_pdv: 'Avoir PDV créé'
+};
+function kbFwStatut(o) {
+  if (!o) return {
+    k: 'todo',
+    t: '⏳ À facturer',
+    c: 'var(--ink-mute)',
+    bg: 'var(--bg-muted)'
+  };
+  const warn = o.last_ok === false;
+  if (o.statut === 'capturee') return {
+    k: 'paid',
+    t: '💳 Payée' + (warn ? ' ⚠' : ''),
+    c: 'var(--accent-dark)',
+    bg: 'var(--accent-soft)'
+  };
+  if (o.statut === 'facturee') return {
+    k: warn ? 'err' : 'billed',
+    t: warn ? '🧾 Facturée ⚠ erreur ensuite' : '🧾 Facturée · capture à venir',
+    c: warn ? 'var(--warn)' : 'var(--info)',
+    bg: warn ? 'var(--warn-soft)' : 'var(--info-soft)'
+  };
+  if (warn) return {
+    k: 'err',
+    t: '❌ Erreur',
+    c: 'var(--danger)',
+    bg: 'var(--danger-soft)'
+  };
+  return {
+    k: 'todo',
+    t: '🧪 Simulée seulement',
+    c: 'var(--ink-soft)',
+    bg: 'var(--bg-muted)'
+  };
+}
+const kbFwEur = v => v == null || v === '' ? '—' : (Number(v) || 0).toLocaleString('fr-FR', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2
+}) + ' €';
+const kbFwTs = t => {
+  try {
+    const d = t && t.toDate ? t.toDate() : null;
+    return d ? d.toLocaleString('fr-FR', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    }) : '';
+  } catch (_) {
+    return '';
+  }
+};
+function KbFwTimeline({
+  reference
+}) {
+  const [st, setSt] = React.useState(null);
+  React.useEffect(() => kbFwSnap('facturation_events', setSt, ['reference', '==', reference]), [reference]);
+  if (!st) return React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--ink-mute)'
+    }
+  }, "Chargement de l'historique…");
+  if (st.err) return React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--danger)'
+    }
+  }, "Historique illisible (", st.err, ").");
+  const ev = [...st.rows].sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.id).localeCompare(String(b.id)));
+  if (!ev.length) return React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--ink-mute)'
+    }
+  }, "Aucun événement enregistré pour cette commande.");
+  return React.createElement(KbFwEventList, {
+    events: ev
+  });
+}
+function KbFwEventList({
+  events,
+  showRef
+}) {
+  const [open, setOpen] = React.useState(null);
+  return React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, events.map(e => {
+    const r = e.resultat || {};
+    const mods = Array.isArray(r.modifications) ? r.modifications : [];
+    return React.createElement("div", {
+      key: e.id,
+      style: {
+        borderLeft: '4px solid ' + (e.ok ? 'var(--accent)' : 'var(--danger)'),
+        background: e.ok ? 'var(--bg-muted)' : 'var(--danger-soft)',
+        borderRadius: 8,
+        padding: '8px 10px',
+        cursor: 'pointer'
+      },
+      onClick: () => setOpen(open === e.id ? null : e.id)
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 8,
+        flexWrap: 'wrap',
+        alignItems: 'baseline'
+      }
+    }, React.createElement("b", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)',
+        minWidth: 118
+      }
+    }, String(e.date || '').slice(0, 16).replace('T', ' ')), showRef && React.createElement("b", null, e.reference || '—'), React.createElement("span", {
+      style: {
+        fontWeight: 700
+      }
+    }, e.ok ? '✅' : '❌', " ", KB_FW_ACTIONS[e.action] || e.action), r.net_ttc != null && React.createElement("span", null, kbFwEur(r.total_initial_ttc), " → ", React.createElement("b", null, kbFwEur(r.net_ttc))), r.statut === 'deja_applique' && React.createElement("span", {
+      className: "badge badge-info"
+    }, "déjà appliqué"), React.createElement("span", {
+      style: {
+        fontSize: 11,
+        color: 'var(--ink-mute)'
+      }
+    }, e.source === 'pdv98' ? 'serveur 98' : e.source, e.operateur ? ' · ' + e.operateur : '')), !e.ok && e.message && React.createElement("div", {
+      style: {
+        marginTop: 4,
+        color: 'var(--danger)',
+        fontWeight: 600,
+        whiteSpace: 'pre-wrap'
+      }
+    }, e.message), mods.length > 0 && React.createElement("ul", {
+      style: {
+        margin: '4px 0 0',
+        paddingLeft: 18,
+        fontSize: 13
+      }
+    }, mods.map((m, i) => React.createElement("li", {
+      key: i
+    }, m))), open === e.id && React.createElement("div", {
+      style: {
+        marginTop: 6,
+        fontSize: 12,
+        color: 'var(--ink-soft)'
+      }
+    }, (e.pdv_commande || e.pdv_facture) && React.createElement("div", null, "PDV : commande ", React.createElement("b", null, e.pdv_commande || '—'), " · facture ", React.createElement("b", null, e.pdv_facture || '—'), " · avoir(s) ", React.createElement("b", null, (e.pdv_avoirs || []).join(', ') || '—')), React.createElement("div", null, "Reçu par l'appli : ", kbFwTs(e.received_at), " · id ", e.id, e.id_order ? ' · commande site #' + e.id_order : ''), e.resultat && React.createElement("pre", {
+      style: {
+        margin: '6px 0 0',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        background: 'white',
+        border: '1px solid var(--line)',
+        borderRadius: 6,
+        padding: 6,
+        maxHeight: 260,
+        overflow: 'auto'
+      }
+    }, JSON.stringify(e.resultat, null, 2))));
+  }));
+}
+function KbFacturationWebPage() {
+  const [day, setDay] = React.useState(() => todayKey());
+  const [batch, setBatch] = React.useState(undefined);
+  const [runs, setRuns] = React.useState([]);
+  const [batchErr, setBatchErr] = React.useState('');
+  const [ords, setOrds] = React.useState(null);
+  const [evs, setEvs] = React.useState(null);
+  const [filt, setFilt] = React.useState('tout');
+  const [q, setQ] = React.useState('');
+  const [sel, setSel] = React.useState(null);
+  const [onlyErr, setOnlyErr] = React.useState(false);
+  const since = addDays(todayKey(), -21);
+  React.useEffect(() => kbFwSnap('facturation_orders', setOrds, ['last_date', '>=', since]), [since]);
+  React.useEffect(() => kbFwSnap('facturation_events', setEvs, ['day', '>=', addDays(todayKey(), -7)]), []);
+  React.useEffect(() => {
+    setBatch(undefined);
+    setRuns([]);
+    setBatchErr('');
+    setSel(null);
+    if (!firebaseConfigured || !fb) {
+      setBatch(null);
+      return;
+    }
+    const id = 'pdv-' + day;
+    const u1 = fb.onSnapshot(fb.doc(fb.db, 'pdv_batches', id), s => setBatch(s.exists() ? {
+      id: s.id,
+      ...s.data()
+    } : null), e => {
+      setBatch(null);
+      setBatchErr(e && e.code || 'erreur');
+    });
+    const u2 = fb.onSnapshot(fb.collection(fb.db, 'pdv_batches', id, 'runs'), s => setRuns(s.docs.map(d => d.data())), () => setRuns([]));
+    return () => {
+      u1 && u1();
+      u2 && u2();
+    };
+  }, [day]);
+  const byRef = React.useMemo(() => {
+    const m = {};
+    (ords && ords.rows || []).forEach(o => {
+      m[o.id] = o;
+    });
+    return m;
+  }, [ords]);
+  const rows = React.useMemo(() => {
+    const list = (batch && batch.orders || []).map(b => {
+      const ref = String(b.ref_prestashop || '').toUpperCase();
+      const f = ref ? byRef[ref] : null;
+      return {
+        ref,
+        b,
+        f,
+        s: kbFwStatut(f)
+      };
+    });
+    return list;
+  }, [batch, byRef]);
+  const count = k => rows.filter(r => r.s.k === k).length;
+  const shown = rows.filter(r => filt === 'tout' || (filt === 'todo' ? r.s.k === 'todo' : filt === 'err' ? r.s.k === 'err' : r.s.k === 'billed' || r.s.k === 'paid')).filter(r => !q || normalizeText([r.ref, r.b.pdv_document, r.b.client_pdv, r.b.lieu_libelle, r.b.lieu].join(' ')).includes(normalizeText(q)));
+  const sumNet = rows.reduce((t, r) => t + (r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : Number(r.b.total_ttc_commande) || 0), 0);
+  const sumIni = rows.reduce((t, r) => t + (Number(r.b.total_ttc_commande) || 0), 0);
+  const journal = React.useMemo(() => (evs && evs.rows || []).filter(e => e.action !== 'etat' && (!onlyErr || !e.ok)).sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.id).localeCompare(String(a.id))).slice(0, 150), [evs, onlyErr]);
+  const denied = [batchErr, ords && ords.err, evs && evs.err].some(e => e === 'permission-denied');
+  const exportXlsx = () => {
+    try {
+      const data = rows.map(r => ({
+        'Réf. site': r.ref,
+        'Commande PDV': r.b.pdv_document,
+        'Client PDV': r.b.client_pdv,
+        'Lieu': r.b.lieu_libelle || r.b.lieu || '',
+        'Créneau': r.b.creneau || '',
+        'Montant commandé': Number(r.b.total_ttc_commande) || 0,
+        'Montant réel': r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : '',
+        'Statut': r.s.t,
+        'Facture PDV': r.f && r.f.pdv_facture || '',
+        'Avoir(s)': (r.f && r.f.pdv_avoirs || []).join(', '),
+        'Dernière action': r.f ? (KB_FW_ACTIONS[r.f.last_action] || r.f.last_action) + ' ' + (r.f.last_date || '') : '',
+        'Erreur': r.f && r.f.last_message || ''
+      }));
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Facturation');
+      XLSX.writeFile(wb, `facturation_web_${day}.xlsx`);
+    } catch (e) {
+      alert('Export impossible : ' + e.message);
+    }
+  };
+  const Tile = ({
+    label,
+    val,
+    sub,
+    color
+  }) => React.createElement("div", {
+    className: "card",
+    style: {
+      margin: 0,
+      padding: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      fontWeight: 600
+    }
+  }, label), React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 700,
+      color: color || 'var(--ink)'
+    }
+  }, val), sub && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-soft)'
+    }
+  }, sub));
+  const S = sel && rows.find(r => r.ref === sel.ref && r.b.pdv_document === sel.doc);
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: 0
+    }
+  }, "🧾 Facturation web"), React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--ink-soft)',
+      fontSize: 13
+    }
+  }, "Commande site → PDV → extraction 10h → prépa/distrib → facture + avoirs PDV → montant réel sur le site → capture PayZen. Tout ce qui se passe est tracé ici."), denied && React.createElement("div", {
+    className: "card",
+    style: {
+      margin: 0,
+      background: 'var(--danger-soft)',
+      color: 'var(--danger)',
+      fontWeight: 600
+    }
+  }, "Lecture refusée par les règles Firestore : autoriser la lecture master (admin) de ", React.createElement("code", null, "pdv_batches"), ", ", React.createElement("code", null, "facturation_orders"), " et ", React.createElement("code", null, "facturation_events"), "."), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setDay(addDays(day, -1))
+  }, "◀"), React.createElement("input", {
+    type: "date",
+    value: day,
+    onChange: e => e.target.value && setDay(e.target.value),
+    style: {
+      maxWidth: 170
+    }
+  }), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setDay(addDays(day, 1))
+  }, "▶"), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setDay(todayKey())
+  }, "Aujourd'hui"), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setDay(addDays(todayKey(), 1))
+  }, "Demain"), React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)',
+      fontSize: 12
+    }
+  }, "jour de distribution")), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))',
+      gap: 10
+    }
+  }, React.createElement(Tile, {
+    label: "① Extraction 10h",
+    val: batch === undefined ? '…' : batch ? batch.nb_commandes ?? rows.length : '—',
+    sub: batch ? 'reçue ' + kbFwTs(batch.received_at) + (runs.length > 1 ? ` · ${runs.length} envois` : '') : batch === null ? 'aucun lot reçu' : '',
+    color: batch === null ? 'var(--warn)' : null
+  }), React.createElement(Tile, {
+    label: "② Facturées (site au bon montant)",
+    val: count('billed') + count('paid'),
+    sub: rows.length ? `sur ${rows.length}` : '',
+    color: "var(--info)"
+  }), React.createElement(Tile, {
+    label: "③ Payées (PayZen capturé)",
+    val: count('paid'),
+    color: "var(--accent-dark)"
+  }), React.createElement(Tile, {
+    label: "Erreurs à regarder",
+    val: count('err'),
+    color: count('err') ? 'var(--danger)' : null
+  }), React.createElement(Tile, {
+    label: "Montant",
+    val: kbFwEur(sumNet),
+    sub: sumIni !== sumNet ? 'commandé ' + kbFwEur(sumIni) : ''
+  })), batch && Array.isArray(batch.anomalies) && batch.anomalies.length > 0 && React.createElement("details", {
+    className: "card",
+    style: {
+      margin: 0,
+      background: 'var(--warn-soft)'
+    },
+    open: true
+  }, React.createElement("summary", {
+    style: {
+      fontWeight: 700,
+      cursor: 'pointer',
+      color: 'var(--warn)'
+    }
+  }, "⚠️ ", batch.anomalies.length, " anomalie(s) à l'extraction"), React.createElement("ul", {
+    style: {
+      margin: '8px 0 0',
+      paddingLeft: 18
+    }
+  }, batch.anomalies.map((a, i) => React.createElement("li", {
+    key: i
+  }, a)))), React.createElement("div", {
+    className: "card",
+    style: {
+      margin: 0
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      marginBottom: 10
+    }
+  }, React.createElement("div", {
+    className: "seg"
+  }, [['tout', `Toutes (${rows.length})`], ['todo', `À facturer (${count('todo')})`], ['err', `Erreurs (${count('err')})`], ['ok', `OK (${count('billed') + count('paid')})`]].map(([k, l]) => React.createElement("button", {
+    key: k,
+    className: filt === k ? 'active' : '',
+    onClick: () => setFilt(k)
+  }, l))), React.createElement("input", {
+    placeholder: "Chercher réf., client, lieu…",
+    value: q,
+    onChange: e => setQ(e.target.value),
+    style: {
+      flex: '1 1 180px',
+      minWidth: 0
+    }
+  }), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: exportXlsx,
+    disabled: !rows.length
+  }, "⬇️ Excel")), batch === undefined ? React.createElement("p", {
+    style: {
+      margin: 0
+    }
+  }, "Chargement…") : !rows.length ? React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--ink-mute)'
+    }
+  }, "Aucune commande web extraite pour le ", day.split('-').reverse().join('/'), ". L'extraction tourne la veille à 10h (serveur 98). Les commandes hors lot restent visibles dans le journal ci-dessous.") : React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      minWidth: 760,
+      borderCollapse: 'collapse',
+      fontSize: 13
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      textAlign: 'left',
+      color: 'var(--ink-mute)',
+      fontSize: 11,
+      textTransform: 'uppercase'
+    }
+  }, React.createElement("th", {
+    style: {
+      padding: 6
+    }
+  }, "Réf. site"), React.createElement("th", null, "PDV"), React.createElement("th", null, "Lieu"), React.createElement("th", {
+    style: {
+      textAlign: 'right'
+    }
+  }, "Commandé"), React.createElement("th", {
+    style: {
+      textAlign: 'right'
+    }
+  }, "Réel"), React.createElement("th", null, "Statut"), React.createElement("th", null, "Dernière action"))), React.createElement("tbody", null, shown.map(r => React.createElement("tr", {
+    key: r.b.pdv_document,
+    onClick: () => setSel({
+      ref: r.ref,
+      doc: r.b.pdv_document
+    }),
+    style: {
+      borderTop: '1px solid var(--line)',
+      cursor: 'pointer',
+      background: S && S.b.pdv_document === r.b.pdv_document ? 'var(--info-soft)' : undefined
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: 6,
+      fontWeight: 700
+    }
+  }, r.ref || React.createElement("span", {
+    style: {
+      color: 'var(--danger)'
+    }
+  }, "sans réf.")), React.createElement("td", {
+    style: {
+      whiteSpace: 'nowrap'
+    }
+  }, r.b.pdv_document), React.createElement("td", null, r.b.lieu || '?', r.b.creneau ? ' · ' + r.b.creneau : ''), React.createElement("td", {
+    style: {
+      textAlign: 'right',
+      whiteSpace: 'nowrap'
+    }
+  }, kbFwEur(r.b.total_ttc_commande)), React.createElement("td", {
+    style: {
+      textAlign: 'right',
+      fontWeight: 700,
+      whiteSpace: 'nowrap'
+    }
+  }, r.f && r.f.net_ttc != null ? kbFwEur(r.f.net_ttc) : '—'), React.createElement("td", null, React.createElement("span", {
+    style: {
+      background: r.s.bg,
+      color: r.s.c,
+      borderRadius: 999,
+      padding: '2px 8px',
+      fontWeight: 700,
+      fontSize: 12,
+      whiteSpace: 'nowrap'
+    }
+  }, r.s.t)), React.createElement("td", {
+    style: {
+      fontSize: 12,
+      color: r.f && r.f.last_ok === false ? 'var(--danger)' : 'var(--ink-soft)'
+    }
+  }, r.f ? (KB_FW_ACTIONS[r.f.last_action] || r.f.last_action) + ' · ' + String(r.f.last_date || '').slice(11, 16) : '', r.f && r.f.last_message ? ' — ' + r.f.last_message.slice(0, 80) : ''))))))), S && React.createElement("div", {
+    className: "card",
+    style: {
+      margin: 0,
+      border: '2px solid var(--info)'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, React.createElement("h3", {
+    style: {
+      margin: 0
+    }
+  }, "Commande ", S.ref || '—', " · PDV ", S.b.pdv_document), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setSel(null)
+  }, "✕")), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      margin: '6px 0 10px'
+    }
+  }, "Client PDV ", S.b.client_pdv, " · ", S.b.lieu_libelle || S.b.lieu || 'lieu ?', " ", S.b.creneau || '', " · commandée le ", String(S.b.date_commande || '').slice(0, 10).split('-').reverse().join('/'), " ", S.b.heure_commande || '', " · statut site à l'extraction : ", S.b.statut_web || '—', S.f && React.createElement(React.Fragment, null, React.createElement("br", null), "Facture PDV ", React.createElement("b", null, S.f.pdv_facture || '—'), " · avoir(s) ", React.createElement("b", null, (S.f.pdv_avoirs || []).join(', ') || '—'), " · ", S.f.nb_erreurs ? S.f.nb_erreurs + ' erreur(s) au total' : 'aucune erreur')), React.createElement("details", {
+    style: {
+      marginBottom: 10
+    }
+  }, React.createElement("summary", {
+    style: {
+      cursor: 'pointer',
+      fontWeight: 700
+    }
+  }, "🛒 Articles commandés (", (S.b.lignes || []).length, ")"), React.createElement("table", {
+    style: {
+      width: '100%',
+      fontSize: 12,
+      marginTop: 6
+    }
+  }, React.createElement("tbody", null, (S.b.lignes || []).map((l, i) => React.createElement("tr", {
+    key: i,
+    style: {
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: 4
+    }
+  }, l.designation || l.produit || l.article), React.createElement("td", null, l.article || l.code_article || ''), React.createElement("td", {
+    style: {
+      textAlign: 'right'
+    }
+  }, "×", l.quantite ?? l.qte ?? ''), React.createElement("td", {
+    style: {
+      textAlign: 'right'
+    }
+  }, kbFwEur(l.total_ttc ?? l.totalTTC))))))), React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 6
+    }
+  }, "📜 Historique"), S.ref ? React.createElement(KbFwTimeline, {
+    reference: S.ref
+  }) : React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--danger)'
+    }
+  }, "Pas de référence site : impossible de relier la commande PDV à PrestaShop.")), React.createElement("div", {
+    className: "card",
+    style: {
+      margin: 0
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 8,
+      flexWrap: 'wrap',
+      marginBottom: 8
+    }
+  }, React.createElement("h3", {
+    style: {
+      margin: 0
+    }
+  }, "📜 Journal (7 derniers jours)"), React.createElement("span", {
+    onClick: () => setOnlyErr(!onlyErr),
+    style: {
+      fontSize: 13,
+      cursor: 'pointer',
+      fontWeight: 600,
+      color: onlyErr ? 'var(--danger)' : 'var(--ink-soft)'
+    }
+  }, onlyErr ? '☑' : '☐', " erreurs seulement")), !evs ? React.createElement("p", {
+    style: {
+      margin: 0
+    }
+  }, "Chargement…") : !journal.length ? React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--ink-mute)'
+    }
+  }, "Rien sur la période.") : React.createElement(KbFwEventList, {
+    events: journal,
+    showRef: true
+  })));
+}
 function SuiviGeneralPage({
   session
 }) {
@@ -40895,7 +41539,7 @@ function SuiviGeneralPage({
     session: session
   }), sub === 'ancien' && React.createElement(AncienSitePilotagePage, {
     session: session
-  }), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement(KbRungisRoute, null), React.createElement(GeotabTruckCard, null), React.createElement(GeotabTruckCard, {
+  }), sub === 'factweb' && React.createElement(KbFacturationWebPage, null), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement(KbRungisRoute, null), React.createElement(GeotabTruckCard, null), React.createElement(GeotabTruckCard, {
     title: "🚚🥬 Camion F&L",
     device: GEOTAB_DEVICE_FL,
     color: "#2e7d32",
@@ -61801,10 +62445,21 @@ function App() {
   const [consumersMeta, setConsumersMeta] = React.useState(null);
   const [catalogue, setCatalogue] = React.useState([]);
   const [catalogueMeta, setCatalogueMeta] = React.useState(null);
-  const kbCatSrc = React.useRef({ csv: [], csvMeta: null, pp: [], ppMeta: null });
+  const kbCatSrc = React.useRef({
+    csv: [],
+    csvMeta: null,
+    pp: [],
+    ppMeta: null
+  });
   const kbApplyCat = () => {
     const s = kbCatSrc.current;
-    if (s.pp.length) { setCatalogue(s.pp); setCatalogueMeta(s.ppMeta); } else { setCatalogue(s.csv); setCatalogueMeta(s.csvMeta); }
+    if (s.pp.length) {
+      setCatalogue(s.pp);
+      setCatalogueMeta(s.ppMeta);
+    } else {
+      setCatalogue(s.csv);
+      setCatalogueMeta(s.csvMeta);
+    }
   };
   React.useEffect(() => {
     let alive = true;
@@ -61814,13 +62469,20 @@ function App() {
         if (!alive) return;
         const pp = kbCatalogueFromProducts(byId);
         kbCatSrc.current.pp = pp;
-        kbCatSrc.current.ppMeta = pp.length ? { count: pp.length, uploadedAt: meta && meta.updatedAt || null, source: 'producerproducts' } : null;
+        kbCatSrc.current.ppMeta = pp.length ? {
+          count: pp.length,
+          uploadedAt: meta && meta.updatedAt || null,
+          source: 'producerproducts'
+        } : null;
         kbApplyCat();
       } catch (_) {}
     };
     load();
     window.addEventListener('kb-products-updated', load);
-    return () => { alive = false; window.removeEventListener('kb-products-updated', load); };
+    return () => {
+      alive = false;
+      window.removeEventListener('kb-products-updated', load);
+    };
   }, []);
   const [dispatchData, setDispatchData] = React.useState({});
   const [lastminute, setLastminute] = React.useState([]);
@@ -62917,6 +63579,10 @@ const KB_MNAV = [{
     sub: 'ancien',
     l: 'Synchro ancien site',
     ic: '🔁'
+  }, {
+    sub: 'factweb',
+    l: 'Facturation web',
+    ic: '🧾'
   }]
 }, {
   s: 'appro',
