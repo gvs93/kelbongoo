@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.52) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.53) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -697,7 +697,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.52';
+const APP_VERSION = 'V10.53';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -1843,8 +1843,17 @@ function kbCatalogueFromProducts(byId) {
     const key = (p.producer || '') + '|' + p.name;
     const cur = best[key];
     if (cur && cur._active && !p.active) continue;
-    best[key] = { producteur: p.producer || '', produit: p.name, unite: p.uv || '', prixAchat: p.price || 0, prixHT: p.priceHT || 0,
-      famille: p.family || '', category: p.category || '', _active: !!p.active };
+    best[key] = {
+      producteur: p.producer || '',
+      produit: p.name,
+      unite: p.uv || '',
+      prixAchat: p.price || 0,
+      prixHT: p.priceHT || 0,
+      prixTTC: p.priceTTC || 0,
+      famille: p.family || '',
+      category: p.category || '',
+      _active: !!p.active
+    };
   }
   return Object.values(best).sort((a, b) => a.produit.localeCompare(b.produit, 'fr'));
 }
@@ -1903,6 +1912,7 @@ function parseProducersJSON(jsonText) {
       family: String(p.family_name || p.family || p.subcategory_name || p.subcategory || '').trim().replace(/^[\s\-–—]+|[\s\-–—]+$/g, ''),
       price: typeof p.producer_price === 'number' ? p.producer_price / 100 : null,
       priceHT: typeof p.kelbongoo_price === 'number' ? p.kelbongoo_price / 100 : null,
+      priceTTC: typeof p.consumer_price === 'number' ? p.consumer_price / 100 : null,
       uv: p.unit_display || '',
       active: p.active !== false
     };
@@ -3643,7 +3653,58 @@ function currentWeek() {
     fridayDate: friday
   };
 }
-function generateLossesPDF(losses, weekInfo) {
+function kbLossSale(l, catalogue) {
+  if (l && typeof l.saleValue === 'number') return l.saleValue;
+  const p = (catalogue || []).find(x => x.produit === l.produit && x.producteur === l.producteur) || (catalogue || []).find(x => x.produit === l.produit);
+  if (!p || !(p.prixTTC > 0)) return null;
+  if (p.prixAchat > 0 && l.totalValue > 0) return l.totalValue * p.prixTTC / p.prixAchat;
+  if (!l.usingWeight && l.quantity > 0) return l.quantity * p.prixTTC;
+  return null;
+}
+function kbLossTotals(losses, catalogue) {
+  const t = {
+    achat: 0,
+    seche: 0,
+    rob: 0,
+    vente: 0,
+    nSeche: 0,
+    nRob: 0,
+    n: 0,
+    sansVente: 0
+  };
+  for (const l of losses || []) {
+    const v = l.totalValue || 0;
+    t.n++;
+    t.achat += v;
+    if (l.destination === 'pribon') {
+      t.rob += v;
+      t.nRob++;
+    } else {
+      t.seche += v;
+      t.nSeche++;
+    }
+    const s = kbLossSale(l, catalogue);
+    if (s == null) t.sansVente++;else t.vente += s;
+  }
+  return t;
+}
+async function kbCaBetween(fromKey, toKey) {
+  let cents = 0,
+    days = 0;
+  for (let d = fromKey; d <= toKey; d = addDays(d, 1)) {
+    const doc = await storage.getDoc('ca_history', d).catch(() => null);
+    const r = doc && doc.totals ? doc.totals.reel || 0 : doc ? totalsFromCaBySite(doc.caBySite).reel : 0;
+    if (r) {
+      cents += r;
+      days++;
+    }
+  }
+  return {
+    ca: cents / 100,
+    days
+  };
+}
+function generateLossesPDF(losses, weekInfo, opts) {
   const {
     jsPDF
   } = window.jspdf;
@@ -3662,35 +3723,50 @@ function generateLossesPDF(losses, weekInfo) {
   doc.setFont(undefined, 'normal');
   doc.text(`Kelbongoo · Semaine du ${formatDateShort(weekInfo.mondayDate)} au ${formatDateShort(weekInfo.fridayDate)}`, 14, 22);
   doc.setTextColor(0, 0, 0);
-  const jete = losses.filter(l => l.destination === 'jete');
-  const pribon = losses.filter(l => l.destination === 'pribon');
-  const totalJete = jete.reduce((s, l) => s + (l.totalValue || 0), 0);
-  const totalPribon = pribon.reduce((s, l) => s + (l.totalValue || 0), 0);
-  const total = totalJete + totalPribon;
+  const T = opts && opts.totals || kbLossTotals(losses, opts && opts.catalogue);
+  const ca = opts && opts.ca;
   doc.setFontSize(11);
   let y = 42;
   doc.setFont(undefined, 'bold');
-  doc.text('Récapitulatif', 14, y);
+  doc.text('Récapitulatif (prix d\'achat HT)', 14, y);
   y += 6;
-  doc.setFont(undefined, 'normal');
   doc.setFontSize(10);
-  doc.text(`Pertes jetées : ${jete.length} entrée${jete.length > 1 ? 's' : ''} · ${totalJete.toFixed(2)} €`, 14, y);
+  doc.text(`PERTE TOTALE : ${T.achat.toFixed(2)} €  (${T.n} entrée${T.n > 1 ? 's' : ''})`, 14, y);
   y += 5;
-  doc.text(`Envoyé à Pribon Montreuil (ROB) : ${pribon.length} entrée${pribon.length > 1 ? 's' : ''} · ${totalPribon.toFixed(2)} €`, 14, y);
+  doc.setFont(undefined, 'normal');
+  doc.text(`  · Perte sèche (jeté + partage équipe) : ${T.seche.toFixed(2)} €  (${T.nSeche})`, 14, y);
   y += 5;
+  doc.text(`  · Envoyé à Robespierre : ${T.rob.toFixed(2)} €  (${T.nRob})`, 14, y);
+  y += 7;
   doc.setFont(undefined, 'bold');
-  doc.text(`TOTAL valorisé : ${total.toFixed(2)} €`, 14, y);
-  y += 8;
+  doc.text(`Valeur au prix de vente Kelbongoo (TTC) : ${T.vente.toFixed(2)} €`, 14, y);
+  y += 5;
+  doc.setFont(undefined, 'normal');
+  if (ca && ca.ca > 0) {
+    doc.text(`CA Kelbongoo de la semaine : ${ca.ca.toFixed(2)} € → pertes = ${(T.vente / ca.ca * 100).toFixed(1)} % du CA (manque à gagner)`, 14, y);
+    y += 5;
+  }
+  if (T.sansVente) {
+    doc.setTextColor(150, 90, 0);
+    doc.text(`${T.sansVente} entrée(s) sans prix de vente connu (non comptées dans la valeur de vente)`, 14, y);
+    doc.setTextColor(0, 0, 0);
+    y += 5;
+  }
+  y += 3;
   const REASON_LABELS = {};
   LOSS_REASONS.forEach(r => REASON_LABELS[r.id] = r.label);
   const DEST_LABELS = {
     jete: 'Jeté',
-    pribon: 'Pribon ROB'
+    partage: 'Partage',
+    pribon: 'ROB'
   };
-  const rows = losses.map(l => [formatDateShort(l.day), l.producteur || '', l.produit || '', (REASON_LABELS[l.reason] || l.reason) + (l.robSentDate ? ` — envoyé le ${formatDateShort(l.robSentDate)} à ROB` : ''), DEST_LABELS[l.destination] || l.destination, l.usingWeight ? `${l.weight} kg` : `${l.quantity} u`, `${(l.unitPrice || 0).toFixed(2)} €`, `${(l.totalValue || 0).toFixed(2)} €`]);
+  const rows = losses.map(l => [formatDateShort(l.day), l.producteur || '', l.produit || '', (REASON_LABELS[l.reason] || l.reason) + (l.robSentDate ? ` — envoyé le ${formatDateShort(l.robSentDate)} à ROB` : ''), DEST_LABELS[l.destination] || l.destination, l.qtyLabel || (l.usingWeight ? `${l.weight} kg` : `${l.quantity} u`), `${(l.totalValue || 0).toFixed(2)} €`, (() => {
+    const s = kbLossSale(l, opts && opts.catalogue);
+    return s == null ? '—' : `${s.toFixed(2)} €`;
+  })()]);
   doc.autoTable({
     startY: y,
-    head: [['Date', 'Producteur', 'Produit', 'Raison', 'Dest.', 'Qté/Poids', 'PU achat', 'Total']],
+    head: [['Date', 'Producteur', 'Produit', 'Raison', 'Dest.', 'Qté', 'Achat HT', 'Vente TTC']],
     body: rows,
     styles: {
       fontSize: 8,
@@ -3704,9 +3780,12 @@ function generateLossesPDF(losses, weekInfo) {
       fillColor: [248, 248, 245]
     },
     columnStyles: {
-      7: {
+      6: {
         halign: 'right',
         fontStyle: 'bold'
+      },
+      7: {
+        halign: 'right'
       }
     }
   });
@@ -42499,7 +42578,11 @@ function LossesPage({
   const [busy, setBusy] = React.useState(false);
   const week = currentWeek();
   React.useEffect(() => {
-    try { window.scrollTo({ top: 0 }); } catch (_) {}
+    try {
+      window.scrollTo({
+        top: 0
+      });
+    } catch (_) {}
   }, []);
   React.useEffect(() => {
     const unsub = storage.subscribe('losses', setLosses);
@@ -42518,6 +42601,17 @@ function LossesPage({
   const totalJete = jeteWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
   const totalPribon = pribonWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
   const totalWeek = totalJete + totalPribon;
+  const T = kbLossTotals(weekLosses, catalogue);
+  const [caWeek, setCaWeek] = React.useState(null);
+  React.useEffect(() => {
+    let alive = true;
+    kbCaBetween(week.monday, weekEnd).then(r => {
+      if (alive) setCaWeek(r);
+    }).catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [week.monday]);
   const handleDelete = async id => {
     if (!confirm('Supprimer cette entrée ?')) return;
     await storage.deleteDoc('losses', id);
@@ -42537,12 +42631,18 @@ function LossesPage({
     setBusy(true);
     try {
       const sorted = [...weekLosses].sort((a, b) => (a.day || '').localeCompare(b.day || ''));
-      const doc = generateLossesPDF(sorted, week);
+      const ca = caWeek || (await kbCaBetween(week.monday, weekEnd).catch(() => null));
+      const doc = generateLossesPDF(sorted, week, {
+        totals: T,
+        catalogue,
+        ca
+      });
       const filename = `Pertes_Kelbongoo_S${week.monday}.pdf`;
       doc.save(filename);
       const b64 = doc.output('datauristring').split(',')[1];
-      const subject = `Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total : ${totalWeek.toFixed(2)}€`;
-      const body = `Bonjour,\n\n` + `Rapport hebdomadaire des pertes en pièce jointe.\n\n` + `Récap :\n` + `- Jetées : ${jeteWeek.length} entrées · ${totalJete.toFixed(2)} €\n` + `- Envoyé Pribon ROB : ${pribonWeek.length} entrées · ${totalPribon.toFixed(2)} €\n` + `- TOTAL valorisé : ${totalWeek.toFixed(2)} €\n\n` + `${session.name}\nPréparation Kelbongoo`;
+      const pct = ca && ca.ca > 0 ? T.vente / ca.ca * 100 : null;
+      const subject = `Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total achat : ${T.achat.toFixed(2)}€`;
+      const body = `Bonjour,\n\n` + `Rapport hebdomadaire des pertes — semaine du ${formatDateShort(week.mondayDate)} au ${formatDateShort(addDays(week.monday, 6))} (PDF en pièce jointe).\n\n` + `AU PRIX D'ACHAT HT\n` + `- PERTE TOTALE : ${T.achat.toFixed(2)} € (${T.n} entrées)\n` + `   · dont perte sèche (jeté + partage équipe) : ${T.seche.toFixed(2)} € (${T.nSeche})\n` + `   · dont envoyé à Robespierre : ${T.rob.toFixed(2)} € (${T.nRob})\n\n` + `AU PRIX DE VENTE KELBONGOO (TTC)\n` + `- Valeur des pertes : ${T.vente.toFixed(2)} €${T.sansVente ? ` (${T.sansVente} entrée(s) sans prix de vente, non comptées)` : ''}\n` + (ca && ca.ca > 0 ? `- CA Kelbongoo de la semaine : ${ca.ca.toFixed(2)} € (${ca.days} jour${ca.days > 1 ? 's' : ''} de distribution)\n` + `- Manque à gagner : ${pct.toFixed(1)} % du CA\n\n` : `- CA de la semaine : non disponible (historique CA non chargé)\n\n`) + `${session.name}\nPréparation Kelbongoo`;
       const r = await stockPost({
         secret: FRESHDESK_SECRET,
         action: 'send_mail',
@@ -42657,7 +42757,7 @@ function LossesPage({
       color: '#1565c0',
       fontWeight: 700
     }
-  }, "🥬 F&L → Montreuil"), React.createElement("button", {
+  }, "🥬 F&L en lot"), React.createElement("button", {
     className: "btn-primary",
     disabled: !catalogue || catalogue.length === 0,
     onClick: () => {
@@ -42671,18 +42771,32 @@ function LossesPage({
       marginTop: -8
     }
   }, "Semaine du ", React.createElement("strong", null, formatDateShort(week.mondayDate), " au ", formatDateShort(week.fridayDate)), ". Saisie possible toute la semaine, envoi vendredi."), new Date().getDay() === 5 && (() => {
-    const flDone = weekLosses.filter(l => l.remark === 'Envoi F&L Montreuil (lot)' && l.day === activeDay());
+    const flDone = weekLosses.filter(l => (l.flLot || l.remark === 'Envoi F&L Montreuil (lot)') && l.destination === 'pribon' && l.day === activeDay());
     const flTot = flDone.reduce((s, l) => s + (l.totalValue || 0), 0);
     return React.createElement("div", {
       className: "card",
-      style: { border: '2px solid #1565c0', background: '#e3f2fd' }
+      style: {
+        border: '2px solid #1565c0',
+        background: '#e3f2fd'
+      }
     }, React.createElement("div", {
-      style: { fontSize: 15, fontWeight: 700, color: '#0d47a1' }
+      style: {
+        fontSize: 15,
+        fontWeight: 700,
+        color: '#0d47a1'
+      }
     }, "🥬 Vendredi : F&L invendu → Robespierre"), React.createElement("div", {
-      style: { fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 10px' }
+      style: {
+        fontSize: 13,
+        color: 'var(--ink-soft)',
+        margin: '4px 0 10px'
+      }
     }, flDone.length ? `✓ Déjà saisi : ${flDone.length} produit${flDone.length > 1 ? 's' : ''} · ${flTot.toFixed(2)} €. Tu peux compléter.` : 'À saisir avant la navette ROB de 18h, puis envoyer le rapport pertes.'), React.createElement("button", {
       className: "btn-primary btn-block",
-      style: { background: '#1565c0', borderColor: '#1565c0' },
+      style: {
+        background: '#1565c0',
+        borderColor: '#1565c0'
+      },
       onClick: () => setShowFl(true)
     }, flDone.length ? 'Compléter l\'envoi F&L' : 'Saisir le F&L envoyé à Montreuil'));
   })(), alreadySent && React.createElement("div", {
@@ -42701,27 +42815,33 @@ function LossesPage({
     className: "stat"
   }, React.createElement("div", {
     className: "stat-value"
-  }, weekLosses.length), React.createElement("div", {
+  }, T.achat.toFixed(0), "€"), React.createElement("div", {
     className: "stat-label"
-  }, "Cette semaine")), React.createElement("div", {
+  }, "Perte totale (achat)")), React.createElement("div", {
     className: "stat"
   }, React.createElement("div", {
     className: "stat-value",
     style: {
       color: 'var(--danger)'
     }
-  }, totalJete.toFixed(0), "€"), React.createElement("div", {
+  }, T.seche.toFixed(0), "€"), React.createElement("div", {
     className: "stat-label"
-  }, "Jeté")), React.createElement("div", {
+  }, "Perte sèche")), React.createElement("div", {
     className: "stat"
   }, React.createElement("div", {
     className: "stat-value",
     style: {
       color: 'var(--info)'
     }
-  }, totalPribon.toFixed(0), "€"), React.createElement("div", {
+  }, T.rob.toFixed(0), "€"), React.createElement("div", {
     className: "stat-label"
-  }, "Pribon ROB"))), totalWeek > 0 && React.createElement("div", {
+  }, "Envoyé ROB"))), T.n > 0 && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      marginTop: -4
+    }
+  }, "Au prix de vente Kelbongoo : ", React.createElement("strong", null, T.vente.toFixed(2), " €"), caWeek && caWeek.ca > 0 ? React.createElement(React.Fragment, null, " · CA semaine ", caWeek.ca.toFixed(0), " € → ", React.createElement("strong", null, (T.vente / caWeek.ca * 100).toFixed(1), " %"), " de manque à gagner") : ' · CA semaine non disponible', T.sansVente ? React.createElement(React.Fragment, null, " · ", T.sansVente, " entrée(s) sans prix de vente") : null), T.achat > 0 && React.createElement("div", {
     className: "card",
     style: {
       background: 'var(--master-soft)',
@@ -42732,7 +42852,7 @@ function LossesPage({
       color: 'var(--master)',
       marginBottom: 8
     }
-  }, "Total semaine : ", totalWeek.toFixed(2), " €"), !pdfGenerated ? React.createElement(React.Fragment, null, React.createElement("button", {
+  }, "Total semaine (achat HT) : ", T.achat.toFixed(2), " €"), !pdfGenerated ? React.createElement(React.Fragment, null, React.createElement("button", {
     className: "btn-primary btn-block btn-lg",
     disabled: busy,
     onClick: handleSendToManager
@@ -43013,8 +43133,11 @@ function FlMontreuilForm({
   const [rows, setRows] = React.useState(() => kbMuCacheGet('fl'));
   const [err, setErr] = React.useState('');
   const [q, setQ] = React.useState('');
-  const [qty, setQty] = React.useState({});
+  const [cag, setCag] = React.useState({});
+  const [uvq, setUvq] = React.useState({});
+  const [open, setOpen] = React.useState(null);
   const [reason, setReason] = React.useState('non_vendu');
+  const [dest, setDest] = React.useState('pribon');
   const [dlc, setDlc] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   React.useEffect(() => {
@@ -43051,8 +43174,16 @@ function FlMontreuilForm({
       iP = col([h => h === 'producteur']),
       iA = col([h => h === 'actif ?', h => h.includes('actif')]),
       iPx = col([h => h.includes('prix achat')]),
-      iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]);
+      iPv = col([h => h.includes('prix vente')]),
+      iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
+      iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]),
+      iMu = col([h => h.startsWith('mu en k')]),
+      iT = col([h => h === 'type']);
     if (iD < 0) return [];
+    const num = v => {
+      const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.'));
+      return isNaN(n) ? 0 : n;
+    };
     const out = [],
       seen = new Set();
     for (let r = 1; r < rows.length; r++) {
@@ -43064,49 +43195,66 @@ function FlMontreuilForm({
       const key = prod + '|' + name;
       if (seen.has(key)) continue;
       seen.add(key);
-      const px = parseFloat(String(iPx >= 0 && row[iPx] != null ? row[iPx] : '').replace(',', '.'));
       out.push({
         key,
         name,
         prod,
         uv: iU >= 0 ? String(row[iU] || '').trim() : '',
-        price: isNaN(px) ? 0 : px
+        type: iT >= 0 ? String(row[iT] || '').trim() : '',
+        pa: iPx >= 0 ? num(row[iPx]) : 0,
+        pv: iPv >= 0 ? num(row[iPv]) : 0,
+        colisage: iC >= 0 ? num(row[iC]) : 0,
+        mu: iMu >= 0 ? num(row[iMu]) : 0
       });
     }
     return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
   }, [rows]);
+  const qtyRungis = x => (cag[x.key] || 0) * (x.colisage || 0) + (uvq[x.key] || 0) * (x.mu > 0 ? x.mu : 1);
+  const unitR = x => /piece|pce|botte|lot/.test(normalizeText(x.type + ' ' + x.uv)) && !(x.mu > 0 && x.mu < 1) ? 'pce' : 'kg';
   const nq = normalizeText(q.trim());
   const shown = nq ? list.filter(x => normalizeText(x.name + ' ' + x.prod).includes(nq)) : list;
-  const picked = list.filter(x => (qty[x.key] || 0) > 0);
-  const total = picked.reduce((t, x) => t + (qty[x.key] || 0) * x.price, 0);
-  const add = (k, d) => setQty(m => ({
+  const picked = list.filter(x => (cag[x.key] || 0) > 0 || (uvq[x.key] || 0) > 0);
+  const noCol = picked.filter(x => (cag[x.key] || 0) > 0 && !(x.colisage > 0));
+  const totA = picked.reduce((t, x) => t + qtyRungis(x) * x.pa, 0);
+  const totV = picked.reduce((t, x) => t + qtyRungis(x) * x.pv, 0);
+  const bumpUv = (k, d) => setUvq(m => ({
     ...m,
     [k]: Math.max(0, (m[k] || 0) + d)
   }));
+  const label = x => [(cag[x.key] || 0) > 0 ? `${fmtCagette(cag[x.key])} cag.` : '', (uvq[x.key] || 0) > 0 ? `${uvq[x.key]} ${(x.uv || 'uv').split(' ')[0]}` : ''].filter(Boolean).join(' + ');
   const validate = async () => {
     if (!picked.length) {
-      showToast('Touche les F&L envoyés à Montreuil');
+      showToast('Indique les cagettes ou sachets');
+      return;
+    }
+    if (noCol.length) {
+      showToast(`Colisage manquant dans le Sheet : ${noCol.map(x => x.name).join(', ')}`);
       return;
     }
     setBusy(true);
     try {
       const now = new Date().toISOString();
       for (const x of picked) {
-        const n = qty[x.key] || 0;
+        const qr = Math.round(qtyRungis(x) * 1000) / 1000;
         const id = `loss_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         await storage.setDoc('losses', id, {
           productKey: x.key,
           producteur: x.prod,
           produit: x.name,
           unite: x.uv,
-          destination: 'pribon',
+          destination: dest,
           reason,
-          usingWeight: false,
-          quantity: n,
-          weight: 0,
-          unitPrice: x.price,
-          totalValue: Math.round(n * x.price * 100) / 100,
-          remark: 'Envoi F&L Montreuil (lot)',
+          usingWeight: unitR(x) === 'kg',
+          quantity: unitR(x) === 'kg' ? 0 : qr,
+          weight: unitR(x) === 'kg' ? qr : 0,
+          cagettes: cag[x.key] || 0,
+          uvQty: uvq[x.key] || 0,
+          qtyLabel: label(x),
+          flLot: true,
+          unitPrice: x.pa,
+          totalValue: Math.round(qr * x.pa * 100) / 100,
+          saleValue: x.pv > 0 ? Math.round(qr * x.pv * 100) / 100 : null,
+          remark: 'F&L en lot · ' + label(x),
           dlc,
           day: activeDay(),
           createdBy: session.name,
@@ -43114,7 +43262,7 @@ function FlMontreuilForm({
           updatedAt: now
         });
       }
-      showToast(`✓ ${picked.length} F&L envoyé(s) à Montreuil · ${total.toFixed(2)} €`);
+      showToast(`✓ ${picked.length} F&L enregistré(s) · ${totA.toFixed(2)} € achat`);
       onClose();
     } catch (e) {
       showToast('Erreur : ' + e.message);
@@ -43122,6 +43270,16 @@ function FlMontreuilForm({
       setBusy(false);
     }
   };
+  const DESTS = [{
+    id: 'pribon',
+    label: '📦 Robespierre'
+  }, {
+    id: 'jete',
+    label: '🗑️ Jeté'
+  }, {
+    id: 'partage',
+    label: '👥 Partage équipe'
+  }];
   return React.createElement("div", {
     className: "modal-backdrop",
     onClick: e => {
@@ -43131,7 +43289,7 @@ function FlMontreuilForm({
     className: "modal"
   }, React.createElement("div", {
     className: "modal-header"
-  }, React.createElement("h2", null, "🥬 Envoi F&L à Montreuil"), React.createElement("button", {
+  }, React.createElement("h2", null, "🥬 F&L en lot"), React.createElement("button", {
     className: "modal-close",
     onClick: onClose
   }, "×")), React.createElement("p", {
@@ -43140,7 +43298,16 @@ function FlMontreuilForm({
       color: 'var(--ink-soft)',
       margin: '0 0 8px'
     }
-  }, "Touche un produit = +1 (unité de vente). Ajuste avec − / +. Chaque produit devient une perte « Envoi Montreuil (Pribon/ROB) »."), err && React.createElement("div", {
+  }, "Comme l'inventaire : 🥬 = cagettes (entières + ¼ ⅓ ½ ⅔ ¾), − / + = sachets. Valorisé au prix d'achat du Sheet FL."), React.createElement("div", {
+    className: "chip-group",
+    style: {
+      marginBottom: 8
+    }
+  }, DESTS.map(d => React.createElement("div", {
+    key: d.id,
+    className: `chip ${dest === d.id ? 'selected' : ''}`,
+    onClick: () => setDest(d.id)
+  }, d.label))), err && React.createElement("div", {
     className: "alert-warning",
     style: {
       fontSize: 12
@@ -43160,7 +43327,7 @@ function FlMontreuilForm({
     }
   }), React.createElement("div", {
     style: {
-      maxHeight: '48vh',
+      maxHeight: '46vh',
       overflowY: 'auto',
       border: '1px solid var(--line)',
       borderRadius: 12
@@ -43170,18 +43337,21 @@ function FlMontreuilForm({
       padding: 14
     }
   }, "Chargement du Sheet FL…"), shown.map((x, i) => {
-    const n = qty[x.key] || 0;
+    const c = cag[x.key] || 0,
+      u = uvq[x.key] || 0,
+      on = c > 0 || u > 0;
     return React.createElement("div", {
       key: x.key,
-      onClick: () => add(x.key, 1),
+      style: {
+        background: on ? '#e3f2fd' : i % 2 ? 'var(--bg-muted,#f7f5f0)' : '#fff',
+        borderTop: i ? '1px solid var(--line)' : 'none'
+      }
+    }, React.createElement("div", {
       style: {
         display: 'flex',
         alignItems: 'center',
-        gap: 10,
-        padding: '10px 12px',
-        cursor: 'pointer',
-        background: n ? '#e3f2fd' : i % 2 ? 'var(--bg-muted,#f7f5f0)' : '#fff',
-        borderTop: i ? '1px solid var(--line)' : 'none'
+        gap: 8,
+        padding: '8px 10px'
       }
     }, React.createElement("span", {
       style: {
@@ -43191,8 +43361,8 @@ function FlMontreuilForm({
     }, React.createElement("span", {
       style: {
         display: 'block',
-        fontSize: 17,
-        fontWeight: 700
+        fontSize: 16,
+        fontWeight: 600
       }
     }, x.name), React.createElement("span", {
       style: {
@@ -43200,28 +43370,63 @@ function FlMontreuilForm({
         fontSize: 12,
         color: 'var(--ink-mute)'
       }
-    }, x.prod, x.uv ? ' · ' + x.uv : '', x.price ? ' · ' + x.price.toFixed(2) + ' €' : '')), n > 0 && React.createElement("button", {
-      onClick: e => {
-        e.stopPropagation();
-        add(x.key, -1);
-      },
+    }, x.prod, x.uv ? ' · ' + x.uv : '', x.colisage ? ` · cagette ${x.colisage} ${unitR(x)}` : ' · ⚠️ colisage ?', x.pa ? ` · ${x.pa.toFixed(2)} €/${unitR(x)}` : ''), on && React.createElement("span", {
       style: {
-        width: 44,
+        display: 'block',
+        fontSize: 12,
+        fontWeight: 600,
+        color: '#1565c0'
+      }
+    }, label(x), " = ", Math.round(qtyRungis(x) * 100) / 100, " ", unitR(x), " · ", (qtyRungis(x) * x.pa).toFixed(2), " €")), React.createElement("button", {
+      onClick: () => setOpen(open === x.key ? null : x.key),
+      style: {
+        minWidth: 60,
         height: 44,
-        fontSize: 24,
         borderRadius: 10,
-        border: '1px solid var(--line)',
+        fontSize: 15,
+        fontWeight: 600,
+        cursor: 'pointer',
+        border: open === x.key ? '2px solid var(--accent)' : '1px solid var(--border)',
+        background: c > 0 ? 'var(--accent-soft)' : '#fff',
+        color: c > 0 ? 'var(--accent-dark)' : 'var(--ink-mute)'
+      }
+    }, "🥬 ", fmtCagette(c)), React.createElement("button", {
+      onClick: () => bumpUv(x.key, -1),
+      style: {
+        width: 32,
+        height: 44,
+        fontSize: 18,
+        borderRadius: 8,
+        border: '1px solid var(--border)',
         background: '#fff'
       }
     }, "−"), React.createElement("span", {
       style: {
-        minWidth: 40,
+        minWidth: 26,
         textAlign: 'center',
-        fontSize: 22,
-        fontWeight: 700,
-        color: n ? '#1565c0' : 'var(--ink-mute)'
+        fontSize: 17,
+        fontWeight: 600,
+        color: u ? '#1565c0' : 'var(--ink-mute)'
       }
-    }, n || '+'));
+    }, u), React.createElement("button", {
+      onClick: () => bumpUv(x.key, 1),
+      style: {
+        width: 32,
+        height: 44,
+        fontSize: 18,
+        borderRadius: 8,
+        border: '1px solid var(--border)',
+        background: '#fff'
+      }
+    }, "+")), open === x.key && React.createElement(FractionPad, {
+      value: c,
+      label: "cagettes",
+      onChange: v => setCag(m => ({
+        ...m,
+        [x.key]: v
+      })),
+      onClose: () => setOpen(null)
+    }));
   })), React.createElement("div", {
     className: "field",
     style: {
@@ -43248,7 +43453,7 @@ function FlMontreuilForm({
     className: "btn-primary",
     disabled: busy || !picked.length,
     onClick: validate
-  }, busy ? 'Enregistrement…' : `✅ Valider l'envoi (${picked.length} produit${picked.length > 1 ? 's' : ''} · ${total.toFixed(2)} €)`))));
+  }, busy ? 'Enregistrement…' : `✅ Valider (${picked.length} produit${picked.length > 1 ? 's' : ''} · ${totA.toFixed(2)} € achat${totV ? ' · ' + totV.toFixed(2) + ' € vente' : ''})`))));
 }
 function LossForm({
   catalogue,
@@ -43281,6 +43486,13 @@ function LossForm({
   const unitPrice = selectedProduct ? selectedProduct.prixAchat || selectedProduct.prixHT || 0 : 0;
   const qtyValue = usingWeight ? parseFloat(weight) || 0 : parseFloat(quantity) || 0;
   const totalValue = unitPrice * qtyValue;
+  const saleValue = selectedProduct ? kbLossSale({
+    ...selectedProduct,
+    totalValue,
+    usingWeight,
+    quantity: qtyValue,
+    saleValue: undefined
+  }, [selectedProduct]) : null;
   const handleSubmit = async () => {
     if (!productKey) {
       showToast('Choisis un produit');
@@ -43313,6 +43525,7 @@ function LossForm({
         weight: usingWeight ? parseFloat(weight) || 0 : 0,
         unitPrice,
         totalValue,
+        saleValue: saleValue == null ? null : Math.round(saleValue * 100) / 100,
         remark,
         dlc,
         day: activeDay(),

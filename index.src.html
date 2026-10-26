@@ -779,7 +779,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.52';
+    const APP_VERSION = 'V10.53';
     // V10.45 — (22/10/2026) Master › Historique : petit lien discret « contrôle des stocks » en bas → coller le tableau brut du mail d'anomalies de Raimbaud ; pour chaque produit, comparaison avec la prépa exacte de l'appli (commandé / mis en casier / rupture) → ✅ NORMAL (manque réel, chercher l'erreur ailleurs) ou ⚠️ ANOMALIE (feuille de stock ≠ prépa), date de distribution détectée automatiquement, résultat copiable.
     // V10.44 — (22/10/2026) Prépa ND : le bouton « 🔴 Cagette ND » (déjà actif) repassait le ND en casier juste après « ✅ Les N sont dans la cagette » → tous les ND finissaient en casier en distrib. Libellé « 🧺 Repasser en casier », bloqué 5 s après validation + confirmation.
     // V10.43 — (22/10/2026) Cagette ND comptée en dessous du total : le client servi en partie passe en rupture PARTIELLE (il garde ses ND posés en distrib) au lieu d'une rupture totale.
@@ -1907,7 +1907,7 @@
         const key = (p.producer || '') + '|' + p.name;
         const cur = best[key];
         if (cur && cur._active && !p.active) continue;
-        best[key] = { producteur: p.producer || '', produit: p.name, unite: p.uv || '', prixAchat: p.price || 0, prixHT: p.priceHT || 0,
+        best[key] = { producteur: p.producer || '', produit: p.name, unite: p.uv || '', prixAchat: p.price || 0, prixHT: p.priceHT || 0, prixTTC: p.priceTTC || 0,
           famille: p.family || '', category: p.category || '', _active: !!p.active };
       }
       return Object.values(best).sort((a, b) => a.produit.localeCompare(b.produit, 'fr'));
@@ -1961,6 +1961,7 @@
           // V10.52 — catalogue Pertes : prix d'achat (producer_price, centimes), UV, actif
           price: (typeof p.producer_price === 'number') ? p.producer_price / 100 : null,
           priceHT: (typeof p.kelbongoo_price === 'number') ? p.kelbongoo_price / 100 : null,
+          priceTTC: (typeof p.consumer_price === 'number') ? p.consumer_price / 100 : null,
           uv: p.unit_display || '',
           active: p.active !== false,
         };
@@ -3258,10 +3259,44 @@
       return { monday: toKey(monday), friday: toKey(friday), mondayDate: monday, fridayDate: friday };
     }
 
+    // V10.53 — Totaux pertes de la semaine.
+    //   achat = prix d'achat HT (totalValue) ; sèche = jeté + partage équipe ; rob = envoyé à Robespierre ;
+    //   vente = valeur au prix de vente Kelbongoo TTC (saleValue enregistrée, sinon recalculée via le catalogue).
+    function kbLossSale(l, catalogue) {
+      if (l && typeof l.saleValue === 'number') return l.saleValue;
+      const p = (catalogue || []).find(x => x.produit === l.produit && x.producteur === l.producteur)
+             || (catalogue || []).find(x => x.produit === l.produit);
+      if (!p || !(p.prixTTC > 0)) return null;
+      if (p.prixAchat > 0 && l.totalValue > 0) return l.totalValue * p.prixTTC / p.prixAchat;
+      if (!l.usingWeight && l.quantity > 0) return l.quantity * p.prixTTC;
+      return null;
+    }
+    function kbLossTotals(losses, catalogue) {
+      const t = { achat: 0, seche: 0, rob: 0, vente: 0, nSeche: 0, nRob: 0, n: 0, sansVente: 0 };
+      for (const l of losses || []) {
+        const v = l.totalValue || 0;
+        t.n++; t.achat += v;
+        if (l.destination === 'pribon') { t.rob += v; t.nRob++; } else { t.seche += v; t.nSeche++; }
+        const s = kbLossSale(l, catalogue);
+        if (s == null) t.sansVente++; else t.vente += s;
+      }
+      return t;
+    }
+    // CA réalisé (centimes → €) des dates [fromKey..toKey] (collection ca_history, 1 doc / date).
+    async function kbCaBetween(fromKey, toKey) {
+      let cents = 0, days = 0;
+      for (let d = fromKey; d <= toKey; d = addDays(d, 1)) {
+        const doc = await storage.getDoc('ca_history', d).catch(() => null);
+        const r = doc && doc.totals ? (doc.totals.reel || 0) : (doc ? totalsFromCaBySite(doc.caBySite).reel : 0);
+        if (r) { cents += r; days++; }
+      }
+      return { ca: cents / 100, days };
+    }
+
     // ============================================================
     // GÉNÉRATION PDF PERTES
     // ============================================================
-    function generateLossesPDF(losses, weekInfo) {
+    function generateLossesPDF(losses, weekInfo, opts) {
       // jsPDF chargé en UMD : window.jspdf.jsPDF
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
@@ -3279,32 +3314,30 @@
 
       doc.setTextColor(0,0,0);
 
-      // Stats globales
-      const jete = losses.filter(l => l.destination === 'jete');
-      const pribon = losses.filter(l => l.destination === 'pribon');
-      const totalJete = jete.reduce((s, l) => s + (l.totalValue || 0), 0);
-      const totalPribon = pribon.reduce((s, l) => s + (l.totalValue || 0), 0);
-      const total = totalJete + totalPribon;
-
+      // Stats globales (V10.53)
+      const T = (opts && opts.totals) || kbLossTotals(losses, opts && opts.catalogue);
+      const ca = opts && opts.ca;
       doc.setFontSize(11);
       let y = 42;
       doc.setFont(undefined, 'bold');
-      doc.text('Récapitulatif', 14, y);
+      doc.text('Récapitulatif (prix d\'achat HT)', 14, y);
       y += 6;
-      doc.setFont(undefined, 'normal');
       doc.setFontSize(10);
-      doc.text(`Pertes jetées : ${jete.length} entrée${jete.length>1?'s':''} · ${totalJete.toFixed(2)} €`, 14, y);
-      y += 5;
-      doc.text(`Envoyé à Pribon Montreuil (ROB) : ${pribon.length} entrée${pribon.length>1?'s':''} · ${totalPribon.toFixed(2)} €`, 14, y);
-      y += 5;
+      doc.text(`PERTE TOTALE : ${T.achat.toFixed(2)} €  (${T.n} entrée${T.n>1?'s':''})`, 14, y); y += 5;
+      doc.setFont(undefined, 'normal');
+      doc.text(`  · Perte sèche (jeté + partage équipe) : ${T.seche.toFixed(2)} €  (${T.nSeche})`, 14, y); y += 5;
+      doc.text(`  · Envoyé à Robespierre : ${T.rob.toFixed(2)} €  (${T.nRob})`, 14, y); y += 7;
       doc.setFont(undefined, 'bold');
-      doc.text(`TOTAL valorisé : ${total.toFixed(2)} €`, 14, y);
-      y += 8;
+      doc.text(`Valeur au prix de vente Kelbongoo (TTC) : ${T.vente.toFixed(2)} €`, 14, y); y += 5;
+      doc.setFont(undefined, 'normal');
+      if (ca && ca.ca > 0) { doc.text(`CA Kelbongoo de la semaine : ${ca.ca.toFixed(2)} € → pertes = ${(T.vente / ca.ca * 100).toFixed(1)} % du CA (manque à gagner)`, 14, y); y += 5; }
+      if (T.sansVente) { doc.setTextColor(150,90,0); doc.text(`${T.sansVente} entrée(s) sans prix de vente connu (non comptées dans la valeur de vente)`, 14, y); doc.setTextColor(0,0,0); y += 5; }
+      y += 3;
 
       // Tableau des pertes
       const REASON_LABELS = {};
       LOSS_REASONS.forEach(r => REASON_LABELS[r.id] = r.label);
-      const DEST_LABELS = { jete: 'Jeté', pribon: 'Pribon ROB' };
+      const DEST_LABELS = { jete: 'Jeté', partage: 'Partage', pribon: 'ROB' };
 
       const rows = losses.map(l => [
         formatDateShort(l.day),
@@ -3312,19 +3345,19 @@
         l.produit || '',
         (REASON_LABELS[l.reason] || l.reason) + (l.robSentDate ? ` — envoyé le ${formatDateShort(l.robSentDate)} à ROB` : ''),
         DEST_LABELS[l.destination] || l.destination,
-        l.usingWeight ? `${l.weight} kg` : `${l.quantity} u`,
-        `${(l.unitPrice || 0).toFixed(2)} €`,
+        l.qtyLabel || (l.usingWeight ? `${l.weight} kg` : `${l.quantity} u`),
         `${(l.totalValue || 0).toFixed(2)} €`,
+        (() => { const s = kbLossSale(l, opts && opts.catalogue); return s == null ? '—' : `${s.toFixed(2)} €`; })(),
       ]);
 
       doc.autoTable({
         startY: y,
-        head: [['Date','Producteur','Produit','Raison','Dest.','Qté/Poids','PU achat','Total']],
+        head: [['Date','Producteur','Produit','Raison','Dest.','Qté','Achat HT','Vente TTC']],
         body: rows,
         styles: { fontSize: 8, cellPadding: 1.5 },
         headStyles: { fillColor: [74, 124, 59], textColor: 255 },
         alternateRowStyles: { fillColor: [248, 248, 245] },
-        columnStyles: { 7: { halign: 'right', fontStyle: 'bold' } },
+        columnStyles: { 6: { halign: 'right', fontStyle: 'bold' }, 7: { halign: 'right' } },
       });
 
       const finalY = doc.lastAutoTable.finalY + 8;
@@ -20867,6 +20900,10 @@
       const totalJete = jeteWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
       const totalPribon = pribonWeek.reduce((s, l) => s + (l.totalValue || 0), 0);
       const totalWeek = totalJete + totalPribon;
+      // V10.53 — totaux du mail : achat (total / sèche / ROB), vente Kelbongoo TTC, CA de la semaine
+      const T = kbLossTotals(weekLosses, catalogue);
+      const [caWeek, setCaWeek] = React.useState(null);
+      React.useEffect(() => { let alive = true; kbCaBetween(week.monday, weekEnd).then(r => { if (alive) setCaWeek(r); }).catch(() => {}); return () => { alive = false; }; }, [week.monday]);
 
       const handleDelete = async (id) => {
         if (!confirm('Supprimer cette entrée ?')) return;
@@ -20884,7 +20921,8 @@
         try {
           // Générer le PDF
           const sorted = [...weekLosses].sort((a, b) => (a.day || '').localeCompare(b.day || ''));
-          const doc = generateLossesPDF(sorted, week);
+          const ca = caWeek || await kbCaBetween(week.monday, weekEnd).catch(() => null);
+          const doc = generateLossesPDF(sorted, week, { totals: T, catalogue, ca });
           const filename = `Pertes_Kelbongoo_S${week.monday}.pdf`;
 
           // Sauvegarder le PDF (copie locale)
@@ -20892,14 +20930,21 @@
 
           // Envoi SERVEUR avec PDF en pièce jointe — jamais de mailto / ouverture mail.
           const b64 = doc.output('datauristring').split(',')[1];
-          const subject = `Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total : ${totalWeek.toFixed(2)}€`;
+          const pct = ca && ca.ca > 0 ? (T.vente / ca.ca * 100) : null;
+          const subject = `Pertes Kelbongoo · Semaine du ${formatDateShort(week.mondayDate)} - Total achat : ${T.achat.toFixed(2)}€`;
           const body =
             `Bonjour,\n\n` +
-            `Rapport hebdomadaire des pertes en pièce jointe.\n\n` +
-            `Récap :\n` +
-            `- Jetées : ${jeteWeek.length} entrées · ${totalJete.toFixed(2)} €\n` +
-            `- Envoyé Pribon ROB : ${pribonWeek.length} entrées · ${totalPribon.toFixed(2)} €\n` +
-            `- TOTAL valorisé : ${totalWeek.toFixed(2)} €\n\n` +
+            `Rapport hebdomadaire des pertes — semaine du ${formatDateShort(week.mondayDate)} au ${formatDateShort(addDays(week.monday, 6))} (PDF en pièce jointe).\n\n` +
+            `AU PRIX D'ACHAT HT\n` +
+            `- PERTE TOTALE : ${T.achat.toFixed(2)} € (${T.n} entrées)\n` +
+            `   · dont perte sèche (jeté + partage équipe) : ${T.seche.toFixed(2)} € (${T.nSeche})\n` +
+            `   · dont envoyé à Robespierre : ${T.rob.toFixed(2)} € (${T.nRob})\n\n` +
+            `AU PRIX DE VENTE KELBONGOO (TTC)\n` +
+            `- Valeur des pertes : ${T.vente.toFixed(2)} €${T.sansVente ? ` (${T.sansVente} entrée(s) sans prix de vente, non comptées)` : ''}\n` +
+            (ca && ca.ca > 0
+              ? `- CA Kelbongoo de la semaine : ${ca.ca.toFixed(2)} € (${ca.days} jour${ca.days > 1 ? 's' : ''} de distribution)\n` +
+                `- Manque à gagner : ${pct.toFixed(1)} % du CA\n\n`
+              : `- CA de la semaine : non disponible (historique CA non chargé)\n\n`) +
             `${session.name}\nPréparation Kelbongoo`;
           const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail',
             to: LOSSES_EMAILS, subject, body,
@@ -20960,7 +21005,7 @@
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <h1>Pertes</h1>
             <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-              <button className="btn-secondary" onClick={() => setShowFl(true)} style={{borderColor:'#1565c0',color:'#1565c0',fontWeight:700}}>🥬 F&L → Montreuil</button>
+              <button className="btn-secondary" onClick={() => setShowFl(true)} style={{borderColor:'#1565c0',color:'#1565c0',fontWeight:700}}>🥬 F&L en lot</button>
               <button className="btn-primary" disabled={!catalogue || catalogue.length === 0} onClick={() => { setEditing(null); setShowForm(true); }}>
                 + Ajouter
               </button>
@@ -20973,7 +21018,7 @@
 
           {/* V10.52 — vendredi : rappel F&L invendu à envoyer à Robespierre avant la navette ROB 18h */}
           {new Date().getDay() === 5 && (() => {
-            const flDone = weekLosses.filter(l => l.remark === 'Envoi F&L Montreuil (lot)' && l.day === activeDay());
+            const flDone = weekLosses.filter(l => (l.flLot || l.remark === 'Envoi F&L Montreuil (lot)') && l.destination === 'pribon' && l.day === activeDay());
             const flTot = flDone.reduce((s, l) => s + (l.totalValue || 0), 0);
             return (
               <div className="card" style={{border:'2px solid #1565c0',background:'#e3f2fd'}}>
@@ -21006,14 +21051,21 @@
           )}
 
           <div className="stat-grid">
-            <div className="stat"><div className="stat-value">{weekLosses.length}</div><div className="stat-label">Cette semaine</div></div>
-            <div className="stat"><div className="stat-value" style={{color:'var(--danger)'}}>{totalJete.toFixed(0)}€</div><div className="stat-label">Jeté</div></div>
-            <div className="stat"><div className="stat-value" style={{color:'var(--info)'}}>{totalPribon.toFixed(0)}€</div><div className="stat-label">Pribon ROB</div></div>
+            <div className="stat"><div className="stat-value">{T.achat.toFixed(0)}€</div><div className="stat-label">Perte totale (achat)</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--danger)'}}>{T.seche.toFixed(0)}€</div><div className="stat-label">Perte sèche</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--info)'}}>{T.rob.toFixed(0)}€</div><div className="stat-label">Envoyé ROB</div></div>
           </div>
+          {T.n > 0 && (
+            <div style={{fontSize:13,color:'var(--ink-soft)',marginTop:-4}}>
+              Au prix de vente Kelbongoo : <strong>{T.vente.toFixed(2)} €</strong>
+              {caWeek && caWeek.ca > 0 ? <> · CA semaine {caWeek.ca.toFixed(0)} € → <strong>{(T.vente / caWeek.ca * 100).toFixed(1)} %</strong> de manque à gagner</> : ' · CA semaine non disponible'}
+              {T.sansVente ? <> · {T.sansVente} entrée(s) sans prix de vente</> : null}
+            </div>
+          )}
 
-          {totalWeek > 0 && (
+          {T.achat > 0 && (
             <div className="card" style={{background:'var(--master-soft)',border:'1px solid var(--master)'}}>
-              <h3 style={{color:'var(--master)',marginBottom:8}}>Total semaine : {totalWeek.toFixed(2)} €</h3>
+              <h3 style={{color:'var(--master)',marginBottom:8}}>Total semaine (achat HT) : {T.achat.toFixed(2)} €</h3>
 
               {!pdfGenerated ? (
                 <>
@@ -21168,15 +21220,20 @@
     }
 
     // === FORM PERTE ===
-    // V10.47 — 🥬 ENVOI F&L À MONTREUIL (ROB) en lot, comme l'inventaire F&L : liste des F&L actifs du Sheet
-    //   COMMANDE FL, toucher la ligne = +1, ajuster −/+, puis « Valider » → une perte « Envoi Montreuil » par produit.
+    // V10.53 — 🥬 F&L EN LOT, comme l'inventaire F&L : par produit, CAGETTES (entières + fraction ¼ ⅓ ½ ⅔ ¾) et/ou
+    //   SACHETS µ (unité de vente). Valorisation via le Sheet COMMANDE FL :
+    //   quantité Rungis = cagettes × COL + sachets × MU EN KILO (1 si vide) ; achat = × PRIX ACHAT HT ; vente = × PRIX VENTE TTC.
+    //   Destination : envoi Robespierre (défaut) / jeté / partage équipe. Une perte par produit.
     function FlMontreuilForm({ session, onClose }) {
       const showToast = React.useContext(ToastContext);
       const [rows, setRows] = React.useState(() => kbMuCacheGet('fl'));
       const [err, setErr] = React.useState('');
       const [q, setQ] = React.useState('');
-      const [qty, setQty] = React.useState({});
+      const [cag, setCag] = React.useState({});   // key → cagettes (décimal)
+      const [uvq, setUvq] = React.useState({});   // key → sachets µ
+      const [open, setOpen] = React.useState(null);
       const [reason, setReason] = React.useState('non_vendu');
+      const [dest, setDest] = React.useState('pribon');
       const [dlc, setDlc] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       React.useEffect(() => { let stop = false;
@@ -21189,54 +21246,73 @@
         const H = rows[0].map(h => normalizeText(String(h || '')).trim());
         const col = (preds) => { for (const p of preds) { const i = H.findIndex(p); if (i >= 0) return i; } return -1; };
         const iD = col([h => h === 'designation', h => h.includes('designation')]), iP = col([h => h === 'producteur']), iA = col([h => h === 'actif ?', h => h.includes('actif')]),
-              iPx = col([h => h.includes('prix achat')]), iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]);
+              iPx = col([h => h.includes('prix achat')]), iPv = col([h => h.includes('prix vente')]), iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
+              iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]), iMu = col([h => h.startsWith('mu en k')]), iT = col([h => h === 'type']);
         if (iD < 0) return [];
+        const num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.')); return isNaN(n) ? 0 : n; };
         const out = [], seen = new Set();
         for (let r = 1; r < rows.length; r++) {
           const row = rows[r] || []; const name = String(row[iD] == null ? '' : row[iD]).trim(); if (!name) continue;
           if (iA >= 0 && !/^actif/.test(normalizeText(String(row[iA] || '')).trim())) continue;
           const prod = iP >= 0 ? String(row[iP] || '').trim() : ''; const key = prod + '|' + name; if (seen.has(key)) continue; seen.add(key);
-          const px = parseFloat(String(iPx >= 0 && row[iPx] != null ? row[iPx] : '').replace(',', '.'));
-          out.push({ key, name, prod, uv: iU >= 0 ? String(row[iU] || '').trim() : '', price: isNaN(px) ? 0 : px });
+          out.push({ key, name, prod, uv: iU >= 0 ? String(row[iU] || '').trim() : '', type: iT >= 0 ? String(row[iT] || '').trim() : '',
+            pa: iPx >= 0 ? num(row[iPx]) : 0, pv: iPv >= 0 ? num(row[iPv]) : 0, colisage: iC >= 0 ? num(row[iC]) : 0, mu: iMu >= 0 ? num(row[iMu]) : 0 });
         }
         return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
       }, [rows]);
+      const qtyRungis = (x) => (cag[x.key] || 0) * (x.colisage || 0) + (uvq[x.key] || 0) * (x.mu > 0 ? x.mu : 1);
+      const unitR = (x) => /piece|pce|botte|lot/.test(normalizeText(x.type + ' ' + x.uv)) && !(x.mu > 0 && x.mu < 1) ? 'pce' : 'kg';
       const nq = normalizeText(q.trim());
       const shown = nq ? list.filter(x => normalizeText(x.name + ' ' + x.prod).includes(nq)) : list;
-      const picked = list.filter(x => (qty[x.key] || 0) > 0);
-      const total = picked.reduce((t, x) => t + (qty[x.key] || 0) * x.price, 0);
-      const add = (k, d) => setQty(m => ({ ...m, [k]: Math.max(0, (m[k] || 0) + d) }));
+      const picked = list.filter(x => (cag[x.key] || 0) > 0 || (uvq[x.key] || 0) > 0);
+      const noCol = picked.filter(x => (cag[x.key] || 0) > 0 && !(x.colisage > 0));
+      const totA = picked.reduce((t, x) => t + qtyRungis(x) * x.pa, 0);
+      const totV = picked.reduce((t, x) => t + qtyRungis(x) * x.pv, 0);
+      const bumpUv = (k, d) => setUvq(m => ({ ...m, [k]: Math.max(0, (m[k] || 0) + d) }));
+      const label = (x) => [ (cag[x.key] || 0) > 0 ? `${fmtCagette(cag[x.key])} cag.` : '', (uvq[x.key] || 0) > 0 ? `${uvq[x.key]} ${(x.uv || 'uv').split(' ')[0]}` : '' ].filter(Boolean).join(' + ');
       const validate = async () => {
-        if (!picked.length) { showToast('Touche les F&L envoyés à Montreuil'); return; }
+        if (!picked.length) { showToast('Indique les cagettes ou sachets'); return; }
+        if (noCol.length) { showToast(`Colisage manquant dans le Sheet : ${noCol.map(x => x.name).join(', ')}`); return; }
         setBusy(true);
         try {
           const now = new Date().toISOString();
           for (const x of picked) {
-            const n = qty[x.key] || 0; const id = `loss_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-            await storage.setDoc('losses', id, { productKey: x.key, producteur: x.prod, produit: x.name, unite: x.uv, destination: 'pribon', reason,
-              usingWeight: false, quantity: n, weight: 0, unitPrice: x.price, totalValue: Math.round(n * x.price * 100) / 100,
-              remark: 'Envoi F&L Montreuil (lot)', dlc, day: activeDay(), createdBy: session.name, createdAt: now, updatedAt: now });
+            const qr = Math.round(qtyRungis(x) * 1000) / 1000;
+            const id = `loss_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+            await storage.setDoc('losses', id, { productKey: x.key, producteur: x.prod, produit: x.name, unite: x.uv, destination: dest, reason,
+              usingWeight: unitR(x) === 'kg', quantity: unitR(x) === 'kg' ? 0 : qr, weight: unitR(x) === 'kg' ? qr : 0,
+              cagettes: cag[x.key] || 0, uvQty: uvq[x.key] || 0, qtyLabel: label(x), flLot: true,
+              unitPrice: x.pa, totalValue: Math.round(qr * x.pa * 100) / 100, saleValue: x.pv > 0 ? Math.round(qr * x.pv * 100) / 100 : null,
+              remark: 'F&L en lot · ' + label(x), dlc, day: activeDay(), createdBy: session.name, createdAt: now, updatedAt: now });
           }
-          showToast(`✓ ${picked.length} F&L envoyé(s) à Montreuil · ${total.toFixed(2)} €`); onClose();
+          showToast(`✓ ${picked.length} F&L enregistré(s) · ${totA.toFixed(2)} € achat`); onClose();
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
+      const DESTS = [{ id: 'pribon', label: '📦 Robespierre' }, { id: 'jete', label: '🗑️ Jeté' }, { id: 'partage', label: '👥 Partage équipe' }];
       return (
         <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') onClose(); }}>
           <div className="modal">
-            <div className="modal-header"><h2>🥬 Envoi F&L à Montreuil</h2><button className="modal-close" onClick={onClose}>×</button></div>
-            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '0 0 8px' }}>Touche un produit = +1 (unité de vente). Ajuste avec − / +. Chaque produit devient une perte « Envoi Montreuil (Pribon/ROB) ».</p>
+            <div className="modal-header"><h2>🥬 F&L en lot</h2><button className="modal-close" onClick={onClose}>×</button></div>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '0 0 8px' }}>Comme l'inventaire : 🥬 = cagettes (entières + ¼ ⅓ ½ ⅔ ¾), − / + = sachets. Valorisé au prix d'achat du Sheet FL.</p>
+            <div className="chip-group" style={{ marginBottom: 8 }}>{DESTS.map(d => <div key={d.id} className={`chip ${dest === d.id ? 'selected' : ''}`} onClick={() => setDest(d.id)}>{d.label}</div>)}</div>
             {err && <div className="alert-warning" style={{ fontSize: 12 }}>⚠️ {err}{rows ? ' — liste du dernier chargement' : ''}</div>}
             <input type="search" value={q} onChange={e => setQ(e.target.value)} placeholder="🔎 Chercher un F&L…" style={{ width: '100%', fontSize: 17, padding: '12px 14px', borderRadius: 12, border: '2px solid var(--line)', marginBottom: 8 }} />
-            <div style={{ maxHeight: '48vh', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 12 }}>
+            <div style={{ maxHeight: '46vh', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 12 }}>
               {rows == null && <div style={{ padding: 14 }}>Chargement du Sheet FL…</div>}
-              {shown.map((x, i) => { const n = qty[x.key] || 0; return (
-                <div key={x.key} onClick={() => add(x.key, 1)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', cursor: 'pointer', background: n ? '#e3f2fd' : (i % 2 ? 'var(--bg-muted,#f7f5f0)' : '#fff'), borderTop: i ? '1px solid var(--line)' : 'none' }}>
-                  <span style={{ flex: 1, minWidth: 0 }}>
-                    <span style={{ display: 'block', fontSize: 17, fontWeight: 700 }}>{x.name}</span>
-                    <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-mute)' }}>{x.prod}{x.uv ? ' · ' + x.uv : ''}{x.price ? ' · ' + x.price.toFixed(2) + ' €' : ''}</span>
-                  </span>
-                  {n > 0 && <button onClick={e => { e.stopPropagation(); add(x.key, -1); }} style={{ width: 44, height: 44, fontSize: 24, borderRadius: 10, border: '1px solid var(--line)', background: '#fff' }}>−</button>}
-                  <span style={{ minWidth: 40, textAlign: 'center', fontSize: 22, fontWeight: 700, color: n ? '#1565c0' : 'var(--ink-mute)' }}>{n || '+'}</span>
+              {shown.map((x, i) => { const c = cag[x.key] || 0, u = uvq[x.key] || 0, on = c > 0 || u > 0; return (
+                <div key={x.key} style={{ background: on ? '#e3f2fd' : (i % 2 ? 'var(--bg-muted,#f7f5f0)' : '#fff'), borderTop: i ? '1px solid var(--line)' : 'none' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px' }}>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', fontSize: 16, fontWeight: 600 }}>{x.name}</span>
+                      <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-mute)' }}>{x.prod}{x.uv ? ' · ' + x.uv : ''}{x.colisage ? ` · cagette ${x.colisage} ${unitR(x)}` : ' · ⚠️ colisage ?'}{x.pa ? ` · ${x.pa.toFixed(2)} €/${unitR(x)}` : ''}</span>
+                      {on && <span style={{ display: 'block', fontSize: 12, fontWeight: 600, color: '#1565c0' }}>{label(x)} = {(Math.round(qtyRungis(x) * 100) / 100)} {unitR(x)} · {(qtyRungis(x) * x.pa).toFixed(2)} €</span>}
+                    </span>
+                    <button onClick={() => setOpen(open === x.key ? null : x.key)} style={{ minWidth: 60, height: 44, borderRadius: 10, fontSize: 15, fontWeight: 600, cursor: 'pointer', border: open === x.key ? '2px solid var(--accent)' : '1px solid var(--border)', background: c > 0 ? 'var(--accent-soft)' : '#fff', color: c > 0 ? 'var(--accent-dark)' : 'var(--ink-mute)' }}>🥬 {fmtCagette(c)}</button>
+                    <button onClick={() => bumpUv(x.key, -1)} style={{ width: 32, height: 44, fontSize: 18, borderRadius: 8, border: '1px solid var(--border)', background: '#fff' }}>−</button>
+                    <span style={{ minWidth: 26, textAlign: 'center', fontSize: 17, fontWeight: 600, color: u ? '#1565c0' : 'var(--ink-mute)' }}>{u}</span>
+                    <button onClick={() => bumpUv(x.key, 1)} style={{ width: 32, height: 44, fontSize: 18, borderRadius: 8, border: '1px solid var(--border)', background: '#fff' }}>+</button>
+                  </div>
+                  {open === x.key && <FractionPad value={c} label="cagettes" onChange={v => setCag(m => ({ ...m, [x.key]: v }))} onClose={() => setOpen(null)} />}
                 </div>); })}
             </div>
             <div className="field" style={{ marginTop: 10 }}>
@@ -21246,7 +21322,7 @@
             <div className="field"><label>DLC (optionnel)</label><input type="date" value={dlc} onChange={e => setDlc(e.target.value)} /></div>
             <div className="row">
               <button className="btn-secondary" onClick={onClose}>Annuler</button>
-              <button className="btn-primary" disabled={busy || !picked.length} onClick={validate}>{busy ? 'Enregistrement…' : `✅ Valider l'envoi (${picked.length} produit${picked.length > 1 ? 's' : ''} · ${total.toFixed(2)} €)`}</button>
+              <button className="btn-primary" disabled={busy || !picked.length} onClick={validate}>{busy ? 'Enregistrement…' : `✅ Valider (${picked.length} produit${picked.length > 1 ? 's' : ''} · ${totA.toFixed(2)} € achat${totV ? ' · ' + totV.toFixed(2) + ' € vente' : ''})`}</button>
             </div>
           </div>
         </div>
@@ -21282,6 +21358,8 @@
       const unitPrice = selectedProduct ? (selectedProduct.prixAchat || selectedProduct.prixHT || 0) : 0;
       const qtyValue = usingWeight ? parseFloat(weight) || 0 : parseFloat(quantity) || 0;
       const totalValue = unitPrice * qtyValue;
+      // V10.53 — valeur au prix de vente Kelbongoo TTC
+      const saleValue = selectedProduct ? kbLossSale({ ...selectedProduct, totalValue, usingWeight, quantity: qtyValue, saleValue: undefined }, [selectedProduct]) : null;
 
       const handleSubmit = async () => {
         if (!productKey) { showToast('Choisis un produit'); return; }
@@ -21302,6 +21380,7 @@
             weight: usingWeight ? parseFloat(weight) || 0 : 0,
             unitPrice,
             totalValue,
+            saleValue: saleValue == null ? null : Math.round(saleValue * 100) / 100,
             remark,
             dlc,
             day: activeDay(),
