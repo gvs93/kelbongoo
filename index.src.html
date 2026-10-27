@@ -779,7 +779,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.54';
+    const APP_VERSION = 'V10.55';
     // V10.45 — (22/10/2026) Master › Historique : petit lien discret « contrôle des stocks » en bas → coller le tableau brut du mail d'anomalies de Raimbaud ; pour chaque produit, comparaison avec la prépa exacte de l'appli (commandé / mis en casier / rupture) → ✅ NORMAL (manque réel, chercher l'erreur ailleurs) ou ⚠️ ANOMALIE (feuille de stock ≠ prépa), date de distribution détectée automatiquement, résultat copiable.
     // V10.44 — (22/10/2026) Prépa ND : le bouton « 🔴 Cagette ND » (déjà actif) repassait le ND en casier juste après « ✅ Les N sont dans la cagette » → tous les ND finissaient en casier en distrib. Libellé « 🧺 Repasser en casier », bloqué 5 s après validation + confirmation.
     // V10.43 — (22/10/2026) Cagette ND comptée en dessous du total : le client servi en partie passe en rupture PARTIELLE (il garde ses ND posés en distrib) au lieu d'une rupture totale.
@@ -10171,6 +10171,8 @@
           });
           setPastUnclosed(curr => curr.filter(p => p.day !== day));
           showToast(`✓ Distribution du ${formatDateShort(day)} clôturée`);
+          // V10.55 — facturation automatique des commandes du nouveau site (clients passés)
+          kbFacturerApresCloture(day, currentSite, session.name, new Set(passedOfDay.map(o => o.orderId)), showToast);
           // V9.61 — récap remises & manquants (ancien site) → hg@
           if (KB_COHABITATION) kbSendDistribRecap(day, currentSite, session.name, { auto: true }).then(lg => { if (!lg.ok) showToast('⚠️ Récap non envoyé : ' + lg.error + ' — renvoyer depuis Pilotage › Ancien site'); });
         } catch (e) {
@@ -10217,6 +10219,8 @@
           });
           setConfirming(false);
           showToast(`✓ Journée clôturée pour ${currentSite}`);
+          // V10.55 — facturation automatique des commandes du nouveau site (clients passés) : PDV + site + PayZen
+          kbFacturerApresCloture(activeDay(), currentSite, session.name, new Set(passed.map(o => o.orderId)), showToast);
           // V9.61 — 🎆 + récap remises & manquants (ancien site) envoyé automatiquement à hg@
           kbCelebrate({ title: `Bravo${session.name ? ' ' + String(session.name).split(' ')[0] : ''}, distribution bouclée !`, sub: `${siteLabel(currentSite)} · ${passed.length} client(s) servi(s) 💚` });
           if (KB_COHABITATION) {
@@ -20194,7 +20198,7 @@
     const KB_FW_ACTIONS = {
       appliquer: 'Montant ajusté (serveur 98)', appliquer_pdv: 'Montant ajusté (lu dans PDV)', manuel: 'Montant ajusté (manuel)',
       manuel_sim: 'Simulation', capturer: 'Capture PayZen', test: 'Test de liaison', lire_pdv: 'Lecture PDV', etat: 'Consultation',
-      extraction: 'Extraction 10h', facturer_pdv: 'Facture PDV créée', avoir_pdv: 'Avoir PDV créé',
+      facturer: 'Facturation complète (PDV + site)', facturer_sim: 'Simulation facturation', extraction: 'Extraction 10h', facturer_pdv: 'Facture PDV créée', avoir_pdv: 'Avoir PDV créé',
     };
     function kbFwStatut(o) {
       if (!o) return { k: 'todo', t: '⏳ À facturer', c: 'var(--ink-mute)', bg: 'var(--bg-muted)' };
@@ -20250,53 +20254,147 @@
       );
     }
 
+    // === V10.55 — FACTURATION WEB AUTOMATIQUE ===
+    // À la clôture d'une distribution (ou depuis Master › Facturation web), pour chaque commande du NOUVEAU site :
+    // écarts de l'appli (ruptures prépa, partiels, remises prépa, remises/retraits distrib, rajouts distrib déduits)
+    // → Cloud Function kbgFacturerWeb → module PrestaShop kbfacturation : facture PDV + avoir + site au montant réel + PayZen.
+    // Idempotent côté module : une commande déjà facturée n'est jamais refacturée.
+    async function kbFactuDayData(day) {
+      const [od, prepArr, fixArr, refArr] = await Promise.all([
+        storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
+        storage.getAll(`day_${day}_prep`).catch(() => []),
+        storage.getAll(`day_${day}_distribfix`).catch(() => []),
+        storage.getAll(`day_${day}_refunds`).catch(() => []),
+      ]);
+      return { orders: (od && od.orders) || [], prep: parsePrepDocs(prepArr), fix: parseDistribFix(fixArr), refunds: (refArr || []).filter(r => r && r.orderId) };
+    }
+    function kbFactuEcarts(o, data) {
+      const site = String(o.site || '').toUpperCase(), client = o.name || '(client)';
+      const { prep, fix, refunds } = data;
+      const out = [];
+      for (const it of (o.items || [])) {
+        const produit = it.produit || '';
+        const k = site + '||' + client + '||' + produit;
+        const q = parseInt(it.qty, 10) || 1;
+        let manque = 0, pct = 0, rq = 0;
+        if (!fix[k]) {
+          if (prep.status[k] === 'rupture') manque = q;
+          else manque = kbPartMiss(prep, k, q);
+        }
+        const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
+        if (rc && rc.pct && q - manque > 0) { pct = Number(rc.pct) || 0; rq = q - manque; }
+        for (const r of refunds) {
+          if (r.orderId !== o.orderId || r.produit !== produit) continue;
+          const rqty = Math.min(parseInt(r.qty, 10) || 1, q - manque);
+          if ((Number(r.pct) || 0) >= 100) manque += rqty;
+          else if ((Number(r.pct) || 0) > pct) { pct = Number(r.pct) || 0; rq = Math.min(Math.max(rq, rqty), q - manque); }
+        }
+        manque = Math.min(manque, q);
+        if (rq > q - manque) rq = q - manque;
+        if (manque > 0 || (pct > 0 && rq > 0)) out.push({ ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), manque, remise_pct: pct, remise_qte: rq, qty: q, prix: it.consumer_price || 0 });
+      }
+      return out;
+    }
+    async function kbFacturerCommande(o, data, dry) {
+      if (!o || !o.psRef) throw new Error('Commande sans référence site');
+      const ecarts = kbFactuEcarts(o, data);
+      const r = await kbCallable('kbgFacturerWeb')({ reference: o.psRef, ecarts: ecarts.map(({ ean, produit, manque, remise_pct, remise_qte }) => ({ ean, produit, manque, remise_pct, remise_qte })), dry_run: !!dry });
+      const d = r.data || {};
+      if (!d.ok) throw new Error(d.erreur || ('HTTP ' + d.http));
+      return { ...d.resultat, _ecarts: ecarts };
+    }
+    // Facture toutes les commandes web d'un local (ou de tous) pour un jour. onlyIds : limiter (ex. clients passés).
+    async function kbFacturerJour(day, site, who, opts) {
+      const o0 = opts || {};
+      const data = await kbFactuDayData(day);
+      const list = data.orders.filter(o => o._ps && o.psRef && (o0.tests || !o._test) && (!site || String(o.site).toUpperCase() === String(site).toUpperCase())
+        && (!o0.onlyIds || o0.onlyIds.has(o.orderId)));
+      const res = { day, site: site || 'TOUS', by: who || '—', at: new Date().toISOString(), total: list.length, ok: 0, deja: 0, erreurs: [] };
+      for (const o of list) {
+        try {
+          const r = await kbFacturerCommande(o, data, false);
+          if (r.statut === 'deja_facture' || r.statut === 'deja_applique') res.deja++; else res.ok++;
+        } catch (e) { res.erreurs.push({ ref: o.psRef, client: o.name, err: kbErrMsg(e) }); }
+        if (o0.onProgress) o0.onProgress(res);
+      }
+      if (site) { try { await storage.setDoc(`day_${day}_closure`, String(site).toUpperCase(), { factuWeb: res }); } catch (_) {} }
+      return res;
+    }
+    // Appelée à la clôture de la distribution d'un local : seuls les clients passés sont facturés
+    // (les non-récupérés le seront depuis Master › Facturation web).
+    function kbFacturerApresCloture(day, site, who, passedIds, toast) {
+      kbFacturerJour(day, site, who, { onlyIds: passedIds })
+        .then(r => { if (r.total && toast) toast(r.erreurs.length ? `⚠️ Facturation web : ${r.erreurs.length} erreur(s) sur ${r.total} — voir Master › Facturation web` : `🧾 ${r.ok + r.deja} commande(s) web facturée(s) au montant réel`); })
+        .catch(e => { if (toast) toast('⚠️ Facturation web non lancée : ' + kbErrMsg(e)); });
+    }
+
     function KbFacturationWebPage() {
       const [day, setDay] = React.useState(() => todayKey());
-      const [batch, setBatch] = React.useState(undefined); // undefined = chargement, null = aucun lot
-      const [runs, setRuns] = React.useState([]);
-      const [batchErr, setBatchErr] = React.useState('');
+      const [od, setOd] = React.useState(undefined);
       const [ords, setOrds] = React.useState(null);
       const [evs, setEvs] = React.useState(null);
       const [filt, setFilt] = React.useState('tout');
+      const [tests, setTests] = React.useState(false);
       const [q, setQ] = React.useState('');
       const [sel, setSel] = React.useState(null);
       const [onlyErr, setOnlyErr] = React.useState(false);
+      const [busy, setBusy] = React.useState('');
+      const [plan, setPlan] = React.useState(null);
+      const [msg, setMsg] = React.useState('');
       const since = addDays(todayKey(), -21);
       React.useEffect(() => kbFwSnap('facturation_orders', setOrds, ['last_date', '>=', since]), [since]);
       React.useEffect(() => kbFwSnap('facturation_events', setEvs, ['day', '>=', addDays(todayKey(), -7)]), []);
       React.useEffect(() => {
-        setBatch(undefined); setRuns([]); setBatchErr(''); setSel(null);
-        if (!firebaseConfigured || !fb) { setBatch(null); return; }
-        const id = 'pdv-' + day;
-        const u1 = fb.onSnapshot(fb.doc(fb.db, 'pdv_batches', id), s => setBatch(s.exists() ? { id: s.id, ...s.data() } : null), e => { setBatch(null); setBatchErr((e && e.code) || 'erreur'); });
-        const u2 = fb.onSnapshot(fb.collection(fb.db, 'pdv_batches', id, 'runs'), s => setRuns(s.docs.map(d => d.data())), () => setRuns([]));
-        return () => { u1 && u1(); u2 && u2(); };
+        setOd(undefined); setSel(null); setPlan(null); setMsg('');
+        if (!firebaseConfigured || !fb) { setOd(null); return; }
+        return fb.onSnapshot(fb.doc(fb.db, `day_${day}_orders`, 'data'), s => setOd(s.exists() ? s.data() : null), () => setOd(null));
       }, [day]);
 
       const byRef = React.useMemo(() => { const m = {}; ((ords && ords.rows) || []).forEach(o => { m[o.id] = o; }); return m; }, [ords]);
-      const rows = React.useMemo(() => {
-        const list = ((batch && batch.orders) || []).map(b => {
-          const ref = String(b.ref_prestashop || '').toUpperCase();
-          const f = ref ? byRef[ref] : null;
-          return { ref, b, f, s: kbFwStatut(f) };
-        });
-        return list;
-      }, [batch, byRef]);
+      const rows = React.useMemo(() => ((od && od.orders) || []).filter(o => o._ps && (tests || !o._test)).map(o => {
+        const ref = String(o.psRef || '').toUpperCase();
+        const f = ref ? byRef[ref] : null;
+        const tot = (o.items || []).reduce((t, it) => t + (Number(it.consumer_price) || 0) * (parseInt(it.qty, 10) || 1), 0) / 100;
+        return { ref, o, f, tot, s: kbFwStatut(f) };
+      }).sort((a, b) => String(a.o.site).localeCompare(String(b.o.site)) || String(a.o.name).localeCompare(String(b.o.name))), [od, byRef, tests]);
       const count = (k) => rows.filter(r => r.s.k === k).length;
       const shown = rows.filter(r => (filt === 'tout' || (filt === 'todo' ? r.s.k === 'todo' : filt === 'err' ? r.s.k === 'err' : r.s.k === 'billed' || r.s.k === 'paid')))
-        .filter(r => !q || normalizeText([r.ref, r.b.pdv_document, r.b.client_pdv, r.b.lieu_libelle, r.b.lieu].join(' ')).includes(normalizeText(q)));
-      const sumNet = rows.reduce((t, r) => t + (r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : Number(r.b.total_ttc_commande) || 0), 0);
-      const sumIni = rows.reduce((t, r) => t + (Number(r.b.total_ttc_commande) || 0), 0);
+        .filter(r => !q || normalizeText([r.ref, r.o.orderId, r.o.name, r.o.site].join(' ')).includes(normalizeText(q)));
+      const sumNet = rows.reduce((t, r) => t + (r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : r.tot), 0);
+      const sumIni = rows.reduce((t, r) => t + r.tot, 0);
       const journal = React.useMemo(() => ((evs && evs.rows) || []).filter(e => e.action !== 'etat' && (!onlyErr || !e.ok))
         .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.id).localeCompare(String(a.id))).slice(0, 150), [evs, onlyErr]);
-      const denied = [batchErr, ords && ords.err, evs && evs.err].some(e => e === 'permission-denied');
+      const denied = [ords && ords.err, evs && evs.err].some(e => e === 'permission-denied');
 
+      const simuler = async (r) => {
+        setBusy(r.ref); setPlan(null); setMsg('');
+        try { const data = await kbFactuDayData(day); const p = await kbFacturerCommande(r.o, data, true); setPlan({ ref: r.ref, p }); }
+        catch (e) { setMsg('❌ ' + r.ref + ' : ' + kbErrMsg(e)); }
+        finally { setBusy(''); }
+      };
+      const facturer = async (r) => {
+        if (!confirm(`Facturer ${r.ref} (${r.o.name}) ?\nPDV : facture + avoir des écarts, puis montant réel sur le site.`)) return;
+        setBusy(r.ref); setMsg('');
+        try { const data = await kbFactuDayData(day); const p = await kbFacturerCommande(r.o, data, false); setMsg(`✅ ${r.ref} : ${p.statut === 'deja_facture' ? 'déjà facturée' : 'facturée'} — ${kbFwEur(p.net_ttc)}`); }
+        catch (e) { setMsg('❌ ' + r.ref + ' : ' + kbErrMsg(e)); }
+        finally { setBusy(''); }
+      };
+      const facturerTout = async () => {
+        const todo = rows.filter(r => r.s.k === 'todo' || r.s.k === 'err');
+        if (!todo.length) { setMsg('Rien à facturer.'); return; }
+        if (!confirm(`Facturer ${todo.length} commande(s) web du ${day.split('-').reverse().join('/')} ?`)) return;
+        setBusy('*'); setMsg('');
+        try {
+          const res = await kbFacturerJour(day, '', (window.__kbClaims && window.__kbClaims.email) || 'master', { tests, onlyIds: new Set(todo.map(r => r.o.orderId)), onProgress: (x) => setMsg(`… ${x.ok + x.deja + x.erreurs.length}/${x.total}`) });
+          setMsg(`${res.erreurs.length ? '⚠️' : '✅'} ${res.ok} facturée(s), ${res.deja} déjà faite(s), ${res.erreurs.length} erreur(s)` + (res.erreurs.length ? ' : ' + res.erreurs.map(e => e.ref + ' ' + e.err).join(' · ') : ''));
+        } catch (e) { setMsg('❌ ' + kbErrMsg(e)); }
+        finally { setBusy(''); }
+      };
       const exportXlsx = () => {
         try {
-          const data = rows.map(r => ({ 'Réf. site': r.ref, 'Commande PDV': r.b.pdv_document, 'Client PDV': r.b.client_pdv, 'Lieu': r.b.lieu_libelle || r.b.lieu || '',
-            'Créneau': r.b.creneau || '', 'Montant commandé': Number(r.b.total_ttc_commande) || 0, 'Montant réel': r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : '',
-            'Statut': r.s.t, 'Facture PDV': (r.f && r.f.pdv_facture) || '', 'Avoir(s)': ((r.f && r.f.pdv_avoirs) || []).join(', '),
-            'Dernière action': r.f ? (KB_FW_ACTIONS[r.f.last_action] || r.f.last_action) + ' ' + (r.f.last_date || '') : '', 'Erreur': (r.f && r.f.last_message) || '' }));
+          const data = rows.map(r => ({ 'Réf. site': r.ref, 'Commande': r.o.orderId, 'Client': r.o.name, 'Lieu': r.o.site, 'Créneau': r.o.psSlot || '',
+            'Commandé': r.tot, 'Réel': r.f && r.f.net_ttc != null ? Number(r.f.net_ttc) : '', 'Statut': r.s.t, 'Facture PDV': (r.f && r.f.pdv_facture) || '',
+            'Avoir(s)': ((r.f && r.f.pdv_avoirs) || []).join(', '), 'Dernière action': r.f ? (KB_FW_ACTIONS[r.f.last_action] || r.f.last_action) + ' ' + (r.f.last_date || '') : '', 'Erreur': (r.f && r.f.last_message) || '' }));
           const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Facturation');
           XLSX.writeFile(wb, `facturation_web_${day}.xlsx`);
         } catch (e) { alert('Export impossible : ' + e.message); }
@@ -20309,38 +20407,31 @@
           {sub && <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>{sub}</div>}
         </div>
       );
-      const S = sel && rows.find(r => r.ref === sel.ref && r.b.pdv_document === sel.doc);
+      const S = sel && rows.find(r => r.o.orderId === sel);
+      const [sEcarts, setSEcarts] = React.useState(null);
+      React.useEffect(() => { setSEcarts(null); if (!S) return; let on = true; kbFactuDayData(day).then(d => { if (on) setSEcarts(kbFactuEcarts(S.o, d)); }).catch(() => {}); return () => { on = false; }; }, [sel, day]);
 
       return (
         <div className="stack">
           <h1 style={{ margin: 0 }}>🧾 Facturation web</h1>
-          <p style={{ margin: 0, color: 'var(--ink-soft)', fontSize: 13 }}>Commande site → PDV → extraction 10h → prépa/distrib → facture + avoirs PDV → montant réel sur le site → capture PayZen. Tout ce qui se passe est tracé ici.</p>
-          {denied && <div className="card" style={{ margin: 0, background: 'var(--danger-soft)', color: 'var(--danger)', fontWeight: 600 }}>Lecture refusée par les règles Firestore : autoriser la lecture master (admin) de <code>pdv_batches</code>, <code>facturation_orders</code> et <code>facturation_events</code>.</div>}
+          <p style={{ margin: 0, color: 'var(--ink-soft)', fontSize: 13 }}>Commandes du nouveau site : à la clôture de la distribution, l'appli envoie les ruptures et remises → PDV fait la facture + l'avoir → le site passe au montant réel → PayZen débite (si activé). Tout est tracé ici.</p>
+          {denied && <div className="card" style={{ margin: 0, background: 'var(--danger-soft)', color: 'var(--danger)', fontWeight: 600 }}>Lecture refusée par les règles Firestore pour <code>facturation_orders</code> / <code>facturation_events</code>.</div>}
 
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <button className="btn-secondary" onClick={() => setDay(addDays(day, -1))}>◀</button>
             <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ maxWidth: 170 }} />
             <button className="btn-secondary" onClick={() => setDay(addDays(day, 1))}>▶</button>
             <button className="btn-secondary" onClick={() => setDay(todayKey())}>Aujourd'hui</button>
-            <button className="btn-secondary" onClick={() => setDay(addDays(todayKey(), 1))}>Demain</button>
-            <span style={{ color: 'var(--ink-mute)', fontSize: 12 }}>jour de distribution</span>
+            <span onClick={() => setTests(!tests)} style={{ fontSize: 13, cursor: 'pointer', fontWeight: 600, color: tests ? 'var(--warn)' : 'var(--ink-soft)' }}>{tests ? '☑' : '☐'} inclure les commandes TEST</span>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 10 }}>
-            <Tile label="① Extraction 10h" val={batch === undefined ? '…' : batch ? (batch.nb_commandes ?? rows.length) : '—'}
-              sub={batch ? 'reçue ' + kbFwTs(batch.received_at) + (runs.length > 1 ? ` · ${runs.length} envois` : '') : batch === null ? 'aucun lot reçu' : ''} color={batch === null ? 'var(--warn)' : null} />
+            <Tile label="① Commandes web du jour" val={od === undefined ? '…' : rows.length} sub={od && od.psLoadedAt ? 'chargées ' + new Date(od.psLoadedAt).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''} />
             <Tile label="② Facturées (site au bon montant)" val={count('billed') + count('paid')} sub={rows.length ? `sur ${rows.length}` : ''} color="var(--info)" />
-            <Tile label="③ Payées (PayZen capturé)" val={count('paid')} color="var(--accent-dark)" />
+            <Tile label="③ Payées (PayZen débité)" val={count('paid')} color="var(--accent-dark)" />
             <Tile label="Erreurs à regarder" val={count('err')} color={count('err') ? 'var(--danger)' : null} />
-            <Tile label="Montant" val={kbFwEur(sumNet)} sub={sumIni !== sumNet ? 'commandé ' + kbFwEur(sumIni) : ''} />
+            <Tile label="Montant" val={kbFwEur(sumNet)} sub={Math.abs(sumIni - sumNet) > 0.005 ? 'commandé ' + kbFwEur(sumIni) : ''} />
           </div>
-
-          {batch && Array.isArray(batch.anomalies) && batch.anomalies.length > 0 && (
-            <details className="card" style={{ margin: 0, background: 'var(--warn-soft)' }} open>
-              <summary style={{ fontWeight: 700, cursor: 'pointer', color: 'var(--warn)' }}>⚠️ {batch.anomalies.length} anomalie(s) à l'extraction</summary>
-              <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>{batch.anomalies.map((a, i) => <li key={i}>{a}</li>)}</ul>
-            </details>
-          )}
 
           <div className="card" style={{ margin: 0 }}>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
@@ -20349,26 +20440,32 @@
                   <button key={k} className={filt === k ? 'active' : ''} onClick={() => setFilt(k)}>{l}</button>)}
               </div>
               <input placeholder="Chercher réf., client, lieu…" value={q} onChange={e => setQ(e.target.value)} style={{ flex: '1 1 180px', minWidth: 0 }} />
+              <button className="btn-primary" onClick={facturerTout} disabled={!!busy || !rows.length}>{busy === '*' ? '…' : '🧾 Facturer les non facturées'}</button>
               <button className="btn-secondary" onClick={exportXlsx} disabled={!rows.length}>⬇️ Excel</button>
             </div>
-            {batch === undefined ? <p style={{ margin: 0 }}>Chargement…</p> : !rows.length ? (
-              <p style={{ margin: 0, color: 'var(--ink-mute)' }}>Aucune commande web extraite pour le {day.split('-').reverse().join('/')}. L'extraction tourne la veille à 10h (serveur 98). Les commandes hors lot restent visibles dans le journal ci-dessous.</p>
+            {msg && <div style={{ margin: '0 0 10px', fontWeight: 600, fontSize: 13, whiteSpace: 'pre-wrap' }}>{msg}</div>}
+            {od === undefined ? <p style={{ margin: 0 }}>Chargement…</p> : !rows.length ? (
+              <p style={{ margin: 0, color: 'var(--ink-mute)' }}>Aucune commande du nouveau site pour le {day.split('-').reverse().join('/')}.</p>
             ) : (
               <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', minWidth: 760, borderCollapse: 'collapse', fontSize: 13 }}>
+                <table style={{ width: '100%', minWidth: 820, borderCollapse: 'collapse', fontSize: 13 }}>
                   <thead><tr style={{ textAlign: 'left', color: 'var(--ink-mute)', fontSize: 11, textTransform: 'uppercase' }}>
-                    <th style={{ padding: 6 }}>Réf. site</th><th>PDV</th><th>Lieu</th><th style={{ textAlign: 'right' }}>Commandé</th><th style={{ textAlign: 'right' }}>Réel</th><th>Statut</th><th>Dernière action</th>
+                    <th style={{ padding: 6 }}>Réf. site</th><th>Client</th><th>Lieu</th><th style={{ textAlign: 'right' }}>Commandé</th><th style={{ textAlign: 'right' }}>Réel</th><th>Statut</th><th></th>
                   </tr></thead>
                   <tbody>
                     {shown.map(r => (
-                      <tr key={r.b.pdv_document} onClick={() => setSel({ ref: r.ref, doc: r.b.pdv_document })} style={{ borderTop: '1px solid var(--line)', cursor: 'pointer', background: S && S.b.pdv_document === r.b.pdv_document ? 'var(--info-soft)' : undefined }}>
-                        <td style={{ padding: 6, fontWeight: 700 }}>{r.ref || <span style={{ color: 'var(--danger)' }}>sans réf.</span>}</td>
-                        <td style={{ whiteSpace: 'nowrap' }}>{r.b.pdv_document}</td>
-                        <td>{r.b.lieu || '?'}{r.b.creneau ? ' · ' + r.b.creneau : ''}</td>
-                        <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{kbFwEur(r.b.total_ttc_commande)}</td>
+                      <tr key={r.o.orderId} style={{ borderTop: '1px solid var(--line)', background: sel === r.o.orderId ? 'var(--info-soft)' : undefined }}>
+                        <td style={{ padding: 6, fontWeight: 700, cursor: 'pointer' }} onClick={() => setSel(r.o.orderId)}>{r.ref || <span style={{ color: 'var(--danger)' }}>sans réf.</span>}</td>
+                        <td style={{ cursor: 'pointer' }} onClick={() => setSel(r.o.orderId)}>{r.o.name}</td>
+                        <td>{r.o.site}{r.o.psSlot ? ' · ' + r.o.psSlot : ''}</td>
+                        <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{kbFwEur(r.tot)}</td>
                         <td style={{ textAlign: 'right', fontWeight: 700, whiteSpace: 'nowrap' }}>{r.f && r.f.net_ttc != null ? kbFwEur(r.f.net_ttc) : '—'}</td>
-                        <td><span style={{ background: r.s.bg, color: r.s.c, borderRadius: 999, padding: '2px 8px', fontWeight: 700, fontSize: 12, whiteSpace: 'nowrap' }}>{r.s.t}</span></td>
-                        <td style={{ fontSize: 12, color: r.f && r.f.last_ok === false ? 'var(--danger)' : 'var(--ink-soft)' }}>{r.f ? (KB_FW_ACTIONS[r.f.last_action] || r.f.last_action) + ' · ' + String(r.f.last_date || '').slice(11, 16) : ''}{r.f && r.f.last_message ? ' — ' + r.f.last_message.slice(0, 80) : ''}</td>
+                        <td><span style={{ background: r.s.bg, color: r.s.c, borderRadius: 999, padding: '2px 8px', fontWeight: 700, fontSize: 12, whiteSpace: 'nowrap' }}>{r.s.t}</span>
+                          {r.f && r.f.last_ok === false && r.f.last_message ? <div style={{ fontSize: 11, color: 'var(--danger)', maxWidth: 280 }}>{r.f.last_message.slice(0, 120)}</div> : null}</td>
+                        <td style={{ whiteSpace: 'nowrap', textAlign: 'right' }}>
+                          <button className="btn-ghost" style={{ padding: '4px 8px', fontSize: 12 }} disabled={!!busy || !r.ref} onClick={() => simuler(r)}>{busy === r.ref ? '…' : 'Simuler'}</button>
+                          {(r.s.k === 'todo' || r.s.k === 'err') && <button className="btn-secondary" style={{ padding: '4px 8px', fontSize: 12, marginLeft: 4 }} disabled={!!busy || !r.ref} onClick={() => facturer(r)}>Facturer</button>}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -20377,24 +20474,38 @@
             )}
           </div>
 
+          {plan && (
+            <div className="card" style={{ margin: 0, border: '2px dashed var(--info)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><h3 style={{ margin: 0 }}>🧪 Simulation {plan.ref}</h3><button className="btn-secondary" onClick={() => setPlan(null)}>✕</button></div>
+              {plan.p.statut === 'deja_facture' ? <p>Déjà facturée : facture {plan.p.pdv_facture}, net {kbFwEur(plan.p.net_ttc)}.</p> : (
+                <div style={{ fontSize: 13 }}>
+                  <p style={{ margin: '6px 0' }}>Commande PDV <b>{plan.p.bcc}</b> (client {plan.p.client_pdv}) : {kbFwEur(plan.p.montant_commande)} → avoir {kbFwEur(plan.p.avoir_ttc)} → <b>net {kbFwEur(plan.p.net_prevu)}</b></p>
+                  {(plan.p.lignes_avoir || []).length ? <ul style={{ margin: 0, paddingLeft: 18 }}>{plan.p.lignes_avoir.map((l, i) => <li key={i}>{l.libelle} : {l.qte} × {kbFwEur(l.pu)}</li>)}</ul> : <p style={{ margin: 0 }}>Aucun écart : facture au montant commandé.</p>}
+                </div>)}
+            </div>
+          )}
+
           {S && (
             <div className="card" style={{ margin: 0, border: '2px solid var(--info)' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                <h3 style={{ margin: 0 }}>Commande {S.ref || '—'} · PDV {S.b.pdv_document}</h3>
+                <h3 style={{ margin: 0 }}>Commande {S.ref || '—'} · {S.o.name}</h3>
                 <button className="btn-secondary" onClick={() => setSel(null)}>✕</button>
               </div>
               <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '6px 0 10px' }}>
-                Client PDV {S.b.client_pdv} · {S.b.lieu_libelle || S.b.lieu || 'lieu ?'} {S.b.creneau || ''} · commandée le {String(S.b.date_commande || '').slice(0, 10).split('-').reverse().join('/')} {S.b.heure_commande || ''} · statut site à l'extraction : {S.b.statut_web || '—'}
-                {S.f && <><br />Facture PDV <b>{S.f.pdv_facture || '—'}</b> · avoir(s) <b>{(S.f.pdv_avoirs || []).join(', ') || '—'}</b> · {S.f.nb_erreurs ? S.f.nb_erreurs + ' erreur(s) au total' : 'aucune erreur'}</>}
+                {S.o.site} {S.o.psSlot || ''} · commande site {S.o.orderId}{S.f ? <> · facture PDV <b>{S.f.pdv_facture || '—'}</b> · avoir(s) <b>{(S.f.pdv_avoirs || []).join(', ') || '—'}</b></> : null}
               </div>
-              <details style={{ marginBottom: 10 }}>
-                <summary style={{ cursor: 'pointer', fontWeight: 700 }}>🛒 Articles commandés ({(S.b.lignes || []).length})</summary>
-                <table style={{ width: '100%', fontSize: 12, marginTop: 6 }}><tbody>
-                  {(S.b.lignes || []).map((l, i) => <tr key={i} style={{ borderTop: '1px solid var(--line)' }}><td style={{ padding: 4 }}>{l.designation || l.produit || l.article}</td><td>{l.article || l.code_article || ''}</td><td style={{ textAlign: 'right' }}>×{l.quantite ?? l.qte ?? ''}</td><td style={{ textAlign: 'right' }}>{kbFwEur(l.total_ttc ?? l.totalTTC)}</td></tr>)}
-                </tbody></table>
-              </details>
+              <table style={{ width: '100%', fontSize: 12, marginBottom: 10 }}><tbody>
+                {(S.o.items || []).map((it, i) => {
+                  const e = (sEcarts || []).find(x => x.produit === String(it.produit || '').replace(/^\[TEST\]\s*/, ''));
+                  const gone = e && e.manque >= (parseInt(it.qty, 10) || 1);
+                  return <tr key={i} style={{ borderTop: '1px solid var(--line)', color: gone ? 'var(--ink-mute)' : undefined }}>
+                    <td style={{ padding: 4 }}>{gone ? <s>{it.produit}</s> : it.produit}</td><td>×{it.qty}</td><td style={{ textAlign: 'right' }}>{kbFwEur((Number(it.consumer_price) || 0) * (parseInt(it.qty, 10) || 1) / 100)}</td>
+                    <td style={{ fontWeight: 700, color: e ? 'var(--danger)' : 'var(--accent-dark)' }}>{e ? [e.manque ? `rupture ×${e.manque}` : '', e.remise_pct ? `remise -${e.remise_pct}% ×${e.remise_qte}` : ''].filter(Boolean).join(' · ') : 'fourni'}</td>
+                  </tr>;
+                })}
+              </tbody></table>
               <div style={{ fontWeight: 700, marginBottom: 6 }}>📜 Historique</div>
-              {S.ref ? <KbFwTimeline reference={S.ref} /> : <p style={{ margin: 0, color: 'var(--danger)' }}>Pas de référence site : impossible de relier la commande PDV à PrestaShop.</p>}
+              {S.ref ? <KbFwTimeline reference={S.ref} /> : <p style={{ margin: 0, color: 'var(--danger)' }}>Pas de référence site.</p>}
             </div>
           )}
 
