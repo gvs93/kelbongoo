@@ -1,5 +1,6 @@
 /**
- * KBG_Rungis.gs — v1.5 (22/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_Rungis.gs — v1.6 (27/10/2026) — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ *   v1.6 : 1 ligne de routage en plus — actions « rungis_ancien_* » → KBG_Ancien.gs (report automatique ancien site). Rien d'autre ne change.
  * ---------------------------------------------------------------------------------------------
  * v1.5 : PLUSIEURS FORMATS KBG = UN SEUL ARTICLE RUNGIS (ex. œufs 6 / 12 / 18 / 24 = boîtes de 6, colis de 16) :
  *        les lignes actives qui ont le MÊME CODE PROBON sont regroupées en UNE ligne de commande.
@@ -404,7 +405,7 @@ function kbRungisRoute_(p) {
     if (p.action === 'rungis_alert') return rgJson_(rgAlert_(p.alert || {}, String(p._by || p.by || '')));
     if (p.action === 'rungis_driver_check') return rgJson_(rgDriverCheck_(String(p.code || '')));
     if (String(p.action).indexOf('rungis_bl_') === 0) return rgJson_(kbBlRoute_(p));   // v1.4 — contrôle BL (KBG_BL.gs)
-    if (String(p.action).indexOf('rungis_ancien_') === 0) return rgJson_(kbAncRoute_(p));   // v1.5 — report automatique ancien site (KBG_Ancien.gs)
+    if (String(p.action).indexOf('rungis_ancien_') === 0) return rgJson_(kbAncRoute_(p));   // v1.6 — report automatique ancien site (KBG_Ancien.gs)
     return rgJson_({ ok: false, error: 'action inconnue' });
   } catch (e) { return rgJson_({ ok: false, error: String(e && e.message ? e.message : e) }); }
 }
