@@ -785,7 +785,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.58';
+    const APP_VERSION = 'V10.59';
+    // V10.59 — (27/10/2026) Pain en prépa : plus coché automatiquement (pouvait être en rupture). Validé comme un produit ND :
+    //   cagette ND du lieu, « ✅ Les N sont dans la cagette » ou quantité réelle (le reste en rupture), jamais en casier ni repassable en casier.
+    //   Distrib inchangée : « 🍞 Pain (ND · à remettre à la main) » + nom du pain, sans n° de bac. Ancien site : statut réel du pain.
     // V10.58 — (27/10/2026) ① 🤖 Report AUTOMATIQUE sur l'ancien site par le serveur (KBG_Ancien.gs : API preparations-new.kelbongoo.com,
     //   ID produit + ID commande, pose / retire / coche Fini, vérification + mail) lancé à la clôture de la prépa ; carte Master › Synchro ancien site
     //   (simuler / reporter maintenant / état). ② Pains : présents pour l'ancien site (depuis V10.56 ils restaient « pas finis »).
@@ -9701,9 +9704,7 @@
           const k = site + '||' + client + '||' + produit, st0 = d._prep.status[k] || '';
           // V9.96 — dispatch dernière minute certain (🟣 prépa) = PRÉSENT : ligne terminée, pas une rupture
           const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + produit]) && st0 !== 'rupture' && st0 !== 'partiel';
-          // V10.58 — pain hors DOM = ND, plus coché en prépa (V10.56) : présent pour l'ancien site (bloquait les pains « pas finis »)
-          const painOk = (it.cat === 'pain') && site !== 'DOM' && st0 !== 'rupture' && st0 !== 'partiel';
-          const st = (lmOn || painOk) ? 'done' : st0;
+          const st = lmOn ? 'done' : st0;   // V10.59 — pain validé en prépa (cagette ND) : vrai statut
           p.ordered += it.qty || 1; p.lines++;
           if (st === 'done' || st === 'rupture' || st === 'partiel') p.fin++;
           p.sig.push(k + '=' + st + (lmOn ? ':lm' : '') + (st === 'partiel' ? ':' + ((d._prep.posedN && d._prep.posedN[k]) || 0) : ''));
@@ -9733,9 +9734,8 @@
           if (!it.id) continue;
           const k = site + '||' + client + '||' + it.produit, st0 = d._prep.status[k] || '', q = Number(it.qty || it.quantity) || 1;
           const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + it.produit]) && st0 !== 'rupture' && st0 !== 'partiel';
-          const painOk = it.cat === 'pain' && site !== 'DOM' && st0 !== 'rupture' && st0 !== 'partiel';
           const miss = lmOn ? 0 : st0 === 'rupture' ? q : st0 === 'partiel' ? kbPartMiss(d._prep, k, q) : 0;
-          const done = lmOn || painOk || st0 === 'done' || st0 === 'rupture' || st0 === 'partiel';
+          const done = lmOn || st0 === 'done' || st0 === 'rupture' || st0 === 'partiel';
           const p = P[it.id] || (P[it.id] = { id: String(it.id), produit: it.produit || '', cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais', done: true, orders: [] });
           if (!done) p.done = false;
           if (o.orderId) p.orders.push({ oid: String(o.orderId), site, q, miss });
@@ -14708,15 +14708,15 @@
       const st = (r) => prep.status[K(r)] || 'todo';
       // V9.76 — traité = déposé, rupture, ou produit passé en dispatch dernière minute (= manquant)
       const isLmRow = (r) => !!prep.lm[PK(r.site, r.product)];
-      // V10.56 — PAIN = ND, point final : pas de casier, rien à faire en prépa (arrive le matin, dispatch pain, remis à la main)
-      const isPainRow = (r) => r.cat === 'pain' && r.site !== 'DOM';
-      const handled = (r) => { if (isPainRow(r)) return true; const x = prep.status[K(r)]; return x === 'done' || x === 'rupture' || x === 'partiel' || isLmRow(r); };
+      // V10.59 — PAIN = ND : validé en prépa comme les autres produits ND (cagette ND, quantité réelle, ruptures) — jamais en casier
+      const handled = (r) => { const x = prep.status[K(r)]; return x === 'done' || x === 'rupture' || x === 'partiel' || isLmRow(r); };
       // V9.79 — quantité manquante d'une ligne (rupture totale = qté, partielle = qté − posés)
       const missOf = (r) => { const x = prep.status[K(r)], q = r.qty || 1; if (x === 'rupture') return q; if (x === 'partiel') return Math.max(0, q - Math.min(q, (prep.count || {})[K(r)] || 0)); return 0; };
       // V9.66 — ND AUTOMATIQUE : produits de type ND (catalogue) → cagette ND par boutique, pas en casier.
       // V10.00 — pas de ND en livraison à domicile (DOM) : tout va directement dans les CARTONS du client
       const ndAuto = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'nd' && r.site !== 'DOM') m.add(PK(r.site, r.product)); }); return m; }, [rows]);
-      const ndOn = (pk) => String(pk).indexOf('DOM||') !== 0 && (kbIsSolidaire(String(pk).split('||').pop()) || !!prep.nd[pk] || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]));
+      const painPk = React.useMemo(() => { const m = new Set(); rows.forEach(r => { if (r.cat === 'pain' && r.site !== 'DOM') m.add(PK(r.site, r.product)); }); return m; }, [rows]); // V10.59 — pain = ND, jamais en casier
+      const ndOn = (pk) => String(pk).indexOf('DOM||') !== 0 && (kbIsSolidaire(String(pk).split('||').pop()) || !!prep.nd[pk] || (painPk.has(pk) && !prep.lm[pk]) || (ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]));
       const ndData = (pk) => prep.nd[pk] || { placed:null, alloc:[], shortage:[] };
 
       // V9.77 — progression en RÉFÉRENCES : une référence est faite quand toutes ses lignes sont traitées
@@ -14751,7 +14751,6 @@
 
       // ---- actions ----
       const toggleDone = (r) => {
-        if (isPainRow(r)) { showToast('🍞 Pain = ND : pas de casier, rien à faire'); return; }
         const k = K(r), cur = st(r), by = (prep.statusBy || {})[k];
         // V9.71 — défaire un dépôt demande TOUJOURS une confirmation (clics accidentels)
         if (cur === 'done') {
@@ -14769,8 +14768,8 @@
         setRecent(m => ({ ...m, [k]: true }));
         setTimeout(() => { armGuard(450); setRecent(m => { const x = { ...m }; delete x[k]; return x; }); }, 1100);
       };
-      const isHidden = (r) => isPainRow(r) || (st(r) === 'done' && !recent[K(r)]);
-      const posed = (r) => (isPainRow(r) || st(r) === 'done') ? (r.qty || 1) : ((prep.count || {})[K(r)] || 0);
+      const isHidden = (r) => st(r) === 'done' && !recent[K(r)];
+      const posed = (r) => st(r) === 'done' ? (r.qty || 1) : ((prep.count || {})[K(r)] || 0);
       const qtyLabel = (r, x) => {
         const q = r.qty || 1;
         if (x === 'done') return `×${q} ✓`;
@@ -14806,7 +14805,6 @@
       // V9.79 — 🚫 sur une ligne déjà entamée (ex. 1/2) = RUPTURE PARTIELLE : on valide les posés, le reste part en manquant.
       //         Re-toucher 🚫 sur une partielle → rupture totale ; encore → annulé (retour au comptage).
       const toggleRuptCli = (r) => {
-        if (isPainRow(r)) { showToast('🍞 Pain = ND : géré le matin au dispatch pain'); return; }
         const k = K(r), x = st(r), q = r.qty || 1, n = Math.min(q, (prep.count || {})[k] || 0);
         if (x === 'rupture') { wStatus(k, null); return; }
         if (x === 'partiel') { wStatus(k, 'rupture'); return; }
@@ -14819,6 +14817,7 @@
       const ndSavedAt = React.useRef({}); // V10.44
       const toggleND = (pk) => {
         if (kbIsSolidaire(String(pk).split('||').pop())) { showToast('🧺 Panier solidaire : cagette à part, jamais en casier'); return; } // V10.05
+        if (painPk.has(pk)) { showToast('🍞 Pain = ND : toujours en cagette ND, jamais en casier'); return; } // V10.59
         if (ndOn(pk)) {
           // V10.44 — anti-clic : juste après « ✅ Les N sont dans la cagette » le bouton passait sous le doigt et
           //   repassait TOUT le ND en casier (22/10 : céleri, salades, poireaux… de tous les lieux). Bloqué 5 s + confirmation.
@@ -14906,7 +14905,7 @@
       const rollSites = React.useMemo(() => {
         const out = {};
         sites.filter(s => s !== 'DOM').forEach(s => {
-          const cl = [...new Set(rows.filter(r => r.site === s && !isPainRow(r) && !ndOn(PK(s, r.product))).map(r => r.client))];
+          const cl = [...new Set(rows.filter(r => r.site === s && !ndOn(PK(s, r.product))).map(r => r.client))];
           const n = cl.reduce((a, c) => a + Math.max(1, getCasiers(s, c).filter(x => x && x !== '?').length), 0);
           out[s] = { casiers: n, rolls: Math.ceil(n / KB_CASIERS_PAR_ROLL) };
         });
@@ -15043,16 +15042,6 @@
         const total = po.reduce((s,r)=>s+r.qty,0);
         const nd = ndOn(pk) ? ndData(pk) : null, lm = prep.lm[pk], ra = prep.remiseAll[pk];
         const allDone = po.every(handled);
-        if (po.every(isPainRow)) return ( // V10.56 — pain = ND : aucun n° de casier, rien à cocher
-          <div key={pk} style={kbSiteVars(site)} className="pdj-card sc done nd">
-            <div className="pdj-pname">{product}<span className="pdj-badge nd">ND</span></div>
-            <div className="pdj-psub">{po[0].producer} · <b>{total} u · {po.length} client{po.length>1?'s':''}</b></div>
-            <div className="pdj-panel nd">
-              <div className="pdj-big">🍞 Pain = ND · <span className="q">{total}×</span> · <b>{site}</b></div>
-              <div className="pdj-hint" style={{color:'#7a3a12'}}>Pas de casier. Le pain arrive le matin (dispatch pain) et le distributeur le remet à la main au client. Rien à faire en prépa.</div>
-            </div>
-          </div>
-        );
         return (
           <div key={pk} style={kbSiteVars(site)} className={"pdj-card sc" + (allDone?" done":"") + (nd?" nd":"") + (lm?" lm":"")}>
             <div className="pdj-pname">{product}
@@ -15133,7 +15122,7 @@
             {moreOpen[pk] && <div className="pdj-menu">
               <div className="pdj-mact" onClick={()=>{ setPoidsProd(site,product); setMoreOpen(m=>({...m,[pk]:false})); }}>⚖️ Poids (produit)</div>
               <div className={"pdj-mact rem"+(ra?" on":"")} onClick={()=>openRemAll(pk)}>🏷️ Remise (produit)</div>
-              {site !== 'DOM' && nd && <div className="pdj-mact" style={{color:'#c2410c',fontWeight:700}} onClick={()=>toggleND(pk)}>🧺 Repasser en casier (sort du ND)</div>}
+              {site !== 'DOM' && nd && !painPk.has(pk) && <div className="pdj-mact" style={{color:'#c2410c',fontWeight:700}} onClick={()=>toggleND(pk)}>🧺 Repasser en casier (sort du ND)</div>}
             </div>}
           </div>
         );
