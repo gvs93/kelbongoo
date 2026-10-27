@@ -1,5 +1,6 @@
 /**
- * KBG_Ancien.gs — v1.0 (27/10/2026) — REPORT AUTOMATIQUE DE LA PRÉPA SUR L'ANCIEN SITE (preparations.kelbongoo.com)
+ * KBG_Ancien.gs — v1.1 (27/10/2026) — v1.1 : Réception ND automatique (quantité reçue + coche), journal détaillé produit par produit en direct.
+ * v1.0 — REPORT AUTOMATIQUE DE LA PRÉPA SUR L'ANCIEN SITE (preparations.kelbongoo.com)
  * À ajouter dans le projet Apps Script « FL_Probon_Proxy » (même projet que KBG_Rungis.gs / KBG_BL.gs).
  * ---------------------------------------------------------------------------------------------------------
  * Remplace Tampermonkey : plus de navigateur, plus de PC allumé. L'ancien site de prépa n'est qu'une API
@@ -87,6 +88,22 @@ function ancGlobalOrder_(day) {
   return g._id;
 }
 /** Tous les produits de la distribution (frais = couloir 0, sec = couloir 1) : { ppId: {name, couloir, prog:{locale:{ord, done, completed}}} } */
+/** v1.1 — Réception non-dispatch (ND) : par lieu, produits sans dispatch → { ppId: { locale: {ord, rec, completed} } } */
+function ancProductsND_(G, locales) {
+  var out = {};
+  locales.forEach(function (loc) {
+    var items = [];
+    for (var page = 1; page <= 10; page++) {
+      var j = ancGet_('globalorders/fetch-locale-products-list', { globalorder_id: G, locale: loc, dispatch_done: { $exists: false }, filterUnsold: true, getGroupedDispatchProducts: false },
+        { page: page, limit: 500, sort: { product_name: 1 } });
+      var got = j.items || []; items = items.concat(got);
+      if (!got.length || items.length >= (Number(j.count) || 0)) break;
+    }
+    items.forEach(function (x) { (out[x.producerproduct_id] = out[x.producerproduct_id] || {})[loc] = { ord: Number(x.locale_quantity_ordered) || 0, rec: Number(x.locale_quantity_received) || 0, completed: !!x.locale_completed, name: x.product_name }; });
+  });
+  return out;
+}
+function ancLocales_(job) { var m = { BIC: 1, BOR: 1, PDP: 1, STB: 1, TOL: 1 }; (job.todo || []).forEach(function (x) { (x.orders || []).forEach(function (o) { if (o.site && o.site !== 'DOM') m[o.site] = 1; }); }); return Object.keys(m); }
 function ancProducts_(G) {
   var out = {};
   [0, 1].forEach(function (cl) {
@@ -142,7 +159,7 @@ function ancStart_(p) {
     var job = { v: 1, day: day, by: String(p.by || '').slice(0, 60), dry: dry, startedAt: new Date().toISOString(), state: 'en cours',
       todo: prods.map(function (x) { return { id: String(x.id), produit: String(x.produit || '').slice(0, 120), cat: String(x.cat || ''), done: !!x.done,
         orders: (x.orders || []).map(function (o) { return { oid: String(o.oid), site: String(o.site || '').toUpperCase(), q: Number(o.q) || 0, miss: Number(o.miss) || 0 }; }) }; }),
-      i: 0, res: { faits: 0, deja: 0, attente: [], absents: [], erreurs: [], inconnus: [], nd: [], poses: 0, retires: 0, coches: 0, appels: 0 } };
+      i: 0, res: { faits: 0, deja: 0, attente: [], absents: [], erreurs: [], inconnus: [], nd: [], ndFaits: 0, poses: 0, retires: 0, coches: 0, appels: 0, detail: [] } };
     ancJobPut_(job); ancTriggersDel_();
     ancWork_(job);
     return { ok: true, result: ancPublic_(ancJobGet_() || job) };
@@ -159,11 +176,11 @@ function ancWork_(job) {
   var t0 = Date.now(), R = job.res;
   try {
     var G = job.G || (job.G = ancGlobalOrder_(job.day));
-    var A = ancProducts_(G);
+    var A = ancProducts_(G), N = ancProductsND_(G, ancLocales_(job));
     if (!Object.keys(A).length) throw new Error('Aucun produit lu sur l\'ancien site pour la distribution du ' + job.day + ' (globalorder ' + G + ')');
     while (job.i < job.todo.length && Date.now() - t0 < ANC_SLICE_MS) {
       var lane = job.todo.slice(job.i, job.i + ANC_LANES);
-      ancDoLane_(G, A, lane, job);
+      ancDoLane_(G, A, N, lane, job);
       job.i += lane.length;
       ancJobPut_(job);
     }
@@ -177,61 +194,79 @@ function ancWork_(job) {
     ancJobPut_(job); ancLog_(job); ancMail_(job);
   }
 }
-/** Un paquet de produits : get-dispatch (parallèle), puis écritures en parallèle sur des produits DIFFÉRENTS (jamais 2 à la fois pour un même produit). */
-function ancDoLane_(G, A, lane, job) {
-  var R = job.res, work = [];
+/** Un paquet de produits : get-dispatch (parallèle), puis écritures en parallèle sur des produits DIFFÉRENTS (jamais 2 à la fois pour un même produit).
+ *  v1.1 : les lieux où le produit est en ND passent par la Réception ND (quantité reçue = commandé − rupture, puis coche). */
+function ancDoLane_(G, A, N, lane, job) {
+  var R = job.res, work = [], queues = {}, D = R.detail || (R.detail = []);
+  var log = function (q, txt) { (q.d = q.d || []).push(txt); };
+  var Q = function (x) { return queues[x.id] || (queues[x.id] = { x: x, calls: [], locs: [], d: [] }); };
   lane.forEach(function (x) {
-    var a = A[x.id];
-    if (!x.done) { R.attente.push(x.produit); return; }
-    if (!a) { if (x.cat === 'nd') R.nd.push(x.produit); else R.absents.push(x.produit); return; }
-    var bySite = {}; x.orders.forEach(function (o) { (bySite[o.site] = bySite[o.site] || {})[o.oid] = ((bySite[o.site] || {})[o.oid] || 0) + Math.max(0, o.q - o.miss); });
-    Object.keys(a.prog).forEach(function (loc) {
+    var a = A[x.id], nd = N[x.id];
+    if (!x.done) { R.attente.push(x.produit); D.push({ p: x.produit, s: 'attente', d: 'pas terminé dans l\'appli — non reporté', at: Date.now() }); return; }
+    if (!a && !nd) { R.absents.push(x.produit); D.push({ p: x.produit, s: 'absent', d: 'introuvable sur l\'ancien site', at: Date.now() }); return; }
+    var bySite = {}, wantSite = {};
+    x.orders.forEach(function (o) { var w = Math.max(0, o.q - o.miss); (bySite[o.site] = bySite[o.site] || {})[o.oid] = ((bySite[o.site] || {})[o.oid] || 0) + w; wantSite[o.site] = (wantSite[o.site] || 0) + w; });
+    if (a) Object.keys(a.prog).forEach(function (loc) {
       var pr = a.prog[loc]; if (!pr.ord) return;
       work.push({ x: x, a: a, loc: loc, want: bySite[loc] || {}, pr: pr });
     });
+    if (nd) Object.keys(nd).forEach(function (loc) {
+      var n = nd[loc]; if (!n.ord) return;
+      var q = Q(x), w = Math.min(n.ord, wantSite[loc] || 0), did = [];
+      if (n.rec !== w) { q.calls.push({ route: 'globalorders/update-nondispatch-quantity-received', params: { globalorder_id: G, locale: loc, producerproduct_id: x.id, quantity: w } }); did.push('reçu ' + w + '/' + n.ord); }
+      if (!n.completed) { q.calls.push({ route: 'globalorders/toggle-golpps-completed', params: { globalorder_id: G, locale: loc, producerproduct_id: x.id, userId: ANC_USER_ID, excludedLocales: [], isND: true }, nd: true }); did.push('✓'); }
+      if (did.length) { q.fresh = true; q.ndDone = (q.ndDone || 0) + 1; log(q, 'ND ' + loc + ' ' + did.join(' ')); } else log(q, 'ND ' + loc + ' déjà ok');
+    });
   });
-  if (!work.length) return;
-  var gets = ancAll_(work.map(function (w) { return ancReq_('globalorders/get-dispatch', { globalorder_id: G, locale: w.loc, producerproduct_id: w.x.id, user_id: ANC_USER_ID, couloir: w.a.couloir ? 'sec' : 'frais', getGroupedDispatchProducts: false }); }));
-  R.appels += gets.length;
-  var queues = {};   // par produit : appels à faire DANS L'ORDRE
-  work.forEach(function (w, k) {
-    var g = gets[k]; if (!g.ok) { R.erreurs.push(w.x.produit + ' (' + w.loc + ') : lecture ' + g.err); return; }
-    var pl = ancPlanLocale_(G, w.x.id, w.loc, w.want, (g.j && g.j.dispatch) || []);
-    if (pl.unknown.length) R.inconnus.push(w.x.produit + ' (' + w.loc + ') : ' + pl.unknown.length + ' commande(s) de l\'ancien site absente(s) de l\'appli — laissée(s) telle(s) quelle(s)');
-    var q = queues[w.x.id] || (queues[w.x.id] = { x: w.x, calls: [], locs: [] });
-    pl.calls.forEach(function (c) { q.calls.push(c); });
-    pl.lines.forEach(function (l) { R.poses += l.pose; R.retires += l.retire; });
-    if (pl.unknown.length) { q.noTick = true; return; }   // sécurité : jamais « Fini » sur un lieu où des commandes nous sont inconnues
-    if (!w.pr.completed || pl.calls.length) q.locs.push(w.loc);
-    q.fresh = q.fresh || (!w.pr.completed || pl.calls.length > 0);
+  if (work.length) {
+    var gets = ancAll_(work.map(function (w) { return ancReq_('globalorders/get-dispatch', { globalorder_id: G, locale: w.loc, producerproduct_id: w.x.id, user_id: ANC_USER_ID, couloir: w.a.couloir ? 'sec' : 'frais', getGroupedDispatchProducts: false }); }));
+    R.appels += gets.length;
+    work.forEach(function (w, k) {
+      var g = gets[k], q = Q(w.x); if (!g.ok) { q.err = (q.err || 0) + 1; R.erreurs.push(w.x.produit + ' (' + w.loc + ') : lecture ' + g.err); log(q, w.loc + ' ⚠️ lecture impossible'); return; }
+      var pl = ancPlanLocale_(G, w.x.id, w.loc, w.want, (g.j && g.j.dispatch) || []);
+      if (pl.unknown.length) R.inconnus.push(w.x.produit + ' (' + w.loc + ') : ' + pl.unknown.length + ' commande(s) de l\'ancien site absente(s) de l\'appli — laissée(s) telle(s) quelle(s)');
+      pl.calls.forEach(function (c) { q.calls.push(c); });
+      var po = 0, re = 0; pl.lines.forEach(function (l) { R.poses += l.pose; R.retires += l.retire; po += l.pose; re += l.retire; });
+      var tick = !pl.unknown.length && (!w.pr.completed || pl.calls.length > 0);
+      if (pl.unknown.length) q.noTick = true;
+      else if (tick) q.locs.push(w.loc);
+      if (!w.pr.completed || pl.calls.length > 0) q.fresh = true;
+      log(q, w.loc + ' : ' + (po || re ? (po ? '+' + po + ' posé' + (po > 1 ? 's' : '') : '') + (re ? ' −' + re + ' retiré' + (re > 1 ? 's' : '') : '') : (w.pr.completed ? 'déjà à jour' : '0 à poser')) + (tick ? ' · ✓ Fini' : '') + (pl.unknown.length ? ' · ⚠️ ' + pl.unknown.length + ' commande(s) inconnue(s), pas de coche' : ''));
+    });
+  }
+  var ids = Object.keys(queues);
+  if (!job.dry) {
+    // Écritures : tour par tour, 1 appel par produit et par tour (parallèle entre produits)
+    var more = true;
+    while (more) {
+      more = false; var batch = [], who = [];
+      ids.forEach(function (id) { var q = queues[id]; if (q.calls.length) { var c = q.calls.shift(); batch.push(ancReq_(c.route, c.params)); who.push({ q: q, c: c }); more = more || q.calls.length > 0; } });
+      if (!batch.length) break;
+      var rs = ancAll_(batch); R.appels += rs.length;
+      rs.forEach(function (r, k) { var q = who[k].q; if (!r.ok) { q.err = (q.err || 0) + 1; if (q.err <= 2) R.erreurs.push(q.x.produit + ' : ' + r.err); } else if (who[k].c.nd) R.coches++; });
+    }
+    // Coche « Fini » par lieu (dispatch) — seulement si aucune erreur sur le produit
+    var ticks = [], tw = [];
+    ids.forEach(function (id) { var q = queues[id]; if (q.err) return; q.locs.forEach(function (loc) { ticks.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: id, userId: ANC_USER_ID, completed: true, excludedLocales: [], isND: false })); tw.push(q); }); });
+    var tr = ancAll_(ticks); R.appels += tr.length;
+    tr.forEach(function (r, k) { if (r.ok) R.coches++; else { tw[k].err = (tw[k].err || 0) + 1; R.erreurs.push(tw[k].x.produit + ' : coche Fini ' + r.err); } });
+  } else ids.forEach(function (id) { var q = queues[id]; R.coches += q.locs.length + q.calls.filter(function (c) { return c.nd; }).length; });
+  ids.forEach(function (id) {
+    var q = queues[id];
+    if (q.err) { D.push({ p: q.x.produit, s: 'err', d: q.d.join(' · ') + ' · ⚠️ erreur', at: Date.now() }); return; }
+    if (q.fresh) { R.faits++; if (q.ndDone) R.ndFaits++; } else R.deja++;
+    D.push({ p: q.x.produit, s: q.fresh ? (job.dry ? 'afaire' : 'ok') : 'deja', d: q.d.join(' · '), at: Date.now() });
   });
-  if (job.dry) {   // SIMULATION : on compte, on n'écrit rien
-    Object.keys(queues).forEach(function (id) { var q = queues[id]; if (q.fresh) { R.faits++; R.coches += q.locs.length; } else R.deja++; });
-    return;
-  }
-  // Écritures : tour par tour, 1 appel par produit et par tour (parallèle entre produits)
-  var ids = Object.keys(queues), more = true;
-  while (more) {
-    more = false; var batch = [], who = [];
-    ids.forEach(function (id) { var q = queues[id]; if (q.calls.length) { var c = q.calls.shift(); batch.push(ancReq_(c.route, c.params)); who.push(q); more = more || q.calls.length > 0; } });
-    if (!batch.length) break;
-    var rs = ancAll_(batch); R.appels += rs.length;
-    rs.forEach(function (r, k) { if (!r.ok) { who[k].err = (who[k].err || 0) + 1; if ((who[k].err || 0) <= 2) R.erreurs.push(who[k].x.produit + ' : ' + r.err); } });
-  }
-  // Coche « Fini » par lieu (seulement si aucune erreur sur le produit)
-  var ticks = [], tw = [];
-  ids.forEach(function (id) { var q = queues[id]; if (q.err) return; q.locs.forEach(function (loc) { ticks.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: id, userId: ANC_USER_ID, completed: true, excludedLocales: [], isND: false })); tw.push(q); }); });
-  var tr = ancAll_(ticks); R.appels += tr.length;
-  tr.forEach(function (r, k) { if (r.ok) R.coches++; else R.erreurs.push(tw[k].x.produit + ' : coche Fini ' + r.err); });
-  ids.forEach(function (id) { var q = queues[id]; if (q.err) return; if (q.fresh) R.faits++; else R.deja++; });
+  if (D.length > 700) R.detail = D.slice(-700);
 }
 /** Relit l'ancien site : chaque produit terminé dans l'appli doit être coché partout, avec le bon nombre d'articles posés. */
 function ancVerify_(G, job) {
-  var A = ancProducts_(G), bad = [];
+  var A = ancProducts_(G), N = ancProductsND_(G, ancLocales_(job)), bad = [];
   job.todo.forEach(function (x) {
-    var a = A[x.id]; if (!x.done || !a) return;
+    var a = A[x.id], nd = N[x.id]; if (!x.done || (!a && !nd)) return;
     var want = {}; x.orders.forEach(function (o) { want[o.site] = (want[o.site] || 0) + Math.max(0, o.q - o.miss); });
-    Object.keys(a.prog).forEach(function (loc) {
+    if (nd) Object.keys(nd).forEach(function (loc) { var n = nd[loc]; if (!n.ord) return; var w = Math.min(n.ord, want[loc] || 0); if (!n.completed || n.rec !== w) bad.push(x.produit + ' · ND ' + loc + ' : reçu ' + n.rec + ' / ' + w + ' attendu(s)' + (n.completed ? '' : ' · pas coché')); });
+    if (a) Object.keys(a.prog).forEach(function (loc) {
       var pr = a.prog[loc]; if (!pr.ord) return;
       var w = want[loc] || 0;
       if (!pr.completed || pr.done !== w) bad.push(x.produit + ' · ' + loc + ' : ' + pr.done + ' posé(s) / ' + w + ' attendu(s)' + (pr.completed ? '' : ' · pas coché'));
@@ -246,7 +281,8 @@ function ancPublic_(job) {
   var R = job.res || {};
   return { day: job.day, dry: !!job.dry, state: job.state, by: job.by, startedAt: job.startedAt, endedAt: job.endedAt || '', error: job.error || '',
     n: (job.todo || []).length, i: job.i || 0, faits: R.faits || 0, deja: R.deja || 0, poses: R.poses || 0, retires: R.retires || 0, coches: R.coches || 0, appels: R.appels || 0,
-    attente: (R.attente || []).slice(0, 50), absents: (R.absents || []).slice(0, 50), nd: (R.nd || []).slice(0, 50), erreurs: (R.erreurs || []).slice(0, 50), inconnus: (R.inconnus || []).slice(0, 30),
+    attente: (R.attente || []).slice(0, 50), absents: (R.absents || []).slice(0, 50), nd: (R.nd || []).slice(0, 50), ndFaits: R.ndFaits || 0, erreurs: (R.erreurs || []).slice(0, 50), inconnus: (R.inconnus || []).slice(0, 30),
+    detail: (R.detail || []).slice(-700),
     verif: job.verif || null, live: ancLive_() };
 }
 function ancStatus_(day) {
@@ -260,9 +296,10 @@ function ancStatus_(day) {
 function ancLog_(job) {
   var ss = blSs_(), sh = ss.getSheetByName(ANC_TAB);
   if (!sh) { sh = ss.insertSheet(ANC_TAB); sh.getRange(1, 1, 1, 7).setValues([['DISTRIBUTION', 'LANCÉ', 'FINI', 'MODE', 'RÉSULTAT', 'DÉTAIL', 'DONNÉES']]).setFontWeight('bold').setBackground('#1a4d2e').setFontColor('#fff'); sh.setFrozenRows(1); }
-  var P = ancPublic_(job);
+  var P = ancPublic_(job), js = JSON.stringify(P);
+  if (js.length > 49000) { var P2 = JSON.parse(js); P2.detail = (P2.detail || []).filter(function (d) { return d.s !== 'deja'; }).slice(-250); js = JSON.stringify(P2); if (js.length > 49000) { delete P2.detail; js = JSON.stringify(P2); } }
   sh.appendRow([job.day, job.startedAt, job.endedAt || '', job.dry ? 'SIMULATION' : 'RÉEL', job.state === 'erreur' ? '⚠️ ERREUR' : (P.verif && P.verif.ok ? '✅ OK' : '⚠️ À VÉRIFIER'),
-    P.faits + ' produit(s) · ' + P.poses + ' posé(s) · ' + P.retires + ' retiré(s) · ' + P.coches + ' coche(s)' + (P.erreurs.length ? ' · ' + P.erreurs.length + ' erreur(s)' : ''), JSON.stringify(P).slice(0, 49000)]);
+    P.faits + ' produit(s) · ' + P.poses + ' posé(s) · ' + P.retires + ' retiré(s) · ' + P.coches + ' coche(s) · ' + P.ndFaits + ' ND' + (P.erreurs.length ? ' · ' + P.erreurs.length + ' erreur(s)' : ''), js]);
 }
 function ancMail_(job) {
   var P = ancPublic_(job), ok = job.state !== 'erreur' && P.verif && P.verif.ok && !P.erreurs.length;
@@ -270,12 +307,12 @@ function ancMail_(job) {
   var html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:680px;color:#1b1b1b">'
     + '<div style="background:' + (ok ? '#2e7d32' : '#c62828') + ';color:#fff;border-radius:14px;padding:16px 20px"><div style="font-size:23px;font-weight:900">' + (ok ? '✅' : '⚠️') + ' Ancien site — prépa du ' + rgEsc_(rgLong_(job.day)) + (job.dry ? ' (SIMULATION)' : '') + '</div>'
     + '<div style="font-size:16px;margin-top:4px">' + (job.state === 'erreur' ? 'Arrêté : ' + rgEsc_(job.error) : P.faits + ' produit(s) reporté(s) · ' + P.deja + ' déjà à jour') + '</div></div>'
-    + '<p style="font-size:15px;margin:12px 2px"><b>' + P.poses + '</b> article(s) posé(s) · <b>' + P.retires + '</b> retiré(s) · <b>' + P.coches + '</b> coche(s) « Fini »' + (job.dry ? ' — <b>à faire</b> (rien n\'a été écrit)' : '') + '</p>'
+    + '<p style="font-size:15px;margin:12px 2px"><b>' + P.poses + '</b> article(s) posé(s) · <b>' + P.retires + '</b> retiré(s) · <b>' + P.coches + '</b> coche(s) « Fini » · <b>' + P.ndFaits + '</b> ND reçu(s)' + (job.dry ? ' — <b>à faire</b> (rien n\'a été écrit)' : '') + '</p>'
     + (P.verif ? '<p style="font-size:15px;margin:4px 2px">' + (P.verif.ok ? '🔎 Vérification : l\'ancien site correspond à la prépa de l\'appli.' : '🔎 Vérification : <b>' + P.verif.nBad + ' écart(s)</b> avec la prépa de l\'appli') + '</p>' : '')
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
-    + li('🥬 ND (réception non-dispatch, à faire à la main)', P.nd, '#00838f') + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.0 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+    + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.1 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
   MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
 
