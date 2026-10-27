@@ -1,5 +1,7 @@
 /**
- * KBG_BL.gs — v1.1 (22/10/2026) — v1.1 : si le CODE PROBON du Sheet est le code article du BL (ex. œufs A00900), rapprochement direct — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
+ * KBG_BL.gs — v1.2 (27/10/2026) — v1.2 : rapprochement BL ↔ commande du jour (nom + quantité + colisage + prix, 2 lignes BL pour 1 produit), « non livré » en gris (info),
+ *   absents du BL vérifiés dans le PVTTC (version actuelle + 2 précédentes), attendu détaillé (kg/pce, colis × colisage, MU), écarts de prix en bas.
+ * v1.1 (22/10/2026) — v1.1 : si le CODE PROBON du Sheet est le code article du BL (ex. œufs A00900), rapprochement direct — à ajouter dans le projet Apps Script « FL_Probon_Proxy »
  * ---------------------------------------------------------------------------------------------
  * CONTRÔLE DU BON DE LIVRAISON RUNGIS (BL) contre la commande KBG du jour.
  *
@@ -239,17 +241,28 @@ function blParse_(items) {
   return { date: date, num: num, ref: ref, totalHt: totalHt, lines: lines };
 }
 
-/* ═════════════════════════════ 3) RAPPROCHEMENT BL ↔ CODE PROBON ═════════════════════════════ */
-var BL_STOP = { BIO: 1, FR: 1, KG: 1, PCE: 1, PC: 1, PIECE: 1, PIECES: 1, DE: 1, DU: 1, LA: 1, LE: 1, LES: 1, DES: 1, ET: 1, EN: 1, A: 1, AU: 1, G: 1, GR: 1, BQ: 1, BARQ: 1, BARQUETTE: 1, SACHET: 1, CAT: 1, CAL: 1, VARIETES: 1, MULTIPLES: 1, ESP: 1, IT: 1, ITA: 1 };
+/* ═════════════════════════════ 3) RAPPROCHEMENT BL ↔ CODE PROBON (v1.2) ═════════════════════════════
+ * Le code du BL (A00xxx) n'est pas le code Probon interne. v1.2 : on se sert de TOUT ce qu'on sait —
+ *   • la concordance déjà apprise (onglet CONCORDANCE BL),
+ *   • la COMMANDE du jour : quantité attendue (colis × colisage), colisage (« 5KG » dans le BL = COL 5),
+ *   • le PVTTC : désignation Rungis + prix d'achat (= prix net du BL),
+ *   • le nom KBG.
+ * Chaque ligne du BL reçoit un score pour chaque produit commandé ; affectation du meilleur au moins bon.
+ * Un même produit KBG peut recevoir 2 lignes du BL (ex. CHOU FLEUR 11PC + CHOU FLEUR 8PC → quantités additionnées).
+ * Relié tout seul si le score est net (et mémorisé dans CONCORDANCE BL si c'est bien le même produit). */
+var BL_STOP = { BIO: 1, FR: 1, ES: 1, IT: 1, ITA: 1, KG: 1, PCE: 1, PC: 1, PIECE: 1, PIECES: 1, DE: 1, DU: 1, LA: 1, LE: 1, LES: 1, DES: 1, ET: 1, EN: 1, A: 1, AU: 1, G: 1, GR: 1, BQ: 1, BARQ: 1, BARQUETTE: 1, SACHET: 1, CAT: 1, CAL: 1, VARIETES: 1, VARIETE: 1, MULTIPLES: 1, MULTIPLE: 1, ESP: 1,
+  AROMATIQUE: 1, LAVEE: 1, LAVE: 1, COLIS: 1, BOIS: 1, CORSE: 0, SELON: 1, ARRIVAGE: 1, COULEUR: 1, BOITE: 1, BOITES: 1 };
+var BL_SYN = { RAINBOW: 'RAIMBOW', COLOREE: 'RAIMBOW', COLORE: 'RAIMBOW', CLEMENTINE: 'CLEMENTINE', CHANTECLERC: 'CHANTECLER', REINETTE: 'REINETTE' };
 function blTok_(s) {
   return String(s == null ? '' : s).normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()
-    .replace(/\b(P|PDT)\b\.?\s*(DE\s+)?TERRE\b/g, 'POMME TERRE').replace(/\bPOMMES\b/g, 'POMME').replace(/\bOIGNONS\b/g, 'OIGNON').replace(/\bPOIRES\b/g, 'POIRE')
+    .replace(/\b(P|PDT)\b\.?\s*(DE\s+)?TERRE\b/g, 'POMME TERRE')
     .replace(/[^A-Z0-9]+/g, ' ').trim().split(' ')
+    .map(function (w) { if (w.length > 4 && /S$/.test(w)) w = w.slice(0, -1); return BL_SYN[w] || w; })   // pluriels : POMMES, OIGNONS, CAROTTES…
     .filter(function (w) { return w && !BL_STOP[w] && !/\d/.test(w) && w.length > 1; });
 }
 function blTokEq_(a, b) {
   if (a === b) return true;
-  if (a.length < 5 || b.length < 5) return false;
+  if (!a || !b || a.length < 5 || b.length < 5) return false;
   if (a.indexOf(b) === 0 || b.indexOf(a) === 0) return true;                 // CHANTECLER / CHANTECLERC
   if (Math.abs(a.length - b.length) > 1) return false;
   var i = 0, j = 0, diff = 0;                                                  // 1 lettre d'écart au plus
@@ -260,6 +273,7 @@ function blTokEq_(a, b) {
   }
   return diff + (a.length - i) + (b.length - j) <= 1;
 }
+function blHead_(s) { return blTok_(s)[0] || ''; }
 function blSim_(a, b) {
   var A = blTok_(a), B = blTok_(b); if (!A.length || !B.length) return 0;
   var ua = {}, ub = {}; A.forEach(function (w) { ua[w] = 1; }); B.forEach(function (w) { ub[w] = 1; });
@@ -268,124 +282,156 @@ function blSim_(a, b) {
   var dice = 2 * inter / (ka.length + kb.length);
   return (blTokEq_(A[0], B[0]) ? 0.15 : 0) + dice;      // même 1er mot (le produit) = bonus
 }
-/** Propose un code Probon pour une ligne de BL.
- *  PV  = PVTTC ({list:[{code,des,pa}], byCode}) ; exp = attendus du jour ({code:{des,pa}}) ; taken = codes déjà reliés à une autre ligne du BL.
- *  Sûr (enregistré tout seul) seulement si :
- *   (a) parmi les produits COMMANDÉS ce jour : même produit (1er mot identique, nom ≥ 75 % proche — désignation PVTTC ou KBG)
- *       et aucun autre produit commandé presque aussi proche (écart ≥ 0,15) ;
- *   (b) sinon dans tout PVTTC : nom quasi identique (≥ 95 %), même prix (±0,02 €) et aucun autre candidat proche.
- *  Sinon : « à rapprocher » dans l'appli avec les meilleures suggestions (jamais de supposition silencieuse). */
-function blGuess_(line, PV, exp, taken) {
-  taken = taken || {}; exp = exp || {};
-  var byCode = PV.byCode || {}, cand = {};
-  var put = function (code, des, pa, inExp) {
-    code = String(code); if (taken[code]) return;
-    var s = blSim_(line.des, des), dp = pa ? Math.abs(Number(pa) - (Number(line.prix) || 0)) : 9;
-    var c = cand[code] || (cand[code] = { code: code, des: des, sim: 0, dp: 9, exp: false });
-    if (s > c.sim) { c.sim = s; c.des = des; }
-    if (dp < c.dp) c.dp = dp;
-    if (inExp) c.exp = true;
-  };
-  Object.keys(exp).forEach(function (code) {
-    var x = exp[code]; put(code, x.des, x.pa, true);
-    if (byCode[code]) put(code, byCode[code].des, byCode[code].pa, true);
-  });
-  (PV.list || []).forEach(function (x) { put(x.code, x.des, x.pa, !!exp[String(x.code)]); });
-  var all = Object.keys(cand).map(function (k) { return cand[k]; }).filter(function (x) { return x.sim >= 0.5; });
-  var head = blTok_(line.des)[0] || '';
-  var headOk = function (x) { return blTokEq_(blTok_(x.des)[0] || '', head); };
-  var ex = all.filter(function (x) { return x.exp; }).sort(function (a, b) { return b.sim - a.sim; });
-  var sure = '';
-  if (ex.length && ex[0].sim >= 0.75 && headOk(ex[0]) && (!ex[1] || ex[0].sim - ex[1].sim >= 0.15)) sure = ex[0].code;
-  if (!sure) {
-    var pv = all.slice().sort(function (a, b) { return (b.sim + (b.dp <= 0.02 ? 0.35 : 0)) - (a.sim + (a.dp <= 0.02 ? 0.35 : 0)); });
-    if (pv.length && pv[0].sim >= 0.95 && pv[0].dp <= 0.02 && headOk(pv[0]) && (!pv[1] || pv[0].sim - pv[1].sim >= 0.2)) sure = pv[0].code;
-  }
-  var top = all.sort(function (a, b) { return (b.sim + (b.exp ? 0.3 : 0)) - (a.sim + (a.exp ? 0.3 : 0)); }).slice(0, 6)
-    .map(function (x) { return { code: x.code, des: x.des, sim: Math.round(x.sim * 100), exp: x.exp }; });
-  return { sure: sure, top: top };
+/** Colisage et unité écrits à la fin de la désignation du BL : « … 5KG » → {col:5, ua:'KG'}, « … 12PC » → {col:12, ua:'PCE'}. */
+function blColOf_(des) {
+  var m = String(des || '').match(/(\d+(?:[.,]\d+)?)\s*(KG|PCE|PC)\s*$/i);
+  return m ? { col: Number(m[1].replace(',', '.')), ua: /KG/i.test(m[2]) ? 'KG' : 'PCE' } : { col: 0, ua: '' };
 }
-
-/** Rapprochement automatique de toutes les lignes inconnues du BL (3 passes : un code relié libère les suivants).
- *  Ajoute les correspondances sûres dans conc (muté) et retourne {blCode: guess} pour les lignes traitées. */
-function blAutoConc_(bl, PV, exp, conc) {
-  var guesses = {};
-  for (var pass = 0; pass < 3; pass++) {
-    var taken = {}; Object.keys(conc).forEach(function (k) { (conc[k] || []).forEach(function (c) { taken[c] = 1; }); });
-    var claim = {}, changed = false;
-    bl.lines.forEach(function (l) {
-      if (conc[l.code] && conc[l.code].length) return;
-      var g = blGuess_(l, PV, exp, taken); guesses[l.code] = g;
-      if (g.sure) (claim[g.sure] = claim[g.sure] || []).push(l.code);
+/** Unité d'un produit attendu : UA du PVTTC, sinon celle du BL, sinon d'après le type KBG. */
+function blUnit_(x, PV, line) {
+  var pv = (PV && PV.byCode && PV.byCode[x.code]) || {};
+  var u = pv.ua || (line && line.ua) || (/PIECE/i.test(x.type || '') ? 'PCE' : 'KG');
+  return /^P/i.test(u) ? 'pce' : 'kg';
+}
+/** Score d'une ligne du BL pour un produit attendu. */
+function blScore_(l, x, PV, learned) {
+  var pv = (PV.byCode || {})[x.code] || {};
+  var sim = Math.max(blSim_(l.des, x.des), pv.des ? blSim_(l.des, pv.des) : 0);
+  var h = blHead_(l.des);
+  var head = !!h && (blTokEq_(h, blHead_(x.des)) || (!!pv.des && blTokEq_(h, blHead_(pv.des))));
+  var s = sim, why = [];
+  if (learned) { s += 0.6; why.push('concordance'); }
+  var hi = Math.ceil((x.colis || 0) - 1e-9) * (x.col || 0), lo = Math.min(x.qty || 0, hi || x.qty || 0);
+  if (l.qte > 0 && x.qty > 0 && (Math.abs(l.qte - hi) < 0.011 || Math.abs(l.qte - x.qty) < 0.011)) { s += 0.35; why.push('même quantité'); }
+  else if (l.qte > 0 && x.qty > 0 && l.qte >= lo * (1 - BL_TOL) - 0.01 && l.qte <= (hi || x.qty) * (1 + BL_TOL) + 0.01) { s += 0.2; why.push('quantité proche'); }
+  if (l.col && x.col && Math.abs(l.col - x.col) < 0.011) { s += 0.15; why.push('même colisage'); }
+  var pa = pv.pa || x.pa; if (pa && l.prix && Math.abs(pa - l.prix) <= 0.02) { s += 0.2; why.push('même prix'); }
+  return { code: String(x.code), s: Math.round(s * 100) / 100, sim: Math.round(sim * 100) / 100, head: head, learned: !!learned, why: why };
+}
+/** PVTTC : le produit Rungis qui EST cette ligne du BL (même nom, même prix, même colisage) — pour les lignes hors commande. */
+function blPvIdentity_(l, PV) {
+  var c = (PV.list || []).map(function (x) {
+    var sim = blSim_(l.des, x.des), ok = blTokEq_(blHead_(l.des), blHead_(x.des)) && sim >= 0.8 && (!x.pa || Math.abs(x.pa - l.prix) <= 0.02) && (!l.col || !x.col || Math.abs(x.col - l.col) < 0.011);
+    return ok ? { code: String(x.code), des: x.des, sim: sim } : null;
+  }).filter(Boolean).sort(function (a, b) { return b.sim - a.sim; });
+  return c.length && (c.length === 1 || c[0].sim - c[1].sim >= 0.1) ? c[0] : null;
+}
+/** Affecte chaque ligne du BL à un produit attendu.
+ *  Retourne { asg: {blCode: {code, s, sim, head, learned, sure, why}}, top: {blCode: [suggestions]} } — fonction pure. */
+function blMatch_(bl, exp, conc, PV) {
+  var pairs = [], top = {};
+  bl.lines.forEach(function (l) {
+    var lc = (conc[l.code] || []).map(String), all = [];
+    Object.keys(exp).forEach(function (code) {
+      var learned = lc.indexOf(String(code)) >= 0 || String(l.code) === String(code);
+      var p = blScore_(l, exp[code], PV, learned);
+      if (!(p.learned || (p.head && p.sim >= 0.5) || p.sim >= 0.7)) return;
+      p.blCode = l.code; all.push(p); pairs.push(p);
     });
-    Object.keys(claim).forEach(function (code) {
-      if (claim[code].length !== 1) { claim[code].forEach(function (bc) { guesses[bc].sure = ''; }); return; } // 2 lignes pour 1 code : on ne tranche pas
-      conc[claim[code][0]] = [code]; changed = true;
-    });
-    if (!changed) break;
-  }
-  Object.keys(guesses).forEach(function (bc) { if (!(conc[bc] && conc[bc].length)) guesses[bc].sure = ''; else guesses[bc].sure = guesses[bc].sure || conc[bc][0]; });
-  return guesses;
+    all.sort(function (a, b) { return b.s - a.s; });
+    top[l.code] = all.slice(0, 6).map(function (p) { return { code: p.code, des: exp[p.code].des, sim: Math.round(p.s * 100), exp: true }; });
+  });
+  pairs.sort(function (a, b) { return b.s - a.s; });
+  var asg = {}, byCode = {};
+  pairs.forEach(function (p) {
+    if (asg[p.blCode]) return;
+    var taken = byCode[p.code];
+    // 2e ligne du BL pour un produit déjà pris : seulement si c'est clairement le même produit (2 formats)
+    if (taken && !(p.learned || (p.head && p.sim >= 0.8))) return;
+    asg[p.blCode] = p; (byCode[p.code] = byCode[p.code] || []).push(p.blCode);
+  });
+  Object.keys(asg).forEach(function (bc) {
+    var p = asg[bc], second = 0;
+    pairs.forEach(function (q) { if (q.blCode === bc && q.code !== p.code && q.s > second) second = q.s; });
+    p.second = second;
+    p.sure = p.learned || (p.s >= 0.9 && p.s - second >= 0.15) || p.s >= 1.25;
+  });
+  return { asg: asg, top: top };
 }
 
 /* ═════════════════════════════ 4) COMPARAISON ═════════════════════════════ */
-/** exp : {code: {code, des, prod, colis, col, qty, pa, cmdColis, rajColis}} — qty = colis × col (kg ou pièces).
- *  conc : {blCode: ["1043", …]}. Retourne { lines:[…], missing:[…], counts, alert } — fonction pure (testée hors Apps Script). */
-function blCompare_(bl, exp, conc, guesses) {
-  var used = {}, out = [];
+/** exp : {code: {code, des, prod, colis, col, qty, pa, cmdColis, rajColis, uv, type, estim}} — qty = colis × col (kg ou pièces).
+ *  conc : {blCode: ["1043", …]}. Retourne { lines:[…], missing:[…], counts, learn:[…] } — fonction pure (testée hors Apps Script). */
+function blCompare_(bl, exp, conc, PV, M) {
+  PV = PV || { list: [], byCode: {} };
+  M = M || blMatch_(bl, exp, conc, PV);
+  var out = [], groups = {}, learn = [];
   bl.lines.forEach(function (l) {
-    var codes = (conc[l.code] || []).filter(Boolean), g = guesses && guesses[l.code];
-    var r = { blCode: l.code, des: l.des, prix: l.prix, qte: l.qte, total: l.total, codes: codes, status: '', msg: '', attendu: null, colis: null, col: null, ecart: 0, prixKbg: null, top: g ? g.top : [] };
-    if (!codes.length) {
-      r.status = 'rapprocher';
-      r.msg = 'Produit du BL pas encore relié à un code Probon — à rapprocher (une seule fois)';
-      out.push(r); return;
-    }
-    var e = codes.map(function (c) { return exp[c]; }).filter(Boolean);
-    codes.forEach(function (c) { used[c] = 1; });
-    if (!e.length) {
+    var p = M.asg[l.code];
+    var r = { blCode: l.code, des: l.des, prix: l.prix, qte: l.qte, total: l.total, ua: l.ua || '', codes: [], status: '', msg: '', attendu: null, colis: null, col: null, ecart: 0, prixKbg: null, top: M.top[l.code] || [] };
+    if (p && p.sure) {
+      r.codes = [p.code]; r.match = p.learned ? 'concordance' : 'deviné';
+      if (!p.learned) {
+        r.why = p.why.join(' · ');
+        if (p.head && p.sim >= 0.65) learn.push({ blCode: l.code, blDes: l.des, code: p.code, des: exp[p.code].des });
+        else r.equiv = true;   // autre variété / autre format livré à la place (pas mémorisé)
+      }
+      (groups[p.code] = groups[p.code] || []).push(r);
+    } else if (p) {
+      r.status = 'rapprocher'; r.guess = p.code;
+      r.msg = 'Probablement « ' + exp[p.code].des + ' » (code ' + p.code + ') — à confirmer';
+    } else {
+      var id = blPvIdentity_(l, PV), lc = (conc[l.code] || []);
+      if (lc.length || id) r.codes = lc.length ? lc.map(String) : [id.code];
+      r.pvDes = id ? id.des : '';
       r.status = l.qte > 0 ? 'nonCommande' : 'ok0';
       r.msg = l.qte > 0 ? 'Livré mais PAS dans la commande KBG du jour' : 'Ligne à 0 (non commandé)';
-      out.push(r); return;
     }
-    var att = 0, colis = 0, colMax = 0, rajColis = 0, unknown = false, hi = 0, pa = 0, des = [];
-    e.forEach(function (x) {
-      if (x.unknown) unknown = true;
-      att += x.qty; colis += x.colis; rajColis += x.rajColis || 0; colMax = Math.max(colMax, x.col || 0);
-      hi += Math.max(x.qty, Math.ceil(x.colis - 1e-9) * (x.col || 0)); if (x.pa) pa = x.pa; des.push(x.des);
-    });
-    r.attendu = Math.round(att * 100) / 100; r.colis = Math.round(colis * 10) / 10; r.col = colMax; r.rajColis = rajColis; r.kbg = des.join(' + ');
-    r.prixKbg = pa || null;
-    var lo = att * (1 - BL_TOL) - 0.01, up = hi * (1 + BL_TOL) + 0.01;
-    if (unknown) { r.status = 'aConfirmer'; r.msg = 'Quantité à confirmer (produit vendu absent du Sheet)'; }
-    else if (att > 0 && l.qte <= 0) { r.status = 'manquant'; r.ecart = -att; r.msg = 'NON LIVRÉ (0 sur le BL)'; }
-    else if (l.qte < lo) { r.status = 'moins'; r.ecart = Math.round((l.qte - att) * 100) / 100; r.msg = 'Livré en MOINS'; }
-    else if (l.qte > up) { r.status = 'plus'; r.ecart = Math.round((l.qte - att) * 100) / 100; r.msg = 'Livré en PLUS'; }
-    else { r.status = 'ok'; r.msg = 'Conforme'; }
-    if (r.status === 'moins' || r.status === 'manquant') {
-      if (rajColis > 0 && Math.abs((att - l.qte) - rajColis * colMax) <= Math.max(0.5, att * BL_TOL)) r.msg += ' — le rajout de la veille (' + blFmt_(rajColis, 1) + ' colis) n\'a pas été livré';
-    }
-    if (r.prixKbg && Math.abs(r.prix - r.prixKbg) > BL_PRIX_TOL) r.prixEcart = Math.round((r.prix - r.prixKbg) * 100) / 100;
     out.push(r);
   });
-  var missing = Object.keys(exp).filter(function (c) { return !used[c] && exp[c].qty > 0 && !exp[c].unknown; }).map(function (c) {
-    var x = exp[c]; return { code: c, des: x.des, prod: x.prod, colis: x.colis, col: x.col, attendu: Math.round(x.qty * 100) / 100, rajColis: x.rajColis || 0, status: 'absent', msg: 'Commandé mais ABSENT du BL' };
+  Object.keys(groups).forEach(function (code) {
+    var x = exp[code], rs = groups[code].sort(function (a, b) { return b.qte - a.qte; }), r = rs[0];
+    var qte = rs.reduce(function (a, y) { return a + (Number(y.qte) || 0); }, 0);
+    var colisE = Math.ceil((x.colis || 0) - 1e-9), hi = colisE * (x.col || 0), att = hi || x.qty;
+    r.code = code; r.kbg = x.des; r.prod = x.prod; r.attendu = Math.round(att * 100) / 100; r.besoin = Math.round(x.qty * 100) / 100;
+    r.colis = colisE; r.colisCmd = Math.round((x.colis || 0) * 10) / 10; r.col = x.col; r.rajColis = x.rajColis || 0;
+    r.unit = blUnit_(x, PV, r); r.estim = x.estim || 0; r.uv = x.uv || ''; r.qteTot = Math.round(qte * 100) / 100;
+    if (rs.length > 1) { r.autres = rs.slice(1).map(function (y) { return { blCode: y.blCode, des: y.des, qte: y.qte }; });
+      rs.slice(1).forEach(function (y) { y.status = 'lie'; y.code = code; y.kbg = x.des; y.msg = 'Compté avec « ' + r.des + ' » (même produit KBG)'; }); }
+    r.prixKbg = ((PV.byCode || {})[code] || {}).pa || x.pa || null;
+    var lo = Math.min(x.qty, att) * (1 - BL_TOL) - 0.01, up = att * (1 + BL_TOL) + 0.01;
+    if (x.unknown) { r.status = 'aConfirmer'; r.msg = 'Quantité à confirmer (produit vendu absent du Sheet)'; }
+    else if (att > 0 && qte <= 0) { r.status = 'manquant'; r.ecart = -att; r.msg = 'Non livré : Rungis a mis 0 sur le BL (pour info)'; }
+    else if (qte < lo) { r.status = 'moins'; r.ecart = Math.round((qte - att) * 100) / 100; r.msg = 'Livré en MOINS'; }
+    else if (qte > up) { r.status = 'plus'; r.ecart = Math.round((qte - att) * 100) / 100; r.msg = 'Livré en PLUS'; }
+    else { r.status = 'ok'; r.msg = 'Conforme'; }
+    if ((r.status === 'moins' || r.status === 'manquant') && r.rajColis > 0 && Math.abs((att - qte) - r.rajColis * (x.col || 0)) <= Math.max(0.5, att * BL_TOL))
+      r.msg += ' — le rajout de la veille (' + blFmt_(r.rajColis, 1) + ' colis) n\'a pas été livré';
+    if (r.equiv) r.msg += ' · livré à la place : « ' + r.des + ' »';
+    rs.forEach(function (y) { if (y.prixKbg == null && y !== r) y.prixKbg = r.prixKbg; if (y.prixKbg && y.prix && Math.abs(y.prix - y.prixKbg) > BL_PRIX_TOL) y.prixEcart = Math.round((y.prix - y.prixKbg) * 100) / 100; });
+    if (r.prixKbg && r.prix && Math.abs(r.prix - r.prixKbg) > BL_PRIX_TOL) r.prixEcart = Math.round((r.prix - r.prixKbg) * 100) / 100;
   });
-  // Commandé mais absent : si une ligne du BL « à rapprocher » le propose, c'est probablement elle (pas un écart tant que non confirmé)
-  missing.forEach(function (m) {
-    var cand = out.filter(function (r) { return r.status === 'rapprocher' && (r.top || []).some(function (t) { return String(t.code) === String(m.code); }); })[0];
-    if (cand) { m.status = 'absentProbable'; m.msg = 'Probablement « ' + cand.des + ' » du BL (' + blFmt_(cand.qte) + ') — à confirmer dans l\'appli'; m.blCode = cand.blCode; }
+  var missing = Object.keys(exp).filter(function (c) { return !groups[c] && exp[c].qty > 0 && !exp[c].unknown; }).map(function (c) {
+    var x = exp[c], colisE = Math.ceil((x.colis || 0) - 1e-9);
+    var m = { code: c, des: x.des, prod: x.prod, colis: colisE, colisCmd: Math.round((x.colis || 0) * 10) / 10, col: x.col, attendu: Math.round((colisE * (x.col || 0) || x.qty) * 100) / 100,
+      besoin: Math.round(x.qty * 100) / 100, rajColis: x.rajColis || 0, unit: blUnit_(x, PV), estim: x.estim || 0, uv: x.uv || '', status: 'absent', msg: 'Commandé mais ABSENT du BL' };
+    var g = out.filter(function (r) { return r.status === 'rapprocher' && r.guess === c; })[0];
+    if (g) { m.status = 'absentProbable'; m.blCode = g.blCode; m.msg = 'Probablement « ' + g.des + ' » du BL (' + blFmt_(g.qte) + ') — à confirmer'; }
+    return m;
   });
-  var res = { lines: out, missing: missing };
+  var res = { lines: out, missing: missing, learn: learn };
   res.counts = blCount_(res);
   return res;
 }
+/** Absents du BL : sont-ils dans la mercuriale PVTTC ? (version actuelle puis les 2 précédentes) */
+function blPvCheck_(missing, H) {
+  if (!H || !H.length) return;
+  var cur = H[0], d = function (v) { return 'PVTTC du ' + rgFr_(v.date) + (v.tab ? ' (' + v.tab + ')' : ''); };
+  missing.forEach(function (m) {
+    if (m.status !== 'absent' || !/^\d{4,}$/.test(String(m.code))) return;   // codes Probon (≥ 4 chiffres) ; œufs A00900 / anciens formats 1-4 : pas dans le PVTTC
+    if (cur.codes[m.code]) { m.pv = 'cur'; m.pvMsg = 'Bien dans la mercuriale (' + d(cur) + ') : Rungis ne l\'a pas livré.'; return; }
+    var old = H.slice(1).filter(function (v) { return v.codes[m.code]; })[0];
+    m.status = 'horsPvttc';
+    if (old) { m.pv = 'old'; m.pvMsg = 'Présent dans la ' + d(old) + ', plus dans la ' + d(cur) + ' : Rungis l\'a retiré. On le vend encore sur le stock restant… ou c\'est une erreur (produit à passer inactif dans COMMANDE FL ?).'; }
+    else { m.pv = 'none'; m.pvMsg = 'Absent de la ' + d(cur) + (H.length > 1 ? ' et des ' + (H.length - 1) + ' version(s) précédente(s) (depuis le ' + rgFr_(H[H.length - 1].date) + ')' : '') + ' : on le vend sur le stock restant, ou erreur de code Probon dans COMMANDE FL.'; }
+  });
+}
 function blCount_(res) {
-  var cnt = { ok: 0, ok0: 0, moins: 0, plus: 0, manquant: 0, absent: 0, absentProbable: 0, nonCommande: 0, rapprocher: 0, aConfirmer: 0, prix: 0 };
+  var cnt = { ok: 0, ok0: 0, lie: 0, moins: 0, plus: 0, manquant: 0, absent: 0, horsPvttc: 0, absentProbable: 0, nonCommande: 0, rapprocher: 0, aConfirmer: 0, prix: 0 };
   res.lines.forEach(function (r) { if (cnt[r.status] != null) cnt[r.status]++; if (r.prixEcart) cnt.prix++; });
   res.missing.forEach(function (m) { cnt[m.status] = (cnt[m.status] || 0) + 1; });
-  res.nEcarts = cnt.moins + cnt.plus + cnt.manquant + cnt.absent + cnt.nonCommande;
-  res.alert = res.nEcarts > 0 || cnt.rapprocher > 0;
+  res.nEcarts = cnt.moins + cnt.plus + cnt.absent + cnt.horsPvttc + cnt.nonCommande;   // « non livré » (0 sur le BL) = pour info
+  res.alert = res.nEcarts > 0 || cnt.rapprocher > 0 || cnt.manquant > 0;
   return cnt;
 }
 function blFmt_(n, dec) { var p = Math.pow(10, dec == null ? 2 : dec); var x = Math.round(Number(n || 0) * p) / p; return String(x).replace('.', ','); }
@@ -423,9 +469,10 @@ function blExpected_(day, PV) {
   for (var i = v.length - 1; i >= 1; i--) { var d = v[i][0] instanceof Date ? rgIso_(v[i][0]) : String(v[i][0]).slice(0, 10); if (d === day) { snap = v[i]; break; } }
   var exp = {}, fl = rgReadFL_(), byDes = {};
   fl.rows.forEach(function (r) { if (r.code) byDes[rgNorm_(r.designation)] = r; });
-  var add = function (code, des, prod, colis, col, pa, kind, unknown) {
+  var add = function (code, des, prod, colis, col, pa, kind, unknown, more) {
     code = String(code || '').trim(); if (!code) return false;
-    var x = exp[code] || (exp[code] = { code: code, des: des, prod: prod, colis: 0, col: Number(col) || 0, qty: 0, pa: Number(pa) || 0, cmdColis: 0, rajColis: 0, unknown: false });
+    var x = exp[code] || (exp[code] = { code: code, des: des, prod: prod, colis: 0, col: Number(col) || 0, qty: 0, pa: Number(pa) || 0, cmdColis: 0, rajColis: 0, unknown: false, uv: '', type: '', estim: 0 });
+    if (more) { if (more.uv && !x.uv) x.uv = more.uv; if (more.type && !x.type) x.type = more.type; x.estim += Number(more.estim) || 0; }
     colis = Number(colis) || 0;
     x.colis += colis; x.qty += colis * (Number(col) || x.col || 0);
     if (kind === 'raj') x.rajColis += colis; else x.cmdColis += colis;
@@ -439,7 +486,7 @@ function blExpected_(day, PV) {
     arr.forEach(function (x) {   // [code, producteur, designation, colis, col, uv, type, pa, totalHt, cmd5h, estim, …]
       var hors = /PAS dans le Sheet/.test(String(x[2] || ''));
       var des = String(x[2] || '').replace(/\s*⚠️.*$/, '');
-      if (!add(x[0], des, x[1], x[3], x[4], x[7], 'cmd', hors && !(Number(x[3]) > 0))) noCode.push({ des: des, prod: x[1], colis: x[3], hors: hors });
+      if (!add(x[0], des, x[1], x[3], x[4], x[7], 'cmd', hors && !(Number(x[3]) > 0), { uv: String(x[5] || ''), type: String(x[6] || ''), estim: x[10] })) noCode.push({ des: des, prod: x[1], colis: x[3], hors: hors });
     });
   }
   var raj = [];
@@ -468,25 +515,26 @@ function kbBlCheck_(p) {
     if (m) { var y = m[3] ? (m[3].length === 2 ? '20' + m[3] : m[3]) : Utilities.formatDate(new Date(), RG_TZ, 'yyyy'); bl.date = y + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2); }
     else bl.date = p.mailDate && /^\d{4}-\d{2}-\d{2}/.test(p.mailDate) ? String(p.mailDate).slice(0, 10) : rgIso_(new Date());
   }
+  bl.lines.forEach(function (l) { var c = blColOf_(l.des); l.col = c.col; l.ua = c.ua; });   // v1.2 — colisage lu sur le BL (« 5KG »)
   var PV = { list: [], byCode: {} }; try { PV = flAutoReadPvttc_(); } catch (e) {}
   var E = blExpected_(bl.date, PV);
   var conc = blConcRead_();
-  bl.lines.forEach(function (l) { if (E.exp[l.code]) conc[l.code] = [l.code]; });   // v1.1 : même code des deux côtés (A00900…)
-  var guesses = blAutoConc_(bl, PV, E.exp, conc);
-  Object.keys(guesses).forEach(function (bc) {
-    var g = guesses[bc]; if (!g.sure) return;
-    var l = bl.lines.filter(function (x) { return x.code === bc; })[0];
-    blConcWrite_(bc, l ? l.des : '', [g.sure], (E.exp[g.sure] || {}).des || (PV.byCode[g.sure] || {}).des || '', 'auto (produit commandé / PVTTC)', 'contrôle BL');
-  });
+  var res = blCompare_(bl, E.exp, conc, PV);
+  // v1.2 — mémorise les rapprochements sûrs (même produit) pour les prochains BL
+  res.learn.forEach(function (x) { if (!(conc[x.blCode] && conc[x.blCode].length)) { try { blConcWrite_(x.blCode, x.blDes, [x.code], x.des, 'auto v1.2 (commande du jour : nom + quantité + colisage + prix)', 'contrôle BL'); } catch (e) {} } });
   // Produits vendus hors Sheet (sans code) : rapprochés par le nom pour info « quantité à confirmer »
-  var res = blCompare_(bl, E.exp, conc, guesses);
   res.lines.forEach(function (r) {
     if (r.status !== 'rapprocher' && r.status !== 'nonCommande') return;
     var h = E.noCode.filter(function (n) { return blSim_(r.des, n.des) >= 0.75 && blTokEq_(blTok_(r.des)[0] || '', blTok_(n.des)[0] || ''); })[0];
     if (h) { r.status = 'aConfirmer'; r.kbg = h.des; r.msg = h.hors ? 'Produit vendu absent du Sheet (commandé « quantité à confirmer ») — à vérifier' : 'Rajout sans code Probon — à vérifier'; }
   });
+  // v1.2 — absents du BL : contrôle dans la mercuriale PVTTC (version actuelle + 2 précédentes)
+  var H = []; try { H = blPvHist_(PV); } catch (e) { res.pvErr = String(e.message || e); }
+  blPvCheck_(res.missing, H);
   res.counts = blCount_(res);
-  var data = { day: bl.date, num: bl.num, ref: bl.ref, totalHt: bl.totalHt, nLines: bl.lines.length, snapFound: E.snapFound, sentAt: E.sentAt, nRaj: E.nRaj,
+  delete res.learn;
+  var data = { v: '1.2', day: bl.date, num: bl.num, ref: bl.ref, totalHt: bl.totalHt, nLines: bl.lines.length, snapFound: E.snapFound, sentAt: E.sentAt, nRaj: E.nRaj,
+    pvVersions: H.map(function (v) { return { date: v.date, tab: v.tab, n: v.n }; }), pvErr: res.pvErr || '',
     noCode: E.noCode, lines: res.lines, missing: res.missing, counts: res.counts, nEcarts: res.nEcarts, alert: res.alert,
     at: Utilities.formatDate(new Date(), RG_TZ, 'dd/MM/yyyy HH:mm'), source: String(p.source || 'appli').slice(0, 40), by: String(p.by || p._by || '').slice(0, 60), name: String(p.name || '').slice(0, 120) };
   if (!E.snapFound) { data.alert = true; data.noCmd = true; }
@@ -509,7 +557,83 @@ function kbBlCheck_(p) {
   return { ok: true, result: data };
 }
 function blSig_(d) {
-  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify([d.lines.map(function (l) { return [l.blCode, l.status, l.qte]; }), d.missing.map(function (m) { return m.code; })]))).slice(0, 16);
+  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify([d.lines.map(function (l) { return [l.blCode, l.status, l.qte]; }), d.missing.map(function (m) { return [m.code, m.status]; })]))).slice(0, 16);
+}
+
+/* ═════════════════════════════ 6 bis) VERSIONS DU PVTTC (v1.2) ═════════════════════════════
+ * Le PVTTC est réécrit par Rungis ~2 fois par semaine (un seul onglet). Pour savoir si un produit « absent du BL »
+ * était encore dans la mercuriale, on garde les listes de codes des versions successives dans l'onglet « PVTTC VERSIONS »
+ * (Sheet COMMANDE FL) : • à chaque contrôle, la version actuelle si elle a changé ;
+ *                     • une fois, reprise de l'historique Drive du fichier (révisions), pour avoir tout de suite les 2 précédentes.
+ * On ne remonte jamais au-delà de 2 versions précédentes. */
+var BL_PVH_TAB = 'PVTTC VERSIONS';
+function blPvhSheet_() {
+  var sh = blSs_().getSheetByName(BL_PVH_TAB);
+  if (!sh) {
+    sh = blSs_().insertSheet(BL_PVH_TAB);
+    sh.getRange(1, 1, 1, 6).setValues([['VERSION DU', 'ONGLET', 'SOURCE', 'NB CODES', 'SIGNATURE', 'CODES']]).setFontWeight('bold').setBackground('#1565c0').setFontColor('#fff');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+function blPvSig_(codes) { return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, codes.join(','))).slice(0, 12); }
+function blPvhRead_(sh) {
+  var v = sh.getDataRange().getValues(), out = [];
+  for (var i = 1; i < v.length; i++) {
+    if (!v[i][4]) continue;
+    var codes = {}; String(v[i][5] || '').split(',').forEach(function (c) { if (c) codes[c] = 1; });
+    out.push({ date: v[i][0] instanceof Date ? rgIso_(v[i][0]) : String(v[i][0]).slice(0, 10), tab: String(v[i][1] || ''), src: String(v[i][2] || ''), n: Number(v[i][3]) || 0, sig: String(v[i][4]), codes: codes });
+  }
+  return out;
+}
+/** Versions connues, de la plus récente à la plus ancienne (actuelle + 2 précédentes au plus). */
+function blPvHist_(PV) {
+  var sh = blPvhSheet_(), known = blPvhRead_(sh);
+  var codes = (PV.list || []).map(function (x) { return String(x.code); }).sort(), sig = blPvSig_(codes);
+  if (codes.length && !known.some(function (k) { return k.sig === sig; })) {
+    var upd = rgIso_(new Date()); try { upd = rgIso_(DriveApp.getFileById(KBA.PV_SS_ID).getLastUpdated()); } catch (e) {}
+    sh.appendRow([upd, PV.tab || '', 'lecture contrôle BL', codes.length, sig, codes.join(',')]);
+    known.push({ date: upd, tab: PV.tab || '', n: codes.length, sig: sig, codes: codes.reduce(function (m, c) { m[c] = 1; return m; }, {}) });
+  }
+  var props = PropertiesService.getScriptProperties();
+  if (known.length < 3 && !props.getProperty('BL_PVH_BOOT')) {
+    try { blPvBoot_(sh, known); } catch (e) { Logger.log('PVTTC historique Drive : ' + e.message); }
+    props.setProperty('BL_PVH_BOOT', new Date().toISOString());
+    known = blPvhRead_(sh);
+  }
+  var bySig = {}, list = [];
+  known.sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });
+  // la version actuelle en tête, puis les précédentes (signatures différentes)
+  var cur = known.filter(function (k) { return k.sig === sig; })[0];
+  if (cur) { list.push(cur); bySig[cur.sig] = 1; }
+  known.forEach(function (k) { if (!bySig[k.sig] && list.length < 3) { bySig[k.sig] = 1; list.push(k); } });
+  return list;
+}
+/** Reprise unique de l'historique Drive du PVTTC (révisions du fichier, export CSV) : 2 versions précédentes au plus. */
+function blPvBoot_(sh, known) {
+  var tok = ScriptApp.getOAuthToken(), H = { headers: { Authorization: 'Bearer ' + tok }, muteHttpExceptions: true };
+  var r = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + KBA.PV_SS_ID + '/revisions?pageSize=200&fields=revisions(id,modifiedTime,exportLinks)', H);
+  if (r.getResponseCode() !== 200) throw new Error('révisions Drive : HTTP ' + r.getResponseCode());
+  var revs = (JSON.parse(r.getContentText()).revisions || []).filter(function (x) { return x.exportLinks && x.exportLinks['text/csv']; });
+  revs.sort(function (a, b) { return a.modifiedTime < b.modifiedTime ? 1 : -1; });
+  var seen = {}; known.forEach(function (k) { seen[k.sig] = 1; });
+  var kept = 0, fetched = 0, lastDay = '';
+  for (var i = 1; i < revs.length && kept < 2 && fetched < 10; i++) {          // i = 0 : version actuelle (déjà connue)
+    var day = String(revs[i].modifiedTime).slice(0, 10); if (day === lastDay) continue; lastDay = day;
+    var c = UrlFetchApp.fetch(revs[i].exportLinks['text/csv'], H); fetched++;
+    if (c.getResponseCode() !== 200) continue;
+    var rows = Utilities.parseCsv(c.getContentText()), hdr = (rows[0] || []).map(function (h) { return String(h).trim().toUpperCase(); }), ci = hdr.indexOf('CODE');
+    if (ci < 0) continue;
+    var codes = rows.slice(1).map(function (x) { return parseInt(x[ci], 10); }).filter(function (n) { return n > 0; }).map(String).sort();
+    var sg = blPvSig_(codes); if (!codes.length || seen[sg]) continue;
+    seen[sg] = 1; kept++;
+    sh.appendRow([day, '', 'historique Drive (révision ' + revs[i].id + ')', codes.length, sg, codes.join(',')]);
+  }
+}
+/** Essai éditeur : affiche les versions PVTTC connues. */
+function blTestPvttc() {
+  var PV = flAutoReadPvttc_(), H = blPvHist_(PV);
+  Logger.log(H.map(function (v) { return v.date + ' · ' + v.tab + ' · ' + v.n + ' codes'; }).join('\n'));
 }
 function blFolder_() {
   var parent = rgFolder_(), it = parent.getFoldersByName(BL_FOLDER);
@@ -560,54 +684,78 @@ function kbBlRecheck_(p) {
 
 /* ═════════════════════════════ 7) MAIL D'ALERTE ═════════════════════════════ */
 var BL_ST = {
-  manquant:    { c: '#c62828', l: '❌ Non livré' },
   absent:      { c: '#c62828', l: '❌ Absent du BL' },
-  absentProbable: { c: '#1565c0', l: '🔗 Probable' },
+  horsPvttc:   { c: '#ef6c00', l: '📋 Plus au PVTTC' },
   moins:       { c: '#e65100', l: '⬇️ En moins' },
   plus:        { c: '#6a1b9a', l: '⬆️ En plus' },
   nonCommande: { c: '#6a1b9a', l: '➕ Non commandé' },
-  rapprocher:  { c: '#1565c0', l: '🔗 À rapprocher' },
+  rapprocher:  { c: '#1565c0', l: '🔗 À confirmer' },
+  absentProbable: { c: '#1565c0', l: '🔗 Probable' },
   aConfirmer:  { c: '#757575', l: '❔ À vérifier' },
+  manquant:    { c: '#9e9e9e', l: '— Non livré (info)' },
+  lie:         { c: '#2e7d32', l: '✅ OK' },
   ok:          { c: '#2e7d32', l: '✅ OK' },
   ok0:         { c: '#9e9e9e', l: '— 0' }
 };
+/** « 36 kg » + détail « 6 colis de 6 kg · pour faire 37 MU (sachet 180g-220g) ». */
+function blAttHtml_(l) {
+  if (l.attendu == null) return '<span style="color:#999">—</span>';
+  var u = l.unit || 'kg', d = [];
+  if (l.colis != null && l.col) d.push(blFmt_(l.colis, 0) + ' colis de ' + blFmt_(l.col) + ' ' + u + (l.colisCmd && Math.abs(l.colisCmd - l.colis) > 0.05 ? ' (besoin ' + blFmt_(l.colisCmd, 1) + ' colis)' : ''));
+  if (l.estim) d.push('pour faire ' + blFmt_(l.estim, 0) + ' MU' + (l.uv ? ' · ' + rgEsc_(l.uv) : ''));
+  if (l.rajColis) d.push('dont rajout de la veille : ' + blFmt_(l.rajColis, 1) + ' colis');
+  return '<div style="font-size:19px;font-weight:900;white-space:nowrap">' + blFmt_(l.attendu) + ' ' + u + '</div>'
+    + (d.length ? '<div style="font-size:12px;color:#666;line-height:1.35">' + d.join('<br>') + '</div>' : '');
+}
 function blMail_(d) {
-  var probable = {};   // « commandé mais absent » probablement = une ligne du BL à rapprocher → affiché sous cette ligne
+  var probable = {};
   d.missing.forEach(function (m) { if (m.status === 'absentProbable' && m.blCode) (probable[m.blCode] = probable[m.blCode] || []).push(m); });
-  var bad = d.lines.filter(function (l) { return ['manquant', 'moins', 'plus', 'nonCommande', 'rapprocher', 'aConfirmer'].indexOf(l.status) >= 0; })
-    .concat(d.missing.filter(function (m) { return m.status === 'absent'; }));
-  var order = { manquant: 0, absent: 1, moins: 2, plus: 3, nonCommande: 4, rapprocher: 5, aConfirmer: 6 };
-  bad.sort(function (a, b) { return (order[a.status] - order[b.status]) || String(a.des).localeCompare(String(b.des), 'fr'); });
-  var td = 'padding:9px 10px;border-bottom:1px solid #eee;';
-  var rows = bad.map(function (l) {
-    var st = BL_ST[l.status] || BL_ST.ok;
-    var att = l.attendu != null ? blFmt_(l.attendu) + (l.colis != null ? '<div style="font-size:12px;color:#777">' + blFmt_(l.colis, 1) + ' colis × ' + blFmt_(l.col, 2) + (l.rajColis ? ' (dont rajout ' + blFmt_(l.rajColis, 1) + ')' : '') + '</div>' : '') : '—';
-    var liv = l.status === 'absent' ? '0' : blFmt_(l.qte);
-    return '<tr><td style="' + td + 'white-space:nowrap"><span style="display:inline-block;background:' + st.c + ';color:#fff;border-radius:8px;padding:3px 8px;font-size:13px;font-weight:800">' + st.l + '</span></td>'
-      + '<td style="' + td + 'font-size:15px;font-weight:700">' + rgEsc_(l.des) + '<div style="font-size:12px;color:#777;font-weight:400">'
-      + rgEsc_([l.blCode ? 'BL ' + l.blCode : '', l.codes && l.codes.length ? 'code ' + l.codes.join('+') : (l.code ? 'code ' + l.code : ''), l.status === 'rapprocher' ? 'pas encore relié à un code Probon' : l.msg].filter(Boolean).join(' · ')) + '</div>'
-      + (probable[l.blCode] ? '<div style="font-size:12px;color:#1565c0;font-weight:700;margin-top:2px">Probablement : ' + probable[l.blCode].map(function (m) { return rgEsc_(m.des) + ' (code ' + rgEsc_(m.code) + ', attendu ' + blFmt_(m.attendu) + ')'; }).join(' + ') + '</div>' : '')
-      + (l.status === 'aConfirmer' && l.kbg ? '<div style="font-size:12px;color:#555;margin-top:2px">KBG : ' + rgEsc_(l.kbg) + '</div>' : '') + '</td>'
-      + '<td style="' + td + 'text-align:right;font-size:18px;font-weight:900">' + att + '</td>'
-      + '<td style="' + td + 'text-align:right;font-size:18px;font-weight:900;color:' + st.c + '">' + liv + '</td></tr>';
-  }).join('');
+  var main = d.lines.filter(function (l) { return ['moins', 'plus', 'nonCommande', 'rapprocher', 'aConfirmer'].indexOf(l.status) >= 0; })
+    .concat(d.missing.filter(function (m) { return m.status === 'absent' || m.status === 'horsPvttc'; }));
+  var info = d.lines.filter(function (l) { return l.status === 'manquant'; });
+  var order = { absent: 0, horsPvttc: 1, moins: 2, plus: 3, nonCommande: 4, rapprocher: 5, aConfirmer: 6 };
+  main.sort(function (a, b) { return (order[a.status] - order[b.status]) || String(a.kbg || a.des).localeCompare(String(b.kbg || b.des), 'fr'); });
+  var td = 'padding:10px;border-bottom:1px solid #eee;vertical-align:top;';
+  var row = function (l, grey) {
+    var st = BL_ST[l.status] || BL_ST.ok, isMiss = l.status === 'absent' || l.status === 'horsPvttc';
+    var titre = isMiss ? l.des : (l.kbg || l.des);
+    var sub = [];
+    if (!isMiss && l.kbg) sub.push('BL : ' + rgEsc_(l.des) + ' (' + rgEsc_(l.blCode) + ')' + (l.autres ? ' + ' + l.autres.map(function (y) { return rgEsc_(y.des) + ' (' + blFmt_(y.qte) + ')'; }).join(' + ') : ''));
+    else if (!isMiss) sub.push('BL ' + rgEsc_(l.blCode) + (l.pvDes ? ' · PVTTC : ' + rgEsc_(l.pvDes) : ''));
+    var code = l.code || (l.codes && l.codes[0]) || ''; if (code) sub.push('code Probon ' + rgEsc_(code));
+    if (l.prod) sub.push(rgEsc_(l.prod));
+    var msg = l.pvMsg || l.msg || '';
+    var blCell = isMiss ? '0' : blFmt_(l.qteTot != null ? l.qteTot : l.qte) + (l.unit ? ' ' + l.unit : (l.ua ? ' ' + (l.ua === 'KG' ? 'kg' : 'pce') : ''));
+    return '<tr style="' + (grey ? 'color:#888' : '') + '"><td style="' + td + 'white-space:nowrap"><span style="display:inline-block;background:' + st.c + ';color:#fff;border-radius:8px;padding:3px 8px;font-size:13px;font-weight:800">' + st.l + '</span></td>'
+      + '<td style="' + td + '"><div style="font-size:16px;font-weight:800">' + rgEsc_(titre) + '</div><div style="font-size:12px;color:#777">' + sub.join(' · ') + '</div>'
+      + (msg ? '<div style="font-size:13px;font-weight:700;color:' + (grey ? '#888' : st.c) + ';margin-top:3px">' + rgEsc_(msg) + '</div>' : '')
+      + (l.why ? '<div style="font-size:11px;color:#999">relié d\'après la commande : ' + rgEsc_(l.why) + '</div>' : '')
+      + (probable[l.blCode] ? '<div style="font-size:12px;color:#1565c0;font-weight:700;margin-top:2px">Probablement : ' + probable[l.blCode].map(function (m) { return rgEsc_(m.des) + ' (code ' + rgEsc_(m.code) + ')'; }).join(' + ') + '</div>' : '')
+      + '</td><td style="' + td + 'text-align:right">' + blAttHtml_(l) + '</td>'
+      + '<td style="' + td + 'text-align:right;font-size:19px;font-weight:900;white-space:nowrap;color:' + (grey ? '#888' : st.c) + '">' + blCell + '</td></tr>';
+  };
+  var head = '<tr style="background:#fafafa"><th style="padding:8px 10px;text-align:left;font-size:12px">ÉTAT</th><th style="padding:8px 10px;text-align:left;font-size:12px">PRODUIT</th><th style="padding:8px 10px;text-align:right;font-size:12px">ATTENDU</th><th style="padding:8px 10px;text-align:right;font-size:12px">BL</th></tr>';
+  var tbl = function (rows) { return '<table role="presentation" width="100%" style="border-collapse:collapse;border:1px solid #e0e0e0">' + head + rows + '</table>'; };
   var prix = d.lines.filter(function (l) { return l.prixEcart; });
-  var html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1b1b1b">'
-    + '<div style="background:#c62828;color:#fff;border-radius:14px;padding:16px 20px"><div style="font-size:24px;font-weight:900">⚠️ BL Rungis du ' + rgEsc_(rgLong_(d.day)) + '</div>'
-    + '<div style="font-size:16px;margin-top:2px">' + (d.noCmd ? 'Aucune commande KBG enregistrée pour ce jour — contrôle impossible' : '<b>' + d.nEcarts + ' écart(s)</b> avec la commande KBG' + (d.counts.rapprocher ? ' · ' + d.counts.rapprocher + ' produit(s) à rapprocher' : ''))
+  var bad = d.nEcarts > 0 || d.noCmd;
+  var pv = (d.pvVersions || []).length ? 'Mercuriale PVTTC contrôlée : ' + d.pvVersions.map(function (v) { return rgFr_(v.date) + (v.tab ? ' (' + rgEsc_(v.tab) + ')' : ''); }).join(', ') + '.' : '';
+  var html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;color:#1b1b1b">'
+    + '<div style="background:' + (bad ? '#c62828' : '#546e7a') + ';color:#fff;border-radius:14px;padding:16px 20px"><div style="font-size:24px;font-weight:900">' + (bad ? '⚠️' : 'ℹ️') + ' BL Rungis du ' + rgEsc_(rgLong_(d.day)) + '</div>'
+    + '<div style="font-size:16px;margin-top:2px">' + (d.noCmd ? 'Aucune commande KBG enregistrée pour ce jour — contrôle impossible' : '<b>' + d.nEcarts + ' écart(s)</b> avec la commande KBG' + (d.counts.rapprocher ? ' · ' + d.counts.rapprocher + ' à confirmer' : '') + (info.length ? ' · ' + info.length + ' non livré(s) pour info' : ''))
     + (d.num ? ' · BL ' + rgEsc_(d.num) : '') + '</div></div>'
-    + '<p style="font-size:14px;color:#555;margin:10px 2px">Quantités en <b>kg ou pièces</b> (comme le BL). Attendu = colis commandés × colisage (commande 4h30' + (d.nRaj ? ' + rajouts F&amp;L de la veille' : '') + ').</p>'
-    + (bad.length ? '<table role="presentation" width="100%" style="border-collapse:collapse;border:1px solid #e0e0e0">'
-      + '<tr style="background:#fafafa"><th style="padding:8px 10px;text-align:left;font-size:12px">ÉTAT</th><th style="padding:8px 10px;text-align:left;font-size:12px">PRODUIT</th><th style="padding:8px 10px;text-align:right;font-size:12px">ATTENDU</th><th style="padding:8px 10px;text-align:right;font-size:12px">BL</th></tr>' + rows + '</table>' : '')
-    + (prix.length ? '<div style="margin-top:14px;font-size:14px;color:#555"><b>Écarts de prix (info)</b> — prix BL vs prix d\'achat COMMANDE FL : '
-      + prix.map(function (l) { return rgEsc_(l.des) + ' ' + blFmt_(l.prix) + ' € (KBG ' + blFmt_(l.prixKbg) + ' €)'; }).join(' · ') + '</div>' : '')
-    + '<p style="font-size:14px;margin-top:14px">✅ ' + d.counts.ok + ' ligne(s) conforme(s) sur ' + d.nLines + '. '
-    + (d.fileUrl ? '<a href="' + d.fileUrl + '" style="color:#1565c0;font-weight:700">Ouvrir le BL (PDF)</a>' : '') + '<br>Détail et rapprochements : appli Kelbongoo › Espace Rungis › 📄 Contrôle BL.</p>'
-    + '<p style="color:#999;font-size:12px">Contrôle automatique Kelbongoo · ' + rgEsc_(d.source) + ' · ' + d.at + '</p></div>';
-  var text = 'BL Rungis du ' + rgFr_(d.day) + ' — ' + d.nEcarts + ' écart(s)\n\n' + bad.map(function (l) {
-    return (BL_ST[l.status] || {}).l + ' · ' + l.des + ' · attendu ' + (l.attendu != null ? blFmt_(l.attendu) : '—') + ' · BL ' + (l.status === 'absent' ? '0' : blFmt_(l.qte));
-  }).join('\n');
-  MailApp.sendEmail({ to: BL_ALERT_TO, subject: '⚠️ BL Rungis ' + rgFr_(d.day) + (d.noCmd ? ' : pas de commande KBG ce jour' : ' : ' + d.nEcarts + ' écart(s) avec la commande'), htmlBody: html, body: text, name: 'Kelbongoo' });
+    + '<p style="font-size:14px;color:#555;margin:10px 2px">Quantités en <b>kg ou pièces</b> comme sur le BL. Attendu = colis commandés × colisage (commande 4h30' + (d.nRaj ? ' + rajouts F&amp;L de la veille' : '') + ').</p>'
+    + (main.length ? tbl(main.map(function (l) { return row(l, false); }).join('')) : '')
+    + (info.length ? '<div style="margin-top:16px;font-size:15px;font-weight:800;color:#888">Pour info — non livrés (Rungis a mis 0 sur le BL)</div>' + tbl(info.map(function (l) { return row(l, true); }).join('')) : '')
+    + '<p style="font-size:14px;margin-top:14px">✅ ' + (d.counts.ok + (d.counts.lie || 0)) + ' ligne(s) conforme(s) sur ' + d.nLines + '. '
+    + (d.fileUrl ? '<a href="' + d.fileUrl + '" style="color:#1565c0;font-weight:700">Ouvrir le BL (PDF)</a>' : '') + '<br>Détail et rapprochements : appli Kelbongoo › Espace Rungis › 📄 Contrôle BL.'
+    + (pv ? '<br><span style="font-size:12px;color:#777">' + pv + '</span>' : '') + '</p>'
+    + (prix.length ? '<div style="margin-top:18px;border-top:2px solid #eee;padding-top:10px"><div style="font-size:14px;font-weight:800;color:#555">Écarts de prix (info) — prix net du BL ≠ prix d\'achat PVTTC</div>'
+      + '<table role="presentation" style="border-collapse:collapse;font-size:13px;color:#555;margin-top:4px">' + prix.map(function (l) {
+        return '<tr><td style="padding:3px 10px 3px 0">' + rgEsc_(l.kbg || l.des) + '</td><td style="padding:3px 10px;text-align:right">BL <b>' + blFmt_(l.prix) + ' €</b></td><td style="padding:3px 10px;text-align:right">PVTTC ' + blFmt_(l.prixKbg) + ' €</td><td style="padding:3px 0;text-align:right;color:' + (l.prixEcart > 0 ? '#c62828' : '#2e7d32') + '">' + (l.prixEcart > 0 ? '+' : '') + blFmt_(l.prixEcart) + ' €</td></tr>'; }).join('') + '</table></div>' : '')
+    + '<p style="color:#999;font-size:12px;margin-top:14px">Contrôle automatique Kelbongoo v' + rgEsc_(d.v || '') + ' · ' + rgEsc_(d.source) + ' · ' + d.at + '</p></div>';
+  var line = function (l) { return (BL_ST[l.status] || {}).l + ' · ' + (l.kbg || l.des) + ' · attendu ' + (l.attendu != null ? blFmt_(l.attendu) + ' ' + (l.unit || '') : '—') + ' · BL ' + ((l.status === 'absent' || l.status === 'horsPvttc') ? '0' : blFmt_(l.qteTot != null ? l.qteTot : l.qte)) + (l.pvMsg ? ' · ' + l.pvMsg : ''); };
+  var text = 'BL Rungis du ' + rgFr_(d.day) + ' — ' + d.nEcarts + ' écart(s)\n\n' + main.map(line).join('\n') + (info.length ? '\n\nPour info (non livrés) :\n' + info.map(line).join('\n') : '');
+  MailApp.sendEmail({ to: BL_ALERT_TO, subject: (bad ? '⚠️' : 'ℹ️') + ' BL Rungis ' + rgFr_(d.day) + (d.noCmd ? ' : pas de commande KBG ce jour' : ' : ' + d.nEcarts + ' écart(s) avec la commande' + (info.length ? ' · ' + info.length + ' non livré(s)' : '')), htmlBody: html, body: text, name: 'Kelbongoo' });
 }
 
 /* ═════════════════════════════ 8) ROUTAGE + ESSAIS ═════════════════════════════ */

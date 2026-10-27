@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.56) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.57) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.56';
+const APP_VERSION = 'V10.57';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -16170,8 +16170,9 @@ function useKbSyncBus() {
   }, []);
   return kbSyncBus;
 }
-function kbSyncLog(L, A) {
+function kbSyncLog(L, A, M) {
   if (!L || !Array.isArray(L.products)) return [];
+  M = M || L.manual || null;
   const sameDay = A && (!A.day || A.day === L.day);
   const done = sameDay && A.done && typeof A.done === 'object' ? A.done : null;
   const warns = sameDay && A.warns || [];
@@ -16193,9 +16194,16 @@ function kbSyncLog(L, A) {
     }
     if (cur && (cur.key === p.key || cur.produit === p.produit) && st !== 'ok') st = 'cur';
     if (!st) st = exp === 'wait' ? 'wait' : done ? 'todo' : 'unk';
-    const ch = !!(d && d.sig && p.sig && d.sig !== p.sig && st === 'ok');
+    const mm = M && M[p.key];
+    if (mm && mm.at && st !== 'ok') {
+      st = 'man';
+      msg = 'fait à la main par ' + String(mm.by || '?').split(' ')[0];
+      at = mm.at;
+    }
+    const ch = !!(d && d.sig && p.sig && d.sig !== p.sig && st === 'ok' || st === 'man' && mm.sig && p.sig && mm.sig !== p.sig);
     return {
       k: p.key,
+      sig: p.sig || '',
       produit: p.produit,
       exp,
       n: p.rupture || 0,
@@ -16325,7 +16333,15 @@ function KbAncienSyncRunner({
           r.closed = false;
         }
         delete r._anyStatus;
-        window.__kbAncienLive = r;
+        let M = null;
+        try {
+          M = await storage.getDoc('app_config', 'ancien_manual_' + pd);
+        } catch (_) {}
+        r.manual = M || null;
+        const forScript = M ? Object.assign({}, r, {
+          products: r.products.filter(p => !(kbManualOk(M, p) && (!M[p.key].sig || M[p.key].sig === p.sig)))
+        }) : r;
+        window.__kbAncienLive = forScript;
         window.dispatchEvent(new CustomEvent('kb-ancien-live'));
         kbSyncBus.last = r;
         kbSyncBus.err = '';
@@ -16529,12 +16545,30 @@ const KB_SYNC_ST = {
   nd: ['🥬', 'ND (rien à reporter)', '#00838f', '#e0f2f1'],
   todo: ['⏳', 'à faire par le script', '#6d4c41', '#f5f5f5'],
   unk: ['❔', 'pas de détail (script v3.3)', '#757575', '#f5f5f5'],
-  wait: ['🕐', 'prépa pas finie', '#9e9e9e', '#fafafa']
+  wait: ['🕐', 'prépa pas finie', '#9e9e9e', '#fafafa'],
+  man: ['✋', 'fait à la main', '#2e7d32', '#e8f5e9']
 };
+function kbManualOk(M, p) {
+  const m = M && M[p.key || p.k];
+  return !!(m && m.at);
+}
+async function kbManualSet(day, key, sig, by, on) {
+  await storage.setDoc('app_config', 'ancien_manual_' + day, {
+    [key]: on ? {
+      by: by || '?',
+      at: Date.now(),
+      sig: sig || ''
+    } : null
+  });
+}
 function AncienSyncJournalCard({
-  day
+  day,
+  session
 }) {
   const bus = useKbSyncBus();
+  const showToast = React.useContext(ToastContext);
+  const [man, setMan] = React.useState({});
+  const [manBusy, setManBusy] = React.useState('');
   const [remote, setRemote] = React.useState(null);
   const [arch, setArch] = React.useState(null);
   const [f, setF] = React.useState('');
@@ -16586,6 +16620,21 @@ function AncienSyncJournalCard({
     ...arch,
     archived: true
   } : null;
+  const manDay = v && v.day;
+  React.useEffect(() => {
+    if (!manDay) return;
+    let stop = false;
+    setMan({});
+    const ld = () => storage.getDoc('app_config', 'ancien_manual_' + manDay).then(d => {
+      if (!stop) setMan(d || {});
+    }).catch(() => {});
+    ld();
+    const t = setInterval(ld, 20000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [manDay]);
   const modeBar = React.createElement("div", {
     style: {
       display: 'flex',
@@ -16628,7 +16677,43 @@ function AncienSyncJournalCard({
       margin: '6px 0 0'
     }
   }, "Rien d'enregistré pour la distribution du ", formatDateShort(day), liveV ? ` (le poste synchro travaille sur le ${formatDateShort(liveV.day)})` : '', "."));
-  const log = v.log || [];
+  const log = (v.log || []).map(r => {
+    const mm = man[r.k];
+    if (mm && mm.at && r.st !== 'ok') return {
+      ...r,
+      st: 'man',
+      msg: 'fait à la main par ' + String(mm.by || '?').split(' ')[0],
+      at: mm.at,
+      ch: !!(mm.sig && r.sig && mm.sig !== r.sig)
+    };
+    if (!(mm && mm.at) && r.st === 'man') return {
+      ...r,
+      st: r.exp === 'wait' ? 'wait' : 'todo',
+      msg: '',
+      ch: false
+    };
+    return r;
+  });
+  const markMan = async (r, on) => {
+    if (on && !confirm(`Marquer « ${kbProdName(r.produit)} » comme FAIT À LA MAIN sur l'ancien site ?\n\nÀ faire :\n${expTxt(r)}\n\nLe script ne le traitera plus.`)) return;
+    setManBusy(r.k);
+    try {
+      await kbManualSet(v.day, r.k, r.sig, session && session.name, on);
+      setMan(m => ({
+        ...m,
+        [r.k]: on ? {
+          by: session && session.name,
+          at: Date.now(),
+          sig: r.sig
+        } : null
+      }));
+      showToast(on ? '✋ Noté : fait à la main' : '↩︎ Annulé');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setManBusy('');
+    }
+  };
   const cnt = {};
   log.forEach(r => {
     cnt[r.st] = (cnt[r.st] || 0) + 1;
@@ -16641,12 +16726,13 @@ function AncienSyncJournalCard({
     unk: 3,
     wait: 4,
     nd: 5,
-    ok: 6
+    man: 6,
+    ok: 7
   };
   const nq = normalizeText(q.trim());
   const rows = log.filter(r => (!f || (f === 'ch' ? r.ch : r.st === f)) && (!nq || normalizeText(r.produit + ' ' + r.cas).includes(nq))).sort((a, b) => order[a.st] - order[b.st] || (b.at || 0) - (a.at || 0) || a.produit.localeCompare(b.produit));
   const expTxt = r => r.exp === 'wait' ? 'prépa du produit pas terminée' : r.exp === 'present' ? 'tout présent → coche ✅' : r.exp === 'total' ? `rupture TOTALE (${r.n}) → horloge` : `rupture ×${r.n} / ${r.ord} → ${r.cas || '?'}`;
-  const done = cnt.ok || 0,
+  const done = (cnt.ok || 0) + (cnt.man || 0),
     need = log.filter(r => r.exp !== 'wait').length;
   return React.createElement("div", {
     className: "card"
@@ -16730,7 +16816,7 @@ function AncienSyncJournalCard({
       padding: '6px 10px'
     },
     onClick: () => setF('')
-  }, "Tous (", log.length, ")"), ['cur', 'warn', 'todo', 'ok', 'nd', 'wait', 'unk'].filter(k => cnt[k]).map(k => React.createElement("button", {
+  }, "Tous (", log.length, ")"), ['cur', 'warn', 'todo', 'man', 'ok', 'nd', 'wait', 'unk'].filter(k => cnt[k]).map(k => React.createElement("button", {
     key: k,
     className: f === k ? 'btn-primary' : 'btn-secondary',
     style: {
@@ -16822,7 +16908,29 @@ function AncienSyncJournalCard({
         color: 'var(--danger)',
         marginTop: 2
       }
-    }, "🔁 changé dans l'appli APRÈS le report → le script ne le refait pas : corriger à la main dans l'ancien admin")));
+    }, "🔁 changé dans l'appli APRÈS le report → le script ne le refait pas : corriger à la main dans l'ancien admin"), r.exp !== 'wait' && r.st !== 'ok' && r.st !== 'nd' && (r.st === 'man' ? React.createElement("button", {
+      className: "btn-ghost",
+      disabled: manBusy === r.k,
+      onClick: () => markMan(r, false),
+      style: {
+        marginTop: 4,
+        fontSize: 12,
+        padding: '4px 8px',
+        width: 'auto'
+      }
+    }, "↩︎ Annuler « fait à la main »") : React.createElement("button", {
+      className: "btn-secondary",
+      disabled: manBusy === r.k,
+      onClick: () => markMan(r, true),
+      style: {
+        marginTop: 6,
+        fontSize: 14,
+        fontWeight: 700,
+        padding: '8px 12px',
+        width: 'auto',
+        minHeight: 40
+      }
+    }, "✋ Mis à jour à la main"))));
   }), !rows.length && React.createElement("div", {
     style: {
       padding: 10,
@@ -16880,7 +16988,8 @@ function AncienSitePilotagePage({
     style: kbBtnSm,
     onClick: () => setDay(activeDay())
   }, "Jour actif")), React.createElement(AncienSyncPosteCard, null), React.createElement(AncienSyncJournalCard, {
-    day: day
+    day: day,
+    session: session
   }), React.createElement("div", {
     className: "card"
   }, React.createElement("h3", {
@@ -52051,14 +52160,24 @@ function RungisCommandePage() {
 }
 const KB_BL_ST = {
   manquant: {
-    c: '#c62828',
-    bg: '#fdecea',
-    l: '❌ Non livré'
+    c: '#9e9e9e',
+    bg: '#f5f5f5',
+    l: '— Non livré (info)'
   },
   absent: {
     c: '#c62828',
     bg: '#fdecea',
     l: '❌ Absent du BL'
+  },
+  horsPvttc: {
+    c: '#ef6c00',
+    bg: '#fff3e0',
+    l: '📋 Plus au PVTTC'
+  },
+  lie: {
+    c: '#2e7d32',
+    bg: '#e8f5e9',
+    l: '✅ OK'
   },
   moins: {
     c: '#e65100',
@@ -52078,7 +52197,7 @@ const KB_BL_ST = {
   rapprocher: {
     c: '#1565c0',
     bg: '#e3f2fd',
-    l: '🔗 À rapprocher'
+    l: '🔗 À confirmer'
   },
   absentProbable: {
     c: '#1565c0',
@@ -52225,10 +52344,11 @@ function RungisBlPage() {
   const d = cur;
   const lines = d && d.lines || [],
     miss = d && d.missing || [];
-  const bad = [...lines.filter(l => ['manquant', 'moins', 'plus', 'nonCommande'].includes(l.status)), ...miss.filter(m => m.status === 'absent')];
+  const bad = [...lines.filter(l => ['moins', 'plus', 'nonCommande'].includes(l.status)), ...miss.filter(m => m.status === 'absent' || m.status === 'horsPvttc')];
+  const nonLivres = lines.filter(l => l.status === 'manquant');
   const toLink = lines.filter(l => l.status === 'rapprocher');
   const toCheck = lines.filter(l => l.status === 'aConfirmer');
-  const okL = lines.filter(l => l.status === 'ok' || l.status === 'ok0');
+  const okL = lines.filter(l => l.status === 'ok' || l.status === 'ok0' || l.status === 'lie');
   const prix = lines.filter(l => l.prixEcart);
   const probable = bc => miss.filter(m => m.status === 'absentProbable' && m.blCode === bc);
   const Num = ({
@@ -52297,19 +52417,24 @@ function RungisBlPage() {
         fontSize: 18,
         fontWeight: 700
       }
-    }, l.des), React.createElement("div", {
+    }, l.kbg && !['absent', 'horsPvttc'].includes(l.status) ? l.kbg : l.des), React.createElement("div", {
       style: {
         fontSize: 13,
         color: 'var(--ink-soft)'
       }
-    }, [l.blCode ? 'BL ' + l.blCode : '', l.codes && l.codes.length ? 'code ' + l.codes.join('+') : l.code ? 'code ' + l.code : '', l.kbg && l.status !== 'absent' ? 'KBG : ' + l.kbg : ''].filter(Boolean).join(' · ')), l.msg && React.createElement("div", {
+    }, [l.kbg && !['absent', 'horsPvttc'].includes(l.status) ? 'BL : ' + l.des + (l.autres ? ' + ' + l.autres.map(y => y.des).join(' + ') : '') : '', l.blCode ? 'BL ' + l.blCode : '', l.codes && l.codes.length ? 'code ' + l.codes.join('+') : l.code ? 'code ' + l.code : ''].filter(Boolean).join(' · ')), (l.pvMsg || l.msg) && React.createElement("div", {
       style: {
         fontSize: 14,
         fontWeight: 700,
         color: x.c,
         marginTop: 2
       }
-    }, l.msg)), React.createElement("div", {
+    }, l.pvMsg || l.msg), l.why && React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)'
+      }
+    }, "relié d'après la commande : ", l.why)), React.createElement("div", {
       style: {
         display: 'flex',
         gap: 14,
@@ -52317,19 +52442,19 @@ function RungisBlPage() {
       }
     }, React.createElement(Num, {
       l: "ATTENDU",
-      v: n2(l.attendu)
+      v: l.attendu == null ? '—' : n2(l.attendu) + (l.unit ? ' ' + l.unit : '')
     }), React.createElement(Num, {
       l: "LIVRÉ (BL)",
-      v: l.status === 'absent' ? '0' : n2(l.qte),
+      v: ['absent', 'horsPvttc'].includes(l.status) ? '0' : n2(l.qteTot != null ? l.qteTot : l.qte) + (l.unit ? ' ' + l.unit : ''),
       c: x.c
-    })), l.colis != null && React.createElement("div", {
+    })), l.colis != null && l.col ? React.createElement("div", {
       style: {
         flex: '1 0 100%',
         fontSize: 13,
         color: 'var(--ink-soft)',
         textAlign: 'right'
       }
-    }, n2(l.colis), " colis × ", n2(l.col), l.rajColis ? ` (dont rajout ${n2(l.rajColis)} colis)` : '', " — en kg ou pièces"));
+    }, n2(l.colis), " colis de ", n2(l.col), " ", l.unit || '', l.estim ? ` · pour faire ${n2(l.estim)} MU${l.uv ? ' (' + l.uv + ')' : ''}` : '', l.rajColis ? ` · dont rajout ${n2(l.rajColis)} colis` : '') : null);
   };
   return React.createElement("div", {
     className: "stack"
@@ -52525,6 +52650,29 @@ function RungisBlPage() {
     }
   }, "⚠️ Écarts · ", bad.length), bad.map((l, i) => React.createElement(Row, {
     key: 'b' + i,
+    l: l
+  }))), nonLivres.length > 0 && React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 0,
+      overflow: 'hidden',
+      border: '2px solid #bdbdbd'
+    }
+  }, React.createElement("div", {
+    style: {
+      background: '#9e9e9e',
+      color: '#fff',
+      padding: '10px 16px',
+      fontSize: 19,
+      fontWeight: 700
+    }
+  }, "— Non livrés, pour info · ", nonLivres.length, " ", React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, "(Rungis a mis 0 sur le BL)")), nonLivres.map((l, i) => React.createElement(Row, {
+    key: 'n' + i,
     l: l
   }))), toLink.length > 0 && React.createElement("div", {
     className: "card",

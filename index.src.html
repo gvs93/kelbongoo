@@ -785,7 +785,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.56';
+    const APP_VERSION = 'V10.57';
+    // V10.57 — (27/10/2026) ① Master › Synchro ancien site : bouton « ✋ Mis à jour à la main » par produit dans le journal
+    //   (app_config/ancien_manual_<jour>) → compté comme reporté, retiré de ce que lit le script Tampermonkey (il ne le refait pas) ;
+    //   s'il change dans l'appli après coup → 🔁 signalé. ② Espace Rungis › Contrôle BL : statuts de KBG_BL v1.2
+    //   (« Non livré » gris pour info, « 📋 Plus au PVTTC », lignes BL regroupées, attendu en kg/pce + colis + MU).
     // V10.56 — (27/10/2026) ① Master PC : menu de gauche DÉROULÉ façon Console Pribon (rubriques en titres, toutes les entrées visibles, plus d'accordéon).
     //   ② Pain = ND, point final : plus aucun n° de bac/casier pour le pain (prépa : carte « 🍞 Pain = ND », rien à cocher ; distrib : « pain · ND »,
     //   plus de case « 🍞 pain » ; mails clients : pain « hors casier » ; dernière minute pain → ND ; DOM inchangé = cartons).
@@ -9730,8 +9734,9 @@
     //   Détail produit par produit si le script transmet ack.done = { clé: { r, msg, at, sig } } et ack.cur (v3.4+) ;
     //   avec la v3.3 (totaux seulement) : points à vérifier rattachés par nom de produit.
     //   Sauvegardé par le poste synchro dans app_config/ancien_sync (en cours) + app_config/ancien_sync_<jour> (historique).
-    function kbSyncLog(L, A) {
+    function kbSyncLog(L, A, M) {
       if (!L || !Array.isArray(L.products)) return [];
+      M = M || L.manual || null;
       const sameDay = A && (!A.day || A.day === L.day);
       const done = sameDay && A.done && typeof A.done === 'object' ? A.done : null;
       const warns = (sameDay && A.warns) || [];
@@ -9744,8 +9749,10 @@
         if (!d) { const nm = String(p.produit || '').toLowerCase(); const w = warns.slice().reverse().find(x => nm && String(x.msg || '').toLowerCase().indexOf(nm) === 0); if (w) { st = 'warn'; msg = w.msg; at = w.at || 0; } }
         if (cur && (cur.key === p.key || cur.produit === p.produit) && st !== 'ok') st = 'cur';
         if (!st) st = exp === 'wait' ? 'wait' : done ? 'todo' : 'unk';
-        const ch = !!(d && d.sig && p.sig && d.sig !== p.sig && st === 'ok'); // modifié dans l'appli après le report
-        return { k: p.key, produit: p.produit, exp, n: p.rupture || 0, ord: p.ordered || 0,
+        const mm = M && M[p.key];
+        if (mm && mm.at && st !== 'ok') { st = 'man'; msg = 'fait à la main par ' + String(mm.by || '?').split(' ')[0]; at = mm.at; }
+        const ch = !!((d && d.sig && p.sig && d.sig !== p.sig && st === 'ok') || (st === 'man' && mm.sig && p.sig && mm.sig !== p.sig)); // modifié dans l'appli après le report
+        return { k: p.key, sig: p.sig || '', produit: p.produit, exp, n: p.rupture || 0, ord: p.ordered || 0,
           cas: (p.cas || []).map(c => c.lab + ((c.n || 1) > 1 ? ' ×' + c.n : '')).join(', '), st, msg: msg.slice(0, 160), at, ch };
       });
     }
@@ -9784,7 +9791,11 @@
             r.started = r.products.some(p => p.done) || !!(r._anyStatus);
             if (!r.started) { r.products = r.products.map(p => Object.assign({}, p, { done: false })); r.closed = false; }
             delete r._anyStatus;
-            window.__kbAncienLive = r; window.dispatchEvent(new CustomEvent('kb-ancien-live')); kbSyncBus.last = r; kbSyncBus.err = ''; kbSyncBus.emit(); save(true);
+            // V10.57 — produits déjà reportés À LA MAIN : retirés de ce que lit le script (sauf s'ils ont changé depuis)
+            let M = null; try { M = await storage.getDoc('app_config', 'ancien_manual_' + pd); } catch (_) {}
+            r.manual = M || null;
+            const forScript = M ? Object.assign({}, r, { products: r.products.filter(p => !(kbManualOk(M, p) && (!M[p.key].sig || M[p.key].sig === p.sig))) }) : r;
+            window.__kbAncienLive = forScript; window.dispatchEvent(new CustomEvent('kb-ancien-live')); kbSyncBus.last = r; kbSyncBus.err = ''; kbSyncBus.emit(); save(true);
           }
           catch (e) { if (!stop) { kbSyncBus.err = e.message || String(e); kbSyncBus.emit(); save(false); } }
         };
@@ -9863,9 +9874,19 @@
       ok: ['✅', 'reporté', '#2e7d32', '#e8f5e9'], cur: ['🔄', 'en cours', '#1565c0', '#e3f2fd'], warn: ['⚠️', 'à vérifier à la main', '#b45309', '#fff4e5'],
       nd: ['🥬', 'ND (rien à reporter)', '#00838f', '#e0f2f1'], todo: ['⏳', 'à faire par le script', '#6d4c41', '#f5f5f5'],
       unk: ['❔', 'pas de détail (script v3.3)', '#757575', '#f5f5f5'], wait: ['🕐', 'prépa pas finie', '#9e9e9e', '#fafafa'],
+      man: ['✋', 'fait à la main', '#2e7d32', '#e8f5e9'],
     };
-    function AncienSyncJournalCard({ day }) {
+    // V10.57 — « fait à la main » : un produit reporté à la main dans l'ancien admin (sans Tampermonkey).
+    //   app_config/ancien_manual_<jour> = { <clé produit>: { by, at, sig } } — le script ne le reçoit plus (il ne le refait pas).
+    function kbManualOk(M, p) { const m = M && M[p.key || p.k]; return !!(m && m.at); }
+    async function kbManualSet(day, key, sig, by, on) {
+      await storage.setDoc('app_config', 'ancien_manual_' + day, { [key]: on ? { by: by || '?', at: Date.now(), sig: sig || '' } : null });
+    }
+    function AncienSyncJournalCard({ day, session }) {
       const bus = useKbSyncBus();
+      const showToast = React.useContext(ToastContext);
+      const [man, setMan] = React.useState({}); // V10.57 — « fait à la main » du jour affiché
+      const [manBusy, setManBusy] = React.useState('');
       const [remote, setRemote] = React.useState(null);
       const [arch, setArch] = React.useState(null);
       const [f, setF] = React.useState('');
@@ -9883,6 +9904,10 @@
       const liveV = local || (remote && remote.day && remote.log ? { day: remote.day, log: remote.log, cur: remote.cur, detail: remote.detail, script: remote.ack && remote.ack.script, at: remote.publishedAt } : null);
       const useLive = liveV && (mode === 'live' || liveV.day === day);
       const v = useLive ? liveV : (arch ? { ...arch, archived: true } : null);
+      const manDay = v && v.day;
+      React.useEffect(() => { if (!manDay) return; let stop = false; setMan({});
+        const ld = () => storage.getDoc('app_config', 'ancien_manual_' + manDay).then(d => { if (!stop) setMan(d || {}); }).catch(() => {});
+        ld(); const t = setInterval(ld, 20000); return () => { stop = true; clearInterval(t); }; }, [manDay]);
       const modeBar = (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
           <button className={mode === 'live' ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setMode('live')}>🟢 En direct{liveV ? ' · prépa du ' + formatDateShort(liveV.day) : ''}</button>
@@ -9891,15 +9916,26 @@
       const hm = (ts) => ts ? new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
       if (arch === null && !liveV) return <div className="card">📋 Journal synchro… </div>;
       if (!v) return <div className="card"><h3 style={{ margin: 0 }}>📋 Journal synchro ancien site</h3>{modeBar}<p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '6px 0 0' }}>Rien d'enregistré pour la distribution du {formatDateShort(day)}{liveV ? ` (le poste synchro travaille sur le ${formatDateShort(liveV.day)})` : ''}.</p></div>;
-      const log = v.log || [];
+      const log = (v.log || []).map(r => {
+        const mm = man[r.k];
+        if (mm && mm.at && r.st !== 'ok') return { ...r, st: 'man', msg: 'fait à la main par ' + String(mm.by || '?').split(' ')[0], at: mm.at, ch: !!(mm.sig && r.sig && mm.sig !== r.sig) };
+        if (!(mm && mm.at) && r.st === 'man') return { ...r, st: r.exp === 'wait' ? 'wait' : 'todo', msg: '', ch: false };
+        return r;
+      });
+      const markMan = async (r, on) => {
+        if (on && !confirm(`Marquer « ${kbProdName(r.produit)} » comme FAIT À LA MAIN sur l'ancien site ?\n\nÀ faire :\n${expTxt(r)}\n\nLe script ne le traitera plus.`)) return;
+        setManBusy(r.k);
+        try { await kbManualSet(v.day, r.k, r.sig, session && session.name, on); setMan(m => ({ ...m, [r.k]: on ? { by: session && session.name, at: Date.now(), sig: r.sig } : null })); showToast(on ? '✋ Noté : fait à la main' : '↩︎ Annulé'); }
+        catch (e) { showToast('Erreur : ' + e.message); } finally { setManBusy(''); }
+      };
       const cnt = {}; log.forEach(r => { cnt[r.st] = (cnt[r.st] || 0) + 1; });
       const nCh = log.filter(r => r.ch).length;
-      const order = { cur: 0, warn: 1, todo: 2, unk: 3, wait: 4, nd: 5, ok: 6 };
+      const order = { cur: 0, warn: 1, todo: 2, unk: 3, wait: 4, nd: 5, man: 6, ok: 7 };
       const nq = normalizeText(q.trim());
       const rows = log.filter(r => (!f || (f === 'ch' ? r.ch : r.st === f)) && (!nq || normalizeText(r.produit + ' ' + r.cas).includes(nq)))
         .sort((a, b) => (order[a.st] - order[b.st]) || (b.at || 0) - (a.at || 0) || a.produit.localeCompare(b.produit));
       const expTxt = (r) => r.exp === 'wait' ? 'prépa du produit pas terminée' : r.exp === 'present' ? 'tout présent → coche ✅' : r.exp === 'total' ? `rupture TOTALE (${r.n}) → horloge` : `rupture ×${r.n} / ${r.ord} → ${r.cas || '?'}`;
-      const done = cnt.ok || 0, need = log.filter(r => r.exp !== 'wait').length;
+      const done = (cnt.ok || 0) + (cnt.man || 0), need = log.filter(r => r.exp !== 'wait').length;
       return (
         <div className="card">
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
@@ -9913,7 +9949,7 @@
           {need > 0 && v.detail && <div style={{ marginTop: 10 }}><div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700 }}><span>Reportés</span><span>{done}/{need}</span></div><KbPsBar pct={100 * done / need} color="#2e7d32" h={12} /></div>}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
             <button className={!f ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setF('')}>Tous ({log.length})</button>
-            {['cur', 'warn', 'todo', 'ok', 'nd', 'wait', 'unk'].filter(k => cnt[k]).map(k => <button key={k} className={f === k ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setF(f === k ? '' : k)}>{KB_SYNC_ST[k][0]} {KB_SYNC_ST[k][1]} ({cnt[k]})</button>)}
+            {['cur', 'warn', 'todo', 'man', 'ok', 'nd', 'wait', 'unk'].filter(k => cnt[k]).map(k => <button key={k} className={f === k ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setF(f === k ? '' : k)}>{KB_SYNC_ST[k][0]} {KB_SYNC_ST[k][1]} ({cnt[k]})</button>)}
             {nCh > 0 && <button className={f === 'ch' ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px', color: f === 'ch' ? '#fff' : 'var(--danger)' }} onClick={() => setF(f === 'ch' ? '' : 'ch')}>🔁 modifié après report ({nCh})</button>}
             <input placeholder="🔎 Produit, casier…" value={q} onChange={e => setQ(e.target.value)} style={{ fontSize: 14, padding: '6px 10px', borderRadius: 8, border: '1px solid var(--line)', minWidth: 160 }} />
           </div>
@@ -9928,6 +9964,10 @@
                   <div style={{ fontSize: 15, fontWeight: 700, color: S[2] }}>{S[0]} {S[1]}{r.at ? <span style={{ fontWeight: 600, fontSize: 12, color: 'var(--ink-mute)' }}> · {hm(r.at)}</span> : null}</div>
                   {r.msg && <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 2, wordBreak: 'break-word' }}>{r.msg}</div>}
                   {r.ch && <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--danger)', marginTop: 2 }}>🔁 changé dans l'appli APRÈS le report → le script ne le refait pas : corriger à la main dans l'ancien admin</div>}
+                  {r.exp !== 'wait' && r.st !== 'ok' && r.st !== 'nd' && (
+                    r.st === 'man'
+                      ? <button className="btn-ghost" disabled={manBusy === r.k} onClick={() => markMan(r, false)} style={{ marginTop: 4, fontSize: 12, padding: '4px 8px', width: 'auto' }}>↩︎ Annuler « fait à la main »</button>
+                      : <button className="btn-secondary" disabled={manBusy === r.k} onClick={() => markMan(r, true)} style={{ marginTop: 6, fontSize: 14, fontWeight: 700, padding: '8px 12px', width: 'auto', minHeight: 40 }}>✋ Mis à jour à la main</button>)}
                 </div>
               </div>); })}
             {!rows.length && <div style={{ padding: 10, color: 'var(--ink-mute)' }}>Aucun produit avec ce filtre.</div>}
@@ -9955,7 +9995,7 @@
             <button className="btn-ghost" style={kbBtnSm} onClick={() => setDay(activeDay())}>Jour actif</button>
           </div>
           <AncienSyncPosteCard />
-          <AncienSyncJournalCard day={day} />
+          <AncienSyncJournalCard day={day} session={session} />
           <div className="card">
             <h3 style={{ marginBottom: 6 }}>🚫 Ruptures prépa — à reporter sur l'ancien site</h3>
             <AncienRupturesPanel key={'r' + day} day={day} session={session} />
@@ -24774,12 +24814,14 @@
     //   BL PDF (kg ou pièces livrés) ↔ commande 4h30 (colis × colisage) + rajouts F&L de la veille — calcul serveur KBG_BL.gs.
     //   Automatique dès que le BL arrive sur achat@probon.fr (script relais) ; sinon chargement ici. Alerte rr@ + hg@ si incohérence.
     const KB_BL_ST = {
-      manquant:       { c: '#c62828', bg: '#fdecea', l: '❌ Non livré' },
+      manquant:       { c: '#9e9e9e', bg: '#f5f5f5', l: '— Non livré (info)' },
       absent:         { c: '#c62828', bg: '#fdecea', l: '❌ Absent du BL' },
+      horsPvttc:      { c: '#ef6c00', bg: '#fff3e0', l: '📋 Plus au PVTTC' },
+      lie:            { c: '#2e7d32', bg: '#e8f5e9', l: '✅ OK' },
       moins:          { c: '#e65100', bg: '#fff3e0', l: '⬇️ En moins' },
       plus:           { c: '#6a1b9a', bg: '#f3e5f5', l: '⬆️ En plus' },
       nonCommande:    { c: '#6a1b9a', bg: '#f3e5f5', l: '➕ Non commandé' },
-      rapprocher:     { c: '#1565c0', bg: '#e3f2fd', l: '🔗 À rapprocher' },
+      rapprocher:     { c: '#1565c0', bg: '#e3f2fd', l: '🔗 À confirmer' },
       absentProbable: { c: '#1565c0', bg: '#e3f2fd', l: '🔗 Probable' },
       aConfirmer:     { c: '#616161', bg: '#f5f5f5', l: '❔ À vérifier' },
       ok:             { c: '#2e7d32', bg: '#e8f5e9', l: '✅ OK' },
@@ -24838,10 +24880,11 @@
       };
       const d = cur;
       const lines = (d && d.lines) || [], miss = (d && d.missing) || [];
-      const bad = [...lines.filter(l => ['manquant', 'moins', 'plus', 'nonCommande'].includes(l.status)), ...miss.filter(m => m.status === 'absent')];
+      const bad = [...lines.filter(l => ['moins', 'plus', 'nonCommande'].includes(l.status)), ...miss.filter(m => m.status === 'absent' || m.status === 'horsPvttc')];
+      const nonLivres = lines.filter(l => l.status === 'manquant'); // V10.57 — Rungis a mis 0 : pour info (gris)
       const toLink = lines.filter(l => l.status === 'rapprocher');
       const toCheck = lines.filter(l => l.status === 'aConfirmer');
-      const okL = lines.filter(l => l.status === 'ok' || l.status === 'ok0');
+      const okL = lines.filter(l => l.status === 'ok' || l.status === 'ok0' || l.status === 'lie');
       const prix = lines.filter(l => l.prixEcart);
       const probable = (bc) => miss.filter(m => m.status === 'absentProbable' && m.blCode === bc);
       const Num = ({ v, c, l }) => <div style={{ textAlign: 'right', minWidth: 74 }}><div style={{ fontSize: 11, color: 'var(--ink-soft)', fontWeight: 600 }}>{l}</div><div style={{ fontSize: 26, fontWeight: 700, color: c || 'var(--ink)', lineHeight: 1.1 }}>{v}</div></div>;
@@ -24852,17 +24895,18 @@
           <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', padding: '12px 14px', borderTop: '1px solid var(--line)', background: x.bg }}>
             <Badge st={l.status} />
             <div style={{ flex: '1 1 240px', minWidth: 0 }}>
-              <div style={{ fontSize: 18, fontWeight: 700 }}>{l.des}</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{l.kbg && !['absent', 'horsPvttc'].includes(l.status) ? l.kbg : l.des}</div>
               <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>
-                {[l.blCode ? 'BL ' + l.blCode : '', (l.codes && l.codes.length) ? 'code ' + l.codes.join('+') : (l.code ? 'code ' + l.code : ''), l.kbg && l.status !== 'absent' ? 'KBG : ' + l.kbg : ''].filter(Boolean).join(' · ')}
+                {[l.kbg && !['absent', 'horsPvttc'].includes(l.status) ? 'BL : ' + l.des + (l.autres ? ' + ' + l.autres.map(y => y.des).join(' + ') : '') : '', l.blCode ? 'BL ' + l.blCode : '', (l.codes && l.codes.length) ? 'code ' + l.codes.join('+') : (l.code ? 'code ' + l.code : '')].filter(Boolean).join(' · ')}
               </div>
-              {l.msg && <div style={{ fontSize: 14, fontWeight: 700, color: x.c, marginTop: 2 }}>{l.msg}</div>}
+              {(l.pvMsg || l.msg) && <div style={{ fontSize: 14, fontWeight: 700, color: x.c, marginTop: 2 }}>{l.pvMsg || l.msg}</div>}
+              {l.why && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>relié d'après la commande : {l.why}</div>}
             </div>
             <div style={{ display: 'flex', gap: 14, marginLeft: 'auto' }}>
-              <Num l="ATTENDU" v={n2(l.attendu)} />
-              <Num l="LIVRÉ (BL)" v={l.status === 'absent' ? '0' : n2(l.qte)} c={x.c} />
+              <Num l="ATTENDU" v={l.attendu == null ? '—' : n2(l.attendu) + (l.unit ? ' ' + l.unit : '')} />
+              <Num l="LIVRÉ (BL)" v={['absent', 'horsPvttc'].includes(l.status) ? '0' : n2(l.qteTot != null ? l.qteTot : l.qte) + (l.unit ? ' ' + l.unit : '')} c={x.c} />
             </div>
-            {l.colis != null && <div style={{ flex: '1 0 100%', fontSize: 13, color: 'var(--ink-soft)', textAlign: 'right' }}>{n2(l.colis)} colis × {n2(l.col)}{l.rajColis ? ` (dont rajout ${n2(l.rajColis)} colis)` : ''} — en kg ou pièces</div>}
+            {l.colis != null && l.col ? <div style={{ flex: '1 0 100%', fontSize: 13, color: 'var(--ink-soft)', textAlign: 'right' }}>{n2(l.colis)} colis de {n2(l.col)} {l.unit || ''}{l.estim ? ` · pour faire ${n2(l.estim)} MU${l.uv ? ' (' + l.uv + ')' : ''}` : ''}{l.rajColis ? ` · dont rajout ${n2(l.rajColis)} colis` : ''}</div> : null}
           </div>
         );
       };
@@ -24915,6 +24959,12 @@
                 <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #c62828' }}>
                   <div style={{ background: '#c62828', color: '#fff', padding: '10px 16px', fontSize: 20, fontWeight: 700 }}>⚠️ Écarts · {bad.length}</div>
                   {bad.map((l, i) => <Row key={'b' + i} l={l} />)}
+                </div>
+              )}
+              {nonLivres.length > 0 && (
+                <div className="card" style={{ padding: 0, overflow: 'hidden', border: '2px solid #bdbdbd' }}>
+                  <div style={{ background: '#9e9e9e', color: '#fff', padding: '10px 16px', fontSize: 19, fontWeight: 700 }}>— Non livrés, pour info · {nonLivres.length} <span style={{ fontSize: 13, fontWeight: 600 }}>(Rungis a mis 0 sur le BL)</span></div>
+                  {nonLivres.map((l, i) => <Row key={'n' + i} l={l} />)}
                 </div>
               )}
               {toLink.length > 0 && (
