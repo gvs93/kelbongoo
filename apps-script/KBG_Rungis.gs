@@ -404,6 +404,7 @@ function kbRungisRoute_(p) {
     if (p.action === 'rungis_alert') return rgJson_(rgAlert_(p.alert || {}, String(p._by || p.by || '')));
     if (p.action === 'rungis_driver_check') return rgJson_(rgDriverCheck_(String(p.code || '')));
     if (String(p.action).indexOf('rungis_bl_') === 0) return rgJson_(kbBlRoute_(p));   // v1.4 — contrôle BL (KBG_BL.gs)
+    if (String(p.action).indexOf('rungis_ancien_') === 0) return rgJson_(kbAncRoute_(p));   // v1.5 — report automatique ancien site (KBG_Ancien.gs)
     return rgJson_({ ok: false, error: 'action inconnue' });
   } catch (e) { return rgJson_({ ok: false, error: String(e && e.message ? e.message : e) }); }
 }

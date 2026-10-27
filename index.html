@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.57) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.58) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.57';
+const APP_VERSION = 'V10.58';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -16088,7 +16088,8 @@ async function kbAncienLive(day) {
       const k = site + '||' + client + '||' + produit,
         st0 = d._prep.status[k] || '';
       const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + produit]) && st0 !== 'rupture' && st0 !== 'partiel';
-      const st = lmOn ? 'done' : st0;
+      const painOk = it.cat === 'pain' && site !== 'DOM' && st0 !== 'rupture' && st0 !== 'partiel';
+      const st = lmOn || painOk ? 'done' : st0;
       p.ordered += it.qty || 1;
       p.lines++;
       if (st === 'done' || st === 'rupture' || st === 'partiel') p.fin++;
@@ -16133,6 +16134,58 @@ async function kbAncienLive(day) {
 try {
   window.kbAncienLive = kbAncienLive;
 } catch (_) {}
+async function kbAncienJob(day) {
+  const d = await kbAncienRuptures(day);
+  const P = {};
+  for (const o of d._orders) {
+    if (kbIsPsOrder(o) || o._test) continue;
+    const site = String(o.site || '').toUpperCase(),
+      client = o.name || '(client)';
+    for (const it of o.items || []) {
+      if (!it.id) continue;
+      const k = site + '||' + client + '||' + it.produit,
+        st0 = d._prep.status[k] || '',
+        q = Number(it.qty || it.quantity) || 1;
+      const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + it.produit]) && st0 !== 'rupture' && st0 !== 'partiel';
+      const painOk = it.cat === 'pain' && site !== 'DOM' && st0 !== 'rupture' && st0 !== 'partiel';
+      const miss = lmOn ? 0 : st0 === 'rupture' ? q : st0 === 'partiel' ? kbPartMiss(d._prep, k, q) : 0;
+      const done = lmOn || painOk || st0 === 'done' || st0 === 'rupture' || st0 === 'partiel';
+      const p = P[it.id] || (P[it.id] = {
+        id: String(it.id),
+        produit: it.produit || '',
+        cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais',
+        done: true,
+        orders: []
+      });
+      if (!done) p.done = false;
+      if (o.orderId) p.orders.push({
+        oid: String(o.orderId),
+        site,
+        q,
+        miss
+      });
+    }
+  }
+  return {
+    day,
+    closed: d.closed,
+    products: Object.values(P)
+  };
+}
+async function kbAncienRun(day, by, opts) {
+  const j = await kbAncienJob(day);
+  if (!j.products.length) return {
+    ok: false,
+    error: 'aucune commande de l\'ancien site ce jour'
+  };
+  return await flPost({
+    action: 'rungis_ancien_run',
+    day,
+    by: by || '',
+    products: j.products,
+    dry: !!(opts && opts.dry)
+  });
+}
 const kbSyncBus = {
   last: null,
   err: '',
@@ -16938,6 +16991,209 @@ function AncienSyncJournalCard({
     }
   }, "Aucun produit avec ce filtre.")));
 }
+function AncienRobotCard({
+  day,
+  session
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [st, setSt] = React.useState(undefined);
+  const [busy, setBusy] = React.useState('');
+  const load = React.useCallback(() => {
+    flPost({
+      action: 'rungis_ancien_status',
+      day
+    }).then(r => setSt(r && r.ok ? r.result : null)).catch(() => setSt(null));
+  }, [day]);
+  React.useEffect(() => {
+    load();
+    const t = setInterval(load, 30000);
+    return () => clearInterval(t);
+  }, [load]);
+  const run = async dry => {
+    if (!dry && !confirm(`Reporter la prépa du ${formatDateShort(day)} sur l'ancien site ?\n\nPose les articles, retire les ruptures, coche « Fini » — produit par produit, d'après la prépa de l'appli.`)) return;
+    setBusy(dry ? 'dry' : 'run');
+    try {
+      const r = await kbAncienRun(day, session && session.name, {
+        dry
+      });
+      if (r && r.ok) {
+        setSt(r.result);
+        showToast(dry ? '🔎 Simulation faite' : '🤖 Report lancé');
+      } else showToast('Erreur : ' + (r && r.error || '?'));
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+  const n = v => v || 0;
+  const s = st;
+  const col = !s ? '#616161' : s.state === 'en cours' ? '#1565c0' : s.state === 'erreur' || s.verif && !s.verif.ok || (s.erreurs || []).length ? '#c62828' : '#2e7d32';
+  const List = ({
+    t,
+    a,
+    c
+  }) => a && a.length ? React.createElement("details", {
+    style: {
+      marginTop: 6
+    }
+  }, React.createElement("summary", {
+    style: {
+      fontWeight: 700,
+      color: c,
+      cursor: 'pointer'
+    }
+  }, t, " (", a.length, ")"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 4
+    }
+  }, a.map((x, i) => React.createElement("div", {
+    key: i
+  }, "• ", x)))) : null;
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      border: '3px solid ' + col
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("h3", {
+    style: {
+      margin: 0,
+      flex: '1 1 240px'
+    }
+  }, "🤖 Report automatique sur l'ancien site"), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      width: 'auto'
+    },
+    disabled: !!busy,
+    onClick: () => run(true)
+  }, busy === 'dry' ? '…' : '🔎 Simuler'), React.createElement("button", {
+    className: "btn-primary",
+    style: {
+      width: 'auto',
+      fontWeight: 700
+    },
+    disabled: !!busy,
+    onClick: () => run(false)
+  }, busy === 'run' ? '…' : '▶️ Reporter maintenant'), React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      width: 'auto'
+    },
+    onClick: load,
+    title: "Actualiser"
+  }, "↻")), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      marginTop: 4
+    }
+  }, "Se lance tout seul à la clôture de la prépa, sur le serveur : pas de PC allumé, pas de Tampermonkey. Pose les articles, laisse les ruptures, coche « Fini », puis vérifie et envoie le récap à ", KB_RECAP_TO, "."), s === undefined && React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, "Chargement…"), s === null && React.createElement("div", {
+    style: {
+      marginTop: 8,
+      color: 'var(--ink-mute)'
+    }
+  }, "Aucun report pour la distribution du ", formatDateShort(day), "."), s && React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      color: col
+    }
+  }, s.state === 'en cours' ? `⏳ En cours · ${n(s.i)}/${n(s.n)} produits` : s.state === 'erreur' ? '⚠️ Arrêté : ' + s.error : s.verif && s.verif.ok ? '✅ Ancien site à jour' : '⚠️ Terminé avec des écarts', s.dry && React.createElement("span", {
+    style: {
+      fontSize: 13,
+      background: '#fff3e0',
+      color: '#e65100',
+      borderRadius: 8,
+      padding: '2px 8px',
+      marginLeft: 8
+    }
+  }, "SIMULATION — rien écrit", s.live === false ? ' (ANC_LIVE pas activé)' : '')), s.state === 'en cours' && React.createElement(KbPsBar, {
+    pct: s.n ? 100 * s.i / s.n : 0,
+    color: "#1565c0",
+    h: 10
+  }), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      marginTop: 8
+    }
+  }, [['Produits reportés', s.faits, '#2e7d32'], ['Déjà à jour', s.deja, '#616161'], ['Articles posés', s.poses, '#1565c0'], ['Retirés', s.retires, '#e65100'], ['Coches « Fini »', s.coches, '#2e7d32']].map(([l, v, c]) => React.createElement("div", {
+    key: l,
+    style: {
+      flex: '1 1 110px',
+      background: c + '14',
+      borderLeft: '6px solid ' + c,
+      borderRadius: 10,
+      padding: '6px 10px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-soft)',
+      fontWeight: 600
+    }
+  }, l), React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontWeight: 700,
+      color: c
+    }
+  }, n(v))))), s.verif && React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontWeight: 700,
+      color: s.verif.ok ? '#2e7d32' : '#c62828'
+    }
+  }, "🔎 Vérification : ", s.verif.ok ? 'l\'ancien site correspond à la prépa' : s.verif.nBad + ' écart(s)'), React.createElement(List, {
+    t: "🔎 Écarts",
+    a: s.verif && s.verif.bad,
+    c: "#c62828"
+  }), React.createElement(List, {
+    t: "⚠️ Erreurs",
+    a: s.erreurs,
+    c: "#c62828"
+  }), React.createElement(List, {
+    t: "⏳ Pas terminés dans l'appli",
+    a: s.attente,
+    c: "#b45309"
+  }), React.createElement(List, {
+    t: "🥬 ND à faire à la main",
+    a: s.nd,
+    c: "#00838f"
+  }), React.createElement(List, {
+    t: "❔ Introuvables sur l'ancien site",
+    a: s.absents,
+    c: "#616161"
+  }), React.createElement(List, {
+    t: "ℹ️ Commandes inconnues de l'appli",
+    a: s.inconnus,
+    c: "#616161"
+  }), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 6
+    }
+  }, "Lancé ", s.startedAt ? new Date(s.startedAt).toLocaleString('fr-FR') : '', s.by ? ' par ' + s.by : '', s.endedAt ? ' · fini ' + new Date(s.endedAt).toLocaleTimeString('fr-FR') : '')));
+}
 function AncienSitePilotagePage({
   session
 }) {
@@ -16987,7 +17243,10 @@ function AncienSitePilotagePage({
     className: "btn-ghost",
     style: kbBtnSm,
     onClick: () => setDay(activeDay())
-  }, "Jour actif")), React.createElement(AncienSyncPosteCard, null), React.createElement(AncienSyncJournalCard, {
+  }, "Jour actif")), React.createElement(AncienRobotCard, {
+    day: day,
+    session: session
+  }), React.createElement(AncienSyncPosteCard, null), React.createElement(AncienSyncJournalCard, {
     day: day,
     session: session
   }), React.createElement("div", {
@@ -29081,6 +29340,12 @@ function PrepaDuJourPage({
       sub: `${rows.length} lignes préparées · merci l'équipe 💚`
     });
     if (KB_COHABITATION) {
+      try {
+        const ar = await kbAncienRun(day, user);
+        showToast(ar && ar.ok ? `🤖 Ancien site : report lancé (${ar.result && ar.result.n || 0} produits)${ar.result && ar.result.dry ? ' — simulation' : ''}` : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — Master › Synchro ancien site');
+      } catch (e) {
+        showToast('⚠️ Report ancien site : ' + e.message);
+      }
       try {
         const lg = await kbSendRuptures(day, user, {
           auto: true
@@ -62612,6 +62877,933 @@ function UpdateChecker() {
     }
   }, "🔄 Nouvelle version ", newVersion, " disponible — toucher pour mettre à jour");
 }
+const KB_SUP_TO = 'hg@probon.fr';
+const KB_SUP_THEMES = [{
+  k: 'bug',
+  ic: '🐞',
+  l: 'Bug — ça ne marche pas'
+}, {
+  k: 'lent',
+  ic: '🐢',
+  l: 'Lent ou bloqué'
+}, {
+  k: 'idee',
+  ic: '💡',
+  l: 'Idée d\'amélioration'
+}, {
+  k: 'question',
+  ic: '❓',
+  l: 'Question — je ne sais pas faire'
+}, {
+  k: 'donnee',
+  ic: '📦',
+  l: 'Erreur de données (produit, commande, casier)'
+}, {
+  k: 'autre',
+  ic: '🙋',
+  l: 'Autre'
+}];
+const kbSupTheme = k => KB_SUP_THEMES.find(t => t.k === k) || KB_SUP_THEMES[KB_SUP_THEMES.length - 1];
+const kbSupUid = () => {
+  const c = window.__kbClaims || {};
+  return c.uid || '';
+};
+const kbHm = ts => {
+  try {
+    const d = new Date(ts);
+    const today = new Date().toDateString() === d.toDateString();
+    return (today ? '' : d.toLocaleDateString('fr-FR', {
+      day: '2-digit',
+      month: '2-digit'
+    }) + ' ') + d.toLocaleTimeString('fr-FR', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  } catch (_) {
+    return '';
+  }
+};
+function kbImgSmall(file) {
+  return new Promise((ok, ko) => {
+    const rd = new FileReader();
+    rd.onerror = () => ko(new Error('photo illisible'));
+    rd.onload = () => {
+      const im = new Image();
+      im.onerror = () => ko(new Error('photo illisible'));
+      im.onload = () => {
+        let max = 1280,
+          q = 0.72,
+          out = '';
+        for (let k = 0; k < 6; k++) {
+          const r = Math.min(1, max / Math.max(im.width, im.height)),
+            cv = document.createElement('canvas');
+          cv.width = Math.round(im.width * r);
+          cv.height = Math.round(im.height * r);
+          cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+          out = cv.toDataURL('image/jpeg', q);
+          if (out.length < 350000) break;
+          max = Math.round(max * 0.8);
+          q = Math.max(0.5, q - 0.06);
+        }
+        ok(out);
+      };
+      im.src = rd.result;
+    };
+    rd.readAsDataURL(file);
+  });
+}
+async function kbSupSend({
+  session,
+  site,
+  tab,
+  theme,
+  text,
+  img
+}) {
+  const th = kbSupTheme(theme),
+    now = Date.now();
+  const id = 'sup_' + now + '_' + Math.random().toString(36).slice(2, 6);
+  const role = session.isMaster ? 'master' : session.role || '';
+  const doc = {
+    from: session.name || '?',
+    fromUid: kbSupUid(),
+    role,
+    site: site || '',
+    tab: tab || '',
+    theme: th.k,
+    text: String(text || '').slice(0, 4000),
+    at: now,
+    status: 'new',
+    thread: [],
+    ver: APP_VERSION,
+    ua: String(navigator.userAgent || '').slice(0, 160),
+    img: img && img.length < 400000 ? img : ''
+  };
+  let saved = false,
+    mailed = false;
+  try {
+    await storage.setDoc('support_msgs', id, doc, {
+      replace: true
+    });
+    saved = true;
+  } catch (_) {}
+  const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const subject = `Appli Kelbongoo — ${doc.from} — ${th.ic} ${th.l}`;
+  const htmlBody = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;color:#1b1b1b">
+<div style="background:#1a4d2e;color:#fff;border-radius:14px;padding:14px 18px"><div style="font-size:22px;font-weight:900">${th.ic} ${esc(th.l)}</div><div style="font-size:15px;margin-top:2px">de <b>${esc(doc.from)}</b> · ${esc(role)}${doc.site ? ' · ' + esc(doc.site) : ''}${doc.tab ? ' · écran « ' + esc(doc.tab) + ' »' : ''}</div></div>
+<div style="font-size:17px;line-height:1.5;white-space:pre-wrap;margin:14px 2px">${esc(doc.text)}</div>
+${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
+<p style="font-size:13px;color:#555">${saved ? 'Réponds depuis l\'appli : Master › 💬 (en bas à droite) — la réponse s\'affiche chez la personne.' : 'Message non enregistré dans l\'appli (règles Firestore support_msgs pas encore déployées) : réponds directement à la personne.'}</p>
+<p style="font-size:12px;color:#999">${esc(APP_VERSION)} · ${esc(new Date(now).toLocaleString('fr-FR'))} · ${esc(doc.ua)}</p></div>`;
+  try {
+    const r = await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'send_mail',
+      to: KB_SUP_TO,
+      subject,
+      htmlBody,
+      body: `${th.l} — ${doc.from} (${role} ${doc.site}) :\n\n${doc.text}`,
+      ...(doc.img ? {
+        attachment: {
+          dataB64: doc.img.split(',')[1] || '',
+          mimeType: 'image/jpeg',
+          name: 'capture.jpg'
+        }
+      } : {})
+    });
+    mailed = !!(r && r.ok !== false);
+  } catch (_) {}
+  return {
+    id,
+    saved,
+    mailed
+  };
+}
+function useKbMastersOnline() {
+  const [list, setList] = React.useState([]);
+  React.useEffect(() => {
+    let stop = false;
+    const u = storage.subscribe(KB_PRES, arr => {
+      if (stop) return;
+      const t = Date.now() - 3 * 60000;
+      setList((arr || []).filter(p => p && p.role === 'master' && p.page === 'master' && (p.at || 0) > t).map(p => p.name));
+    });
+    const t = setInterval(() => setList(l => [...l]), 60000);
+    return () => {
+      stop = true;
+      u && u();
+      clearInterval(t);
+    };
+  }, []);
+  return list;
+}
+const kbFabStyle = bottom => ({
+  position: 'fixed',
+  right: 12,
+  bottom,
+  zIndex: 900,
+  width: 46,
+  height: 46,
+  borderRadius: 23,
+  border: '1px solid var(--line,#ddd)',
+  background: '#fff',
+  boxShadow: '0 3px 12px rgba(0,0,0,.18)',
+  fontSize: 22,
+  lineHeight: '44px',
+  textAlign: 'center',
+  cursor: 'pointer',
+  padding: 0,
+  opacity: .92
+});
+const KbBadge = ({
+  n
+}) => n > 0 ? React.createElement("span", {
+  style: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 20,
+    height: 20,
+    borderRadius: 10,
+    background: '#e53935',
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 700,
+    lineHeight: '20px',
+    padding: '0 5px'
+  }
+}, n) : null;
+function KbThread({
+  m,
+  me
+}) {
+  const items = [{
+    by: 'user',
+    from: m.from,
+    text: m.text,
+    at: m.at,
+    img: m.img
+  }, ...(m.thread || [])];
+  return React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, items.map((t, i) => {
+    const mine = me === 'master' ? t.by === 'master' : t.by !== 'master';
+    return React.createElement("div", {
+      key: i,
+      style: {
+        alignSelf: mine ? 'flex-end' : 'flex-start',
+        maxWidth: '88%',
+        background: mine ? '#e8f5e9' : '#f3f3f3',
+        border: '1px solid ' + (mine ? '#a5d6a7' : '#e0e0e0'),
+        borderRadius: 12,
+        padding: '7px 10px'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--ink-mute)',
+        fontWeight: 600
+      }
+    }, t.by === 'master' ? '🛟 ' : '', t.from, " · ", kbHm(t.at)), React.createElement("div", {
+      style: {
+        fontSize: 15,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word'
+      }
+    }, t.text), t.img && React.createElement("img", {
+      src: t.img,
+      alt: "photo",
+      onClick: () => {
+        const w = window.open();
+        if (w) w.document.write('<img src="' + t.img + '" style="max-width:100%">');
+      },
+      style: {
+        marginTop: 6,
+        maxWidth: 180,
+        maxHeight: 140,
+        borderRadius: 8,
+        cursor: 'zoom-in'
+      }
+    }));
+  }));
+}
+function KbSupportUser({
+  session,
+  tab,
+  site,
+  bottom
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [open, setOpen] = React.useState(false);
+  const [theme, setTheme] = React.useState('');
+  const [text, setText] = React.useState('');
+  const [img, setImg] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [sent, setSent] = React.useState(null);
+  const [mine, setMine] = React.useState([]);
+  const [reply, setReply] = React.useState({});
+  const online = useKbMastersOnline();
+  const uid = kbSupUid();
+  React.useEffect(() => {
+    if (!uid) return;
+    return storage.subscribeWhere('support_msgs', 'fromUid', '==', uid, arr => setMine((arr || []).sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 10)));
+  }, [uid]);
+  const unread = mine.filter(m => (m.thread || []).some(t => t.by === 'master' && (t.at || 0) > (m.userReadAt || 0))).length;
+  React.useEffect(() => {
+    if (open && unread) mine.forEach(m => {
+      if ((m.thread || []).some(t => t.by === 'master' && (t.at || 0) > (m.userReadAt || 0))) storage.setDoc('support_msgs', m.id, {
+        userReadAt: Date.now()
+      }).catch(() => {});
+    });
+  }, [open, unread]);
+  const pickImg = async f => {
+    if (!f) return;
+    try {
+      setImg(await kbImgSmall(f));
+    } catch (e) {
+      showToast(e.message);
+    }
+  };
+  const send = async () => {
+    if (!theme) {
+      showToast('Choisis d\'abord le thème');
+      return;
+    }
+    if (text.trim().length < 3) {
+      showToast('Écris ton message');
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await kbSupSend({
+        session,
+        site,
+        tab,
+        theme,
+        text: text.trim(),
+        img
+      });
+      setSent(r);
+      if (r.mailed || r.saved) {
+        setText('');
+        setImg('');
+        setTheme('');
+      } else showToast('⚠️ Envoi impossible — réessaie');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const answer = async m => {
+    const t = String(reply[m.id] || '').trim();
+    if (!t) return;
+    try {
+      await storage.setDoc('support_msgs', m.id, {
+        thread: [...(m.thread || []), {
+          by: 'user',
+          from: session.name,
+          text: t,
+          at: Date.now()
+        }],
+        userReadAt: Date.now(),
+        status: 'new'
+      });
+      setReply(r => ({
+        ...r,
+        [m.id]: ''
+      }));
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    }
+  };
+  return React.createElement(React.Fragment, null, React.createElement("button", {
+    "aria-label": "Support appli",
+    title: "Un souci, une idée ? Écris à Henry",
+    onClick: () => {
+      setOpen(true);
+      setSent(null);
+    },
+    style: kbFabStyle(bottom)
+  }, "💬", React.createElement(KbBadge, {
+    n: unread
+  })), open && React.createElement(KbSheet, {
+    title: "💬 Un souci, une idée sur l'appli ?",
+    onClose: () => setOpen(false)
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)',
+      marginBottom: 8
+    }
+  }, online.length ? React.createElement("b", {
+    style: {
+      color: '#2e7d32'
+    }
+  }, "🟢 ", online.map(n => String(n).split(' ')[0]).join(', '), " en ligne : réponse ici même. ") : null, "Henry reçoit aussi un mail dans tous les cas."), sent && React.createElement("div", {
+    style: {
+      background: '#e8f5e9',
+      border: '2px solid #2e7d32',
+      borderRadius: 12,
+      padding: '10px 12px',
+      marginBottom: 10,
+      fontWeight: 700,
+      color: '#1b5e20'
+    }
+  }, "✅ Envoyé, merci ! ", sent.mailed ? 'Henry a reçu un mail.' : ''), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginBottom: 6
+    }
+  }, "1. Le thème"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 6,
+      marginBottom: 10
+    }
+  }, KB_SUP_THEMES.map(t => React.createElement("button", {
+    key: t.k,
+    onClick: () => setTheme(t.k),
+    style: {
+      flex: '1 1 46%',
+      minHeight: 50,
+      fontSize: 15,
+      fontWeight: 700,
+      textAlign: 'left',
+      padding: '8px 10px',
+      borderRadius: 12,
+      cursor: 'pointer',
+      border: '3px solid ' + (theme === t.k ? 'var(--accent-dark,#2f5326)' : 'var(--line,#ddd)'),
+      background: theme === t.k ? 'var(--accent-soft,#eaf1e6)' : '#fff',
+      color: 'var(--ink)'
+    }
+  }, t.ic, " ", t.l))), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginBottom: 6
+    }
+  }, "2. Ton message"), React.createElement("textarea", {
+    value: text,
+    onChange: e => setText(e.target.value),
+    rows: 4,
+    placeholder: theme === 'bug' ? 'Qu\'est-ce que tu faisais ? Qu\'est-ce qui s\'est passé ?' : 'Écris ici…',
+    style: {
+      width: '100%',
+      boxSizing: 'border-box',
+      fontSize: 16,
+      padding: 10,
+      borderRadius: 12,
+      border: '2px solid var(--line,#ddd)'
+    }
+  }), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      margin: '8px 0 12px',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("label", {
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      cursor: 'pointer',
+      margin: 0,
+      fontSize: 15,
+      fontWeight: 700,
+      textTransform: 'none',
+      letterSpacing: 0,
+      padding: '10px 14px',
+      borderRadius: 12,
+      border: '2px solid var(--line,#ddd)',
+      background: '#fff',
+      color: 'var(--ink)'
+    }
+  }, "📷 ", img ? 'Changer la photo' : 'Ajouter une photo / capture', React.createElement("input", {
+    type: "file",
+    accept: "image/*",
+    style: {
+      display: 'none'
+    },
+    onChange: e => pickImg(e.target.files && e.target.files[0])
+  })), img && React.createElement(React.Fragment, null, React.createElement("img", {
+    src: img,
+    alt: "",
+    style: {
+      height: 48,
+      borderRadius: 6
+    }
+  }), React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      width: 'auto'
+    },
+    onClick: () => setImg('')
+  }, "✕"))), React.createElement("button", {
+    className: "btn-primary btn-block",
+    disabled: busy,
+    onClick: send,
+    style: {
+      minHeight: 54,
+      fontSize: 18,
+      fontWeight: 700
+    }
+  }, busy ? 'Envoi…' : '📨 Envoyer à Henry'), mine.length > 0 && React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginBottom: 6
+    }
+  }, "Mes messages"), mine.map(m => {
+    const th = kbSupTheme(m.theme);
+    return React.createElement("div", {
+      key: m.id,
+      style: {
+        border: '1px solid var(--line,#ddd)',
+        borderRadius: 12,
+        padding: 10,
+        marginBottom: 8
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700,
+        marginBottom: 6
+      }
+    }, th.ic, " ", th.l, " · ", kbHm(m.at), " ", m.status === 'done' ? React.createElement("span", {
+      style: {
+        color: '#2e7d32'
+      }
+    }, "· ✓ traité") : null), React.createElement(KbThread, {
+      m: m,
+      me: "user"
+    }), (m.thread || []).length > 0 && m.status !== 'done' && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        marginTop: 6
+      }
+    }, React.createElement("input", {
+      value: reply[m.id] || '',
+      onChange: e => setReply(r => ({
+        ...r,
+        [m.id]: e.target.value
+      })),
+      placeholder: "Répondre…",
+      style: {
+        flex: 1,
+        fontSize: 15,
+        padding: '8px 10px',
+        borderRadius: 10,
+        border: '1px solid var(--line,#ddd)'
+      }
+    }), React.createElement("button", {
+      className: "btn-primary",
+      style: {
+        width: 'auto'
+      },
+      onClick: () => answer(m)
+    }, "➤")));
+  }))));
+}
+function KbMasterComms({
+  session,
+  tab,
+  bottom
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [open, setOpen] = React.useState(false);
+  const [pane, setPane] = React.useState('sup');
+  const [sup, setSup] = React.useState([]);
+  const [chat, setChat] = React.useState([]);
+  const [reply, setReply] = React.useState({});
+  const [msg, setMsg] = React.useState('');
+  const [pop, setPop] = React.useState(null);
+  const [seenChat, setSeenChat] = React.useState(() => {
+    try {
+      return Number(localStorage.getItem('kb_chat_seen') || 0);
+    } catch (_) {
+      return 0;
+    }
+  });
+  const mount = React.useRef(Date.now());
+  const online = useKbMastersOnline();
+  React.useEffect(() => {
+    const beat = () => kbPresence(session, {
+      page: 'master',
+      task: 'Master',
+      taskAt: Date.now()
+    }, 0);
+    beat();
+    const t = setInterval(beat, 60000);
+    return () => clearInterval(t);
+  }, []);
+  React.useEffect(() => storage.subscribe('support_msgs', arr => {
+    const L = (arr || []).sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 80);
+    setSup(prev => {
+      const last = L.find(m => m.status === 'new' && Math.max(m.at || 0, ...(m.thread || []).map(t => t.at || 0)) > mount.current && !prev.some(p => p.id === m.id && (p.thread || []).length === (m.thread || []).length && p.status === m.status));
+      if (last) {
+        const lt = (last.thread || []).slice(-1)[0];
+        setPop({
+          kind: 'sup',
+          id: last.id,
+          from: lt ? lt.from : last.from,
+          text: lt ? lt.text : last.text,
+          theme: last.theme
+        });
+      }
+      return L;
+    });
+  }), []);
+  React.useEffect(() => storage.subscribe('master_chat', arr => {
+    const t0 = Date.now() - 14 * 864e5;
+    const L = (arr || []).filter(m => (m.at || 0) > t0).sort((a, b) => (a.at || 0) - (b.at || 0)).slice(-120);
+    setChat(prev => {
+      const n = L[L.length - 1];
+      if (n && n.at > mount.current && n.from !== session.name && (!prev.length || prev[prev.length - 1].id !== n.id)) setPop({
+        kind: 'chat',
+        from: n.from,
+        text: n.text
+      });
+      return L;
+    });
+  }), []);
+  const nNew = sup.filter(m => m.status === 'new').length;
+  const nChat = chat.filter(m => (m.at || 0) > seenChat && m.from !== session.name).length;
+  React.useEffect(() => {
+    if (open && pane === 'chat' && nChat) {
+      const t = Date.now();
+      setSeenChat(t);
+      try {
+        localStorage.setItem('kb_chat_seen', String(t));
+      } catch (_) {}
+    }
+  }, [open, pane, nChat]);
+  const answer = async (m, done) => {
+    const t = String(reply[m.id] || '').trim();
+    if (!t && !done) return;
+    try {
+      await storage.setDoc('support_msgs', m.id, {
+        thread: t ? [...(m.thread || []), {
+          by: 'master',
+          from: session.name,
+          text: t,
+          at: Date.now()
+        }] : m.thread || [],
+        status: done ? 'done' : 'answered'
+      });
+      setReply(r => ({
+        ...r,
+        [m.id]: ''
+      }));
+    } catch (e) {
+      showToast('Erreur : ' + e.message + ' (règles Firestore support_msgs ?)');
+    }
+  };
+  const sendChat = async () => {
+    const t = msg.trim();
+    if (!t) return;
+    try {
+      await storage.setDoc('master_chat', 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5), {
+        from: session.name,
+        fromUid: kbSupUid(),
+        text: t.slice(0, 2000),
+        at: Date.now()
+      }, {
+        replace: true
+      });
+      setMsg('');
+    } catch (e) {
+      showToast('Erreur : ' + e.message + ' (règles Firestore master_chat ?)');
+    }
+  };
+  const openPane = p => {
+    setPane(p);
+    setOpen(true);
+    setPop(null);
+  };
+  return React.createElement(React.Fragment, null, React.createElement("button", {
+    "aria-label": "Support et chat master",
+    title: "Support équipe · Chat master",
+    onClick: () => open ? setOpen(false) : openPane(nNew || !nChat ? 'sup' : 'chat'),
+    style: kbFabStyle(bottom)
+  }, "💬", React.createElement(KbBadge, {
+    n: nNew + nChat
+  })), pop && !open && React.createElement("div", {
+    onClick: () => openPane(pop.kind),
+    style: {
+      position: 'fixed',
+      right: 12,
+      bottom: bottom + 56,
+      zIndex: 901,
+      width: 300,
+      maxWidth: 'calc(100vw - 24px)',
+      background: '#fff',
+      borderRadius: 14,
+      boxShadow: '0 8px 26px rgba(0,0,0,.22)',
+      borderLeft: '6px solid ' + (pop.kind === 'sup' ? '#1565c0' : '#2e7d32'),
+      padding: '10px 12px',
+      cursor: 'pointer'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center'
+    }
+  }, React.createElement("b", {
+    style: {
+      flex: 1,
+      fontSize: 14
+    }
+  }, pop.kind === 'sup' ? kbSupTheme(pop.theme).ic + ' ' + pop.from : '👥 ' + pop.from), React.createElement("button", {
+    onClick: e => {
+      e.stopPropagation();
+      setPop(null);
+    },
+    style: {
+      border: 0,
+      background: 'none',
+      fontSize: 18,
+      cursor: 'pointer'
+    }
+  }, "×")), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)',
+      marginTop: 2,
+      overflow: 'hidden',
+      display: '-webkit-box',
+      WebkitLineClamp: 3,
+      WebkitBoxOrient: 'vertical'
+    }
+  }, pop.text), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#1565c0',
+      fontWeight: 700,
+      marginTop: 4
+    }
+  }, "Répondre →")), open && React.createElement("div", {
+    style: {
+      position: 'fixed',
+      right: 0,
+      top: 0,
+      bottom: 0,
+      width: 420,
+      maxWidth: '100vw',
+      zIndex: 3000,
+      background: '#fff',
+      boxShadow: '-6px 0 24px rgba(0,0,0,.18)',
+      display: 'flex',
+      flexDirection: 'column'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '10px 12px',
+      borderBottom: '1px solid var(--line,#ddd)'
+    }
+  }, [['sup', '🛟 Support équipe', nNew], ['chat', '👥 Chat master', nChat]].map(([k, l, n]) => React.createElement("button", {
+    key: k,
+    onClick: () => setPane(k),
+    className: pane === k ? 'btn-primary' : 'btn-secondary',
+    style: {
+      width: 'auto',
+      fontSize: 14,
+      fontWeight: 700,
+      position: 'relative'
+    }
+  }, l, n ? ` (${n})` : '')), React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }), React.createElement("button", {
+    onClick: () => setOpen(false),
+    style: {
+      border: 0,
+      background: 'none',
+      fontSize: 26,
+      cursor: 'pointer'
+    },
+    "aria-label": "Fermer"
+  }, "×")), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      padding: '6px 12px'
+    }
+  }, "🟢 En ligne dans le Master : ", online.length ? online.join(', ') : '—'), pane === 'sup' ? React.createElement("div", {
+    style: {
+      overflowY: 'auto',
+      flex: 1,
+      padding: '6px 12px 20px'
+    }
+  }, !sup.length && React.createElement("div", {
+    style: {
+      color: 'var(--ink-mute)',
+      padding: 10
+    }
+  }, "Aucun message de l'équipe."), sup.map(m => {
+    const th = kbSupTheme(m.theme);
+    return React.createElement("div", {
+      key: m.id,
+      style: {
+        border: '2px solid ' + (m.status === 'new' ? '#1565c0' : 'var(--line,#ddd)'),
+        borderRadius: 12,
+        padding: 10,
+        marginBottom: 10,
+        opacity: m.status === 'done' ? .65 : 1
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700
+      }
+    }, th.ic, " ", th.l), React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)',
+        marginBottom: 6
+      }
+    }, m.from, " · ", m.role, m.site ? ' · ' + m.site : '', m.tab ? ' · écran ' + m.tab : '', " · ", m.ver || ''), React.createElement(KbThread, {
+      m: m,
+      me: "master"
+    }), m.status !== 'done' && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        marginTop: 8
+      }
+    }, React.createElement("input", {
+      value: reply[m.id] || '',
+      onChange: e => setReply(r => ({
+        ...r,
+        [m.id]: e.target.value
+      })),
+      onKeyDown: e => {
+        if (e.key === 'Enter') answer(m, false);
+      },
+      placeholder: "Répondre…",
+      style: {
+        flex: 1,
+        fontSize: 15,
+        padding: '8px 10px',
+        borderRadius: 10,
+        border: '1px solid var(--line,#ddd)'
+      }
+    }), React.createElement("button", {
+      className: "btn-primary",
+      style: {
+        width: 'auto'
+      },
+      onClick: () => answer(m, false)
+    }, "➤"), React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        width: 'auto'
+      },
+      title: "Marquer traité",
+      onClick: () => answer(m, true)
+    }, "✓")));
+  })) : React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      overflowY: 'auto',
+      flex: 1,
+      padding: '6px 12px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, !chat.length && React.createElement("div", {
+    style: {
+      color: 'var(--ink-mute)',
+      padding: 10
+    }
+  }, "Pas encore de message. Écris aux autres personnes connectées au Master."), chat.map(m => {
+    const me = m.from === session.name;
+    return React.createElement("div", {
+      key: m.id,
+      style: {
+        alignSelf: me ? 'flex-end' : 'flex-start',
+        maxWidth: '85%',
+        background: me ? '#e8f5e9' : '#f3f3f3',
+        borderRadius: 12,
+        padding: '6px 10px'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--ink-mute)',
+        fontWeight: 600
+      }
+    }, me ? 'Moi' : m.from, " · ", kbHm(m.at)), React.createElement("div", {
+      style: {
+        fontSize: 15,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word'
+      }
+    }, m.text));
+  })), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      padding: 10,
+      borderTop: '1px solid var(--line,#ddd)'
+    }
+  }, React.createElement("input", {
+    value: msg,
+    onChange: e => setMsg(e.target.value),
+    onKeyDown: e => {
+      if (e.key === 'Enter') sendChat();
+    },
+    placeholder: "Message aux personnes du Master…",
+    style: {
+      flex: 1,
+      fontSize: 15,
+      padding: '10px 12px',
+      borderRadius: 12,
+      border: '1px solid var(--line,#ddd)'
+    }
+  }), React.createElement("button", {
+    className: "btn-primary",
+    style: {
+      width: 'auto'
+    },
+    onClick: sendChat
+  }, "➤")))));
+}
+function KbSupport({
+  session,
+  tab,
+  site
+}) {
+  if (!session || !session.name) return null;
+  const master = session.isMaster && !session._masterView && !!(window.__kbClaims && window.__kbClaims.admin);
+  const wide = typeof window !== 'undefined' && window.innerWidth >= 1100;
+  const bottom = wide && session.isMaster ? 18 : 84;
+  return master ? React.createElement(KbMasterComms, {
+    session: session,
+    tab: tab,
+    bottom: bottom
+  }) : React.createElement(KbSupportUser, {
+    session: session,
+    tab: tab,
+    site: site,
+    bottom: bottom
+  });
+}
 function App() {
   const [, setLieuxRev] = React.useState(0);
   React.useEffect(() => {
@@ -63384,6 +64576,10 @@ function App() {
     }, overlay, React.createElement(UpdateChecker, null), React.createElement(DlcMorningPopup, {
       session: effSession,
       setTab: setTab
+    }), React.createElement(KbSupport, {
+      session: effSession,
+      tab: tab,
+      site: "ENTREPOT"
     }), React.createElement("div", {
       className: "topbar"
     }, React.createElement("div", {
@@ -63530,7 +64726,11 @@ function App() {
   }
   return React.createElement("div", {
     className: 'app-shell' + (effSession.isMaster ? ' kb-wide' : '')
-  }, overlay, React.createElement(UpdateChecker, null), effSession.isMaster && React.createElement(KbMasterSidebar, {
+  }, overlay, React.createElement(UpdateChecker, null), React.createElement(KbSupport, {
+    session: effSession,
+    tab: tab,
+    site: currentSite
+  }), effSession.isMaster && React.createElement(KbMasterSidebar, {
     tab: tab,
     setTab: setTab,
     session: effSession,
