@@ -1,5 +1,8 @@
 /**
- * KBG_Ancien.gs — v1.2 (27/10/2026) — v1.2 : REMISES de prépa reportées (poids réel réduit : « Ajuster le poids », globalorderlocales/update-order-item-weight).
+ * KBG_Ancien.gs — v1.3 (27/10/2026) — v1.3 : CORRECTIF coches — « toggle-golpps-completed » agit sur TOUS les lieux non exclus :
+ *   avant, 1 appel par lieu → un produit ND sur 2 ou 4 lieux était coché puis décoché. Désormais 1 seul appel par produit,
+ *   avec excludedLocales = tous les autres lieux.
+ * v1.2 : REMISES de prépa reportées (poids réel réduit : « Ajuster le poids », globalorderlocales/update-order-item-weight).
  * v1.1 : Réception ND automatique (quantité reçue + coche), journal détaillé produit par produit en direct.
  * v1.0 — REPORT AUTOMATIQUE DE LA PRÉPA SUR L'ANCIEN SITE (preparations.kelbongoo.com)
  * À ajouter dans le projet Apps Script « FL_Probon_Proxy » (même projet que KBG_Rungis.gs / KBG_BL.gs).
@@ -212,9 +215,11 @@ function ancWork_(job) {
 function ancDoLane_(G, A, N, lane, job) {
   var R = job.res, work = [], queues = {}, D = R.detail || (R.detail = []);
   var log = function (q, txt) { (q.d = q.d || []).push(txt); };
-  var Q = function (x) { return queues[x.id] || (queues[x.id] = { x: x, calls: [], locs: [], d: [] }); };
+  var allBy = {}, Q = function (x) { return queues[x.id] || (queues[x.id] = { x: x, calls: [], locs: [], d: [], all: allBy[x.id] || [] }); };
   lane.forEach(function (x) {
     var a = A[x.id], nd = N[x.id];
+    // v1.3 — tous les lieux connus du produit (pour exclure ceux qu'on ne coche pas)
+    var all = {}; ancLocales_(job).concat(['DOM']).concat(Object.keys((a && a.prog) || {})).concat(Object.keys(nd || {})).forEach(function (l) { all[l] = 1; }); allBy[x.id] = Object.keys(all);
     if (!x.done) { R.attente.push(x.produit); D.push({ p: x.produit, s: 'attente', d: 'pas terminé dans l\'appli — non reporté', at: Date.now() }); return; }
     if (!a && !nd) { R.absents.push(x.produit); D.push({ p: x.produit, s: 'absent', d: 'introuvable sur l\'ancien site', at: Date.now() }); return; }
     var bySite = {}, wantSite = {}, remSite = {};
@@ -224,13 +229,16 @@ function ancDoLane_(G, A, N, lane, job) {
       var pr = a.prog[loc]; if (!pr.ord) return;
       work.push({ x: x, a: a, loc: loc, want: bySite[loc] || {}, rem: remSite[loc] || {}, pr: pr });
     });
+    var ndTick = [];
     if (nd) Object.keys(nd).forEach(function (loc) {
       var n = nd[loc]; if (!n.ord) return;
       var q = Q(x), w = Math.min(n.ord, wantSite[loc] || 0), did = [];
       if (n.rec !== w) { q.calls.push({ route: 'globalorders/update-nondispatch-quantity-received', params: { globalorder_id: G, locale: loc, producerproduct_id: x.id, quantity: w } }); did.push('reçu ' + w + '/' + n.ord); }
-      if (!n.completed) { q.calls.push({ route: 'globalorders/toggle-golpps-completed', params: { globalorder_id: G, locale: loc, producerproduct_id: x.id, userId: ANC_USER_ID, excludedLocales: [], isND: true }, nd: true }); did.push('✓'); }
+      if (!n.completed) { ndTick.push(loc); did.push('✓'); }
       if (did.length) { q.fresh = true; q.ndDone = (q.ndDone || 0) + 1; log(q, 'ND ' + loc + ' ' + did.join(' ')); } else log(q, 'ND ' + loc + ' déjà ok');
     });
+    // v1.3 — UNE coche ND pour le produit : la bascule s'applique à tous les lieux non exclus
+    if (ndTick.length) Q(x).calls.push({ route: 'globalorders/toggle-golpps-completed', params: { globalorder_id: G, locale: ndTick[0], producerproduct_id: x.id, userId: ANC_USER_ID, excludedLocales: allBy[x.id].filter(function (l) { return ndTick.indexOf(l) < 0; }), isND: true }, nd: ndTick.length });
   });
   if (work.length) {
     var gets = ancAll_(work.map(function (w) { return ancReq_('globalorders/get-dispatch', { globalorder_id: G, locale: w.loc, producerproduct_id: w.x.id, user_id: ANC_USER_ID, couloir: w.a.couloir ? 'sec' : 'frais', getGroupedDispatchProducts: false }); }));
@@ -257,14 +265,16 @@ function ancDoLane_(G, A, N, lane, job) {
       ids.forEach(function (id) { var q = queues[id]; if (q.calls.length) { var c = q.calls.shift(); batch.push(ancReq_(c.route, c.params)); who.push({ q: q, c: c }); more = more || q.calls.length > 0; } });
       if (!batch.length) break;
       var rs = ancAll_(batch); R.appels += rs.length;
-      rs.forEach(function (r, k) { var q = who[k].q; if (!r.ok) { q.err = (q.err || 0) + 1; if (q.err <= 2) R.erreurs.push(q.x.produit + ' : ' + r.err); } else if (who[k].c.nd) R.coches++; });
+      rs.forEach(function (r, k) { var q = who[k].q; if (!r.ok) { q.err = (q.err || 0) + 1; if (q.err <= 2) R.erreurs.push(q.x.produit + ' : ' + r.err); } else if (who[k].c.nd) R.coches += who[k].c.nd; });
     }
     // Coche « Fini » par lieu (dispatch) — seulement si aucune erreur sur le produit
     var ticks = [], tw = [];
-    ids.forEach(function (id) { var q = queues[id]; if (q.err) return; q.locs.forEach(function (loc) { ticks.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: id, userId: ANC_USER_ID, completed: true, excludedLocales: [], isND: false })); tw.push(q); }); });
+    // v1.3 — 1 appel par produit, lieux non concernés exclus (sinon tous les lieux sont cochés)
+    //   (completed:true = mise à « fini », pas une bascule → 1 appel par lieu traité, sans risque de décocher)
+    ids.forEach(function (id) { var q = queues[id]; if (q.err) return; var ex = (q.all || []).filter(function (l) { return q.locs.indexOf(l) < 0; }); q.locs.forEach(function (loc) { ticks.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: id, userId: ANC_USER_ID, completed: true, excludedLocales: ex, isND: false })); tw.push(q); }); });
     var tr = ancAll_(ticks); R.appels += tr.length;
     tr.forEach(function (r, k) { if (r.ok) R.coches++; else { tw[k].err = (tw[k].err || 0) + 1; R.erreurs.push(tw[k].x.produit + ' : coche Fini ' + r.err); } });
-  } else ids.forEach(function (id) { var q = queues[id]; R.coches += q.locs.length + q.calls.filter(function (c) { return c.nd; }).length; });
+  } else ids.forEach(function (id) { var q = queues[id]; R.coches += q.locs.length + q.calls.reduce(function (s, c) { return s + (c.nd || 0); }, 0); });
   ids.forEach(function (id) {
     var q = queues[id];
     if (q.err) { D.push({ p: q.x.produit, s: 'err', d: q.d.join(' · ') + ' · ⚠️ erreur', at: Date.now() }); return; }
@@ -326,7 +336,7 @@ function ancMail_(job) {
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
     + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.2 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.3 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
   MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
 
