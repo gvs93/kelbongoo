@@ -785,7 +785,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.60';
+    const APP_VERSION = 'V10.61';
+    // V10.61 — (27/10/2026) Ancien site : report serveur v1.1 (Réception ND automatique) + journal détaillé produit par produit en direct
+    //   (Master › Synchro ancien site, rafraîchi toutes les 8 s pendant le report). Prépa clôturée = tout traité (pains sans statut = présents).
+    //   Retirés : carte « Poste synchro » et journal Tampermonkey (plus besoin), et le moteur de publication pour Tampermonkey.
     // V10.60 — (27/10/2026) Prépa sur téléphone : le bouton « Clôturer » était au bout de la ligne du bandeau (il fallait faire défiler) →
     //   placé juste après le %, toujours visible ; les autres boutons (DOM, ruptures ancien site…) suivent.
     // V10.59 — (27/10/2026) Pain en prépa : plus coché automatiquement (pouvait être en rupture). Validé comme un produit ND :
@@ -9737,7 +9740,8 @@
           const k = site + '||' + client + '||' + it.produit, st0 = d._prep.status[k] || '', q = Number(it.qty || it.quantity) || 1;
           const lmOn = !!(d._prep.lm && d._prep.lm[site + '||' + it.produit]) && st0 !== 'rupture' && st0 !== 'partiel';
           const miss = lmOn ? 0 : st0 === 'rupture' ? q : st0 === 'partiel' ? kbPartMiss(d._prep, k, q) : 0;
-          const done = lmOn || st0 === 'done' || st0 === 'rupture' || st0 === 'partiel';
+          // V10.61 — prépa CLÔTURÉE : tout est traité (ex. pains clôturés avant V10.59 sans statut) → présent sauf rupture notée
+          const done = !!d.closed || lmOn || st0 === 'done' || st0 === 'rupture' || st0 === 'partiel';
           const p = P[it.id] || (P[it.id] = { id: String(it.id), produit: it.produit || '', cat: it.cat || DISPATCH_TYPE[it.dispatchType] || 'frais', done: true, orders: [] });
           if (!done) p.done = false;
           if (o.orderId) p.orders.push({ oid: String(o.orderId), site, q, miss });
@@ -10016,7 +10020,10 @@
       const [st, setSt] = React.useState(undefined);
       const [busy, setBusy] = React.useState('');
       const load = React.useCallback(() => { flPost({ action: 'rungis_ancien_status', day }).then(r => setSt(r && r.ok ? r.result : null)).catch(() => setSt(null)); }, [day]);
-      React.useEffect(() => { load(); const t = setInterval(load, 30000); return () => clearInterval(t); }, [load]);
+      const running = st && st.state === 'en cours';
+      React.useEffect(() => { load(); const t = setInterval(load, running ? 8000 : 30000); return () => clearInterval(t); }, [load, running]);
+      const [jf, setJf] = React.useState('');
+      const [jq, setJq] = React.useState('');
       const run = async (dry) => {
         if (!dry && !confirm(`Reporter la prépa du ${formatDateShort(day)} sur l'ancien site ?\n\nPose les articles, retire les ruptures, coche « Fini » — produit par produit, d'après la prépa de l'appli.`)) return;
         setBusy(dry ? 'dry' : 'run');
@@ -10035,7 +10042,7 @@
             <button className="btn-primary" style={{ width: 'auto', fontWeight: 700 }} disabled={!!busy} onClick={() => run(false)}>{busy === 'run' ? '…' : '▶️ Reporter maintenant'}</button>
             <button className="btn-ghost" style={{ width: 'auto' }} onClick={load} title="Actualiser">↻</button>
           </div>
-          <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 4 }}>Se lance tout seul à la clôture de la prépa, sur le serveur : pas de PC allumé, pas de Tampermonkey. Pose les articles, laisse les ruptures, coche « Fini », puis vérifie et envoie le récap à {KB_RECAP_TO}.</div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 4 }}>Se lance tout seul à la clôture de la prépa, sur le serveur : pas de PC allumé, pas de Tampermonkey. Dispatch frais et sec : pose les articles, laisse les ruptures, coche « Fini ». Réception ND : quantité reçue (rupture déduite) puis coche. Vérifie et envoie le récap à {KB_RECAP_TO}.</div>
           {s === undefined && <div style={{ marginTop: 8 }}>Chargement…</div>}
           {s === null && <div style={{ marginTop: 8, color: 'var(--ink-mute)' }}>Aucun report pour la distribution du {formatDateShort(day)}.</div>}
           {s && (
@@ -10046,14 +10053,37 @@
               </div>
               {s.state === 'en cours' && <KbPsBar pct={s.n ? 100 * s.i / s.n : 0} color="#1565c0" h={10} />}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-                {[['Produits reportés', s.faits, '#2e7d32'], ['Déjà à jour', s.deja, '#616161'], ['Articles posés', s.poses, '#1565c0'], ['Retirés', s.retires, '#e65100'], ['Coches « Fini »', s.coches, '#2e7d32']].map(([l, v, c]) =>
+                {[['Produits reportés', s.faits, '#2e7d32'], ['Déjà à jour', s.deja, '#616161'], ['Articles posés', s.poses, '#1565c0'], ['Retirés', s.retires, '#e65100'], ['Coches « Fini »', s.coches, '#2e7d32'], ['ND reçus', s.ndFaits, '#00838f']].map(([l, v, c]) =>
                   <div key={l} style={{ flex: '1 1 110px', background: c + '14', borderLeft: '6px solid ' + c, borderRadius: 10, padding: '6px 10px' }}><div style={{ fontSize: 12, color: 'var(--ink-soft)', fontWeight: 600 }}>{l}</div><div style={{ fontSize: 24, fontWeight: 700, color: c }}>{n(v)}</div></div>)}
               </div>
               {s.verif && <div style={{ marginTop: 8, fontWeight: 700, color: s.verif.ok ? '#2e7d32' : '#c62828' }}>🔎 Vérification : {s.verif.ok ? 'l\'ancien site correspond à la prépa' : s.verif.nBad + ' écart(s)'}</div>}
               <List t="🔎 Écarts" a={s.verif && s.verif.bad} c="#c62828" />
               <List t="⚠️ Erreurs" a={s.erreurs} c="#c62828" />
               <List t="⏳ Pas terminés dans l'appli" a={s.attente} c="#b45309" />
-              <List t="🥬 ND à faire à la main" a={s.nd} c="#00838f" />
+              {(s.detail || []).length > 0 && (() => {
+                const SD = { ok: ['✅', 'reporté', '#2e7d32', '#e8f5e9'], afaire: ['🔎', 'à faire (simulation)', '#1565c0', '#e3f2fd'], deja: ['·', 'déjà à jour', '#757575', '#fafafa'], err: ['⚠️', 'erreur', '#c62828', '#fdecea'], attente: ['⏳', 'pas fini', '#b45309', '#fff4e5'], absent: ['❔', 'introuvable', '#616161', '#f5f5f5'] };
+                const D = s.detail.slice().reverse(), cnt = {}; D.forEach(d => { cnt[d.s] = (cnt[d.s] || 0) + 1; });
+                const nq = normalizeText(jq.trim());
+                const rows = D.filter(d => (!jf || d.s === jf) && (!nq || normalizeText(d.p + ' ' + d.d).includes(nq)));
+                return (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 16, fontWeight: 700 }}>📋 Ce que fait l'automatisation, produit par produit {running ? <span style={{ fontSize: 12, color: '#1565c0' }}>· en direct</span> : null}</div>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', margin: '6px 0' }}>
+                      <button className={!jf ? 'btn-primary' : 'btn-secondary'} style={{ width: 'auto', fontSize: 13, padding: '5px 10px' }} onClick={() => setJf('')}>Tout ({D.length})</button>
+                      {Object.keys(SD).filter(k => cnt[k]).map(k => <button key={k} className={jf === k ? 'btn-primary' : 'btn-secondary'} style={{ width: 'auto', fontSize: 13, padding: '5px 10px' }} onClick={() => setJf(jf === k ? '' : k)}>{SD[k][0]} {SD[k][1]} ({cnt[k]})</button>)}
+                      <input value={jq} onChange={e => setJq(e.target.value)} placeholder="🔎 Produit, lieu…" style={{ fontSize: 14, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--line)', minWidth: 150 }} />
+                    </div>
+                    <div style={{ maxHeight: '60vh', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 10 }}>
+                      {rows.map((d, i) => { const x = SD[d.s] || SD.deja; return (
+                        <div key={i} style={{ display: 'flex', gap: 10, padding: '7px 10px', borderTop: i ? '1px solid var(--line)' : 'none', background: x[3], alignItems: 'baseline' }}>
+                          <span style={{ flex: '0 0 auto', fontWeight: 700, color: x[2], minWidth: 24 }}>{x[0]}</span>
+                          <span style={{ flex: '1 1 auto', minWidth: 0 }}><b style={{ fontSize: 15 }}>{kbProdName(d.p)}</b><span style={{ display: 'block', fontSize: 13, color: 'var(--ink-soft)' }}>{d.d}</span></span>
+                          <span style={{ flex: '0 0 auto', fontSize: 12, color: 'var(--ink-mute)' }}>{d.at ? new Date(d.at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                        </div>); })}
+                      {!rows.length && <div style={{ padding: 10, color: 'var(--ink-mute)' }}>Rien avec ce filtre.</div>}
+                    </div>
+                  </div>);
+              })()}
               <List t="❔ Introuvables sur l'ancien site" a={s.absents} c="#616161" />
               <List t="ℹ️ Commandes inconnues de l'appli" a={s.inconnus} c="#616161" />
               <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Lancé {s.startedAt ? new Date(s.startedAt).toLocaleString('fr-FR') : ''}{s.by ? ' par ' + s.by : ''}{s.endedAt ? ' · fini ' + new Date(s.endedAt).toLocaleTimeString('fr-FR') : ''}</div>
@@ -10082,8 +10112,6 @@
             <button className="btn-ghost" style={kbBtnSm} onClick={() => setDay(activeDay())}>Jour actif</button>
           </div>
           <AncienRobotCard day={day} session={session} />
-          <AncienSyncPosteCard />
-          <AncienSyncJournalCard day={day} session={session} />
           <div className="card">
             <h3 style={{ marginBottom: 6 }}>🚫 Ruptures prépa — à reporter sur l'ancien site</h3>
             <AncienRupturesPanel key={'r' + day} day={day} session={session} />
@@ -30154,7 +30182,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
           {tab === 'suivi' && effSession.isMaster && <SuiviGeneralPage session={effSession} />}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
-          {session && (session.isMaster || session.role === 'master') && <KbAncienSyncRunner who={session.name} />}{/* V10.32 — poste synchro ancien site, quelle que soit la page */}
+          {/* V10.61 — poste synchro Tampermonkey retiré : le report est fait par le serveur (KBG_Ancien) */}
           {tab === 'today' && effSession.isMaster && <KbTodayPage session={effSession} setTab={setTab} />}
           {tab === 'mpain' && effSession.isMaster && <PrintPainPage session={effSession} master />}
           {tab === 'mdom' && effSession.isMaster && <PrintLabelsPage session={effSession} embedded />}
