@@ -1,5 +1,7 @@
 /**
- * KBG_Ancien.gs — v1.3 (27/10/2026) — v1.3 : CORRECTIF coches — « toggle-golpps-completed » agit sur TOUS les lieux non exclus :
+ * KBG_Ancien.gs — v1.4 (27/10/2026) — v1.4 : ND d'un lieu SANS commande dans l'appli → laissé tel quel (avant : reçu mis à 0) ;
+ *   contrôle des coches ND après report : un lieu resté « pas fini » est recoché seul (comme le site : autres lieux exclus).
+ * v1.3 : CORRECTIF coches — « toggle-golpps-completed » agit sur TOUS les lieux non exclus :
  *   avant, 1 appel par lieu → un produit ND sur 2 ou 4 lieux était coché puis décoché. Désormais 1 seul appel par produit,
  *   avec excludedLocales = tous les autres lieux.
  * v1.2 : REMISES de prépa reportées (poids réel réduit : « Ajuster le poids », globalorderlocales/update-order-item-weight).
@@ -201,7 +203,8 @@ function ancWork_(job) {
       ancJobPut_(job);
     }
     if (job.i < job.todo.length) { ScriptApp.newTrigger('ancienContinue').timeBased().after(60000).create(); return; }
-    // Fin : vérification sur l'état relu de l'ancien site
+    // v1.4 — contrôle des coches ND (relecture) puis vérification sur l'état relu de l'ancien site
+    if (!job.dry) ancNdFix_(G, job);
     job.verif = ancVerify_(G, job);
     job.state = 'terminé'; job.endedAt = new Date().toISOString();
     ancJobPut_(job); ancLog_(job); ancMail_(job);
@@ -209,6 +212,24 @@ function ancWork_(job) {
     job.state = 'erreur'; job.error = String(e.message || e); job.endedAt = new Date().toISOString();
     ancJobPut_(job); ancLog_(job); ancMail_(job);
   }
+}
+/** v1.4 — Relit la Réception ND : tout lieu reporté (quantité OK) mais resté « pas fini » est recoché SEUL
+ *  (excludedLocales = tous les autres lieux, exactement comme le bouton du site). Un seul passage. */
+function ancNdFix_(G, job) {
+  var R = job.res, N = ancProductsND_(G, ancLocales_(job)), reqs = [], who = [], L = ancLocales_(job).concat(['DOM']);
+  (job.todo || []).forEach(function (x) {
+    var nd = N[x.id]; if (!x.done || !nd) return;
+    var want = {}; x.orders.forEach(function (o) { want[o.site] = (want[o.site] || 0) + Math.max(0, o.q - o.miss); });
+    Object.keys(nd).forEach(function (loc) {
+      var n = nd[loc]; if (!n.ord || n.completed || !Object.prototype.hasOwnProperty.call(want, loc) || n.rec !== Math.min(n.ord, want[loc])) return;
+      var all = {}; L.concat(Object.keys(nd)).forEach(function (l) { all[l] = 1; });
+      reqs.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: x.id, userId: ANC_USER_ID, excludedLocales: Object.keys(all).filter(function (l) { return l !== loc; }), isND: true }));
+      who.push(x.produit + ' · ND ' + loc);
+    });
+  });
+  if (!reqs.length) return;
+  var rs = ancAll_(reqs); R.appels += rs.length;
+  rs.forEach(function (r, k) { if (r.ok) { R.coches++; (R.detail || (R.detail = [])).push({ p: who[k].split(' · ')[0], s: 'ok', d: who[k].split(' · ')[1] + ' ✓ (recoché au contrôle)', at: Date.now() }); } else R.erreurs.push(who[k] + ' : recoche ' + r.err); });
 }
 /** Un paquet de produits : get-dispatch (parallèle), puis écritures en parallèle sur des produits DIFFÉRENTS (jamais 2 à la fois pour un même produit).
  *  v1.1 : les lieux où le produit est en ND passent par la Réception ND (quantité reçue = commandé − rupture, puis coche). */
@@ -232,7 +253,10 @@ function ancDoLane_(G, A, N, lane, job) {
     var ndTick = [];
     if (nd) Object.keys(nd).forEach(function (loc) {
       var n = nd[loc]; if (!n.ord) return;
-      var q = Q(x), w = Math.min(n.ord, wantSite[loc] || 0), did = [];
+      var q = Q(x);
+      // v1.4 — aucune commande de ce produit à ce lieu dans l'appli : on ne sait pas → on ne touche à rien
+      if (!Object.prototype.hasOwnProperty.call(wantSite, loc)) { log(q, 'ND ' + loc + ' : aucune commande dans l\'appli — laissé tel quel'); R.inconnus.push(x.produit + ' (ND ' + loc + ') : ' + n.ord + ' commandé(s) sur l\'ancien site, aucun dans l\'appli — laissé tel quel'); return; }
+      var w = Math.min(n.ord, wantSite[loc]), did = [];
       if (n.rec !== w) { q.calls.push({ route: 'globalorders/update-nondispatch-quantity-received', params: { globalorder_id: G, locale: loc, producerproduct_id: x.id, quantity: w } }); did.push('reçu ' + w + '/' + n.ord); }
       if (!n.completed) { ndTick.push(loc); did.push('✓'); }
       if (did.length) { q.fresh = true; q.ndDone = (q.ndDone || 0) + 1; log(q, 'ND ' + loc + ' ' + did.join(' ')); } else log(q, 'ND ' + loc + ' déjà ok');
@@ -289,7 +313,7 @@ function ancVerify_(G, job) {
   job.todo.forEach(function (x) {
     var a = A[x.id], nd = N[x.id]; if (!x.done || (!a && !nd)) return;
     var want = {}; x.orders.forEach(function (o) { want[o.site] = (want[o.site] || 0) + Math.max(0, o.q - o.miss); });
-    if (nd) Object.keys(nd).forEach(function (loc) { var n = nd[loc]; if (!n.ord) return; var w = Math.min(n.ord, want[loc] || 0); if (!n.completed || n.rec !== w) bad.push(x.produit + ' · ND ' + loc + ' : reçu ' + n.rec + ' / ' + w + ' attendu(s)' + (n.completed ? '' : ' · pas coché')); });
+    if (nd) Object.keys(nd).forEach(function (loc) { var n = nd[loc]; if (!n.ord || !Object.prototype.hasOwnProperty.call(want, loc)) return; var w = Math.min(n.ord, want[loc] || 0); if (!n.completed || n.rec !== w) bad.push(x.produit + ' · ND ' + loc + ' : reçu ' + n.rec + ' / ' + w + ' attendu(s)' + (n.completed ? '' : ' · pas coché')); });
     if (a) Object.keys(a.prog).forEach(function (loc) {
       var pr = a.prog[loc]; if (!pr.ord) return;
       var w = want[loc] || 0;
@@ -336,7 +360,7 @@ function ancMail_(job) {
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
     + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.3 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.4 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
   MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
 
