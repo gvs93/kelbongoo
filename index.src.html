@@ -785,8 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.64';
-    // V10.64 — (28/10/2026) Casiers nouveau site : toujours des NUMÉROS à la suite de l'ancien site (plus de lettres en TEST), jamais deux fois le même numéro dans un lieu (renumérotation auto si conflit)
+    const APP_VERSION = 'V10.65';
+    // V10.65 — (28/10/2026) Livraison DOM : créneau modifiable avant la clôture (Master › DOM, « 🕑 changer créneau ») → étiquettes + CSV Dromy envoyé à la clôture
+    // V10.64 — (28/10/2026) Contenants nouveau site (casier boutique / cagette camion / carton DOM) : toujours des NUMÉROS à la suite de l'ancien site (plus de lettres en TEST), jamais deux fois le même numéro dans un lieu (renumérotation auto si conflit)
     // V10.63 — (28/10/2026) Facturation web à la clôture : inclut aussi les commandes du nouveau site importées en mode TEST (ce sont de vraies commandes PrestaShop/PDV)
     // V10.62 — (27/10/2026) Ancien site : remises de prépa reportées (poids ajusté, roue crantée) — KBG_Ancien v1.2
     // V10.61 — (27/10/2026) Ancien site : report serveur v1.1 (Réception ND automatique) + journal détaillé produit par produit en direct
@@ -2161,7 +2162,7 @@
         const cas = String(n);
         o.casiersFrais = (o.items || []).some(x => x.cat === 'frais') ? [cas] : [];
         o.casiersSec = (o.items || []).some(x => x.cat !== 'frais') ? [cas] : [];
-        changed++;
+        o._renum = true; changed++;
       }
       return changed;
     }
@@ -12162,6 +12163,7 @@
     function kbDomRows(data, opts) {
       const includeTest = !!(opts && opts.includeTest);
       const door = (data.prep.dromy && data.prep.dromy.door) || {};
+      const slotFix = (data.prep.dromy && data.prep.dromy.slotFix) || {}; // V10.65 — créneau modifié à la main (client qui rappelle)
       const seen = {}, out = [];
       for (const o of (data.orders || [])) {
         if (String(o.site || '').toUpperCase() !== 'DOM') continue;
@@ -12172,11 +12174,12 @@
         seen[client] = 1;
         const nm = kbSplitName(o);
         const cartons = kbClientCasiers(data.prep, 'DOM', client, o).slice().sort(casCmp);
-        const slotRaw = o.psSlot || o.slot || '';
+        const slotFixed = slotFix[client] ? String(slotFix[client]) : '';
+        const slotRaw = slotFixed || o.psSlot || o.slot || '';
         const auto = o.depotPorte != null ? !!o.depotPorte : null;
         const depot = (door[client] != null) ? !!door[client] : (auto === true);
         const addr = o.addr || null;
-        const r = { client, prenom: nm.prenom, nom: nm.nom, email: o.email || '', tel: kbPhoneFR(o.tel), addr, slotRaw, slot: kbSlotParse(slotRaw),
+        const r = { client, prenom: nm.prenom, nom: nm.nom, email: o.email || '', tel: kbPhoneFR(o.tel), addr, slotRaw, slot: kbSlotParse(slotRaw), slotFixed: !!slotFixed, slotOrig: o.psSlot || o.slot || '',
           cartons, depot, depotAuto: auto, depotForced: door[client] != null, test: !!o._test, missing: [] };
         if (!cartons.length) r.missing.push('carton');
         if (!addr || !addr.line1) r.missing.push('adresse');
@@ -12711,6 +12714,11 @@
       const nCartons = rows.reduce((s, r) => s + r.cartons.length, 0);
       const ready = confirmed && chk.ok && rows.length > 0 && (closed || force);
       const sent = data.prep && data.prep.dromy && data.prep.dromy.sent;
+      const [slotEdit, setSlotEdit] = React.useState(null); // V10.65 — { client, start, end }
+      const saveSlot = async (client, val) => {
+        try { await storage.setDoc(`day_${day}_prep`, 'dromy', { slotFix: { [client]: val } }); setSlotEdit(null); reload(); showToast(val ? `🕑 Créneau ${val.replace('-', '–')} enregistré` : '🕑 Créneau du client rétabli'); }
+        catch (e) { showToast('Erreur : ' + e.message); }
+      };
       const toggleDoor = async (r) => {
         try { await storage.setDoc(`day_${day}_prep`, 'dromy', { door: { [r.client]: !r.depot } }); reload(); }
         catch (e) { showToast('Erreur : ' + e.message); }
@@ -12765,6 +12773,21 @@
               <button className="btn-secondary" style={{ marginTop: 8, fontSize: 12, padding: '6px 10px', color: r.depot ? '#2e7d32' : 'var(--ink-soft)', borderColor: r.depot ? '#a5d6a7' : undefined }} onClick={() => toggleDoor(r)}>
                 {r.depot ? '🚪 Dépôt porte' : '🙅 Pas dépôt porte'}{r.depotForced ? ' (modifié)' : (r.depotAuto == null ? ' (par défaut)' : ' (client)')} · changer
               </button>
+              {session.isMaster && !(slotEdit && slotEdit.client === r.client) && (
+                <button className="btn-secondary" style={{ marginTop: 8, marginLeft: 6, fontSize: 12, padding: '6px 10px', color: r.slotFixed ? '#2c4a8c' : 'var(--ink-soft)', borderColor: r.slotFixed ? '#b9c7e6' : undefined }}
+                  onClick={() => { const sl = r.slot || kbSlotParse(cfg.defaultSlot || DROMY_DEFAULT_SLOT) || { start: '09:00', end: '13:00' }; setSlotEdit({ client: r.client, start: sl.start, end: sl.end }); }}>
+                  🕑 {r.slot ? `${r.slot.start}–${r.slot.end}` : 'créneau ?'}{r.slotFixed ? ' (modifié)' : ''} · changer créneau
+                </button>)}
+              {slotEdit && slotEdit.client === r.client && (
+                <div style={{ marginTop: 8, display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', fontSize: 13 }}>
+                  🕑 de <input type="time" step="900" value={slotEdit.start} onChange={e => setSlotEdit({ ...slotEdit, start: e.target.value })} style={{ fontSize: 15, padding: 4 }} />
+                  à <input type="time" step="900" value={slotEdit.end} onChange={e => setSlotEdit({ ...slotEdit, end: e.target.value })} style={{ fontSize: 15, padding: 4 }} />
+                  <button className="btn-primary" style={{ fontSize: 12, padding: '6px 10px' }} disabled={!slotEdit.start || !slotEdit.end || slotEdit.end <= slotEdit.start}
+                    onClick={() => saveSlot(r.client, `${slotEdit.start}-${slotEdit.end}`)}>Enregistrer</button>
+                  {r.slotFixed && <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => saveSlot(r.client, '')}>Rétablir {r.slotOrig ? `(${r.slotOrig})` : 'celui du client'}</button>}
+                  <button className="btn-secondary" style={{ fontSize: 12, padding: '6px 10px' }} onClick={() => setSlotEdit(null)}>Annuler</button>
+                  {closed && sent && sent.ok && <span style={{ fontSize: 11, color: 'var(--warn)', fontWeight: 600 }}>⚠️ Fichier déjà envoyé à Dromy : renvoyer après modification</span>}
+                </div>)}
             </div>
           ))}
         </div>
@@ -25390,7 +25413,8 @@
           try { const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data'); psKeep = (ex && ex.orders) ? ex.orders.filter(o => o._ps) : []; } catch (_) {}
           // V10.64 — un casier du nouveau site déjà pris par l'ancien site → renuméroté à la suite
           const nRenum = psRenumberCasiers(res.orders, psKeep);
-          if (nRenum) showToast(`⚠️ ${nRenum} casier(s) nouveau site renuméroté(s) (conflit avec l'ancien site) — reprendre les étiquettes`);
+          if (nRenum) { const w = [...new Set(psKeep.filter(o => o._renum).map(o => o.site === 'DOM' ? 'carton' : KB_BOUTIQUES_DEFAULT.includes(o.site) ? 'casier' : 'cagette'))].join(' / ');
+            showToast(`⚠️ ${nRenum} commande(s) nouveau site renumérotée(s) (${w} déjà pris par l'ancien site) — reprendre les étiquettes`); }
           await storage.setDoc(`day_${dayKey}_orders`, 'data', {
             orders: [...res.orders, ...psKeep],
             uploadedBy: session.name,
