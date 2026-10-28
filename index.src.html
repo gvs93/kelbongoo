@@ -785,7 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.65';
+    const APP_VERSION = 'V10.67';
+    // V10.67 — (28/10/2026) DLC À retirer : « 🧹 Retirer ×N » = UN SEUL TOUCHER (plus de saisie) · « ✏️ Autre quantité » si différent (0 = rien trouvé) · en petit : stock théorique (feuille de stock) + vendus depuis l'inventaire → « rotation bien faite = rien à retirer »
+    // V10.66 — (28/10/2026) DLC À retirer : quantité à retirer affichée en gros (popup du matin + page) · bouton « Plus en rayon » supprimé → un seul « 🧹 Retirer ×N » (0 = rien trouvé) · « ➕ Produit pas vu à l'inventaire » (produit + DLC + quantité) en haut de la page
     // V10.65 — (28/10/2026) Livraison DOM : créneau modifiable avant la clôture (Master › DOM, « 🕑 changer créneau ») → étiquettes + CSV Dromy envoyé à la clôture
     // V10.64 — (28/10/2026) Contenants nouveau site (casier boutique / cagette camion / carton DOM) : toujours des NUMÉROS à la suite de l'ancien site (plus de lettres en TEST), jamais deux fois le même numéro dans un lieu (renumérotation auto si conflit)
     // V10.63 — (28/10/2026) Facturation web à la clôture : inclut aussi les commandes du nouveau site importées en mode TEST (ce sont de vraies commandes PrestaShop/PDV)
@@ -26370,10 +26372,40 @@
       return lv;
     }
     function kbDlcExpected(i, lv) {
+      if (i.horsInv) return { qty: Math.max(0, Math.round(Number(i.qtyInit != null ? i.qtyInit : i.qty) || 0)), src: 'vu' };
       const s = lv && lv.levels && i.productId ? lv.levels[i.productId] : null;
       if (s) return { qty: Math.max(0, Math.round(s.stock || 0)), src: 'stock' };
       const q = Number(i.qtyCount != null ? i.qtyCount : (i.qtyInit != null ? i.qtyInit : i.qty)) || 0;
       return { qty: q, src: 'inv' };
+    }
+
+    // V10.67 — N à retirer + infos rotation : qté à cette DLC (inventaire / saisie), stock théorique (feuille de stock),
+    //   vendus depuis l'inventaire → reste théorique si la rotation (FIFO) a été bien faite.
+    function kbDlcInfo(i, lv, sales) {
+      const base = kbDlcBase(i);
+      const s = lv && lv.levels && i.productId ? lv.levels[i.productId] : null;
+      const stockTh = s ? Math.max(0, Math.round(s.stock || 0)) : null;
+      const sd = sales && sales.ready ? kbDlcSold(i, sales, base.from) : { sold: 0, found: false };
+      const atDlc = Math.max(0, Math.round(base.qty || 0));
+      let n = atDlc || (stockTh || 0);
+      if (stockTh != null && atDlc) n = Math.min(atDlc, stockTh);
+      const sold = sd.found ? Math.round(sd.sold) : null;
+      const resteTh = sold != null && atDlc ? Math.max(0, atDlc - sold) : null;
+      return { n, atDlc, from: base.from, stockTh, sold, resteTh };
+    }
+    function DlcRotationLine({ info, today }) {
+      const bits = [];
+      if (info.atDlc) bits.push(`×${info.atDlc} à cette DLC (${info.from === today ? 'vu aujourd’hui' : 'inventaire ' + formatDateShort(info.from)})`);
+      if (info.stockTh != null) bits.push(`stock théorique ×${info.stockTh}`);
+      if (info.sold != null) bits.push(`vendus depuis ×${info.sold}`);
+      if (!bits.length) return null;
+      return (
+        <div style={{ fontSize: 13, color: 'var(--ink-mute)', marginTop: 4, lineHeight: 1.3 }}>
+          {bits.join(' · ')}
+          {info.resteTh === 0 && <div style={{ color: '#2e7d32', fontWeight: 700 }}>🔄 Rotation bien faite = il ne devrait rien rester à retirer</div>}
+          {info.resteTh > 0 && <div style={{ color: '#b26a00', fontWeight: 700 }}>🔄 Même avec une bonne rotation, il en reste ≈×{info.resteTh}</div>}
+        </div>
+      );
     }
 
     // Tableau commun (page, popup, hub, clôture)
@@ -26407,15 +26439,15 @@
         byNav[k].map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))).join('');
       return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
         + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>`
-        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Plus en rayon', vide.length, '#2e7d32')}</tr></table>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Rien trouvé', vide.length, '#2e7d32')}</tr></table>`
         + robHtml
         + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
-        + sec('✅ Plus en rayon (rien à retirer)', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
+        + sec('✅ Rien trouvé en rayon', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
         + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
     }
     function kbDlcRecapText(day, done) {
       const L = [`DLC du jour traitées — ${kbCmDate(day)}`, ''];
-      done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'plus en rayon'}`));
+      done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'rien trouvé en rayon'}`));
       return L.join('\n');
     }
     async function kbSendDlcRecap(day, done, m, by) {
@@ -26448,6 +26480,7 @@
       const showToast = React.useContext(ToastContext);
       const board = useDlcBoard();
       const lv = useStockLevels(board.nextDistrib);
+      const sales = useDlcSales(board.list);
       const [code, setCode] = React.useState('');
       const [err, setErr] = React.useState('');
       const [busy, setBusy] = React.useState(false);
@@ -26482,12 +26515,19 @@
               <div style={{ fontSize: 15, fontWeight: 600 }}>{board.total} produit{board.total > 1 ? 's' : ''} ne peuvent plus partir à la distrib du {formatDateShort(board.nextDistrib)}</div>
             </div>
             <div style={{ padding: '10px 18px 18px', maxHeight: '74vh', overflowY: 'auto' }}>
-              <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginBottom: 6 }}>Le client doit avoir une <b>DLC ≥ jour de retrait + 3 jours</b>.</div>
+              <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginBottom: 6 }}>Le client doit avoir une <b>DLC ≥ jour de retrait + 3 jours</b>. Quantité = ce qui était à cette DLC à l'inventaire (limité au stock théorique).</div>
               <div style={{ border: '2px solid #c62828', borderRadius: 12 }}>
-                {board.list.map((i, k) => { const e = kbDlcExpected(i, lv); return (
-                  <div key={i.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 10, padding: '11px 12px', borderTop: k ? '1px solid var(--line)' : 'none', fontSize: 18 }}>
-                    <span style={{ fontWeight: 700, minWidth: 0 }}>{kbProdName(i.produit)}</span>
-                    <span style={{ fontWeight: 700, whiteSpace: 'nowrap', color: '#c62828' }}>{e.qty ? `≈${e.qty} · ` : ''}DLC {kbDlcFmt(i.dlc, board.today)}</span>
+                {board.list.map((i, k) => { const e = kbDlcInfo(i, lv, sales); return (
+                  <div key={i.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '10px 12px', borderTop: k ? '1px solid var(--line)' : 'none' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 19, lineHeight: 1.15 }}>{kbProdName(i.produit)}</div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: '#c62828' }}>DLC {kbDlcFmt(i.dlc, board.today)}</div>
+                      <DlcRotationLine info={e} today={board.today} />
+                    </div>
+                    <div style={{ textAlign: 'center', minWidth: 78, background: '#c62828', color: '#fff', borderRadius: 12, padding: '4px 8px' }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase' }}>À retirer</div>
+                      <div style={{ fontSize: 30, fontWeight: 900, lineHeight: 1 }}>{e.n ? '×' + e.n : '?'}</div>
+                    </div>
                   </div>
                 ); })}
               </div>
@@ -26504,11 +26544,75 @@
       );
     }
 
+    // ---- V10.66 — Produit vu en rayon mais pas à l'inventaire ----
+    // Crée une ligne dlc_watch (status watch, horsInv) : si la DLC tombe avant prochaine distrib + 3 → apparaît
+    // tout de suite dans « À retirer » avec la quantité saisie ; sinon elle est suivie et y passera au bon moment.
+    function DlcAddSeenForm({ products, session, board, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const [productKey, setProductKey] = React.useState('');
+      const [dlc, setDlc] = React.useState('');
+      const [qty, setQty] = React.useState(1);
+      const [busy, setBusy] = React.useState(false);
+      const today = board.today;
+      const dlcOk = kbDlcValid(dlc);
+      const willRemove = dlcOk && kbDlcToRemove({ dlc }, today);
+      const valider = async () => {
+        if (!productKey) { showToast('Choisis le produit'); return; }
+        if (!dlcOk) { showToast('Indique la DLC'); return; }
+        const q = Math.round(Number(qty) || 0);
+        if (q <= 0) { showToast('Indique la quantité vue en rayon'); return; }
+        let produit = productKey, producteur = '', productId = '';
+        if (productKey.startsWith('FREE:')) produit = productKey.slice(5);
+        else {
+          const [pr, pn] = productKey.split('|'); producteur = pr || ''; produit = pn || productKey;
+          const p = (products || []).find(x => `${x.producteur}|${x.produit}` === productKey);
+          productId = (p && (p.id || p.productId)) || '';
+        }
+        setBusy(true);
+        try {
+          const id = `dlcw_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+          const now = new Date().toISOString();
+          await storage.setDoc('dlc_watch', id, {
+            id, produit, producteur, productId, dlc, qty: q, qtyInit: q, invDay: today, horsInv: true,
+            status: 'watch', createdBy: session.name, createdAt: now, lastCheckAt: now, lastCheckBy: session.name,
+          });
+          showToast(willRemove ? `🧹 ${kbProdName(produit)} ajouté dans « À retirer »` : `📅 ${kbProdName(produit)} suivi → passera dans « À retirer » au bon moment`);
+          onClose();
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const lbl = { fontSize: 16, fontWeight: 700, display: 'block', marginBottom: 6 };
+      return (
+        <div style={{ border: '3px solid #1565c0', borderRadius: 16, padding: 14, background: 'var(--bg-card)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <div style={{ fontSize: 21, fontWeight: 700, color: '#0d47a1' }}>➕ Pas vu à l'inventaire</div>
+            <button className="btn-ghost" style={{ fontSize: 15 }} onClick={onClose}>Fermer</button>
+          </div>
+          <label style={lbl}>1 · Produit</label>
+          <ProductPicker products={products} value={productKey} onChange={setProductKey} allowFreetext={true} />
+          <label style={{ ...lbl, marginTop: 12 }}>2 · DLC</label>
+          <input type="date" value={dlc} onChange={e => setDlc(e.target.value)} style={{ fontSize: 22, padding: '10px', width: '100%', boxSizing: 'border-box' }} />
+          <label style={{ ...lbl, marginTop: 12 }}>3 · Quantité vue en rayon</label>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14 }}>
+            <button onClick={() => setQty(v => Math.max(1, (Number(v) || 1) - 1))} style={{ width: 68, height: 68, fontSize: 38, fontWeight: 700, borderRadius: 16, border: '2px solid var(--line)', background: 'var(--bg-card)' }}>−</button>
+            <input type="number" inputMode="numeric" min="1" value={qty} onChange={e => setQty(e.target.value)} style={{ width: 100, fontSize: 40, fontWeight: 700, textAlign: 'center', padding: 6 }} />
+            <button onClick={() => setQty(v => (Number(v) || 0) + 1)} style={{ width: 68, height: 68, fontSize: 38, fontWeight: 700, borderRadius: 16, border: 'none', background: '#1565c0', color: '#fff' }}>+</button>
+          </div>
+          {dlcOk && (
+            <div style={{ marginTop: 12, borderRadius: 12, padding: '10px 12px', fontSize: 16, fontWeight: 700, background: willRemove ? '#fdecea' : '#e8f5e9', border: '2px solid ' + (willRemove ? '#c62828' : '#2e7d32'), color: willRemove ? '#b71c1c' : '#1b5e20' }}>
+              {willRemove ? `🧹 Invendable à la distrib du ${formatDateShort(board.nextDistrib)} → va dans « À retirer »` : `✅ DLC OK pour la distrib du ${formatDateShort(board.nextDistrib)} → suivi, passera dans « À retirer » le moment venu`}
+            </div>
+          )}
+          <button disabled={busy} onClick={valider} style={{ width: '100%', marginTop: 12, minHeight: 62, fontSize: 20, fontWeight: 700, borderRadius: 14, border: 'none', background: '#1565c0', color: '#fff' }}>{busy ? 'Enregistrement…' : '✅ Ajouter'}</button>
+        </div>
+      );
+    }
+
     // ---- Page « À retirer » (Prépa › DLC & suivi › DLC) ----
     function DlcWatchPage({ session, products, catalogue }) {
       const showToast = React.useContext(ToastContext);
       const board = useDlcBoard();
       const lv = useStockLevels(board.nextDistrib);
+      const sales = useDlcSales(board.list);
       const [sheet, setSheet] = React.useState(null);     // { i, qty }
       const [flash, setFlash] = React.useState(null);     // consigne affichée après « il en reste »
       const [busy, setBusy] = React.useState(false);
@@ -26537,7 +26641,7 @@
         setBusy(true);
         try {
           await storage.setDoc('dlc_watch', i.id, { status: 'ecoule', qtyRetired: 0, retirerDay: today, outcome: 'vide', resolvedAt: new Date().toISOString(), resolvedBy: session.name });
-          muCelebrate(0); showToast(`✅ ${kbProdName(i.produit)} : plus en rayon`);
+          muCelebrate(0); showToast(`✅ ${kbProdName(i.produit)} : rien trouvé en rayon`);
           await finishIfDone(board.total - 1);
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
@@ -26595,6 +26699,8 @@
             <span style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'right' }}>Distrib du <b>{formatDateShort(board.nextDistrib)}</b><br />DLC mini <b>{formatDateShort(addDays(board.nextDistrib, 3))}</b></span>
           </div>
           <DlcMorningBanner board={board} />
+          {!showForm && <button onClick={() => setShowForm(true)} style={{ minHeight: 60, fontSize: 19, fontWeight: 700, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', cursor: 'pointer' }}>➕ Produit pas vu à l'inventaire</button>}
+          {showForm && <DlcAddSeenForm products={products} session={session} board={board} onClose={() => setShowForm(false)} />}
           {all > 0 && (
             <div style={{ background: 'var(--bg-card)', border: '2px solid var(--line)', borderRadius: 14, padding: '10px 12px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 16, fontWeight: 700 }}><span>{doneN}/{all} traités</span><span>{pct}%</span></div>
@@ -26612,7 +26718,7 @@
           )}
 
           {board.list.map(i => {
-            const e = kbDlcExpected(i, lv);
+            const e = kbDlcInfo(i, lv, sales);
             const d = i.days;
             const tag = d == null ? 'date à vérifier' : d < 0 ? `périmé depuis ${-d} j` : d === 0 ? "DLC aujourd'hui" : d === 1 ? 'DLC demain' : `DLC dans ${d} j`;
             return (
@@ -26622,15 +26728,16 @@
                     <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.15 }}>{kbProdName(i.produit)}</div>
                     {i.producteur && <div style={{ fontSize: 14, color: 'var(--ink-mute)' }}>{i.producteur}</div>}
                     <span style={{ display: 'inline-block', marginTop: 6, background: d != null && d <= 0 ? '#c62828' : '#b26a00', color: '#fff', borderRadius: 10, padding: '4px 12px', fontWeight: 700, fontSize: 17 }}>DLC {kbDlcFmt(i.dlc, today)} · {tag}</span>
+                    <DlcRotationLine info={e} today={today} />
                   </div>
-                  <div style={{ textAlign: 'center', minWidth: 74 }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink-mute)', textTransform: 'uppercase' }}>{e.src === 'stock' ? 'En stock' : 'Inventaire'}</div>
-                    <div style={{ fontSize: 40, fontWeight: 700, lineHeight: 1 }}>{e.qty || '?'}</div>
+                  <div style={{ textAlign: 'center', minWidth: 86, background: '#c62828', color: '#fff', borderRadius: 14, padding: '6px 8px' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>À retirer</div>
+                    <div style={{ fontSize: 40, fontWeight: 900, lineHeight: 1 }}>{e.n ? '×' + e.n : '?'}</div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                  <BigBtn bg="#2e7d32" onClick={() => plusEnRayon(i)}>✅ Plus en rayon</BigBtn>
-                  <BigBtn bg="#ef6c00" onClick={() => setSheet({ i, qty: Math.max(1, e.qty || 1) })}>📦 Il en reste</BigBtn>
+                  {e.n > 0 && <BigBtn bg="#ef6c00" onClick={() => ilEnReste(i, e.n)}>🧹 Retirer ×{e.n}</BigBtn>}
+                  <button disabled={busy} onClick={() => setSheet({ i, qty: e.n || 1, expected: e.n || 0 })} style={{ flex: e.n > 0 ? '0 0 34%' : 1, minHeight: 64, fontSize: e.n > 0 ? 15 : 19, fontWeight: 700, borderRadius: 14, border: '2px solid var(--line)', background: 'var(--bg-card)', color: 'var(--ink)', cursor: 'pointer' }}>✏️ {e.n > 0 ? 'Autre quantité' : 'Indiquer la quantité'}</button>
                 </div>
               </div>
             );
@@ -26645,7 +26752,7 @@
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <b>{kbProdName(i.produit)}</b> <span style={{ color: 'var(--ink-mute)' }}>· DLC {kbDlcFmt(i.dlc, today)}</span>
                       <div style={{ fontSize: 13, fontWeight: 600, color: i.status === 'rob' ? '#6e4a9c' : i.status === 'perte' ? '#c62828' : '#2e7d32' }}>
-                        {i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ plus en rayon'} · {i.resolvedBy} {kbHhmm(i.resolvedAt)}
+                        {i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ rien trouvé en rayon'} · {i.resolvedBy} {kbHhmm(i.resolvedAt)}
                       </div>
                     </div>
                     <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => annuler(i)}>Annuler</button>
@@ -26655,27 +26762,28 @@
             </details>
           )}
 
-          <button className="btn-ghost" style={{ fontSize: 13, alignSelf: 'flex-start', color: 'var(--ink-mute)' }} onClick={() => setShowForm(s => !s)}>{showForm ? 'Fermer' : '+ Signaler une DLC courte hors inventaire'}</button>
-          {showForm && <DlcWatchForm products={products} session={session} onClose={() => setShowForm(false)} />}
 
           {sheet && (
             <div className="modal-backdrop" style={{ alignItems: 'center' }} onClick={(e) => { if (e.target.className === 'modal-backdrop') setSheet(null); }}>
               <div className="modal" style={{ maxWidth: 480, borderRadius: 18 }}>
                 <div style={{ fontSize: 24, fontWeight: 700 }}>{kbProdName(sheet.i.produit)}</div>
-                <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginBottom: 10 }}>DLC {kbDlcFmt(sheet.i.dlc, today)} · combien en reste-t-il en rayon ?</div>
+                <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginBottom: 4 }}>DLC {kbDlcFmt(sheet.i.dlc, today)}</div>
+                <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 10 }}>{sheet.expected ? <>À retirer : <span style={{ color: '#c62828' }}>×{sheet.expected}</span> · combien en as-tu retiré ?</> : 'Combien en as-tu retiré du rayon ?'}</div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14 }}>
-                  <button onClick={() => setSheet(s => ({ ...s, qty: Math.max(1, (Number(s.qty) || 1) - 1) }))} style={{ width: 72, height: 72, fontSize: 40, fontWeight: 700, borderRadius: 16, border: '2px solid var(--line)', background: 'var(--bg-card)' }}>−</button>
-                  <input type="number" inputMode="numeric" min="1" value={sheet.qty} onChange={e => setSheet(s => ({ ...s, qty: e.target.value }))} style={{ width: 110, fontSize: 44, fontWeight: 700, textAlign: 'center', padding: '6px' }} />
+                  <button onClick={() => setSheet(s => ({ ...s, qty: Math.max(0, (Number(s.qty) || 0) - 1) }))} style={{ width: 72, height: 72, fontSize: 40, fontWeight: 700, borderRadius: 16, border: '2px solid var(--line)', background: 'var(--bg-card)' }}>−</button>
+                  <input type="number" inputMode="numeric" min="0" value={sheet.qty} onChange={e => setSheet(s => ({ ...s, qty: e.target.value }))} style={{ width: 110, fontSize: 44, fontWeight: 700, textAlign: 'center', padding: '6px' }} />
                   <button onClick={() => setSheet(s => ({ ...s, qty: (Number(s.qty) || 0) + 1 }))} style={{ width: 72, height: 72, fontSize: 40, fontWeight: 700, borderRadius: 16, border: 'none', background: '#2e7d32', color: '#fff' }}>+</button>
                 </div>
-                {(() => { const r = kbRouteRetrait(kbDlcValid(sheet.i.dlc) ? sheet.i.dlc : '', new Date()); const rob = r.dest === 'pribon' && r.navette; return (
+                {Number(sheet.qty) === 0 ? (
+                  <div style={{ marginTop: 14, borderRadius: 14, padding: '12px 14px', background: 'var(--bg-muted)', border: '2px solid var(--line)', fontSize: 17, fontWeight: 700 }}>0 = rien trouvé en rayon (déjà vendu ou déjà retiré)</div>
+                ) : (() => { const r = kbRouteRetrait(kbDlcValid(sheet.i.dlc) ? sheet.i.dlc : '', new Date()); const rob = r.dest === 'pribon' && r.navette; return (
                   <div style={{ marginTop: 14, borderRadius: 14, padding: '12px 14px', background: rob ? '#f3edfb' : '#fdecea', border: '2px solid ' + (rob ? '#6e4a9c' : '#c62828'), fontSize: 18, fontWeight: 700, color: rob ? '#4a148c' : '#b71c1c' }}>
                     {rob ? <>🚚 Mets-les dans la <u>zone ROB</u> · navette {r.navette.label}, {kbCmDate(r.navette.date)}</> : <>🤝 Mets-les dans la <u>cagette partage équipe</u> (plus de navette avant la DLC)</>}
                   </div>
                 ); })()}
                 <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
                   <button className="btn-ghost" style={{ fontSize: 16 }} onClick={() => setSheet(null)}>Annuler</button>
-                  <BigBtn bg="#2e7d32" onClick={() => ilEnReste(sheet.i, sheet.qty)}>✅ C'est fait</BigBtn>
+                  <BigBtn bg="#2e7d32" onClick={() => { if (String(sheet.qty).trim() === '' || Number(sheet.qty) < 0 || isNaN(Number(sheet.qty))) { showToast('Indique la quantité retirée'); return; } if (Number(sheet.qty) === 0) { setSheet(null); plusEnRayon(sheet.i); } else ilEnReste(sheet.i, sheet.qty); }}>✅ C'est fait</BigBtn>
                 </div>
               </div>
             </div>
