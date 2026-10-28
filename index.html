@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.63) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.64) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.63';
+const APP_VERSION = 'V10.64';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2109,7 +2109,7 @@ function prestaToOrders(json, opts) {
     });
     if (!items.length) continue;
     const i = idxBySite[site] = idxBySite[site] == null ? 0 : idxBySite[site] + 1;
-    const cas = test ? psLetters(i + ((o0.offsetBySite || {})[site] || 0)) : String((maxBySite[site] || 0) + i + 1);
+    const cas = String((maxBySite[site] || 0) + i + 1);
     const hasSec = items.some(x => x.cat !== 'frais');
     out.push({
       orderId: (test ? 'PST_' : 'PS_') + po.id_order,
@@ -2169,6 +2169,35 @@ async function psFetchJson(rawUrl, dayKey) {
   return json;
 }
 const psIdOf = o => String(o.orderId || '').replace(/^PST?_/, '');
+function psRenumberCasiers(base, ps) {
+  const used = {},
+    max = {};
+  const take = (st, c) => {
+    const n = parseInt(c, 10);
+    if (isNaN(n) || String(n) !== String(c).trim()) return;
+    (used[st] = used[st] || new Set()).add(n);
+    if (n > (max[st] || 0)) max[st] = n;
+  };
+  for (const b of base) for (const c of [...(b.casiersFrais || []), ...(b.casiersSec || [])]) take(b.site || '', c);
+  let changed = 0;
+  const todo = [];
+  for (const o of ps) {
+    const st = o.site || '';
+    const c = [...(o.casiersFrais || []), ...(o.casiersSec || [])][0];
+    const n = parseInt(c, 10);
+    if (c != null && !isNaN(n) && String(n) === String(c).trim() && !(used[st] && used[st].has(n))) take(st, c);else todo.push(o);
+  }
+  for (const o of todo) {
+    const st = o.site || '';
+    const n = (max[st] || 0) + 1;
+    take(st, String(n));
+    const cas = String(n);
+    o.casiersFrais = (o.items || []).some(x => x.cat === 'frais') ? [cas] : [];
+    o.casiersSec = (o.items || []).some(x => x.cat !== 'frais') ? [cas] : [];
+    changed++;
+  }
+  return changed;
+}
 async function psMergeDay(dayKey, json, opts) {
   const test = !!(opts && opts.test);
   const who = opts && opts.who || 'auto';
@@ -2196,6 +2225,7 @@ async function psMergeDay(dayKey, json, opts) {
     offsetBySite
   });
   const psFinal = [...keep, ...fresh];
+  const renum = psRenumberCasiers(base, psFinal);
   const bySite = {};
   psFinal.forEach(o => {
     bySite[o.site] = (bySite[o.site] || 0) + 1;
@@ -2210,9 +2240,10 @@ async function psMergeDay(dayKey, json, opts) {
     base: base.length,
     test,
     modeSwitch,
+    renum,
     written: false
   };
-  if (!fresh.length && !modeSwitch) return res;
+  if (!fresh.length && !modeSwitch && !renum) return res;
   if (!existing && !psFinal.length) return res;
   const now = new Date().toISOString();
   const src0 = existing && existing.source ? String(existing.source).replace(/\+?prestashop(-test)?/g, '') : '';
@@ -53839,6 +53870,8 @@ function AdminPage({
         const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data');
         psKeep = ex && ex.orders ? ex.orders.filter(o => o._ps) : [];
       } catch (_) {}
+      const nRenum = psRenumberCasiers(res.orders, psKeep);
+      if (nRenum) showToast(`⚠️ ${nRenum} casier(s) nouveau site renuméroté(s) (conflit avec l'ancien site) — reprendre les étiquettes`);
       await storage.setDoc(`day_${dayKey}_orders`, 'data', {
         orders: [...res.orders, ...psKeep],
         uploadedBy: session.name,

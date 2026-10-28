@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.63';
+    const APP_VERSION = 'V10.64';
+    // V10.64 — (28/10/2026) Casiers nouveau site : toujours des NUMÉROS à la suite de l'ancien site (plus de lettres en TEST), jamais deux fois le même numéro dans un lieu (renumérotation auto si conflit)
     // V10.63 — (28/10/2026) Facturation web à la clôture : inclut aussi les commandes du nouveau site importées en mode TEST (ce sont de vraies commandes PrestaShop/PDV)
     // V10.62 — (27/10/2026) Ancien site : remises de prépa reportées (poids ajusté, roue crantée) — KBG_Ancien v1.2
     // V10.61 — (27/10/2026) Ancien site : report serveur v1.1 (Réception ND automatique) + journal détaillé produit par produit en direct
@@ -2108,7 +2109,7 @@
         });
         if (!items.length) continue;
         const i = idxBySite[site] = (idxBySite[site] == null ? 0 : idxBySite[site] + 1);
-        const cas = test ? psLetters(i + ((o0.offsetBySite || {})[site] || 0)) : String((maxBySite[site] || 0) + i + 1);
+        const cas = String((maxBySite[site] || 0) + i + 1);
         const hasSec = items.some(x => x.cat !== 'frais');
         out.push({
           orderId: (test ? 'PST_' : 'PS_') + po.id_order, status: 1, site,
@@ -2142,6 +2143,28 @@
       return json;
     }
     const psIdOf = o => String(o.orderId || '').replace(/^PST?_/, '');
+    // V10.64 — casiers PS : numéros uniques par lieu, à la suite des casiers de l'ancien site.
+    // Un casier PS déjà numéroté et libre est conservé ; lettre / doublon → prochain numéro libre.
+    // Retourne le nombre de commandes PS renumérotées (les objets sont modifiés sur place).
+    function psRenumberCasiers(base, ps) {
+      const used = {}, max = {};
+      const take = (st, c) => { const n = parseInt(c, 10); if (isNaN(n) || String(n) !== String(c).trim()) return; (used[st] = used[st] || new Set()).add(n); if (n > (max[st] || 0)) max[st] = n; };
+      for (const b of base) for (const c of [...(b.casiersFrais || []), ...(b.casiersSec || [])]) take(b.site || '', c);
+      let changed = 0; const todo = [];
+      for (const o of ps) {
+        const st = o.site || ''; const c = [...(o.casiersFrais || []), ...(o.casiersSec || [])][0];
+        const n = parseInt(c, 10);
+        if (c != null && !isNaN(n) && String(n) === String(c).trim() && !(used[st] && used[st].has(n))) take(st, c); else todo.push(o);
+      }
+      for (const o of todo) {
+        const st = o.site || ''; const n = (max[st] || 0) + 1; take(st, String(n));
+        const cas = String(n);
+        o.casiersFrais = (o.items || []).some(x => x.cat === 'frais') ? [cas] : [];
+        o.casiersSec = (o.items || []).some(x => x.cat !== 'frais') ? [cas] : [];
+        changed++;
+      }
+      return changed;
+    }
     // Fusionne le JSON kbprepa dans day_<dayKey>_orders. Ajout seulement : les commandes PS déjà
     // présentes gardent leurs casiers ; les commandes Mongo (sans _ps) ne sont jamais touchées.
     async function psMergeDay(dayKey, json, opts) {
@@ -2162,10 +2185,11 @@
       const prodById = (await readCache('products')) || {};
       const fresh = prestaToOrders({ orders: list.filter(po => !known.has(String(po.id_order))) }, { test, prodById, baseOrders: [...base, ...keep], offsetBySite });
       const psFinal = [...keep, ...fresh];
+      const renum = psRenumberCasiers(base, psFinal);
       const bySite = {}; psFinal.forEach(o => { bySite[o.site] = (bySite[o.site] || 0) + 1; });
       const unknown = Object.keys(bySite).filter(k => /^PS\d+$/.test(k));
-      const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, written: false };
-      if (!fresh.length && !modeSwitch) return res;
+      const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, renum, written: false };
+      if (!fresh.length && !modeSwitch && !renum) return res;
       if (!existing && !psFinal.length) return res;
       const now = new Date().toISOString();
       const src0 = existing && existing.source ? String(existing.source).replace(/\+?prestashop(-test)?/g, '') : '';
@@ -25364,6 +25388,9 @@
           // V9.52 — on conserve les commandes PrestaShop déjà fusionnées pour ce jour (Mongo ne les écrase pas)
           let psKeep = [];
           try { const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data'); psKeep = (ex && ex.orders) ? ex.orders.filter(o => o._ps) : []; } catch (_) {}
+          // V10.64 — un casier du nouveau site déjà pris par l'ancien site → renuméroté à la suite
+          const nRenum = psRenumberCasiers(res.orders, psKeep);
+          if (nRenum) showToast(`⚠️ ${nRenum} casier(s) nouveau site renuméroté(s) (conflit avec l'ancien site) — reprendre les étiquettes`);
           await storage.setDoc(`day_${dayKey}_orders`, 'data', {
             orders: [...res.orders, ...psKeep],
             uploadedBy: session.name,
