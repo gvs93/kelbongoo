@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.73) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.74) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.73';
+const APP_VERSION = 'V10.74';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -26845,18 +26845,84 @@ function PainPribonPage({
     }, "✅ Marquer facturé (", eur(todoEur), ")")));
   })));
 }
+function kbMepWord(site, n) {
+  const s = String(site || '').toUpperCase();
+  const w = s === 'DOM' ? 'carton' : BOUTIQUES.includes(s) ? 'casier' : 'cagette';
+  return w + (n > 1 ? 's' : '');
+}
+function kbMepOrderCont(o) {
+  const l = (o.casiersFrais && o.casiersFrais.length ? o.casiersFrais : o.casiersSec || []).map(x => String(x).trim()).filter(Boolean);
+  return Math.max(1, new Set(l).size);
+}
+async function kbMepCalib() {
+  const t = todayKey(),
+    lk = 'kb_mep_calib_' + t;
+  try {
+    const c = JSON.parse(localStorage.getItem(lk) || 'null');
+    if (c && c.sites) return c;
+  } catch (_) {}
+  const days = [];
+  for (let i = 0; i <= 10; i++) days.push(addDays(t, -i));
+  const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+  const sites = {};
+  let gO = 0,
+    gC = 0,
+    nDays = 0;
+  docs.forEach(d => {
+    const list = (d && d.orders || []).filter(o => o && !o._test);
+    if (!list.length) return;
+    nDays++;
+    list.forEach(o => {
+      const s = String(o.site || '?').toUpperCase();
+      const c = kbMepOrderCont(o);
+      const x = sites[s] = sites[s] || {
+        o: 0,
+        c: 0
+      };
+      x.o++;
+      x.c += c;
+      if (s !== 'DOM') {
+        gO++;
+        gC += c;
+      }
+    });
+  });
+  const out = {
+    sites: {},
+    global: gO ? gC / gO : 1.15,
+    nDays
+  };
+  Object.keys(sites).forEach(s => {
+    const x = sites[s];
+    out.sites[s] = x.o >= 5 ? x.c / x.o : null;
+  });
+  try {
+    if (nDays) {
+      Object.keys(localStorage).filter(k => k.indexOf('kb_mep_calib_') === 0 && k !== lk).forEach(k => localStorage.removeItem(k));
+      localStorage.setItem(lk, JSON.stringify(out));
+    }
+  } catch (_) {}
+  return out;
+}
+function kbMepRatio(calib, site) {
+  const s = String(site || '').toUpperCase();
+  if (calib && calib.sites && calib.sites[s]) return calib.sites[s];
+  if (s === 'DOM') return 1.6;
+  return calib && calib.global || 1.15;
+}
 function KbMiseEnPlace() {
   const [days, setDays] = React.useState(null);
   const [day, setDay] = React.useState(null);
   const [orders, setOrders] = React.useState(null);
   const [open, setOpen] = React.useState(false);
+  const [fc, setFc] = React.useState(undefined);
+  const [calib, setCalib] = React.useState(null);
+  const [fcTick, setFcTick] = React.useState(0);
   React.useEffect(() => {
     let stop = false;
     kbUpcomingDays(7).then(l => {
       if (stop) return;
-      const d = (l || []).filter(x => x.count > 0);
-      setDays(d);
-      setDay(d.length ? d[0].day : null);
+      setDays((l || []).filter(x => x.count > 0));
     }).catch(() => {
       if (!stop) setDays([]);
     });
@@ -26865,7 +26931,73 @@ function KbMiseEnPlace() {
     };
   }, []);
   React.useEffect(() => {
-    if (!day) return;
+    let stop = false;
+    flPost({
+      secret: FRESHDESK_SECRET,
+      action: 'fl_auto_mep',
+      force: fcTick > 0,
+      ts: Date.now()
+    }).then(r => {
+      if (!stop) setFc(r && r.ok !== false ? r : {
+        days: [],
+        err: r && r.error || 'réponse invalide'
+      });
+    }).catch(e => {
+      if (!stop) setFc({
+        days: [],
+        err: kbErrMsg(e)
+      });
+    });
+    return () => {
+      stop = true;
+    };
+  }, [fcTick]);
+  React.useEffect(() => {
+    if (!fc || !fc.refreshing) return;
+    const t = setTimeout(() => flPost({
+      secret: FRESHDESK_SECRET,
+      action: 'fl_auto_mep',
+      ts: Date.now()
+    }).then(r => {
+      if (r && r.ok !== false) setFc(r);
+    }).catch(() => {}), 40000);
+    return () => clearTimeout(t);
+  }, [fc]);
+  React.useEffect(() => {
+    let stop = false;
+    kbMepCalib().then(c => {
+      if (!stop) setCalib(c);
+    }).catch(() => {
+      if (!stop) setCalib({
+        sites: {},
+        global: 1.15,
+        nDays: 0
+      });
+    });
+    return () => {
+      stop = true;
+    };
+  }, []);
+  const loaded = days || [];
+  const fcDays = (fc && fc.days || []).filter(d => d && d.day && !loaded.some(x => x.day === d.day));
+  const allDays = [...loaded.map(d => ({
+    day: d.day,
+    exact: true
+  })), ...fcDays.map(d => ({
+    day: d.day,
+    exact: false,
+    f: d
+  }))].sort((a, b) => a.day < b.day ? -1 : 1);
+  React.useEffect(() => {
+    if (day || !allDays.length) return;
+    setDay(allDays[0].day);
+  }, [allDays.length, day]);
+  const cur = allDays.find(d => d.day === day) || null;
+  React.useEffect(() => {
+    if (!day || !cur || !cur.exact) {
+      setOrders(null);
+      return;
+    }
     let stop = false;
     setOrders(null);
     storage.getDoc(`day_${day}_orders`, 'data').then(d => {
@@ -26876,21 +27008,87 @@ function KbMiseEnPlace() {
     return () => {
       stop = true;
     };
-  }, [day]);
-  const by = {};
-  let solT = 0;
-  (orders || []).forEach(o => {
-    const s = String(o.site || '?').toUpperCase();
-    const r = by[s] = by[s] || {
-      n: 0,
-      sol: 0
-    };
-    r.n++;
-    const q = (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0);
-    r.sol += q;
-    solT += q;
+  }, [day, cur && cur.exact]);
+  let rows = [],
+    totN = null,
+    totSol = null,
+    totNow = null,
+    est = false;
+  if (cur && cur.exact && orders) {
+    const by = {};
+    orders.forEach(o => {
+      const s = String(o.site || '?').toUpperCase();
+      const r = by[s] = by[s] || {
+        n: 0,
+        sol: 0,
+        cont: 0
+      };
+      r.n++;
+      r.cont += kbMepOrderCont(o);
+      r.sol += (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0);
+    });
+    rows = Object.entries(by).map(([c, r]) => ({
+      c,
+      n: r.n,
+      sol: r.sol,
+      cont: r.cont
+    }));
+    totN = orders.length;
+    totSol = rows.reduce((a, r) => a + r.sol, 0);
+  } else if (cur && !cur.exact) {
+    est = !cur.f.closed;
+    rows = Object.entries(cur.f.sites || {}).map(([c, r]) => ({
+      c,
+      n: r.nEst,
+      now: r.n,
+      sol: r.solEst != null ? r.solEst : r.sol,
+      cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c)))
+    }));
+    totN = cur.f.total.nEst;
+    totNow = cur.f.total.n;
+    totSol = cur.f.total.solEst != null ? cur.f.total.solEst : cur.f.total.sol;
+  }
+  rows.forEach(r => {
+    r.rolls = r.c === 'DOM' ? 0 : Math.ceil(r.cont / KB_CASIERS_PAR_ROLL);
   });
-  const sites = Object.entries(by).sort((a, b) => kbPrintSite(a[0]).localeCompare(kbPrintSite(b[0]), 'fr'));
+  rows.sort((a, b) => kbPrintSite(a.c).localeCompare(kbPrintSite(b.c), 'fr'));
+  const totRolls = rows.reduce((a, r) => a + r.rolls, 0);
+  const dom = rows.find(r => r.c === 'DOM');
+  const ap = est ? '≈ ' : '';
+  const loading = days === null || fc === undefined;
+  const first = allDays[0];
+  const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir' : cur && cur.day === day ? `${cur.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`;
+  const Card = ({
+    bg,
+    lbl,
+    v,
+    col,
+    note
+  }) => React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 140,
+      background: bg,
+      borderRadius: 12,
+      padding: '10px 12px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, lbl), React.createElement("div", {
+    style: {
+      fontSize: 44,
+      fontWeight: 700,
+      lineHeight: 1,
+      color: col || 'var(--ink)'
+    }
+  }, v), note && React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, note));
   return React.createElement("div", {
     style: {
       border: '3px solid #1565c0',
@@ -26932,9 +27130,9 @@ function KbMiseEnPlace() {
     style: {
       fontSize: 14,
       fontWeight: 600,
-      color: 'var(--ink-mute)'
+      color: est ? '#e65100' : 'var(--ink-mute)'
     }
-  }, days === null ? 'Chargement…' : !days.length ? 'Aucune commande chargée' : `Commandes du ${formatDateShort(day)} : ${orders == null ? '…' : orders.length} cmd · 🧺 ${orders == null ? '…' : solT} panier${solT > 1 ? 's' : ''} solidaire${solT > 1 ? 's' : ''}`)), React.createElement("span", {
+  }, sub)), React.createElement("span", {
     style: {
       marginLeft: 'auto',
       fontSize: 26,
@@ -26942,26 +27140,26 @@ function KbMiseEnPlace() {
       transform: open ? 'rotate(180deg)' : 'none',
       transition: 'transform .2s'
     }
-  }, "▾")), open && (days === null ? React.createElement("div", {
+  }, "▾")), open && (loading && !allDays.length ? React.createElement("div", {
     style: {
       fontSize: 15,
       marginTop: 6
     }
-  }, "Chargement…") : !days.length ? React.createElement("div", {
+  }, "Chargement…") : !allDays.length ? React.createElement("div", {
     style: {
       fontSize: 16,
       fontWeight: 600,
       marginTop: 6,
       color: 'var(--danger)'
     }
-  }, "Aucune commande chargée pour les prochains jours.") : React.createElement(React.Fragment, null, React.createElement("div", {
+  }, "Aucune commande pour les prochains jours.", fc && fc.err ? ' (prévision admin : ' + fc.err + ')' : '') : React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
       display: 'flex',
       gap: 6,
       flexWrap: 'wrap',
       marginTop: 6
     }
-  }, days.map(d => React.createElement("button", {
+  }, allDays.map(d => React.createElement("button", {
     key: d.day,
     onClick: () => setDay(d.day),
     className: d.day === day ? 'btn-primary' : 'btn-secondary',
@@ -26970,105 +27168,156 @@ function KbMiseEnPlace() {
       fontWeight: 700,
       padding: '8px 12px'
     }
-  }, "Commandes du ", formatDateShort(d.day)))), React.createElement("div", {
+  }, d.exact ? '' : '≈ ', "Distrib. du ", formatDateShort(d.day)))), React.createElement("div", {
     style: {
       fontSize: 16,
       marginTop: 8,
       textTransform: 'capitalize'
     }
-  }, "Distribution du ", React.createElement("b", null, formatDateFR(day))), React.createElement("div", {
+  }, "Distribution du ", React.createElement("b", null, formatDateFR(day))), cur && !cur.exact && (cur.f.closed ? React.createElement("div", {
+    style: {
+      marginTop: 8,
+      padding: '8px 12px',
+      borderRadius: 10,
+      background: '#e8f5e9',
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "✅ Commandes clôturées (admin) — pas encore chargées dans l'appli. Les ", kbMepWord('BIC', 2), " restent une estimation.") : React.createElement("div", {
+    style: {
+      marginTop: 8,
+      padding: '10px 12px',
+      borderRadius: 10,
+      background: '#fff3e0',
+      border: '2px solid #ef6c00'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      color: '#e65100'
+    }
+  }, "≈ ENVIRON — commandes encore ouvertes"), React.createElement("div", {
+    style: {
+      fontSize: 14
+    }
+  }, "Fin des commandes le ", React.createElement("b", null, cur.f.closeAt), ". Déjà ", React.createElement("b", null, totNow), " commande", totNow > 1 ? 's' : '', " → estimé à 10h : ", React.createElement("b", null, "≈ ", totN), " (d'après ", cur.f.basis, ")."), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 2
+    }
+  }, "Mis à jour ", fc && fc.at ? new Date(fc.at).toLocaleTimeString('fr-FR', {
+    hour: '2-digit',
+    minute: '2-digit'
+  }) : '—', fc && fc.refreshing ? ' · actualisation en cours…' : '', " · ", React.createElement("span", {
+    style: {
+      textDecoration: 'underline',
+      cursor: 'pointer'
+    },
+    onClick: () => setFcTick(t => t + 1)
+  }, "actualiser")))), cur && cur.exact && React.createElement("div", {
+    style: {
+      marginTop: 6,
+      fontSize: 13,
+      fontWeight: 600,
+      color: '#2e7d32'
+    }
+  }, "✅ Commandes chargées : chiffres exacts."), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 12,
       flexWrap: 'wrap',
       marginTop: 8
     }
-  }, React.createElement("div", {
-    style: {
-      flex: 1,
-      minWidth: 140,
-      background: '#e3f2fd',
-      borderRadius: 12,
-      padding: '10px 12px'
-    }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600
-    }
-  }, "Commandes totales"), React.createElement("div", {
-    style: {
-      fontSize: 44,
-      fontWeight: 700,
-      lineHeight: 1
-    }
-  }, orders == null ? '…' : orders.length)), React.createElement("div", {
-    style: {
-      flex: 1,
-      minWidth: 140,
-      background: '#fff3e0',
-      borderRadius: 12,
-      padding: '10px 12px'
-    }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600
-    }
-  }, "🧺 Paniers solidaires"), React.createElement("div", {
-    style: {
-      fontSize: 44,
-      fontWeight: 700,
-      lineHeight: 1,
-      color: '#e65100'
-    }
-  }, orders == null ? '…' : solT), React.createElement("div", {
-    style: {
-      fontSize: 12
-    }
-  }, "cagette à part — jamais en casier"))), orders && sites.length > 0 && React.createElement("div", {
+  }, React.createElement(Card, {
+    bg: "#e3f2fd",
+    lbl: "Commandes totales",
+    v: totN == null ? '…' : ap + totN
+  }), React.createElement(Card, {
+    bg: "#ede7f6",
+    lbl: "🛒 Rolls (hors DOM)",
+    v: totN == null ? '…' : ap + totRolls,
+    col: "#4527a0",
+    note: `${KB_CASIERS_PAR_ROLL} casiers par roll`
+  }), dom && React.createElement(Card, {
+    bg: "#e0f2f1",
+    lbl: "📦 Cartons DOM",
+    v: ap + dom.cont,
+    col: "#00695c",
+    note: `${ap}${dom.n} livraison${dom.n > 1 ? 's' : ''} à domicile`
+  }), React.createElement(Card, {
+    bg: "#fff3e0",
+    lbl: "🧺 Paniers solidaires",
+    v: totSol == null ? '…' : ap + totSol,
+    col: "#e65100",
+    note: "cagette à part — jamais en casier"
+  })), totN != null && rows.length > 0 && React.createElement("div", {
     style: {
       display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fill,minmax(150px,1fr))',
+      gridTemplateColumns: 'repeat(auto-fill,minmax(160px,1fr))',
       gap: 8,
       marginTop: 10
     }
-  }, sites.map(([c, r]) => React.createElement("div", {
-    key: c,
+  }, rows.map(r => React.createElement("div", {
+    key: r.c,
     style: {
       borderRadius: 12,
       padding: '8px 10px',
-      borderLeft: '8px solid ' + kbSiteColor(c),
-      background: kbSiteColor(c) + '1F'
+      borderLeft: '8px solid ' + kbSiteColor(r.c),
+      background: kbSiteColor(r.c) + '1F'
     }
   }, React.createElement("div", {
     style: {
       fontSize: 15,
       fontWeight: 700
     }
-  }, kbPrintSite(c), " ", React.createElement("span", {
+  }, kbPrintSite(r.c), " ", React.createElement("span", {
     style: {
       fontSize: 12,
       opacity: .7
     }
-  }, c)), React.createElement("div", {
+  }, r.c)), React.createElement("div", {
     style: {
       fontSize: 28,
       fontWeight: 700,
       lineHeight: 1.1
     }
-  }, r.n, " ", React.createElement("span", {
+  }, ap, r.n, " ", React.createElement("span", {
     style: {
       fontSize: 14,
       fontWeight: 600
     }
-  }, "cmd")), React.createElement("div", {
+  }, "cmd"), est && r.now != null && React.createElement("span", {
     style: {
-      fontSize: 16,
+      fontSize: 12,
+      fontWeight: 600,
+      color: 'var(--ink-mute)'
+    }
+  }, " (déjà ", r.now, ")")), React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, ap, r.cont, " ", kbMepWord(r.c, r.cont)), r.c !== 'DOM' && React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      color: '#4527a0'
+    }
+  }, "🛒 ", ap, r.rolls, " roll", r.rolls > 1 ? 's' : ''), React.createElement("div", {
+    style: {
+      fontSize: 15,
       fontWeight: 700,
       color: r.sol ? '#e65100' : 'var(--ink-mute)'
     }
-  }, "🧺 ", r.sol, " panier", r.sol > 1 ? 's' : '', " solidaire", r.sol > 1 ? 's' : '')))))));
+  }, "🧺 ", ap, r.sol, " panier", r.sol > 1 ? 's' : '', " solidaire", r.sol > 1 ? 's' : '')))), cur && !cur.exact && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 8
+    }
+  }, "Casiers / cagettes / cartons estimés d'après les ", calib && calib.nDays ? calib.nDays + ' derniers jours chargés' : 'habitudes', " (nb moyen par commande, lieu par lieu). Les vrais numéros arrivent avec le chargement des commandes."))));
 }
 function PrepSuiviHub({
   setTab
@@ -51014,6 +51263,266 @@ function RungisEpalView({
     }
   }, busy ? 'Enregistrement…' : total ? '✅ Valider ' + total + ' palette' + (total > 1 ? 's' : '') : 'Touche une boutique pour compter'));
 }
+function RungisEpalBureauPage() {
+  const E = useKbEpal();
+  const mv = E.raw || {};
+  const codes = React.useMemo(() => {
+    const s = new Set(KB_EPAL_STORES);
+    Object.keys(mv).forEach(k => {
+      const m = mv[k];
+      if (m && !m.cancelled && m.code && String(m.day || '') >= KB_EPAL_START) s.add(String(m.code).toUpperCase());
+    });
+    return [...s].sort();
+  }, [E.raw]);
+  const bal = React.useMemo(() => {
+    const o = {};
+    codes.forEach(c => {
+      o[c] = kbEpalBalance(mv, c);
+    });
+    return o;
+  }, [codes, E.raw]);
+  const list = codes.map(c => ({
+    c,
+    b: bal[c]
+  })).sort((a, b) => Math.max(0, b.b.due) - Math.max(0, a.b.due) || a.c.localeCompare(b.c));
+  const dueTotal = list.reduce((a, x) => a + Math.max(0, x.b.due), 0);
+  const hist = Object.keys(mv).map(k => mv[k]).filter(m => m && !m.cancelled && String(m.day || '') >= KB_EPAL_START && Math.round(Number(m.n) || 0)).sort((a, b) => (b.day || '').localeCompare(a.day || '') || (b.at || 0) - (a.at || 0)).slice(0, 40);
+  const typeLbl = m => m.type === 'envoi' ? {
+    t: '🚚 Envoyée',
+    c: '#c62828'
+  } : m.type === 'retour' ? {
+    t: '↩️ Rendue',
+    c: '#2e7d32'
+  } : {
+    t: '✏️ Ajustement',
+    c: '#6d4c41'
+  };
+  const pl = n => n + ' palette' + (Math.abs(n) > 1 ? 's' : '');
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("div", {
+    style: {
+      background: 'linear-gradient(135deg,#4e342e,#795548)',
+      color: '#fff',
+      borderRadius: 20,
+      padding: '16px 18px',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 14,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("div", {
+    style: {
+      flex: '1 1 260px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 700
+    }
+  }, "🟫 Palettes EPAL"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginTop: 4,
+      opacity: .92
+    }
+  }, "Ce que chaque boutique nous doit (palettes envoyées par Rungis − palettes rendues), depuis le ", kbEnlDay(KB_EPAL_START), ".")), React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      background: 'rgba(255,255,255,.15)',
+      borderRadius: 16,
+      padding: '8px 18px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "Total dû"), React.createElement("div", {
+    style: {
+      fontSize: 48,
+      fontWeight: 700,
+      lineHeight: 1
+    }
+  }, E.raw === undefined ? '…' : dueTotal)), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: E.reload,
+    title: "Actualiser",
+    style: {
+      width: 'auto'
+    }
+  }, "↻")), E.raw === undefined && React.createElement("div", {
+    className: "card",
+    style: {
+      fontSize: 16
+    }
+  }, "Chargement des compteurs…"), E.raw === null && React.createElement("div", {
+    className: "card",
+    style: {
+      fontSize: 15,
+      color: 'var(--danger)'
+    }
+  }, "⚠️ Compteurs indisponibles (", E.err, "). ", React.createElement("button", {
+    className: "btn-secondary",
+    onClick: E.reload
+  }, "Réessayer")), E.raw !== undefined && React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fill,minmax(250px,1fr))',
+      gap: 12
+    }
+  }, list.map(({
+    c,
+    b
+  }) => {
+    const col = KB_SITE_COLORS[c] || '#5d4037';
+    const due = Math.max(0, b.due);
+    return React.createElement("div", {
+      key: c,
+      style: {
+        borderRadius: 18,
+        border: '4px solid ' + (due ? '#c62828' : col),
+        background: due ? '#fdecea' : 'var(--bg-card)',
+        padding: '14px 16px'
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10
+      }
+    }, React.createElement("span", {
+      style: {
+        background: col,
+        color: '#fff',
+        borderRadius: 10,
+        padding: '4px 12px',
+        fontSize: 22,
+        fontWeight: 700
+      }
+    }, c), React.createElement("span", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700,
+        minWidth: 0
+      }
+    }, siteLabel(c) || KB_ENL_STORE_LONG[c] || c)), React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: 8,
+        marginTop: 10
+      }
+    }, React.createElement("span", {
+      style: {
+        fontSize: 60,
+        fontWeight: 700,
+        lineHeight: 1,
+        color: due ? '#c62828' : '#2e7d32'
+      }
+    }, due), React.createElement("span", {
+      style: {
+        fontSize: 18,
+        fontWeight: 700,
+        color: due ? '#c62828' : '#2e7d32'
+      }
+    }, due ? 'palette' + (due > 1 ? 's' : '') + ' due' + (due > 1 ? 's' : '') : 'Ne doit rien 👌')), due > 0 && b.since && React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 600,
+        color: '#b71c1c',
+        marginTop: 4
+      }
+    }, "⏳ depuis le ", kbEnlDay(b.since)), b.due < 0 && React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 600,
+        color: '#6d4c41',
+        marginTop: 4
+      }
+    }, "⚠️ ", pl(-b.due), " rendue", -b.due > 1 ? 's' : '', " en trop (à vérifier)"), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: 'var(--ink-soft)',
+        marginTop: 8,
+        lineHeight: 1.5
+      }
+    }, "🚚 Envoyées : ", React.createElement("b", null, b.sent), " · ↩️ Rendues : ", React.createElement("b", null, b.back), b.adj ? React.createElement(React.Fragment, null, " · ✏️ Ajust. : ", React.createElement("b", null, b.adj > 0 ? '+' + b.adj : b.adj)) : null, React.createElement("br", null), "Dernier retour : ", b.last ? React.createElement("b", null, kbEnlDay(b.last.day), " · ", pl(b.last.n), b.last.by ? ' · ' + b.last.by : '') : 'aucun'));
+  })), hist.length > 0 && React.createElement("div", {
+    className: "card",
+    style: {
+      padding: '12px 14px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      marginBottom: 6
+    }
+  }, "📜 Derniers mouvements"), React.createElement("div", {
+    style: {
+      overflow: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: 15
+    }
+  }, React.createElement("tbody", null, hist.map((m, i) => {
+    const t = typeLbl(m);
+    const c = String(m.code || '').toUpperCase();
+    return React.createElement("tr", {
+      key: i,
+      style: {
+        borderTop: '1px solid var(--line)'
+      }
+    }, React.createElement("td", {
+      style: {
+        padding: '8px 6px',
+        whiteSpace: 'nowrap',
+        fontWeight: 600
+      }
+    }, kbEnlDay(m.day)), React.createElement("td", {
+      style: {
+        padding: '8px 6px'
+      }
+    }, React.createElement("span", {
+      style: {
+        background: KB_SITE_COLORS[c] || '#5d4037',
+        color: '#fff',
+        borderRadius: 8,
+        padding: '2px 8px',
+        fontWeight: 700
+      }
+    }, c)), React.createElement("td", {
+      style: {
+        padding: '8px 6px',
+        fontWeight: 700,
+        color: t.c,
+        whiteSpace: 'nowrap'
+      }
+    }, t.t), React.createElement("td", {
+      style: {
+        padding: '8px 6px',
+        fontWeight: 700,
+        fontSize: 18,
+        textAlign: 'right'
+      }
+    }, Math.round(Number(m.n) || 0)), React.createElement("td", {
+      style: {
+        padding: '8px 6px',
+        color: 'var(--ink-soft)',
+        fontSize: 13
+      }
+    }, m.by || (m.src === 'rungis' ? 'Rungis' : ''), (typeof m.bl === 'string' || typeof m.bl === 'number') && m.bl ? ' · BL ' + m.bl : ''));
+  }))))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "Envois : enregistrés côté Rungis (BL / Centrale PDP). Retours : comptés par le chauffeur (écran chauffeur › 🟫 Retour palettes EPAL). Actualisé toutes les 2 min."));
+}
 function RungisDriverHome({
   session
 }) {
@@ -52223,6 +52732,10 @@ const KB_RG_NAV = [{
   k: 'trucks',
   ic: '🚚',
   l: 'Suivi camions'
+}, {
+  k: 'epal',
+  ic: '🟫',
+  l: 'Palettes EPAL'
 }];
 function RungisSpace({
   session,
@@ -52296,7 +52809,7 @@ function RungisSpace({
       padding: '10px 6px',
       fontWeight: 700
     }
-  }, n.ic, " ", n.l))), page === 'cmd' && React.createElement(RungisCommandePage, null), page === 'bl' && React.createElement(RungisBlPage, null), page === 'enl' && React.createElement(RungisEnlClearPage, null), page === 'trucks' && React.createElement(RungisTrucksPage, null));
+  }, n.ic, " ", n.l))), page === 'cmd' && React.createElement(RungisCommandePage, null), page === 'bl' && React.createElement(RungisBlPage, null), page === 'enl' && React.createElement(RungisEnlClearPage, null), page === 'trucks' && React.createElement(RungisTrucksPage, null), page === 'epal' && React.createElement(RungisEpalBureauPage, null));
 }
 function RungisCommandePage() {
   const [day, setDay] = React.useState(todayKey());
