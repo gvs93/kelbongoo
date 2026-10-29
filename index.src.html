@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.72';
+    const APP_VERSION = 'V10.73';
+    // V10.73 — (29/10/2026) Push boutiques : un message validé (initiales) par une personne du lieu ne revient plus (accusé gardé aussi sur l'appareil + renvoi auto si l'écriture échoue) ; « Annuler » dans l'historique = définitif (cancelledAt, plus réactivable par une ancienne version de l'appli) ; message de plus de 7 jours plus jamais affiché (nouveau lieu / changement de lieu ne fait plus remonter l'historique) ; popup : « Transmets l'info à tes collègues »
     // V10.72 — (28/10/2026) Créneau DOM lu dans le JSON des commandes (champ livdomDeliveryRange ajouté par la vue Mongo orders-since-2023, $lookup consumers) au lieu du fichier consommateurs de la semaine → plus de créneau manquant pour les commandes passées après le chargement des consommateurs ; vérifié = même jour que la distribution
     // V10.71 — (28/10/2026) CSV Dromy : client sans créneau connu → plage du JOUR de livraison (jeudi 15:00-22:00, samedi 09:00-14:00) au lieu de 09:00-13:00 (jeudi matin = faux) ; créneau hors plage du jour (sauf modifié à la main) = refusé et signalé
     // V10.70 — (28/10/2026) Distrib : « Arrivé / Parti » sans effet sur la tablette PDP (partagée avec la prépa) → pages distrib ré-abonnées au bon jour (clé jour) + bascule auto à minuit ; Prépa : client à plusieurs casiers → numéros à la ligne (plus coupés par 0/2)
@@ -3874,7 +3875,21 @@
       );
     }
 
-    function PushOverlay({ message, count, onAck }) {
+    // V10.73 — push : annulation définitive, ancienneté max, accusé gardé sur l'appareil
+    const KB_PUSH_MAX_DAYS = 7;
+    const kbPushCancelled = (m) => !!(m && (m.cancelled || m.cancelledAt));
+    const kbPushTooOld = (m) => { const t = Date.parse((m && m.createdAt) || ''); return !t || (Date.now() - t) > KB_PUSH_MAX_DAYS * 86400000; };
+    const KB_PUSH_ACK_LS = 'kb_push_acked_v1';
+    const KB_PUSH_PENDING_LS = 'kb_push_pending_v1';
+    function kbLsGet(k) { try { return JSON.parse(localStorage.getItem(k) || '{}') || {}; } catch (_) { return {}; } }
+    function kbLsSet(k, o) { try { localStorage.setItem(k, JSON.stringify(o)); } catch (_) {} }
+    function kbPushLocalMark(key) {
+      const o = kbLsGet(KB_PUSH_ACK_LS); const now = Date.now(); o[key] = now;
+      for (const k of Object.keys(o)) if (now - o[k] > 30 * 86400000) delete o[k];
+      kbLsSet(KB_PUSH_ACK_LS, o); return o;
+    }
+
+    function PushOverlay({ message, count, onAck, team }) {
       const [initials, setInitials] = React.useState('');
       const [reply, setReply] = React.useState('');
       const ini = initials.trim().toUpperCase();
@@ -3890,6 +3905,12 @@
               Envoyé par {message.createdBy || 'Master'}
               {message.createdAt ? ` · ${formatDateShort(message.createdAt.slice(0,10))}` : ''}
             </div>
+            {team && (
+              <div style={{marginTop:14,background:'#fff3cd',border:'3px solid #f0b429',borderRadius:14,padding:'12px 14px',fontSize:20,fontWeight:900,color:'#5d4200',lineHeight:1.3}}>
+                👥 Transmets l'info à tes collègues
+                <div style={{fontSize:14,fontWeight:600,marginTop:4}}>Ce message ne s'affichera plus pour les autres : c'est toi qui le fais passer.</div>
+              </div>
+            )}
             {needReply && (
               <div style={{marginTop:14,textAlign:'left'}}>
                 <label style={{fontSize:14,fontWeight:700,display:'block',marginBottom:6}}>Ta réponse (raison / suivi)</label>
@@ -29212,9 +29233,11 @@
       };
 
       const cancelMsg = async (m) => {
-        if (!confirm('Annuler ce message ? Il ne s\'affichera plus.')) return;
-        await storage.setDoc('push_messages', m.id, { cancelled: true, cancelledBy: session.name, cancelledAt: new Date().toISOString() });
-        showToast('Message annulé');
+        if (!confirm('Annuler ce message ? Il ne s\'affichera plus nulle part (même s\'il n\'a pas encore été lu).')) return;
+        try {
+          await storage.setDoc('push_messages', m.id, { cancelled: true, cancelledBy: session.name, cancelledAt: new Date().toISOString() });
+          showToast('🚫 Message annulé — il ne s\'affiche plus');
+        } catch (e) { showToast('⚠️ Annulation non enregistrée : ' + (e && e.message || e) + ' — réessaie'); }
       };
 
       // Historique trié récent → ancien
@@ -29234,7 +29257,7 @@
         <div className="stack">
           <h1>📣 Push & mails</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Push = message plein écran sur l'appli des boutiques. Mail = email aux clients du jour (BCC, envoi serveur).
+            Push = message plein écran sur l'appli des boutiques : validé par UNE personne du lieu (initiales), qui transmet à ses collègues · « Annuler » l'arrête partout · plus affiché après 7 jours. Mail = email aux clients du jour (BCC, envoi serveur).
           </p>
 
           <div className="card" style={{display:'flex',flexDirection:'column',gap:12}}>
@@ -29320,17 +29343,17 @@
               {history.map(m => {
                 const { seen, total, list } = ackSummary(m);
                 return (
-                  <div key={m.id} className="list-item" style={{flexDirection:'column',alignItems:'stretch',gap:6,opacity:m.cancelled?0.55:1}}>
+                  <div key={m.id} className="list-item" style={{flexDirection:'column',alignItems:'stretch',gap:6,opacity:(kbPushCancelled(m) || kbPushTooOld(m))?0.55:1}}>
                     <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
                       <div style={{minWidth:0}}>
-                        <div style={{fontWeight:600}}>{m.icon} {m.title}{m.cancelled && <span className="badge badge-info" style={{marginLeft:6}}>annulé</span>}</div>
+                        <div style={{fontWeight:600}}>{m.icon} {m.title}{kbPushCancelled(m) ? <span className="badge badge-info" style={{marginLeft:6}}>annulé</span> : kbPushTooOld(m) ? <span className="badge badge-info" style={{marginLeft:6}}>expiré (+{KB_PUSH_MAX_DAYS} j)</span> : null}</div>
                         <div style={{fontSize:13,color:'var(--ink-soft)',whiteSpace:'pre-wrap',marginTop:2}}>{m.body}</div>
                         <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>
                           {m.createdBy} · {m.createdAt ? formatDateShort(m.createdAt.slice(0,10)) : ''} ·
                           {m.target === 'all' ? ' toutes' : m.target === 'prep' ? (' 🥕 ' + ((m.to||[]).length ? (m.to||[]).join(', ') : 'toute l\'équipe prépa')) : ' ' + (m.sites||[]).join(', ')}
                         </div>
                       </div>
-                      {!m.cancelled && (
+                      {!kbPushCancelled(m) && !kbPushTooOld(m) && (
                         <button className="btn-ghost" style={{fontSize:12,padding:'4px 8px'}} onClick={()=>cancelMsg(m)}>Annuler</button>
                       )}
                     </div>
@@ -30051,48 +30074,79 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       // ── Messages push à valider pour CE site (master → boutiques) ──────────
       // Un message s'affiche en plein écran tant que ce site (ou ce distributeur)
       // ne l'a pas marqué « vu ». Master ne reçoit pas ses propres push.
+      // V10.73 — accusés gardés sur l'appareil (le message ne revient jamais, même si Firestore tarde ou refuse)
+      const [pushLocalAck, setPushLocalAck] = React.useState(() => kbLsGet(KB_PUSH_ACK_LS));
+      const pushAckKey = (m) => m.target === 'prep' ? ((m.to && m.to.length) ? 'u:' + ((session && session.name) || '') : 'team:prep') : currentSite;
       const pendingPush = React.useMemo(() => {
         if (!session || session.isMaster) return [];
         const site = currentSite;
+        const live = (pushMessages || []).filter(m => m && m.id && !kbPushCancelled(m) && !kbPushTooOld(m)
+          && !(m.expiresAt && Date.now() > new Date(m.expiresAt).getTime())
+          && !pushLocalAck[m.id + '|' + pushAckKey(m)]);
         // V9.72 — équipe prépa : messages « prépa » validés PAR PERSONNE (nom du code perso)
         if (session.role === 'prep') {
           const me = 'u:' + (session.name || '');
-          return (pushMessages || [])
-            .filter(m => !m.cancelled && m.target === 'prep')
+          return live
+            .filter(m => m.target === 'prep')
             .filter(m => !(m.to && m.to.length) || m.to.includes(session.name))
-            .filter(m => !(m.expiresAt && Date.now() > new Date(m.expiresAt).getTime()))
             .filter(m => (m.to && m.to.length) ? !(m.acks || {})[me] : !Object.keys(m.acks || {}).length) // V9.91 — lu une fois par l'équipe
             .sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
         }
-        return (pushMessages || [])
-          .filter(m => !m.cancelled && m.target !== 'prep')
+        if (!site) return [];
+        return live
+          .filter(m => m.target !== 'prep')
           .filter(m => {
             // cible : 'all' ou liste de sites contenant le site courant
             if (m.target && m.target !== 'all') {
               const sites = Array.isArray(m.sites) ? m.sites : [];
               if (!sites.includes(site)) return false;
             }
-            // expiration éventuelle
-            if (m.expiresAt && Date.now() > new Date(m.expiresAt).getTime()) return false;
-            // déjà vu par ce site ?
-            const acks = m.acks || {};
-            return !acks[site];
+            // déjà vu par une personne de ce lieu ?
+            return !(m.acks || {})[site];
           })
           .sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
-      }, [pushMessages, session, currentSite]);
+      }, [pushMessages, session, currentSite, pushLocalAck]);
 
       // V9.91 — accusé écrit en FUSION (plus de « ...m » : ne ré-active plus un message annulé, n'écrase rien)
+      // V10.73 — accusé : d'abord sur l'appareil (le message disparaît tout de suite et ne revient plus),
+      //   puis Firestore (3 essais) ; en cas d'échec il est gardé et renvoyé automatiquement.
+      const writePushAck = async (id, key, ack) => {
+        let err = null;
+        for (let i = 0; i < 3; i++) {
+          try { await storage.setDoc('push_messages', id, { acks: { [key]: ack } }); return true; }
+          catch (e) { err = e; await new Promise(r => setTimeout(r, 800 * (i + 1))); }
+        }
+        throw err;
+      };
       const ackPush = async (m, initials, reply) => {
         const at = new Date().toISOString();
-        const key = m.target === 'prep' ? ((m.to && m.to.length) ? 'u:' + (session.name || '') : 'team:prep') : currentSite;
+        const key = pushAckKey(m);
         const ack = { by: initials || session.name, initials: initials || '', name: session.name, at, ...(reply ? { reply } : {}) };
+        setPushLocalAck(kbPushLocalMark(m.id + '|' + key));
         try {
-          await storage.setDoc('push_messages', m.id, { acks: { [key]: ack } });
+          await writePushAck(m.id, key, ack);
           if (m.followupId && reply) {
             await storage.setDoc('followups', m.followupId, { distribNotes: { ['n' + Date.now()]: { from: `${currentSite} · ${initials}`, text: reply, at, kind: 'reply', pushId: m.id } }, lastDistribReplyAt: at });
           }
-        } catch (e) { alert('⚠️ Lecture non enregistrée : ' + (e && e.message || e) + '\nRéessaie.'); }
+        } catch (e) {
+          const q = kbLsGet(KB_PUSH_PENDING_LS); q[m.id + '|' + key] = { id: m.id, key, ack }; kbLsSet(KB_PUSH_PENDING_LS, q);
+          console.warn('[push] accusé en attente de renvoi', e);
+        }
       };
+      // Renvoi des accusés restés en attente (réseau / droits) dès que les messages se rechargent
+      React.useEffect(() => {
+        const q = kbLsGet(KB_PUSH_PENDING_LS); const keys = Object.keys(q);
+        if (!keys.length || !session || session.isMaster) return;
+        (async () => {
+          for (const k of keys) {
+            const it = q[k];
+            const m = (pushMessages || []).find(x => x && x.id === it.id);
+            if (!m || kbPushCancelled(m) || (m.acks || {})[it.key]) { delete q[k]; continue; }
+            try { await storage.setDoc('push_messages', it.id, { acks: { [it.key]: it.ack } }); delete q[k]; } catch (_) {}
+          }
+          kbLsSet(KB_PUSH_PENDING_LS, q);
+        })();
+      }, [pushMessages, session]);
 
       // ── Relance récurrente : non-récupéré non résolu, ré-affiché tous les 3 jours ──
       // Sur le site courant, tant qu'un client n'est pas résolu, un push « à relancer »
@@ -30181,7 +30235,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         }
         if (pendingPush.length > 0) {
           const m = pendingPush[0];
-          return <PushOverlay key={m.id} message={m} count={pendingPush.length} onAck={(initials, reply) => ackPush(m, initials, reply)} />;
+          return <PushOverlay key={m.id} message={m} count={pendingPush.length} team={!(m.target === 'prep' && m.to && m.to.length)} onAck={(initials, reply) => ackPush(m, initials, reply)} />;
         }
         if (nonRecup8.length > 0) {
           const f = nonRecup8[0];

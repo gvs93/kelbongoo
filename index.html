@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.72) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.73) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.72';
+const APP_VERSION = 'V10.73';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -4680,10 +4680,39 @@ function NonRecupAlertOverlay({
     className: "fs-count"
   }, count - 1, " autre(s) commande(s) à signaler")));
 }
+const KB_PUSH_MAX_DAYS = 7;
+const kbPushCancelled = m => !!(m && (m.cancelled || m.cancelledAt));
+const kbPushTooOld = m => {
+  const t = Date.parse(m && m.createdAt || '');
+  return !t || Date.now() - t > KB_PUSH_MAX_DAYS * 86400000;
+};
+const KB_PUSH_ACK_LS = 'kb_push_acked_v1';
+const KB_PUSH_PENDING_LS = 'kb_push_pending_v1';
+function kbLsGet(k) {
+  try {
+    return JSON.parse(localStorage.getItem(k) || '{}') || {};
+  } catch (_) {
+    return {};
+  }
+}
+function kbLsSet(k, o) {
+  try {
+    localStorage.setItem(k, JSON.stringify(o));
+  } catch (_) {}
+}
+function kbPushLocalMark(key) {
+  const o = kbLsGet(KB_PUSH_ACK_LS);
+  const now = Date.now();
+  o[key] = now;
+  for (const k of Object.keys(o)) if (now - o[k] > 30 * 86400000) delete o[k];
+  kbLsSet(KB_PUSH_ACK_LS, o);
+  return o;
+}
 function PushOverlay({
   message,
   count,
-  onAck
+  onAck,
+  team
 }) {
   const [initials, setInitials] = React.useState('');
   const [reply, setReply] = React.useState('');
@@ -4700,7 +4729,25 @@ function PushOverlay({
     className: "fs-body"
   }, message.body), React.createElement("div", {
     className: "fs-meta"
-  }, "Envoyé par ", message.createdBy || 'Master', message.createdAt ? ` · ${formatDateShort(message.createdAt.slice(0, 10))}` : ''), needReply && React.createElement("div", {
+  }, "Envoyé par ", message.createdBy || 'Master', message.createdAt ? ` · ${formatDateShort(message.createdAt.slice(0, 10))}` : ''), team && React.createElement("div", {
+    style: {
+      marginTop: 14,
+      background: '#fff3cd',
+      border: '3px solid #f0b429',
+      borderRadius: 14,
+      padding: '12px 14px',
+      fontSize: 20,
+      fontWeight: 900,
+      color: '#5d4200',
+      lineHeight: 1.3
+    }
+  }, "👥 Transmets l'info à tes collègues", React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600,
+      marginTop: 4
+    }
+  }, "Ce message ne s'affichera plus pour les autres : c'est toi qui le fais passer.")), needReply && React.createElement("div", {
     style: {
       marginTop: 14,
       textAlign: 'left'
@@ -63143,13 +63190,17 @@ function PushComposerPage({
     }
   };
   const cancelMsg = async m => {
-    if (!confirm('Annuler ce message ? Il ne s\'affichera plus.')) return;
-    await storage.setDoc('push_messages', m.id, {
-      cancelled: true,
-      cancelledBy: session.name,
-      cancelledAt: new Date().toISOString()
-    });
-    showToast('Message annulé');
+    if (!confirm('Annuler ce message ? Il ne s\'affichera plus nulle part (même s\'il n\'a pas encore été lu).')) return;
+    try {
+      await storage.setDoc('push_messages', m.id, {
+        cancelled: true,
+        cancelledBy: session.name,
+        cancelledAt: new Date().toISOString()
+      });
+      showToast('🚫 Message annulé — il ne s\'affiche plus');
+    } catch (e) {
+      showToast('⚠️ Annulation non enregistrée : ' + (e && e.message || e) + ' — réessaie');
+    }
   };
   const history = React.useMemo(() => [...(pushMessages || [])].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')), [pushMessages]);
   const ackSummary = m => {
@@ -63179,7 +63230,7 @@ function PushComposerPage({
       fontSize: 13,
       marginTop: -8
     }
-  }, "Push = message plein écran sur l'appli des boutiques. Mail = email aux clients du jour (BCC, envoi serveur)."), React.createElement("div", {
+  }, "Push = message plein écran sur l'appli des boutiques : validé par UNE personne du lieu (initiales), qui transmet à ses collègues · « Annuler » l'arrête partout · plus affiché après 7 jours. Mail = email aux clients du jour (BCC, envoi serveur)."), React.createElement("div", {
     className: "card",
     style: {
       display: 'flex',
@@ -63350,7 +63401,7 @@ function PushComposerPage({
         flexDirection: 'column',
         alignItems: 'stretch',
         gap: 6,
-        opacity: m.cancelled ? 0.55 : 1
+        opacity: kbPushCancelled(m) || kbPushTooOld(m) ? 0.55 : 1
       }
     }, React.createElement("div", {
       style: {
@@ -63367,12 +63418,17 @@ function PushComposerPage({
       style: {
         fontWeight: 600
       }
-    }, m.icon, " ", m.title, m.cancelled && React.createElement("span", {
+    }, m.icon, " ", m.title, kbPushCancelled(m) ? React.createElement("span", {
       className: "badge badge-info",
       style: {
         marginLeft: 6
       }
-    }, "annulé")), React.createElement("div", {
+    }, "annulé") : kbPushTooOld(m) ? React.createElement("span", {
+      className: "badge badge-info",
+      style: {
+        marginLeft: 6
+      }
+    }, "expiré (+", KB_PUSH_MAX_DAYS, " j)") : null), React.createElement("div", {
       style: {
         fontSize: 13,
         color: 'var(--ink-soft)',
@@ -63385,7 +63441,7 @@ function PushComposerPage({
         color: 'var(--ink-mute)',
         marginTop: 4
       }
-    }, m.createdBy, " · ", m.createdAt ? formatDateShort(m.createdAt.slice(0, 10)) : '', " ·", m.target === 'all' ? ' toutes' : m.target === 'prep' ? ' 🥕 ' + ((m.to || []).length ? (m.to || []).join(', ') : 'toute l\'équipe prépa') : ' ' + (m.sites || []).join(', '))), !m.cancelled && React.createElement("button", {
+    }, m.createdBy, " · ", m.createdAt ? formatDateShort(m.createdAt.slice(0, 10)) : '', " ·", m.target === 'all' ? ' toutes' : m.target === 'prep' ? ' 🥕 ' + ((m.to || []).length ? (m.to || []).join(', ') : 'toute l\'équipe prépa') : ' ' + (m.sites || []).join(', '))), !kbPushCancelled(m) && !kbPushTooOld(m) && React.createElement("button", {
       className: "btn-ghost",
       style: {
         fontSize: 12,
@@ -64940,26 +64996,45 @@ function App() {
       arrivedAt: new Date().toISOString()
     });
   };
+  const [pushLocalAck, setPushLocalAck] = React.useState(() => kbLsGet(KB_PUSH_ACK_LS));
+  const pushAckKey = m => m.target === 'prep' ? m.to && m.to.length ? 'u:' + (session && session.name || '') : 'team:prep' : currentSite;
   const pendingPush = React.useMemo(() => {
     if (!session || session.isMaster) return [];
     const site = currentSite;
+    const live = (pushMessages || []).filter(m => m && m.id && !kbPushCancelled(m) && !kbPushTooOld(m) && !(m.expiresAt && Date.now() > new Date(m.expiresAt).getTime()) && !pushLocalAck[m.id + '|' + pushAckKey(m)]);
     if (session.role === 'prep') {
       const me = 'u:' + (session.name || '');
-      return (pushMessages || []).filter(m => !m.cancelled && m.target === 'prep').filter(m => !(m.to && m.to.length) || m.to.includes(session.name)).filter(m => !(m.expiresAt && Date.now() > new Date(m.expiresAt).getTime())).filter(m => m.to && m.to.length ? !(m.acks || {})[me] : !Object.keys(m.acks || {}).length).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      return live.filter(m => m.target === 'prep').filter(m => !(m.to && m.to.length) || m.to.includes(session.name)).filter(m => m.to && m.to.length ? !(m.acks || {})[me] : !Object.keys(m.acks || {}).length).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
     }
-    return (pushMessages || []).filter(m => !m.cancelled && m.target !== 'prep').filter(m => {
+    if (!site) return [];
+    return live.filter(m => m.target !== 'prep').filter(m => {
       if (m.target && m.target !== 'all') {
         const sites = Array.isArray(m.sites) ? m.sites : [];
         if (!sites.includes(site)) return false;
       }
-      if (m.expiresAt && Date.now() > new Date(m.expiresAt).getTime()) return false;
-      const acks = m.acks || {};
-      return !acks[site];
+      return !(m.acks || {})[site];
     }).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
-  }, [pushMessages, session, currentSite]);
+  }, [pushMessages, session, currentSite, pushLocalAck]);
+  const writePushAck = async (id, key, ack) => {
+    let err = null;
+    for (let i = 0; i < 3; i++) {
+      try {
+        await storage.setDoc('push_messages', id, {
+          acks: {
+            [key]: ack
+          }
+        });
+        return true;
+      } catch (e) {
+        err = e;
+        await new Promise(r => setTimeout(r, 800 * (i + 1)));
+      }
+    }
+    throw err;
+  };
   const ackPush = async (m, initials, reply) => {
     const at = new Date().toISOString();
-    const key = m.target === 'prep' ? m.to && m.to.length ? 'u:' + (session.name || '') : 'team:prep' : currentSite;
+    const key = pushAckKey(m);
     const ack = {
       by: initials || session.name,
       initials: initials || '',
@@ -64969,12 +65044,9 @@ function App() {
         reply
       } : {})
     };
+    setPushLocalAck(kbPushLocalMark(m.id + '|' + key));
     try {
-      await storage.setDoc('push_messages', m.id, {
-        acks: {
-          [key]: ack
-        }
-      });
+      await writePushAck(m.id, key, ack);
       if (m.followupId && reply) {
         await storage.setDoc('followups', m.followupId, {
           distribNotes: {
@@ -64990,9 +65062,40 @@ function App() {
         });
       }
     } catch (e) {
-      alert('⚠️ Lecture non enregistrée : ' + (e && e.message || e) + '\nRéessaie.');
+      const q = kbLsGet(KB_PUSH_PENDING_LS);
+      q[m.id + '|' + key] = {
+        id: m.id,
+        key,
+        ack
+      };
+      kbLsSet(KB_PUSH_PENDING_LS, q);
+      console.warn('[push] accusé en attente de renvoi', e);
     }
   };
+  React.useEffect(() => {
+    const q = kbLsGet(KB_PUSH_PENDING_LS);
+    const keys = Object.keys(q);
+    if (!keys.length || !session || session.isMaster) return;
+    (async () => {
+      for (const k of keys) {
+        const it = q[k];
+        const m = (pushMessages || []).find(x => x && x.id === it.id);
+        if (!m || kbPushCancelled(m) || (m.acks || {})[it.key]) {
+          delete q[k];
+          continue;
+        }
+        try {
+          await storage.setDoc('push_messages', it.id, {
+            acks: {
+              [it.key]: it.ack
+            }
+          });
+          delete q[k];
+        } catch (_) {}
+      }
+      kbLsSet(KB_PUSH_PENDING_LS, q);
+    })();
+  }, [pushMessages, session]);
   const BLOCK_DAYS_RELANCE = 3;
   const overdueFollowups = React.useMemo(() => {
     if (!session || session.isMaster || session.role !== 'distrib') return [];
@@ -65106,6 +65209,7 @@ function App() {
         key: m.id,
         message: m,
         count: pendingPush.length,
+        team: !(m.target === 'prep' && m.to && m.to.length),
         onAck: (initials, reply) => ackPush(m, initials, reply)
       });
     }
