@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.73';
+    const APP_VERSION = 'V10.74';
+    // V10.74 — (29/10/2026) Prépa › 📦 Mise en place : PRÉVISION « ≈ environ » dès la veille (vente encore ouverte sur admin.kelbongoo.com, lue toutes les 30 min par KBG_MEP.gs, projetée à 10h d'après les 3 dernières ventes du même jour) : par lieu ≈ commandes, ≈ casiers / cagettes / cartons DOM, ≈ rolls (16 casiers), paniers solidaires ; exact dès le chargement des commandes. Espace Rungis : menu 🟫 Palettes EPAL = ce que chaque boutique doit (envoyées − rendues, depuis quand, derniers mouvements)
     // V10.73 — (29/10/2026) Push boutiques : un message validé (initiales) par une personne du lieu ne revient plus (accusé gardé aussi sur l'appareil + renvoi auto si l'écriture échoue) ; « Annuler » dans l'historique = définitif (cancelledAt, plus réactivable par une ancienne version de l'appli) ; message de plus de 7 jours plus jamais affiché (nouveau lieu / changement de lieu ne fait plus remonter l'historique) ; popup : « Transmets l'info à tes collègues »
     // V10.72 — (28/10/2026) Créneau DOM lu dans le JSON des commandes (champ livdomDeliveryRange ajouté par la vue Mongo orders-since-2023, $lookup consumers) au lieu du fichier consommateurs de la semaine → plus de créneau manquant pour les commandes passées après le chargement des consommateurs ; vérifié = même jour que la distribution
     // V10.71 — (28/10/2026) CSV Dromy : client sans créneau connu → plage du JOUR de livraison (jeudi 15:00-22:00, samedi 09:00-14:00) au lieu de 09:00-13:00 (jeudi matin = faux) ; créneau hors plage du jour (sauf modifié à la main) = refusé et signalé
@@ -13991,49 +13992,141 @@
 
     // V10.05 — 📦 MISE EN PLACE (Prépa › DLC & suivi) : commandes chargées de la prochaine distribution,
     //   total, par lieu (couleur du lieu) avec le nombre de 🧺 paniers solidaires (cagette à part).
+    // V10.74 — + PRÉVISION « ≈ environ » dès la veille, avant la fin des commandes (10h) : lue sur admin.kelbongoo.com
+    //   par le serveur (KBG_MEP.gs, toutes les 30 min, action fl_auto_mep) et projetée à 10h d'après les ventes passées.
+    //   Par lieu : ≈ commandes, ≈ casiers (boutiques) / cagettes (camions) / cartons (DOM), ≈ rolls (16 casiers par roll).
+    //   Casiers par commande appris sur les 10 derniers jours chargés dans l'appli (JSON), lieu par lieu.
+    function kbMepWord(site, n) {
+      const s = String(site || '').toUpperCase();
+      const w = s === 'DOM' ? 'carton' : BOUTIQUES.includes(s) ? 'casier' : 'cagette';
+      return w + (n > 1 ? 's' : '');
+    }
+    function kbMepOrderCont(o) {
+      const l = ((o.casiersFrais && o.casiersFrais.length) ? o.casiersFrais : (o.casiersSec || [])).map(x => String(x).trim()).filter(Boolean);
+      return Math.max(1, new Set(l).size);
+    }
+    // casiers (ou cagettes / cartons) par commande, lieu par lieu, appris sur les jours déjà chargés — 1 calcul par jour et par appareil
+    async function kbMepCalib() {
+      const t = todayKey(), lk = 'kb_mep_calib_' + t;
+      try { const c = JSON.parse(localStorage.getItem(lk) || 'null'); if (c && c.sites) return c; } catch (_) {}
+      const days = []; for (let i = 0; i <= 10; i++) days.push(addDays(t, -i));
+      const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+      const sites = {}; let gO = 0, gC = 0, nDays = 0;
+      docs.forEach(d => {
+        const list = ((d && d.orders) || []).filter(o => o && !o._test); if (!list.length) return; nDays++;
+        list.forEach(o => { const s = String(o.site || '?').toUpperCase(); const c = kbMepOrderCont(o); const x = sites[s] = sites[s] || { o: 0, c: 0 }; x.o++; x.c += c; if (s !== 'DOM') { gO++; gC += c; } });
+      });
+      const out = { sites: {}, global: gO ? gC / gO : 1.15, nDays };
+      Object.keys(sites).forEach(s => { const x = sites[s]; out.sites[s] = x.o >= 5 ? x.c / x.o : null; });
+      try { if (nDays) { Object.keys(localStorage).filter(k => k.indexOf('kb_mep_calib_') === 0 && k !== lk).forEach(k => localStorage.removeItem(k)); localStorage.setItem(lk, JSON.stringify(out)); } } catch (_) {}
+      return out;
+    }
+    function kbMepRatio(calib, site) {
+      const s = String(site || '').toUpperCase();
+      if (calib && calib.sites && calib.sites[s]) return calib.sites[s];
+      if (s === 'DOM') return 1.6;
+      return (calib && calib.global) || 1.15;
+    }
     function KbMiseEnPlace() {
       const [days, setDays] = React.useState(null);
       const [day, setDay] = React.useState(null);
       const [orders, setOrders] = React.useState(null);
       const [open, setOpen] = React.useState(false); // V10.07 — menu déroulant
-      React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; const d = (l || []).filter(x => x.count > 0); setDays(d); setDay(d.length ? d[0].day : null); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
-      React.useEffect(() => { if (!day) return; let stop = false; setOrders(null);
+      const [fc, setFc] = React.useState(undefined);  // V10.74 — prévision serveur (admin)
+      const [calib, setCalib] = React.useState(null);
+      const [fcTick, setFcTick] = React.useState(0);
+      React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; setDays((l || []).filter(x => x.count > 0)); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
+      React.useEffect(() => {
+        let stop = false;
+        flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_mep', force: fcTick > 0, ts: Date.now() })
+          .then(r => { if (!stop) setFc(r && r.ok !== false ? r : { days: [], err: (r && r.error) || 'réponse invalide' }); })
+          .catch(e => { if (!stop) setFc({ days: [], err: kbErrMsg(e) }); });
+        return () => { stop = true; };
+      }, [fcTick]);
+      // réponse « en cours de calcul » → relire 40 s plus tard
+      React.useEffect(() => { if (!fc || !fc.refreshing) return; const t = setTimeout(() => flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_mep', ts: Date.now() }).then(r => { if (r && r.ok !== false) setFc(r); }).catch(() => {}), 40000); return () => clearTimeout(t); }, [fc]);
+      React.useEffect(() => { let stop = false; kbMepCalib().then(c => { if (!stop) setCalib(c); }).catch(() => { if (!stop) setCalib({ sites: {}, global: 1.15, nDays: 0 }); }); return () => { stop = true; }; }, []);
+      // jours : chargés dans l'appli (exact) + ventes encore ouvertes sur l'admin (≈), sans doublon
+      const loaded = days || [];
+      const fcDays = ((fc && fc.days) || []).filter(d => d && d.day && !loaded.some(x => x.day === d.day));
+      const allDays = [...loaded.map(d => ({ day: d.day, exact: true })), ...fcDays.map(d => ({ day: d.day, exact: false, f: d }))].sort((a, b) => a.day < b.day ? -1 : 1);
+      React.useEffect(() => { if (day || !allDays.length) return; setDay(allDays[0].day); }, [allDays.length, day]);
+      const cur = allDays.find(d => d.day === day) || null;
+      React.useEffect(() => { if (!day || !cur || !cur.exact) { setOrders(null); return; } let stop = false; setOrders(null);
         storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
-        return () => { stop = true; }; }, [day]);
-      const by = {}; let solT = 0;
-      (orders || []).forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0 }; r.n++;
-        const q = (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); r.sol += q; solT += q; });
-      const sites = Object.entries(by).sort((a, b) => kbPrintSite(a[0]).localeCompare(kbPrintSite(b[0]), 'fr'));
+        return () => { stop = true; }; }, [day, cur && cur.exact]);
+
+      // lignes par lieu : { c, n, sol, cont, rolls, now } — exact (JSON) ou estimé (admin)
+      let rows = [], totN = null, totSol = null, totNow = null, est = false;
+      if (cur && cur.exact && orders) {
+        const by = {};
+        orders.forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0, cont: 0 }; r.n++; r.cont += kbMepOrderCont(o);
+          r.sol += (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); });
+        rows = Object.entries(by).map(([c, r]) => ({ c, n: r.n, sol: r.sol, cont: r.cont }));
+        totN = orders.length; totSol = rows.reduce((a, r) => a + r.sol, 0);
+      } else if (cur && !cur.exact) {
+        est = !cur.f.closed;
+        rows = Object.entries(cur.f.sites || {}).map(([c, r]) => ({ c, n: r.nEst, now: r.n, sol: r.solEst != null ? r.solEst : r.sol, cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c))) }));
+        totN = cur.f.total.nEst; totNow = cur.f.total.n; totSol = cur.f.total.solEst != null ? cur.f.total.solEst : cur.f.total.sol;
+      }
+      rows.forEach(r => { r.rolls = r.c === 'DOM' ? 0 : Math.ceil(r.cont / KB_CASIERS_PAR_ROLL); });
+      rows.sort((a, b) => kbPrintSite(a.c).localeCompare(kbPrintSite(b.c), 'fr'));
+      const totRolls = rows.reduce((a, r) => a + r.rolls, 0);
+      const dom = rows.find(r => r.c === 'DOM');
+      const ap = est ? '≈ ' : '';
+      const loading = days === null || fc === undefined;
+      const first = allDays[0];
+      const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir'
+        : (cur && cur.day === day ? `${cur.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`);
+      const Card = ({ bg, lbl, v, col, note }) => (
+        <div style={{ flex: 1, minWidth: 140, background: bg, borderRadius: 12, padding: '10px 12px' }}>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>{lbl}</div>
+          <div style={{ fontSize: 44, fontWeight: 700, lineHeight: 1, color: col || 'var(--ink)' }}>{v}</div>
+          {note && <div style={{ fontSize: 12 }}>{note}</div>}
+        </div>);
       return (
         <div style={{ border: '3px solid #1565c0', borderRadius: 'var(--radius)', background: 'var(--bg-card, #fff)', padding: '14px 14px 12px' }}>
           <button onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', background: 'none', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left', color: 'var(--ink)' }}>
             <span style={{ fontSize: 34, lineHeight: 1 }}>📦</span>
             <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
               <span style={{ fontSize: 20, fontWeight: 700 }}>MISE EN PLACE</span>
-              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink-mute)' }}>{days === null ? 'Chargement…' : !days.length ? 'Aucune commande chargée' : `Commandes du ${formatDateShort(day)} : ${orders == null ? '…' : orders.length} cmd · 🧺 ${orders == null ? '…' : solT} panier${solT > 1 ? 's' : ''} solidaire${solT > 1 ? 's' : ''}`}</span>
+              <span style={{ fontSize: 14, fontWeight: 600, color: est ? '#e65100' : 'var(--ink-mute)' }}>{sub}</span>
             </span>
             <span style={{ marginLeft: 'auto', fontSize: 26, color: '#1565c0', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }}>▾</span>
           </button>
-          {open && (days === null ? <div style={{ fontSize: 15, marginTop: 6 }}>Chargement…</div>
-            : !days.length ? <div style={{ fontSize: 16, fontWeight: 600, marginTop: 6, color: 'var(--danger)' }}>Aucune commande chargée pour les prochains jours.</div>
+          {open && (loading && !allDays.length ? <div style={{ fontSize: 15, marginTop: 6 }}>Chargement…</div>
+            : !allDays.length ? <div style={{ fontSize: 16, fontWeight: 600, marginTop: 6, color: 'var(--danger)' }}>Aucune commande pour les prochains jours.{fc && fc.err ? ' (prévision admin : ' + fc.err + ')' : ''}</div>
             : <>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                {days.map(d => <button key={d.day} onClick={() => setDay(d.day)} className={d.day === day ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 15, fontWeight: 700, padding: '8px 12px' }}>Commandes du {formatDateShort(d.day)}</button>)}
+                {allDays.map(d => <button key={d.day} onClick={() => setDay(d.day)} className={d.day === day ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 15, fontWeight: 700, padding: '8px 12px' }}>{d.exact ? '' : '≈ '}Distrib. du {formatDateShort(d.day)}</button>)}
               </div>
               <div style={{ fontSize: 16, marginTop: 8, textTransform: 'capitalize' }}>Distribution du <b>{formatDateFR(day)}</b></div>
+              {cur && !cur.exact && (cur.f.closed
+                ? <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 10, background: '#e8f5e9', fontSize: 14, fontWeight: 600 }}>✅ Commandes clôturées (admin) — pas encore chargées dans l'appli. Les {kbMepWord('BIC', 2)} restent une estimation.</div>
+                : <div style={{ marginTop: 8, padding: '10px 12px', borderRadius: 10, background: '#fff3e0', border: '2px solid #ef6c00' }}>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#e65100' }}>≈ ENVIRON — commandes encore ouvertes</div>
+                    <div style={{ fontSize: 14 }}>Fin des commandes le <b>{cur.f.closeAt}</b>. Déjà <b>{totNow}</b> commande{totNow > 1 ? 's' : ''} → estimé à 10h : <b>≈ {totN}</b> (d'après {cur.f.basis}).</div>
+                    <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>Mis à jour {fc && fc.at ? new Date(fc.at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—'}{fc && fc.refreshing ? ' · actualisation en cours…' : ''} · <span style={{ textDecoration: 'underline', cursor: 'pointer' }} onClick={() => setFcTick(t => t + 1)}>actualiser</span></div>
+                  </div>)}
+              {cur && cur.exact && <div style={{ marginTop: 6, fontSize: 13, fontWeight: 600, color: '#2e7d32' }}>✅ Commandes chargées : chiffres exacts.</div>}
               <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
-                <div style={{ flex: 1, minWidth: 140, background: '#e3f2fd', borderRadius: 12, padding: '10px 12px' }}><div style={{ fontSize: 14, fontWeight: 600 }}>Commandes totales</div><div style={{ fontSize: 44, fontWeight: 700, lineHeight: 1 }}>{orders == null ? '…' : orders.length}</div></div>
-                <div style={{ flex: 1, minWidth: 140, background: '#fff3e0', borderRadius: 12, padding: '10px 12px' }}><div style={{ fontSize: 14, fontWeight: 600 }}>🧺 Paniers solidaires</div><div style={{ fontSize: 44, fontWeight: 700, lineHeight: 1, color: '#e65100' }}>{orders == null ? '…' : solT}</div><div style={{ fontSize: 12 }}>cagette à part — jamais en casier</div></div>
+                <Card bg="#e3f2fd" lbl="Commandes totales" v={totN == null ? '…' : ap + totN} />
+                <Card bg="#ede7f6" lbl="🛒 Rolls (hors DOM)" v={totN == null ? '…' : ap + totRolls} col="#4527a0" note={`${KB_CASIERS_PAR_ROLL} casiers par roll`} />
+                {dom && <Card bg="#e0f2f1" lbl="📦 Cartons DOM" v={ap + dom.cont} col="#00695c" note={`${ap}${dom.n} livraison${dom.n > 1 ? 's' : ''} à domicile`} />}
+                <Card bg="#fff3e0" lbl="🧺 Paniers solidaires" v={totSol == null ? '…' : ap + totSol} col="#e65100" note="cagette à part — jamais en casier" />
               </div>
-              {orders && sites.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(150px,1fr))', gap: 8, marginTop: 10 }}>
-                {sites.map(([c, r]) => (
-                  <div key={c} style={{ borderRadius: 12, padding: '8px 10px', borderLeft: '8px solid ' + kbSiteColor(c), background: kbSiteColor(c) + '1F' }}>
-                    <div style={{ fontSize: 15, fontWeight: 700 }}>{kbPrintSite(c)} <span style={{ fontSize: 12, opacity: .7 }}>{c}</span></div>
-                    <div style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.1 }}>{r.n} <span style={{ fontSize: 14, fontWeight: 600 }}>cmd</span></div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: r.sol ? '#e65100' : 'var(--ink-mute)' }}>🧺 {r.sol} panier{r.sol > 1 ? 's' : ''} solidaire{r.sol > 1 ? 's' : ''}</div>
+              {totN != null && rows.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(160px,1fr))', gap: 8, marginTop: 10 }}>
+                {rows.map(r => (
+                  <div key={r.c} style={{ borderRadius: 12, padding: '8px 10px', borderLeft: '8px solid ' + kbSiteColor(r.c), background: kbSiteColor(r.c) + '1F' }}>
+                    <div style={{ fontSize: 15, fontWeight: 700 }}>{kbPrintSite(r.c)} <span style={{ fontSize: 12, opacity: .7 }}>{r.c}</span></div>
+                    <div style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.1 }}>{ap}{r.n} <span style={{ fontSize: 14, fontWeight: 600 }}>cmd</span>{est && r.now != null && <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}> (déjà {r.now})</span>}</div>
+                    <div style={{ fontSize: 17, fontWeight: 700 }}>{ap}{r.cont} {kbMepWord(r.c, r.cont)}</div>
+                    {r.c !== 'DOM' && <div style={{ fontSize: 17, fontWeight: 700, color: '#4527a0' }}>🛒 {ap}{r.rolls} roll{r.rolls > 1 ? 's' : ''}</div>}
+                    <div style={{ fontSize: 15, fontWeight: 700, color: r.sol ? '#e65100' : 'var(--ink-mute)' }}>🧺 {ap}{r.sol} panier{r.sol > 1 ? 's' : ''} solidaire{r.sol > 1 ? 's' : ''}</div>
                   </div>
                 ))}
               </div>}
+              {cur && !cur.exact && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 8 }}>Casiers / cagettes / cartons estimés d'après les {calib && calib.nDays ? calib.nDays + ' derniers jours chargés' : 'habitudes'} (nb moyen par commande, lieu par lieu). Les vrais numéros arrivent avec le chargement des commandes.</div>}
             </>)}
         </div>
       );
@@ -24526,6 +24619,84 @@
       );
     }
 
+    // ───────── V10.74 — Espace Rungis (bureau) › 🟫 Palettes EPAL : ce que chaque boutique doit ─────────
+    //   Même registre et même calcul que le chauffeur, la Centrale PDP, la Console et le mail BL (epal/mvts, depuis le 22/10).
+    //   Lecture seule : envois = Rungis (BL), retours = chauffeur (« Retour palettes EPAL »).
+    function RungisEpalBureauPage() {
+      const E = useKbEpal();
+      const mv = E.raw || {};
+      const codes = React.useMemo(() => {
+        const s = new Set(KB_EPAL_STORES);
+        Object.keys(mv).forEach(k => { const m = mv[k]; if (m && !m.cancelled && m.code && String(m.day || '') >= KB_EPAL_START) s.add(String(m.code).toUpperCase()); });
+        return [...s].sort();
+      }, [E.raw]);
+      const bal = React.useMemo(() => { const o = {}; codes.forEach(c => { o[c] = kbEpalBalance(mv, c); }); return o; }, [codes, E.raw]);
+      const list = codes.map(c => ({ c, b: bal[c] })).sort((a, b) => (Math.max(0, b.b.due) - Math.max(0, a.b.due)) || a.c.localeCompare(b.c));
+      const dueTotal = list.reduce((a, x) => a + Math.max(0, x.b.due), 0);
+      const hist = Object.keys(mv).map(k => mv[k]).filter(m => m && !m.cancelled && String(m.day || '') >= KB_EPAL_START && Math.round(Number(m.n) || 0))
+        .sort((a, b) => (b.day || '').localeCompare(a.day || '') || (b.at || 0) - (a.at || 0)).slice(0, 40);
+      const typeLbl = (m) => m.type === 'envoi' ? { t: '🚚 Envoyée', c: '#c62828' } : m.type === 'retour' ? { t: '↩️ Rendue', c: '#2e7d32' } : { t: '✏️ Ajustement', c: '#6d4c41' };
+      const pl = (n) => n + ' palette' + (Math.abs(n) > 1 ? 's' : '');
+      return (
+        <div className="stack">
+          <div style={{ background: 'linear-gradient(135deg,#4e342e,#795548)', color: '#fff', borderRadius: 20, padding: '16px 18px', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+            <div style={{ flex: '1 1 260px' }}>
+              <div style={{ fontSize: 26, fontWeight: 700 }}>🟫 Palettes EPAL</div>
+              <div style={{ fontSize: 15, marginTop: 4, opacity: .92 }}>Ce que chaque boutique nous doit (palettes envoyées par Rungis − palettes rendues), depuis le {kbEnlDay(KB_EPAL_START)}.</div>
+            </div>
+            <div style={{ textAlign: 'center', background: 'rgba(255,255,255,.15)', borderRadius: 16, padding: '8px 18px' }}>
+              <div style={{ fontSize: 14, fontWeight: 600 }}>Total dû</div>
+              <div style={{ fontSize: 48, fontWeight: 700, lineHeight: 1 }}>{E.raw === undefined ? '…' : dueTotal}</div>
+            </div>
+            <button className="btn-secondary" onClick={E.reload} title="Actualiser" style={{ width: 'auto' }}>↻</button>
+          </div>
+          {E.raw === undefined && <div className="card" style={{ fontSize: 16 }}>Chargement des compteurs…</div>}
+          {E.raw === null && <div className="card" style={{ fontSize: 15, color: 'var(--danger)' }}>⚠️ Compteurs indisponibles ({E.err}). <button className="btn-secondary" onClick={E.reload}>Réessayer</button></div>}
+          {E.raw !== undefined && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(250px,1fr))', gap: 12 }}>
+            {list.map(({ c, b }) => {
+              const col = KB_SITE_COLORS[c] || '#5d4037'; const due = Math.max(0, b.due);
+              return (
+                <div key={c} style={{ borderRadius: 18, border: '4px solid ' + (due ? '#c62828' : col), background: due ? '#fdecea' : 'var(--bg-card)', padding: '14px 16px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span style={{ background: col, color: '#fff', borderRadius: 10, padding: '4px 12px', fontSize: 22, fontWeight: 700 }}>{c}</span>
+                    <span style={{ fontSize: 16, fontWeight: 700, minWidth: 0 }}>{siteLabel(c) || KB_ENL_STORE_LONG[c] || c}</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 10 }}>
+                    <span style={{ fontSize: 60, fontWeight: 700, lineHeight: 1, color: due ? '#c62828' : '#2e7d32' }}>{due}</span>
+                    <span style={{ fontSize: 18, fontWeight: 700, color: due ? '#c62828' : '#2e7d32' }}>{due ? 'palette' + (due > 1 ? 's' : '') + ' due' + (due > 1 ? 's' : '') : 'Ne doit rien 👌'}</span>
+                  </div>
+                  {due > 0 && b.since && <div style={{ fontSize: 15, fontWeight: 600, color: '#b71c1c', marginTop: 4 }}>⏳ depuis le {kbEnlDay(b.since)}</div>}
+                  {b.due < 0 && <div style={{ fontSize: 14, fontWeight: 600, color: '#6d4c41', marginTop: 4 }}>⚠️ {pl(-b.due)} rendue{-b.due > 1 ? 's' : ''} en trop (à vérifier)</div>}
+                  <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 8, lineHeight: 1.5 }}>
+                    🚚 Envoyées : <b>{b.sent}</b> · ↩️ Rendues : <b>{b.back}</b>{b.adj ? <> · ✏️ Ajust. : <b>{b.adj > 0 ? '+' + b.adj : b.adj}</b></> : null}
+                    <br />Dernier retour : {b.last ? <b>{kbEnlDay(b.last.day)} · {pl(b.last.n)}{b.last.by ? ' · ' + b.last.by : ''}</b> : 'aucun'}
+                  </div>
+                </div>
+              );
+            })}
+          </div>}
+          {hist.length > 0 && <div className="card" style={{ padding: '12px 14px' }}>
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 6 }}>📜 Derniers mouvements</div>
+            <div style={{ overflow: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 15 }}>
+                <tbody>
+                  {hist.map((m, i) => { const t = typeLbl(m); const c = String(m.code || '').toUpperCase(); return (
+                    <tr key={i} style={{ borderTop: '1px solid var(--line)' }}>
+                      <td style={{ padding: '8px 6px', whiteSpace: 'nowrap', fontWeight: 600 }}>{kbEnlDay(m.day)}</td>
+                      <td style={{ padding: '8px 6px' }}><span style={{ background: KB_SITE_COLORS[c] || '#5d4037', color: '#fff', borderRadius: 8, padding: '2px 8px', fontWeight: 700 }}>{c}</span></td>
+                      <td style={{ padding: '8px 6px', fontWeight: 700, color: t.c, whiteSpace: 'nowrap' }}>{t.t}</td>
+                      <td style={{ padding: '8px 6px', fontWeight: 700, fontSize: 18, textAlign: 'right' }}>{Math.round(Number(m.n) || 0)}</td>
+                      <td style={{ padding: '8px 6px', color: 'var(--ink-soft)', fontSize: 13 }}>{m.by || (m.src === 'rungis' ? 'Rungis' : '')}{(typeof m.bl === 'string' || typeof m.bl === 'number') && m.bl ? ' · BL ' + m.bl : ''}</td>
+                    </tr>); })}
+                </tbody>
+              </table>
+            </div>
+          </div>}
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Envois : enregistrés côté Rungis (BL / Centrale PDP). Retours : comptés par le chauffeur (écran chauffeur › 🟫 Retour palettes EPAL). Actualisé toutes les 2 min.</div>
+        </div>
+      );
+    }
+
     // ───────── Chauffeur : écran d'accueil ─────────
     function RungisDriverHome({ session }) {
       const [view, setView] = React.useState('home');
@@ -24868,6 +25039,7 @@
       { k: 'bl', ic: '📄', l: 'Contrôle BL' },        // V10.40
       { k: 'enl', ic: '📦', l: 'Enlèvements' },
       { k: 'trucks', ic: '🚚', l: 'Suivi camions' },
+      { k: 'epal', ic: '🟫', l: 'Palettes EPAL' },    // V10.74
     ];
     function RungisSpace({ session, onLogout, switcher, overlay }) {
       const [page, setPage] = React.useState('cmd');
@@ -24895,6 +25067,7 @@
           {page === 'bl' && <RungisBlPage />}
           {page === 'enl' && <RungisEnlClearPage />}
           {page === 'trucks' && <RungisTrucksPage />}
+          {page === 'epal' && <RungisEpalBureauPage />}
         </div>
       );
     }
