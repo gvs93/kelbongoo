@@ -30,7 +30,7 @@ exports.kbgFactuLog = onRequest(
   async (req, res) => {
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "POST only" });
     const sig = String(req.get("X-KBG-Signature") || "");
-    const expected = crypto.createHmac("sha256", FACTU_LOG_SECRET.value()).update(req.rawBody).digest("hex");
+    const expected = crypto.createHmac("sha256", FACTU_LOG_SECRET.value().trim()).update(req.rawBody).digest("hex");
     const a = Buffer.from(sig, "hex"), b = Buffer.from(expected, "hex");
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ ok: false, error: "signature" });
 
@@ -112,7 +112,7 @@ exports.kbgFacturerWeb = onCall(
       by: str(t.kbName || t.email || request.auth.uid, 80) };
     if (d.bcc) payload.bcc = str(d.bcc, 32);
     const body = JSON.stringify(payload);
-    const sig = crypto.createHmac("sha256", FACTU_LOG_SECRET.value()).update(body).digest("hex");
+    const sig = crypto.createHmac("sha256", FACTU_LOG_SECRET.value().trim()).update(body).digest("hex");
     let r, j;
     try {
       r = await fetch(MODULE_API, { method: "POST", headers: { "Content-Type": "application/json", "X-KBG-Signature": sig }, body });
@@ -121,5 +121,55 @@ exports.kbgFacturerWeb = onCall(
       throw new HttpsError("unavailable", "Site injoignable : " + String(e.message || e));
     }
     return { ok: !!(j && j.ok), http: r.status, resultat: (j && j.resultat) || null, erreur: (j && j.erreur) || null };
+  }
+);
+
+// ---------------------------------------------------------------------------------------------
+// kbgReglesCommandes — Master › Horaires de commande : lit / écrit les règles du module kbhoraires
+// (ouverture par jour de retrait, heure limite, mode test). Master (admin) uniquement.
+// Copie de l'état dans Firestore app_config/regles_commandes (lu par l'appli : synchro prépa).
+// ---------------------------------------------------------------------------------------------
+const HORAIRES_API = "https://www.kelbongoo.com.livesaas.fr/index.php?fc=module&module=kbhoraires&controller=api";
+
+exports.kbgReglesCommandes = onCall(
+  { region: "europe-west1", secrets: [FACTU_LOG_SECRET], maxInstances: 2, timeoutSeconds: 60 },
+  async (request) => {
+    const t = (request.auth && request.auth.token) || {};
+    if (t.admin !== true) throw new HttpsError("permission-denied", "Réservé au master");
+    const d = request.data || {};
+    const ecrire = d.action === "ecrire";
+    const payload = { action: ecrire ? "ecrire" : "lire", ts: Math.floor(Date.now() / 1000), by: str(t.kbName || t.email || request.auth.uid, 80) };
+    if (ecrire) {
+      const g = d.regles || {};
+      const rules = {};
+      for (const [wd, x] of Object.entries(g.open_rules || {})) {
+        const w = parseInt(wd, 10);
+        if (w >= 0 && w <= 6 && x && x.wd !== "" && x.wd != null) rules[String(w)] = { wd: Math.max(0, Math.min(6, parseInt(x.wd, 10) || 0)), h: Math.max(0, Math.min(23, parseInt(x.h, 10) || 0)) };
+      }
+      payload.regles = {
+        cutoff_on: !!g.cutoff_on, cutoff_hour: Math.max(0, Math.min(23, parseInt(g.cutoff_hour, 10) || 0)),
+        cutoff_days: Math.max(0, Math.min(14, parseInt(g.cutoff_days, 10) || 0)),
+        open_on: !!g.open_on, open_rules: rules, test: !!g.test,
+      };
+    }
+    const body = JSON.stringify(payload);
+    const sig = crypto.createHmac("sha256", FACTU_LOG_SECRET.value().trim()).update(body).digest("hex");
+    let r, j;
+    try {
+      r = await fetch(HORAIRES_API, { method: "POST", headers: { "Content-Type": "application/json", "X-KBG-Signature": sig }, body });
+      const txt = await r.text();
+      try { j = JSON.parse(txt); } catch (_) { j = { ok: false, erreur: "Réponse non JSON (HTTP " + r.status + ") — module kbhoraires installé ?" }; }
+    } catch (e) {
+      throw new HttpsError("unavailable", "Site injoignable : " + String(e.message || e));
+    }
+    if (j && j.ok) {
+      try {
+        await admin.firestore().doc("app_config/regles_commandes").set({
+          test: !!j.test, cutoff_on: !!j.cutoff_on, cutoff_effectif: !!j.cutoff_effectif, cutoff_hour: j.cutoff_hour, cutoff_days: j.cutoff_days,
+          open_on: !!j.open_on, open_rules: j.open_rules || {}, lu_le: new Date().toISOString(), par: payload.by, ecrit: ecrire,
+        }, { merge: false });
+      } catch (_) { /* copie facultative */ }
+    }
+    return { ok: !!(j && j.ok), http: r.status, etat: (j && j.ok) ? j : null, erreur: (j && j.erreur) || null };
   }
 );
