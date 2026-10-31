@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.77';
+    const APP_VERSION = 'V10.78';
+    // V10.78 — (31/10/2026) Master › Horaires de commande : ouverture par jour de retrait (mer/jeu dès vendredi, ven/sam dès mardi), heure limite, mode TEST du site (module kbhoraires via kbgReglesCommandes) ; synchro prépa à l'heure limite choisie
     // V10.77 — (31/10/2026) Facturation web à la clôture : TOUTES les commandes du nouveau site du lieu sont facturées (passées ou non récupérées)
     // V10.75 — (29/10/2026) Distrib : ⚖️ fourchette de poids « entre XX et YY g » sous chaque produit (fiche client, ND « à donner en plus », dernière minute) — même source que la prépa (Sheet COMMANDE FL + liste MU)
     // V10.74 — (29/10/2026) Prépa › 📦 Mise en place : PRÉVISION « ≈ environ » dès la veille (vente encore ouverte sur admin.kelbongoo.com, lue toutes les 30 min par KBG_MEP.gs, projetée à 10h d'après les 3 dernières ventes du même jour) : par lieu ≈ commandes, ≈ casiers / cagettes / cartons DOM, ≈ rolls (16 casiers), paniers solidaires ; exact dès le chargement des commandes. Espace Rungis : menu 🟫 Palettes EPAL = ce que chaque boutique doit (envoyées − rendues, depuis quand, derniers mouvements)
@@ -2228,7 +2229,10 @@
       // V9.56 — Le mode réel n'auto-synchronise qu'à partir de PS_AUTO_HOUR (10h) ;
       // le mode TEST s'auto-synchronise à toute heure, pour pouvoir vérifier la
       // chaîne chargement → prépa n'importe quand, sans clic manuel.
-      if (!cfg.test && new Date().getHours() < PS_AUTO_HOUR) return null;
+      // V10.78 — heure = heure limite réglée dans Master › Horaires de commande ; site en mode TEST → toute heure
+      let rc = null; try { rc = await storage.getDoc('app_config', 'regles_commandes'); } catch (_) {}
+      const autoHour = (rc && rc.cutoff_hour != null) ? Number(rc.cutoff_hour) : PS_AUTO_HOUR;
+      if (!cfg.test && !(rc && rc.test) && new Date().getHours() < autoHour) return null;
       const dayKey = addDays(todayKey(), 1);
       const st = await storage.getDoc('app_config', 'kbprepa_status');
       if (st && st.dayKey === dayKey && st.at) {
@@ -20932,6 +20936,80 @@
       );
     }
 
+
+    // ── V10.78 — Master › Horaires de commande (site) : module PrestaShop kbhoraires via kbgReglesCommandes ──
+    const KBH_JOURS = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+    function KbHorairesCommandePage() {
+      const showToast = React.useContext(ToastContext);
+      const [etat, setEtat] = React.useState(null);
+      const [f, setF] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [err, setErr] = React.useState('');
+      const fromEtat = (e) => ({ test: !!e.test, cutoff_on: !!e.cutoff_on, cutoff_hour: e.cutoff_hour, cutoff_days: e.cutoff_days, open_on: !!e.open_on, open_rules: { ...(e.open_rules || {}) } });
+      const call = async (action, regles) => {
+        setBusy(true); setErr('');
+        try {
+          const r = await kbCallable('kbgReglesCommandes')(action === 'ecrire' ? { action, regles } : { action: 'lire' });
+          const d = r.data || {};
+          if (!d.ok) throw new Error(d.erreur === 'signature' ? 'Signature refusée : le secret FACTU_LOG_SECRET (Firebase) ne correspond pas au secret du module kbfacturation.' : (d.erreur || ('HTTP ' + d.http)));
+          setEtat(d.etat); setF(fromEtat(d.etat));
+          if (action === 'ecrire') showToast(d.etat.test ? '🧪 Site en MODE TEST : tous les créneaux sont commandables' : '✓ Horaires enregistrés sur le site');
+        } catch (e) { setErr(kbErrMsg(e) === 'Serveur injoignable. Réessaie dans un instant.' ? String(e.message || e) : kbErrMsg(e)); }
+        finally { setBusy(false); }
+      };
+      React.useEffect(() => { call('lire'); }, []);
+      const setRule = (wd, k, v) => setF(x => { const r = { ...(x.open_rules || {}) }; if (k === 'wd' && v === '') delete r[wd]; else r[wd] = { wd: 0, h: 0, ...(r[wd] || {}), [k]: Number(v) }; return { ...x, open_rules: r }; });
+      const inp = { padding: '6px 8px', borderRadius: 8, border: '1px solid var(--line)', fontSize: 15 };
+      return (
+        <div className="stack">
+          <h1 style={{ margin: 0 }}>🕙 Horaires de commande (site)</h1>
+          <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Quand les clients peuvent commander sur le nouveau site : ouverture par jour de retrait et heure limite. Appliqué tout de suite sur le site (Click &amp; Collect).</p>
+          {err && <div className="alert-warning" style={{ fontSize: 13 }}>⚠️ {err}</div>}
+          {!f && !err && <div className="card">Lecture des réglages du site…</div>}
+          {f && <>
+            <div className="card" style={{ borderLeft: '4px solid ' + (f.test ? '#d97706' : '#2e7d32') }}>
+              <label style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 16, fontWeight: 700, cursor: 'pointer' }}>
+                <input type="checkbox" checked={f.test} onChange={e => setF({ ...f, test: e.target.checked })} style={{ width: 22, height: 22 }} />
+                🧪 Mode TEST : tout est commandable (ouverture et heure limite levées)
+              </label>
+              {f.test && <div style={{ fontSize: 12, color: '#b45309', marginTop: 4 }}>À couper après les essais : les vrais clients pourraient commander n'importe quel jour.</div>}
+            </div>
+            <div className="card" style={{ opacity: f.test ? .55 : 1 }}>
+              <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontWeight: 700 }}><input type="checkbox" checked={f.cutoff_on} onChange={e => setF({ ...f, cutoff_on: e.target.checked })} style={{ width: 18, height: 18 }} /> ⏰ Heure limite</label>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8, fontSize: 15 }}>
+                Commande possible jusqu'à
+                <select value={f.cutoff_days} onChange={e => setF({ ...f, cutoff_days: Number(e.target.value) })} style={inp}>
+                  {[0, 1, 2, 3].map(d => <option key={d} value={d}>{d === 0 ? 'le jour même' : d === 1 ? 'la veille' : d + ' jours avant'}</option>)}
+                </select>
+                à
+                <select value={f.cutoff_hour} onChange={e => setF({ ...f, cutoff_hour: Number(e.target.value) })} style={inp}>
+                  {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{h}h</option>)}
+                </select>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 4 }}>La prépa charge les commandes du lendemain à partir de cette heure.</div>
+            </div>
+            <div className="card" style={{ opacity: f.test ? .55 : 1 }}>
+              <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontWeight: 700 }}><input type="checkbox" checked={f.open_on} onChange={e => setF({ ...f, open_on: e.target.checked })} style={{ width: 18, height: 18 }} /> 📅 Ouverture des commandes par jour de retrait</label>
+              <table style={{ marginTop: 8, fontSize: 15, borderCollapse: 'collapse' }}><tbody>
+                {[1, 2, 3, 4, 5, 6, 0].map(wd => { const r = f.open_rules[String(wd)]; return (
+                  <tr key={wd}><td style={{ padding: '4px 10px 4px 0' }}>Retrait <b>{KBH_JOURS[wd]}</b></td>
+                    <td style={{ padding: 4 }}>ouvre le <select value={r ? r.wd : ''} onChange={e => setRule(String(wd), 'wd', e.target.value)} style={inp}>
+                      <option value="">— toujours ouvert —</option>{KBH_JOURS.map((j, i) => <option key={i} value={i}>{j} d'avant</option>)}</select>
+                      {r && <> à <select value={r.h || 0} onChange={e => setRule(String(wd), 'h', e.target.value)} style={inp}>{Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{h}h</option>)}</select></>}
+                    </td></tr>); })}
+              </tbody></table>
+            </div>
+            <button className="btn-primary btn-lg" disabled={busy} onClick={() => call('ecrire', f)}>{busy ? 'Enregistrement…' : '💾 Enregistrer sur le site'}</button>
+          </>}
+          {etat && <div className="card">
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>📆 Sur le site maintenant ({etat.maintenant})</div>
+            {(etat.jours || []).map(j => <div key={j.jour} style={{ fontSize: 14, padding: '2px 0' }}>{j.libelle} — {j.clos ? '🔒 clos' : j.ouvert ? '✅ commandable' : `⏳ ouvre ${j.ouverture}`}</div>)}
+            <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>Module kbhoraires {etat.module} · kbtunnel {etat.kbtunnel || 'absent'}{etat.kbtunnel_actif ? '' : ' (inactif)'} · seuls les jours proposés par le site (créneaux Prestatill) sont réellement commandables.</div>
+          </div>}
+        </div>
+      );
+    }
+
     function SuiviGeneralPage({ session }) {
       // V10.48 — le menu est désormais unique (KB_MNAV : barre latérale PC / barre du bas + puces mobile).
       const [sub, setSub] = React.useState(() => { try { const v = localStorage.getItem('kbg_suivi_sub') || 'ca'; return KB_MSUBS.includes(v) ? v : 'ca'; } catch (e) { return 'ca'; } });
@@ -20952,6 +21030,7 @@
           {sub === 'cmails' && <KbClientMailsPage session={session} />}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
           {sub === 'factweb' && <KbFacturationWebPage />}
+          {sub === 'horaires' && <KbHorairesCommandePage />}
           {sub === 'rungis' && <><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'invfl' && <FlInventorySuiviCard session={session} />}
           {sub === 'live' && <KbLivePage />}
@@ -30867,6 +30946,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         { sub: 'live', l: 'Qui fait quoi', ic: '🟢' },
         { sub: 'ancien', l: 'Synchro ancien site', ic: '🔁' },
         { sub: 'factweb', l: 'Facturation web', ic: '🧾' },
+        { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
       ] },
       { s: 'appro', l: 'Achats & prépa', sh: 'Achats', ic: '🥬', items: [
         { t: 'fl', l: 'F&L : contrôle & rajout', ic: '🥬' },
