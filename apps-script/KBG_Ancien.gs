@@ -1,5 +1,7 @@
 /**
- * KBG_Ancien.gs — v1.6 (01/11/2026) — v1.6 : • appels réseau via KBG_Reseau (kbFetch_ / kbFetchAll_ : relance auto sur coupure
+ * KBG_Ancien.gs — v1.7 (01/11/2026) — v1.7 : fin du report (terminé, réel) → KBG_Locaux : Terminer la préparation +
+ *   Lancer la distribution sur locaux.kelbongoo.com pour chaque lieu.
+ * v1.6 (01/11/2026) — v1.6 : • appels réseau via KBG_Reseau (kbFetch_ / kbFetchAll_ : relance auto sur coupure
  *   réseau Google, ex. « Adresse non disponible ») ; • DOM confirmé (v1.5, jamais déployée avant) : sur l'ancien site DOM a
  *   des ND comme les autres lieux, mais dans l'appli DOM n'a PAS de cagette ND : tout est dans les cartons de la prépa DOM.
  *   → ND de DOM sur l'ancien site : quantité reçue = commandé − rupture des commandes DOM de l'appli (cartons), puis coche.
@@ -215,6 +217,7 @@ function ancWork_(job) {
     job.verif = ancVerify_(G, job);
     job.state = 'terminé'; job.endedAt = new Date().toISOString();
     ancJobPut_(job); ancLog_(job); ancMail_(job);
+    if (typeof locAfterPrepa_ === 'function') locAfterPrepa_(job);   // v1.7 — locaux : prépa terminée → distribution lancée
   } catch (e) {
     job.state = 'erreur'; job.error = String(e.message || e); job.endedAt = new Date().toISOString();
     ancJobPut_(job); ancLog_(job); ancMail_(job);
@@ -367,7 +370,7 @@ function ancMail_(job) {
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
     + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.6 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.7 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
   MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
 
