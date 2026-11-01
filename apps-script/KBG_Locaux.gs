@@ -66,11 +66,12 @@ function locGlobale_(ddp, day) {
     var hit = (r && r.items || []).filter(function (x) { return locParisDay_(x.distribution_date || (x.distributions && x.distributions[0] && x.distributions[0].start)) === day; })[0];
     if (hit) { P.setProperty(k, hit.globalorder_id); return hit.globalorder_id; }
   }
-  throw new Error('globale du ' + day + ' introuvable sur locaux.kelbongoo.com');
+  return null;   // pas de distribution ce jour-là (ex. lundi) : rien à faire
 }
 /** { G, lieux:[{locale, name, status}] } */
 function locEtat_(ddp, day) {
   var G = locGlobale_(ddp, day), first = null, out = [];
+  if (!G) return null;
   for (var i = 0; i < LOC.PROBE.length && !first; i++) { try { first = locCall_(ddp, 'globalorders.fetchLocaleDetail', { globalorder_id: G, locale: LOC.PROBE[i] }); } catch (e) {} }
   if (!first || !first.globalorder) throw new Error('détail de la globale ' + G + ' illisible');
   var codes = (first.globalorder.locales || []).map(function (l) { return String(l.locale || l.code || l).toUpperCase(); }).filter(Boolean);
@@ -92,6 +93,7 @@ function locDo_(ddp, G, l, method, lines, dry) {
 /** Prépa finie (veille de la distribution « day ») : Terminer la préparation puis Lancer la distribution, pour chaque lieu. */
 function locPrepa_(day, why) {
   var ddp = locConnect_(), E = locEtat_(ddp, day), dry = !locLive_(), lines = [];
+  if (!E) return lines;
   E.lieux.forEach(function (l) {
     if (l.status === 2) { if (!locDo_(ddp, E.G, l, 'globalorders.closeLocalePreparation', lines, dry)) return; if (dry) l.status = 3; }
     if (l.status === 3) locDo_(ddp, E.G, l, 'globalorders.launchLocaleDistribution', lines, dry);
@@ -102,6 +104,7 @@ function locPrepa_(day, why) {
 /** Distribution « day » : Terminer la distribution des lieux prêts (report ancien site fait sans erreur, ou aucune commande ancien site). */
 function locDistrib_(day, why, all) {
   var ddp = locConnect_(), E = locEtat_(ddp, day), dry = !locLive_(), lines = [], P = PropertiesService.getScriptProperties();
+  if (!E) return lines;
   var od = null; try { od = fsDoc_('day_' + day + '_orders', 'data'); } catch (e) {}
   var orders = (od && od.orders) || [], oldBySite = {};
   orders.forEach(function (o) { if (!o._test && DIS_OLD_ID.test(String(o.orderId || ''))) oldBySite[String(o.site || '').toUpperCase()] = 1; });
@@ -150,11 +153,11 @@ function locInstaller() {
   console.log('Déclencheur locAuto créé · ' + (locLive_() ? 'RÉEL' : 'SIMULATION'));
 }
 /* ── Manuel : changer LOC_MANUEL.day (date de distribution) puis exécuter ── */
-function locManuelEtat() { var d = locConnect_(), E = locEtat_(d, LOC_MANUEL.day); console.log(LOC_MANUEL.day + ' · globale ' + E.G + ' · ' + E.lieux.map(function (l) { return l.locale + '=' + (LOC.ST[l.status] || l.err); }).join(' · ')); }
+function locManuelEtat() { var d = locConnect_(), E = locEtat_(d, LOC_MANUEL.day); if (!E) { console.log('pas de globale le ' + LOC_MANUEL.day); return; } console.log(LOC_MANUEL.day + ' · globale ' + E.G + ' · ' + E.lieux.map(function (l) { return l.locale + '=' + (LOC.ST[l.status] || l.err); }).join(' · ')); }
 function locManuelPrepa() { console.log(locPrepa_(LOC_MANUEL.day, 'manuel').join('\n') || 'rien à faire'); }
 /** Report ancien site (roue pour tous) de tous les lieux + DOM, puis Terminer la distribution des lieux reportés. */
 function locManuelDistrib() {
-  var day = LOC_MANUEL.day, E = locEtat_(locConnect_(), day);
+  var day = LOC_MANUEL.day, E = locEtat_(locConnect_(), day); if (!E) { console.log('pas de globale le ' + day); return; }
   // roue pour tous les clients de chaque lieu encore en distribution (sans attendre la clôture dans l'appli)
   E.lieux.filter(function (l) { return l.status === 4; }).forEach(function (l) { ancienDistribJour(day, true, l.locale); });
   console.log(locDistrib_(day, 'manuel', false).join('\n') || 'rien à faire');
