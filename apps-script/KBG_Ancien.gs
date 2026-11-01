@@ -1,5 +1,10 @@
 /**
- * KBG_Ancien.gs — v1.4 (27/10/2026) — v1.4 : ND d'un lieu SANS commande dans l'appli → laissé tel quel (avant : reçu mis à 0) ;
+ * KBG_Ancien.gs — v1.6 (01/11/2026) — v1.6 : • appels réseau via KBG_Reseau (kbFetch_ / kbFetchAll_ : relance auto sur coupure
+ *   réseau Google, ex. « Adresse non disponible ») ; • DOM confirmé (v1.5, jamais déployée avant) : sur l'ancien site DOM a
+ *   des ND comme les autres lieux, mais dans l'appli DOM n'a PAS de cagette ND : tout est dans les cartons de la prépa DOM.
+ *   → ND de DOM sur l'ancien site : quantité reçue = commandé − rupture des commandes DOM de l'appli (cartons), puis coche.
+ * v1.5 (28/10/2026) : ND de DOM traités (DOM était exclu de la lecture « Réception ND »).
+ * v1.4 (27/10/2026) — v1.4 : ND d'un lieu SANS commande dans l'appli → laissé tel quel (avant : reçu mis à 0) ;
  *   contrôle des coches ND après report : un lieu resté « pas fini » est recoché seul (comme le site : autres lieux exclus).
  * v1.3 : CORRECTIF coches — « toggle-golpps-completed » agit sur TOUS les lieux non exclus :
  *   avant, 1 appel par lieu → un produit ND sur 2 ou 4 lieux était coché puis décoché. Désormais 1 seul appel par produit,
@@ -57,7 +62,7 @@ function ancToken_() {
   var c = CacheService.getScriptCache(), t = c.get('ANC_TOKEN'); if (t) return t;
   var P = ancProps_(), email = P.getProperty('ANC_EMAIL'), pass = P.getProperty('ANC_PASSWORD');
   if (!email || !pass) throw new Error('Compte ancien site non configuré (propriétés ANC_EMAIL / ANC_PASSWORD)');
-  var r = UrlFetchApp.fetch('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + ANC_FB_KEY, {
+  var r = kbFetch_('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + ANC_FB_KEY, {
     method: 'post', contentType: 'application/json', muteHttpExceptions: true,
     payload: JSON.stringify({ email: email, password: pass, returnSecureToken: true }) });
   var j = {}; try { j = JSON.parse(r.getContentText()); } catch (e) {}
@@ -75,11 +80,11 @@ function ancParse_(r) {
   if (code !== 200) throw new Error('HTTP ' + code + ' ' + String((j && (j.message || j.error)) || txt).slice(0, 160));
   return j;
 }
-function ancGet_(route, params, options) { var q = ancReq_(route, params, options); return ancParse_(UrlFetchApp.fetch(q.url, q)); }
+function ancGet_(route, params, options) { var q = ancReq_(route, params, options); return ancParse_(kbFetch_(q.url, q)); }
 /** Plusieurs appels en parallèle ; renvoie [{ok, j, err}]. */
 function ancAll_(reqs) {
   if (!reqs.length) return [];
-  var rs = UrlFetchApp.fetchAll(reqs);
+  var rs = kbFetchAll_(reqs);   // v1.6 — relance réseau (KBG_Reseau)
   return rs.map(function (r) { try { return { ok: true, j: ancParse_(r) }; } catch (e) { return { ok: false, err: String(e.message || e) }; } });
 }
 
@@ -109,7 +114,9 @@ function ancProductsND_(G, locales) {
   });
   return out;
 }
-function ancLocales_(job) { var m = { BIC: 1, BOR: 1, PDP: 1, STB: 1, TOL: 1 }; (job.todo || []).forEach(function (x) { (x.orders || []).forEach(function (o) { if (o.site && o.site !== 'DOM') m[o.site] = 1; }); }); return Object.keys(m); }
+// v1.5 — DOM inclus : sur l'ancien site, les produits ND livrés à domicile sont en « Réception ND » de DOM ;
+//   dans l'appli ils sont dans les cartons DOM (pas de cagette ND) → reçu = commandé − rupture DOM.
+function ancLocales_(job) { var m = { BIC: 1, BOR: 1, PDP: 1, STB: 1, TOL: 1, DOM: 1 }; (job.todo || []).forEach(function (x) { (x.orders || []).forEach(function (o) { if (o.site) m[o.site] = 1; }); }); return Object.keys(m); }
 function ancProducts_(G) {
   var out = {};
   [0, 1].forEach(function (cl) {
@@ -360,7 +367,7 @@ function ancMail_(job) {
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
     + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.4 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.6 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
   MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
 

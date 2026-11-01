@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.79) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.81) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.79';
+const APP_VERSION = 'V10.81';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -1416,6 +1416,7 @@ function kbLmAttribution(lastminute, site, clients) {
         lmId: l.id,
         produit: l.produit,
         producteur: l.producteur || '',
+        productId: l.productId || '',
         qty: cand.got,
         casier: kbCasiersOf(cand.o)[0] || ''
       });
@@ -2044,6 +2045,34 @@ function progmagToOrders(lines) {
     o.frais = o.items.slice();
   });
   return orders;
+}
+function kbIsCagette(n) {
+  return /^C\d{1,3}$/i.test(String(n || '').trim());
+}
+function kbCasName(n) {
+  const v = String(n || '').trim();
+  return kbIsCagette(v) ? 'Cagette ' + v.slice(1) : 'Casier ' + v;
+}
+function kbCasShort(n) {
+  const v = String(n || '').trim();
+  return kbIsCagette(v) ? '🧺' + v.slice(1) : v;
+}
+function kbParseGrams(v) {
+  const m = String(v || '').replace(',', '.').match(/(\d+(?:\.\d+)?)\s*(kg|g|gr|grammes?)?/i);
+  if (!m) return 0;
+  let x = parseFloat(m[1]);
+  if (m[2] ? /kg/i.test(m[2]) : x < 20) x *= 1000;
+  return Math.round(x);
+}
+function kbNameGrams(name) {
+  const m = String(name || '').match(/(\d+(?:[.,]\d+)?)\s*(kg|g|gr|grammes?)\b/i);
+  if (!m) return 0;
+  let v = parseFloat(m[1].replace(',', '.'));
+  if (/kg/i.test(m[2])) v *= 1000;
+  return Math.round(v);
+}
+function kbPoidsPct(reel, prevu) {
+  return reel > 0 && prevu > 0 && reel < prevu ? Math.max(1, Math.min(99, Math.round((1 - reel / prevu) * 100))) : 0;
 }
 function casCmp(a, b) {
   const na = parseInt(a, 10),
@@ -6486,7 +6515,7 @@ function ClientsPage({
         letterSpacing: '.03em',
         marginBottom: 4
       }
-    }, "❌ Rupture finalement (prévu en dernière minute) — à RETIRER dans l'ancienne appli"), (o.removed || []).filter(r => r._lmKo).map((p, k) => React.createElement("div", {
+    }, "❌ Rupture finalement (prévu en dernière minute) — non livré, non facturé"), (o.removed || []).filter(r => r._lmKo).map((p, k) => React.createElement("div", {
       key: 'ko' + k,
       style: {
         display: 'flex',
@@ -6504,7 +6533,7 @@ function ClientsPage({
         fontSize: 17
       }
     }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit)))), React.createElement(KbAckBtn, {
-      label: "✅ C'est fait : retiré dans l'ancienne appli",
+      label: "✅ C'est noté : pas donné au client",
       onClick: () => kbAckSet('ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo), true, session.name)
     })), lmItems.length > 0 && !kbAckOk(lmDone, 'lm', kbClientKey(o), lmItems) && React.createElement("div", {
       style: {
@@ -6523,7 +6552,7 @@ function ClientsPage({
         letterSpacing: '.03em',
         marginBottom: 4
       }
-    }, lmItems.every(p => p.certain) ? '🚚 Dernière minute — à donner · déjà facturé : NE PAS rajouter dans l\'ancienne appli' : '🚚 Dispatch dernière minute — à rajouter dans l\'ancienne appli (sinon non facturé)'), lmItems.map((p, k) => React.createElement("div", {
+    }, lmItems.every(p => p.certain) ? '🚚 Dernière minute — à donner au client' : '🚚 Dispatch dernière minute — à donner au client'), lmItems.map((p, k) => React.createElement("div", {
       key: 'lm' + k,
       style: {
         display: 'flex',
@@ -6545,7 +6574,7 @@ function ClientsPage({
       p: p,
       light: true
     })))), React.createElement(KbAckBtn, {
-      label: lmItems.every(p => p.certain) ? '✅ C\'est fait : donné au client' : '✅ C\'est fait : rajouté dans l\'ancienne appli',
+      label: "✅ C'est fait : donné au client",
       onClick: () => kbAckSet('lm', kbClientKey(o), lmItems, true, session.name)
     })), React.createElement("div", {
       className: "list-item-sub",
@@ -6699,6 +6728,84 @@ function ClientsPage({
     onClose: () => setSelectedClient(null)
   }));
 }
+async function kbRefundRetourPdp(refId, order, product, qty, dlc, session, dayKey) {
+  const rid = 'rf_' + String(refId).replace(/[\/]/g, '_'),
+    site = order.site;
+  if (!dlc) {
+    await Promise.all([storage.deleteDoc('pdp_returns', `pdpret_${rid}`), storage.deleteDoc('losses', `lossret_${rid}`), storage.deleteDoc('dlc_watch', `pdpret_${rid}`)].map(p => p.catch(() => {})));
+    return '';
+  }
+  const next = nextDistribDateForSite(site, dayKey);
+  const perte = isDlcToday(dlc, dayKey) || next && dlc < next;
+  const produit = product.produit || '',
+    producteur = product.producteur || '',
+    now = new Date().toISOString();
+  const who = order.name || displayName(order),
+    by = session && session.name || '';
+  if (perte) {
+    await storage.deleteDoc('pdp_returns', `pdpret_${rid}`).catch(() => {});
+    await storage.setDoc('losses', `lossret_${rid}`, {
+      id: `lossret_${rid}`,
+      productKey: `${producteur}|${produit}`,
+      producteur,
+      produit,
+      unite: '',
+      destination: 'jete',
+      reason: 'dlc',
+      usingWeight: false,
+      quantity: qty || 1,
+      weight: 0,
+      unitPrice: 0,
+      totalValue: 0,
+      dlc,
+      recupPerso: false,
+      remark: `Laissé par le client ${who} — distrib ${site}`,
+      day: dayKey,
+      fromReturn: true,
+      fromDistrib: true,
+      createdBy: by,
+      createdAt: now,
+      updatedAt: now
+    });
+    return ' · ⚠️ DLC trop courte → perte (pertes prépa)';
+  }
+  await storage.deleteDoc('losses', `lossret_${rid}`).catch(() => {});
+  await storage.setDoc('pdp_returns', `pdpret_${rid}`, {
+    id: `pdpret_${rid}`,
+    refundId: refId,
+    site,
+    productKey: `${producteur}|${produit}`,
+    productLabel: `${produit}${producteur ? ' (' + producteur + ')' : ''}`,
+    produit,
+    producteur,
+    qty: qty || 1,
+    clientName: who,
+    dlc,
+    pickupDate: next || '',
+    anomalyLabel: 'Retour PDP (laissé par le client)',
+    remark: '',
+    day: dayKey,
+    status: 'pending',
+    createdBy: by,
+    createdAt: now,
+    updatedAt: now
+  });
+  try {
+    await storage.setDoc('dlc_watch', `pdpret_${rid}`, {
+      id: `pdpret_${rid}`,
+      produit,
+      producteur,
+      qty: qty || 1,
+      dlc,
+      status: 'watch',
+      source: 'retour_pdp',
+      site,
+      createdBy: by,
+      createdAt: now
+    });
+  } catch (_) {}
+  return ' · ↩️ Retour PDP enregistré';
+}
 function RefundModal({
   order,
   product,
@@ -6726,6 +6833,8 @@ function RefundModal({
   const [wTarget, setWTarget] = React.useState(weightHint ? String(weightHint) : '');
   const [wReal, setWReal] = React.useState('');
   const [pctDirect, setPctDirect] = React.useState('10');
+  const [retPdp, setRetPdp] = React.useState(!!(existing && existing.retourPdp));
+  const [retDlc, setRetDlc] = React.useState(existing && existing.retourDlc || '');
   const lineQ = Math.max(1, Number(product.qty) || 1);
   const [onN, setOnN] = React.useState(() => Math.min(lineQ, Math.max(1, existing && existing.mode !== 'units' && Number(existing.qty) || lineQ)));
   let pct = 0;
@@ -6779,6 +6888,11 @@ function RefundModal({
       showToast("Indique d'abord la remise");
       return;
     }
+    const wantRet = mode === 'total' && retPdp;
+    if (wantRet && !retDlc) {
+      showToast('Retour PDP : indique la DLC du produit');
+      return;
+    }
     const dayKey = activeDay();
     const id = `${order.orderId}__${product.id || normalizeText(product.produit)}`;
     const detail = (mode === 'units' ? `${brokenN} cassé(s) sur ${totalN}` : mode === 'weight' ? `${wReal} g au lieu de ${wTarget} g` : mode === 'pct' ? `remise ${pct}%` : 'retrait total') + (partQ < lineQ ? ` · sur ${partQ} article${partQ > 1 ? 's' : ''} / ${lineQ}` : '');
@@ -6800,15 +6914,26 @@ function RefundModal({
       status: 'a_qualifier',
       reason: '',
       createdBy: session && session.name || '',
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      retourPdp: wantRet,
+      retourDlc: wantRet ? retDlc : ''
     });
-    showToast(`✓ Remboursement ${pct}% (${fmtEuro(refundCents)}) → Qualité`);
+    let retMsg = '';
+    try {
+      retMsg = await kbRefundRetourPdp(id, order, product, partQ, wantRet ? retDlc : '', session, dayKey);
+    } catch (e) {
+      retMsg = ' · ⚠️ retour PDP non enregistré (' + (e && e.message || e) + ')';
+    }
+    showToast(`✓ Remboursement ${pct}% (${fmtEuro(refundCents)}) → Qualité${retMsg}`);
     onClose();
   };
   const remove = async () => {
     const dayKey = activeDay();
     const id = `${order.orderId}__${product.id || normalizeText(product.produit)}`;
     await storage.deleteDoc(`day_${dayKey}_refunds`, id);
+    try {
+      await kbRefundRetourPdp(id, order, product, 0, '', session, dayKey);
+    } catch (_) {}
     showToast('Remboursement annulé');
     onClose();
   };
@@ -7027,7 +7152,57 @@ function RefundModal({
       fontSize: 13,
       color: 'var(--ink-soft)'
     }
-  }, "Produit entièrement retiré → remboursement de 100 %."), React.createElement("div", {
+  }, "Produit entièrement retiré → remboursement de 100 %."), mode === 'total' && React.createElement("div", {
+    style: {
+      marginBottom: 12,
+      border: '2px solid #1565c0',
+      borderRadius: 12,
+      padding: '8px 10px',
+      background: retPdp ? '#e3f2fd' : 'var(--bg-card,#fff)'
+    }
+  }, React.createElement("label", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#0d47a1',
+      cursor: 'pointer'
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: retPdp,
+    onChange: e => setRetPdp(e.target.checked),
+    style: {
+      width: 22,
+      height: 22
+    }
+  }), "↩️ Le client laisse le produit : Retour PDP"), retPdp && React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginBottom: 4
+    }
+  }, "DLC du produit (le chauffeur le ramène à l'entrepôt ; DLC trop courte → perte) :"), React.createElement("input", {
+    type: "date",
+    value: retDlc,
+    onChange: e => setRetDlc(e.target.value),
+    style: {
+      fontSize: 18,
+      padding: 8,
+      width: '100%'
+    }
+  }), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "À mettre dans la cagette « Retour PDP » du lieu."))), React.createElement("div", {
     style: {
       textAlign: 'center',
       padding: '10px',
@@ -7084,6 +7259,27 @@ async function kbAckSet(kind, ck, arr, on, who) {
     });
   } catch (e) {
     alert('Enregistrement impossible : ' + (e.message || e));
+    return;
+  }
+  if (kind === 'lm') {
+    try {
+      const items = (arr || []).filter(p => p && !p.certain).map(p => ({
+        productId: String(p.productId || ''),
+        produit: p.produit || '',
+        producteur: p.producteur || '',
+        qty: Number(p.qty) || 1
+      }));
+      if (items.length || !on) await storage.setDoc(`day_${activeDay()}_lmdone`, ('lmadd|' + encodeURIComponent(String(ck))).slice(0, 700), {
+        kind: 'lmadd',
+        orderIds: String(ck).split('|'),
+        items,
+        done: !!on && items.length > 0,
+        by: who || '',
+        at: new Date().toISOString()
+      }, {
+        replace: true
+      });
+    } catch (_) {}
   }
 }
 function KbAckBtn({
@@ -7203,7 +7399,7 @@ function LmRangeModal({
       fontWeight: 600,
       marginBottom: 10
     }
-  }, "Mets chaque produit dans le casier indiqué, puis touche « Rangé ». 🟣 « Prévu » = déjà facturé, ne rien rajouter. Les autres : à rajouter au client dans l'ancienne appli."), React.createElement("div", {
+  }, "Mets chaque produit dans le casier indiqué, puis touche « Rangé »."), React.createElement("div", {
     className: "stack",
     style: {
       gap: 14
@@ -7254,13 +7450,13 @@ function LmRangeModal({
         fontSize: 13,
         fontWeight: 700
       }
-    }, "🟣 Prévu · déjà facturé, ne pas rajouter") : React.createElement("span", {
+    }, "🟣 Prévu en prépa") : React.createElement("span", {
       style: {
         display: 'block',
         fontSize: 13,
         fontWeight: 700
       }
-    }, "➕ à rajouter dans l'ancienne appli")), React.createElement("span", {
+    }, "➕ arrivé ce matin")), React.createElement("span", {
       style: {
         fontSize: 14,
         fontWeight: 700
@@ -7637,12 +7833,12 @@ function ClientDetailV4({
       fontSize: 11,
       fontWeight: 700
     }
-  }, x.t === '🍞' ? '🍞 pain' : '🧊 casier'), React.createElement("div", {
+  }, x.t === '🍞' ? '🍞 pain' : kbIsCagette(x.c) ? '🧺 cagette' : '🧊 casier'), React.createElement("div", {
     style: {
       fontSize: 36,
       fontWeight: 700
     }
-  }, x.c)))), !casiers.length && React.createElement("div", {
+  }, kbIsCagette(x.c) ? String(x.c).slice(1) : x.c)))), !casiers.length && React.createElement("div", {
     style: {
       marginTop: 6,
       fontSize: 15,
@@ -7843,7 +8039,7 @@ function ClientDetailV4({
       }
     }, React.createElement(KbAckDone, {
       a: a,
-      txt: "rupture finalement retirée dans l'ancienne appli",
+      txt: "rupture finalement notée (non facturée)",
       onUndo: () => kbAckSet('ko', kbClientKey(o), ko, false, session.name)
     })) : null;
   })(), (o.removed || []).some(r => r._lmKo) && !kbAckOk(acks, 'ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo)) && React.createElement("div", {
@@ -7867,7 +8063,7 @@ function ClientDetailV4({
       fontWeight: 600,
       marginBottom: 6
     }
-  }, "Prévu en dernière minute mais pas arrivé : non livré. À RETIRER du client dans l'ancienne appli (sinon facturé)."), (o.removed || []).filter(r => r._lmKo).map((p, i) => React.createElement("div", {
+  }, "Prévu en dernière minute mais pas arrivé : non livré, non facturé."), (o.removed || []).filter(r => r._lmKo).map((p, i) => React.createElement("div", {
     key: i,
     style: {
       display: 'flex',
@@ -7887,7 +8083,7 @@ function ClientDetailV4({
       fontSize: 18
     }
   }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit), p.producteur ? ` · ${p.producteur}` : ''))), React.createElement(KbAckBtn, {
-    label: "✅ C'est fait : retiré dans l'ancienne appli",
+    label: "✅ C'est noté : pas donné au client",
     onClick: () => kbAckSet('ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo), true, session.name)
   })), lm.length > 0 && kbAckOk(acks, 'lm', kbClientKey(o), lm) && React.createElement("div", {
     style: {
@@ -7895,7 +8091,7 @@ function ClientDetailV4({
     }
   }, React.createElement(KbAckDone, {
     a: kbAckOk(acks, 'lm', kbClientKey(o), lm),
-    txt: lm.every(p => p.certain) ? 'dernière minute donnée' : 'dernière minute faite (rajoutée dans l\'ancienne appli)',
+    txt: "dernière minute donnée",
     onUndo: () => kbAckSet('lm', kbClientKey(o), lm, false, session.name)
   })), lm.length > 0 && !kbAckOk(acks, 'lm', kbClientKey(o), lm) && React.createElement("div", {
     style: {
@@ -7918,7 +8114,7 @@ function ClientDetailV4({
       fontWeight: 600,
       marginBottom: 6
     }
-  }, lm.every(p => p.certain) ? 'Prévu en dernière minute : à donner au client. Déjà facturé, NE PAS rajouter dans l\'ancienne appli.' : 'Arrivé ce matin : à donner au client ET à rajouter dans l\'ancienne appli (sinon non facturé).'), React.createElement("div", {
+  }, lm.every(p => p.certain) ? 'Prévu en dernière minute : à donner au client.' : 'Arrivé ce matin : à donner au client.'), React.createElement("div", {
     className: "stack",
     style: {
       gap: 4
@@ -7947,7 +8143,7 @@ function ClientDetailV4({
     p: p,
     light: true
   }))))), React.createElement(KbAckBtn, {
-    label: lm.every(p => p.certain) ? '✅ C\'est fait : donné au client' : '✅ C\'est fait : rajouté dans l\'ancienne appli',
+    label: "✅ C'est fait : donné au client",
     onClick: () => kbAckSet('lm', kbClientKey(o), lm, true, session.name)
   })), o.removed && o.removed.length > 0 && React.createElement("div", {
     style: {
@@ -28420,6 +28616,21 @@ function kbClientMailsClients(day, data) {
     return out;
   }).sort((a, b) => a.site.localeCompare(b.site) || casCmp(a.casiers[0], b.casiers[0]) || a.name.localeCompare(b.name));
 }
+function kbCmWhen(day) {
+  const t = todayKey();
+  if (day === t) return {
+    rel: '',
+    future: false
+  };
+  if (day === addDays(t, 1)) return {
+    rel: 'demain',
+    future: true
+  };
+  return {
+    rel: '',
+    future: day > t
+  };
+}
 function kbMailHtml(kind, day, c, lieu, hours) {
   const G = '#2e7d32',
     jour = kbCmDate(day);
@@ -28431,7 +28642,7 @@ function kbMailHtml(kind, day, c, lieu, hours) {
   const section = (title, color, sub, rows) => rows ? `<tr><td style="padding:18px 0 4px"><div style="font-size:16px;font-weight:800;color:${color}">${title}</div>${sub ? `<div style="font-size:13px;color:#666;margin-top:2px">${sub}</div>` : ''}<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:6px">${rows}</table></td></tr>` : '';
   const isDom = c.site === 'DOM';
   const horaire = hours ? `${hours.start.replace(':', 'h')} – ${hours.end.replace(':', 'h')}` : '';
-  const casBox = isDom ? `<div style="font-size:15px;color:#555">Livraison à domicile</div><div style="font-size:28px;font-weight:900;color:${G};margin-top:4px">${horaire ? 'Entre ' + horaire : kbEsc(c.slot || '')}</div>` : `<div style="font-size:15px;color:#555">${c.casiers.length > 1 ? 'Vos casiers' : 'Votre casier'}</div><div style="font-size:54px;line-height:1.1;font-weight:900;color:${G};letter-spacing:1px;margin-top:4px">${c.casiers.length ? c.casiers.map(kbEsc).join(' · ') : '—'}</div>`;
+  const casBox = isDom ? `<div style="font-size:15px;color:#555">Livraison à domicile</div><div style="font-size:28px;font-weight:900;color:${G};margin-top:4px">${horaire ? 'Entre ' + horaire : kbEsc(c.slot || '')}</div>` : `<div style="font-size:15px;color:#555">${c.casiers.length > 1 ? 'Vos casiers' : 'Votre casier'}</div><div style="font-size:54px;line-height:1.1;font-weight:900;color:${G};letter-spacing:1px;margin-top:4px">${c.casiers.length ? c.casiers.filter(n => !kbIsCagette(n)).map(kbEsc).join(' · ') || '—' : '—'}</div>${c.casiers.some(kbIsCagette) ? `<div style="font-size:16px;font-weight:700;color:#7a3a12;margin-top:4px">+ ${c.casiers.filter(kbIsCagette).map(kbCasName).join(' · ')} (à demander au distributeur)</div>` : ''}`;
   const lieuBox = isDom ? '' : `<div style="margin-top:12px;font-size:16px"><b>📍 ${kbEsc(lieuNom)}</b> <span style="color:#777">(${kbEsc(c.site)})</span>${lieu && lieu.adresse ? `<br><span style="color:#555;font-size:14px">${kbEsc(lieu.adresse)}</span>` : ''}<br>🗓️ ${kbEsc(jour)}${horaire ? ` · 🕑 <b>${horaire}</b>` : ''}</div>`;
   let intro,
     sections = '';
@@ -28442,22 +28653,24 @@ function kbMailHtml(kind, day, c, lieu, hours) {
     return `<span style="text-decoration:line-through;color:#999">${qte(l)}</span> <span style="color:#c62828;font-weight:700">· finalement indisponible, non facturé</span>`;
   };
   if (kind === 'cloture') {
-    intro = `Bonjour ${kbEsc(first)},<br><br>Votre commande pour le <b>${kbEsc(jour)}</b> vient d'être préparée. Voici le récapitulatif.`;
+    const when = kbCmWhen(day);
+    intro = isDom ? `Bonjour ${kbEsc(first)},<br><br>Notre équipe vient de préparer votre commande${when.rel ? ' de <b>' + when.rel + '</b>' : ''}. Elle vous sera livrée le <b>${kbEsc(jour)}</b>${horaire ? ` entre <b>${horaire}</b>` : ''}. Voici le récapitulatif.` : `Bonjour ${kbEsc(first)},<br><br>Notre équipe vient de préparer votre commande${when.rel ? ' de <b>' + when.rel + '</b>' : ''}. Elle sera à retirer le <b>${kbEsc(jour)}</b>${horaire ? ` entre <b>${horaire}</b>` : ''} à <b>${kbEsc(lieuNom)}</b>${when.future ? ' — <b>pas avant</b>' : ''}. Voici le récapitulatif.`;
     sections += section(`🧺 Dans votre casier (${c.casier.reduce((a, l) => a + l.qty, 0)} article${c.casier.reduce((a, l) => a + l.qty, 0) > 1 ? 's' : ''})`, '#222', '', list(c.casier, l => qte(l) + rem(l)));
     sections += section('🤲 Hors casier', '#7a3a12', 'Remis en main propre par le distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>' + rem(l)));
     sections += section('🟣 Dernière minute (probable)', '#7c3aed', 'Produits attendus le jour de la distribution : ajoutés s\'ils arrivent, sinon non facturés.', list(c.lm, lmLabel));
     sections += section('🚫 En rupture', '#c62828', 'Non disponibles : ils ne vous seront pas facturés.', list(c.rupt, l => `<span style="text-decoration:line-through;color:#999">${qte(l)}</span>`));
   } else {
     intro = isDom ? `Bonjour ${kbEsc(first)},<br><br>Votre commande Kelbongoo est livrée <b>aujourd'hui</b>${horaire ? ` entre <b>${horaire}</b>` : ''}.` : `Bonjour ${kbEsc(first)},<br><br>Votre commande vous attend <b>aujourd'hui</b>${horaire ? ` entre <b>${horaire}</b>` : ''} à <b>${kbEsc(lieuNom)}</b>.`;
+    sections += section(`🧺 ${isDom ? 'Votre commande' : 'Dans votre casier'} (${c.casier.reduce((a, l) => a + l.qty, 0)} article${c.casier.reduce((a, l) => a + l.qty, 0) > 1 ? 's' : ''})`, '#222', '', list(c.casier, l => qte(l) + rem(l)));
     sections += section('🟣 Dernière minute', '#7c3aed', '', list(c.lm, lmLabel));
-    sections += section('🤲 Hors casier', '#7a3a12', 'À demander au distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>'));
+    sections += section('🤲 Hors casier', '#7a3a12', 'À demander au distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>' + rem(l)));
     if (c.rupt.length) sections += section('🚫 En rupture (non facturé)', '#c62828', '', list(c.rupt, l => `<span style="text-decoration:line-through;color:#999">${qte(l)}</span>`));
   }
   const footer = `Paiement débité le jour du retrait, ruptures et remises déduites. Poids ±10 % au même prix.<br>Une question ? Répondez à ce mail ou écrivez à <a href="mailto:contact@kelbongoo.com" style="color:${G}">contact@kelbongoo.com</a>.`;
   return `<!doctype html><html><body style="margin:0;padding:0;background:#f3f1ec;font-family:Arial,Helvetica,sans-serif;color:#222">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f1ec;padding:16px 0"><tr><td align="center">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:14px;overflow:hidden">
-<tr><td style="background:${G};padding:16px 22px;color:#fff;font-size:22px;font-weight:900">🥬 Kelbongoo<div style="font-size:14px;font-weight:600;opacity:.9;margin-top:2px">${kind === 'cloture' ? 'Votre commande est prête' : 'Rappel : votre commande vous attend'}</div></td></tr>
+<tr><td style="background:${G};padding:16px 22px;color:#fff;font-size:22px;font-weight:900">🥬 Kelbongoo<div style="font-size:14px;font-weight:600;opacity:.9;margin-top:2px">${kind === 'cloture' ? `Votre commande a été préparée · retrait le ${kbEsc(jour)}` : 'Rappel : votre commande vous attend aujourd\'hui'}</div></td></tr>
 <tr><td style="padding:20px 22px 4px;font-size:15px;line-height:1.5">${intro}</td></tr>
 <tr><td style="padding:14px 22px"><div style="border:3px solid ${G};border-radius:14px;padding:14px 16px;text-align:center;background:#f1f8e9">${casBox}${lieuBox}</div></td></tr>
 <tr><td style="padding:0 22px"><table width="100%" cellpadding="0" cellspacing="0">${sections}</table></td></tr>
@@ -28468,7 +28681,7 @@ function kbMailText(kind, day, c, lieu, hours) {
   const L = [];
   const horaire = hours ? `${hours.start}-${hours.end}` : '';
   L.push(`Bonjour ${c.firstname || String(c.name).split(' ')[0]},`, '');
-  L.push(kind === 'cloture' ? `Votre commande Kelbongoo pour le ${kbCmDate(day)} est prête.` : `Votre commande vous attend aujourd'hui${horaire ? ' ' + horaire : ''}.`);
+  L.push(kind === 'cloture' ? `Notre équipe vient de préparer votre commande${kbCmWhen(day).rel ? ' de ' + kbCmWhen(day).rel : ''}. ${c.site === 'DOM' ? 'Livraison' : 'À retirer'} le ${kbCmDate(day)}${horaire ? ' ' + horaire : ''}${kbCmWhen(day).future && c.site !== 'DOM' ? ' (pas avant)' : ''}.` : `Votre commande vous attend aujourd'hui${horaire ? ' ' + horaire : ''}.`);
   if (c.site !== 'DOM') L.push(`CASIER${c.casiers.length > 1 ? 'S' : ''} : ${c.casiers.join(' · ') || '-'}`, `Lieu : ${lieu && lieu.name || c.site} (${c.site})${lieu && lieu.adresse ? ' - ' + lieu.adresse : ''}${horaire ? ' - ' + horaire : ''}`);
   const sec = (t, arr, fn) => {
     if (arr.length) {
@@ -28477,7 +28690,7 @@ function kbMailText(kind, day, c, lieu, hours) {
     }
   };
   const q = l => `${l.qty > 1 ? l.qty + ' x ' : ''}${l.product}`;
-  if (kind === 'cloture') sec('Dans votre casier :', c.casier, l => q(l) + (l.rem ? ` (remise -${l.rem.pct}%)` : ''));
+  sec(c.site === 'DOM' ? 'Votre commande :' : 'Dans votre casier :', c.casier, l => q(l) + (l.rem ? ` (remise -${l.rem.pct}%)` : ''));
   sec('Hors casier (remis par le distributeur) :', c.hors, l => q(l) + ' (hors casier)');
   sec('Dernière minute :', c.lm, l => q(l) + (kind === 'cloture' || l.lmState === 'attente' ? ' - ajouté si reçu' : l.lmState === 'ok' ? ' - reçu, dans votre casier' : l.lmState === 'nd' ? ' - remis par le distributeur selon arrivage' : ' - indisponible, non facturé'));
   sec('En rupture (non facturé) :', c.rupt, q);
@@ -28517,7 +28730,7 @@ function kbClientMailsBuild(day, data, cfg, nowMs) {
         type: 'cloture',
         to,
         sendAt: new Date(now).toISOString(),
-        subject: `${tag}Kelbongoo · votre commande du ${kbCmDate(day)} est prête${cas}`,
+        subject: `${tag}Kelbongoo · commande préparée · ${c.site === 'DOM' ? 'livrée' : 'à retirer'} le ${kbCmDate(day)}${cas}`,
         htmlBody: kbMailHtml('cloture', day, c, lieu, hours),
         body: kbMailText('cloture', day, c, lieu, hours)
       });
@@ -29590,15 +29803,48 @@ function PrepaDuJourPage({
     const all = po.every(r => st(r) === 'rupture');
     po.forEach(r => wStatus(K(r), all ? null : 'rupture'));
   };
-  const setPoids1 = r => {
-    const cur = prep.poids[K(r)] || '';
-    const v = prompt('Poids réel constaté ? (ex : 320g)', cur);
-    if (v !== null) wPoids(K(r), v.trim() || null);
+  const setPoidsRows = (rs, cur, perClient) => {
+    if (!rs.length) return;
+    const prevuNom = kbNameGrams(rs[0].product);
+    const v = prompt(`Poids réel constaté${perClient ? ' (1 article)' : ' (s\'applique à ce produit)'} ?${prevuNom ? ` Prévu : ${prevuNom} g.` : ''} — ex : 320g`, cur || '');
+    if (v === null) return;
+    if (!v.trim()) {
+      rs.forEach(r => {
+        wPoids(K(r), null);
+        const rc = prep.remiseCli[K(r)];
+        if (rc && rc.reason === 'Poids réel') wRemCli(K(r), null);
+      });
+      showToast('⚖️ Poids et remise poids retirés');
+      return;
+    }
+    const reel = kbParseGrams(v);
+    let prevu = prevuNom;
+    if (!prevu) {
+      const p2 = prompt('Poids prévu (étiquette / commande) ? — ex : 500g', '');
+      if (p2 === null) return;
+      prevu = kbParseGrams(p2);
+    }
+    rs.forEach(r => wPoids(K(r), v.trim()));
+    const pct = kbPoidsPct(reel, prevu);
+    if (!pct) {
+      showToast(reel && prevu ? '⚖️ Poids noté — pas de remise (poids ≥ prévu)' : '⚖️ Poids noté — poids illisible, pas de remise');
+      return;
+    }
+    const other = rs.filter(r => {
+      const rc = prep.remiseCli[K(r)];
+      return rc && rc.reason !== 'Poids réel';
+    }).length;
+    if (!confirm(`⚖️ ${reel} g au lieu de ${prevu} g → remise −${pct} %${perClient && rs[0].qty > 1 ? ` sur 1 article (sur ${rs[0].qty})` : ''}.\nTransmise à la distrib, au mail client et à l'ancien site.${other ? `\n⚠️ Remplace ${other} remise(s) déjà faite(s).` : ''}\n\nValider la remise ?`)) return;
+    rs.forEach(r => wRemCli(K(r), {
+      pct,
+      reason: 'Poids réel',
+      q: r.qty || 1,
+      n: perClient && (r.qty || 1) > 1 ? 1 : 0
+    }));
+    showToast(`🏷️ Remise poids −${pct} % enregistrée (${rs.length} client${rs.length > 1 ? 's' : ''})`);
   };
-  const setPoidsProd = (site, product) => {
-    const v = prompt('Poids réel (s\'applique à ce produit) — ex : 320g', '');
-    if (v && v.trim()) rows.filter(r => r.site === site && r.product === product).forEach(r => wPoids(K(r), v.trim()));
-  };
+  const setPoids1 = r => setPoidsRows([r], prep.poids[K(r)] || '', true);
+  const setPoidsProd = (site, product) => setPoidsRows(rows.filter(r => r.site === site && r.product === product), '', false);
   const ndSavedAt = React.useRef({});
   const toggleND = pk => {
     if (kbIsSolidaire(String(pk).split('||').pop())) {
@@ -29752,6 +29998,21 @@ function PrepaDuJourPage({
     setCasErr('');
     return true;
   };
+  const nextCagette = site => {
+    const own = casOwners(site);
+    let i = 1;
+    while (own['C' + i]) i++;
+    return 'C' + i;
+  };
+  const giveCagette = (site, client) => {
+    const v = nextCagette(site),
+      cur = getCasiers(site, client).map(String);
+    wCas(CK(site, client), [...cur, v]);
+    showToast(`🧺 Cagette ${v.slice(1)} ajoutée à ${client.split(' ')[0]} (${site}) — pas de nouveau roll`);
+    setCasPick(null);
+    setCasNum('');
+    setCasErr('');
+  };
   const addCasierFor = (site, client) => {
     setCasPick({
       site,
@@ -29895,9 +30156,11 @@ function PrepaDuJourPage({
     const out = {};
     sites.filter(s => s !== 'DOM').forEach(s => {
       const cl = [...new Set(rows.filter(r => r.site === s && !ndOn(PK(s, r.product))).map(r => r.client))];
-      const n = cl.reduce((a, c) => a + Math.max(1, getCasiers(s, c).filter(x => x && x !== '?').length), 0);
+      const n = cl.reduce((a, c) => a + Math.max(1, getCasiers(s, c).filter(x => x && x !== '?' && !kbIsCagette(x)).length), 0);
+      const cg = cl.reduce((a, c) => a + getCasiers(s, c).filter(kbIsCagette).length, 0);
       out[s] = {
         casiers: n,
+        cagettes: cg,
         rolls: Math.ceil(n / KB_CASIERS_PAR_ROLL)
       };
     });
@@ -30240,7 +30503,7 @@ function PrepaDuJourPage({
           className: "pdj-cnum" + (cs.length > 1 ? " many" : "")
         }, cs.map((c, ci) => React.createElement("span", {
           key: ci
-        }, c)));
+        }, kbCasShort(c))));
       })(), React.createElement("span", {
         className: "pdj-cname"
       }, r.client.split(' ')[0]), rc && React.createElement("span", {
@@ -31134,17 +31397,17 @@ function PrepaDuJourPage({
       }, nums.map((n, i) => nums.length <= 1 ? React.createElement("span", {
         key: i,
         className: "pdj-cas"
-      }, "Casier ", n) : React.createElement("span", {
+      }, kbCasName(n)) : React.createElement("span", {
         key: i,
         className: "pdj-cas" + (i > 0 ? " add" : "")
-      }, "Casier ", n, React.createElement("button", {
+      }, kbCasName(n), React.createElement("button", {
         className: "pdj-rmcas",
         title: "Supprimer ce casier",
         onClick: () => removeCasier(c, i)
       }, "✕"))), React.createElement("button", {
         className: "pdj-addcas",
         onClick: () => addCasier(c)
-      }, "📦 Casier plein → +1")));
+      }, "📦 Casier plein → +1 casier / 🧺 cagette")));
     }) : React.createElement("div", {
       className: "pdj-no"
     }, "Aucun client ne correspond."));
@@ -31179,11 +31442,17 @@ function PrepaDuJourPage({
     }, cur.map((n, i) => React.createElement("span", {
       key: n,
       className: "pdj-cas"
-    }, "Casier ", n, cur.length > 1 && React.createElement("button", {
+    }, kbCasName(n), cur.length > 1 && React.createElement("button", {
       className: "pdj-rmcas",
       title: "Supprimer ce casier",
       onClick: () => removeCasierFor(site, client, i)
     }, "✕")))), React.createElement("button", {
+      className: "pdj-cpbtn",
+      style: {
+        background: '#7a3a12'
+      },
+      onClick: () => giveCagette(site, client)
+    }, "🧺 + Cagette ", nextCagette(site).slice(1), React.createElement("small", null, "casiers pleins, juste 1-2 produits de plus : pas de nouveau roll")), React.createElement("button", {
       className: "pdj-cpbtn",
       onClick: () => giveCasier(site, client, auto)
     }, "⚡ Automatique → Casier ", auto, React.createElement("small", null, "prochain numéro libre à ", site)), React.createElement("div", {
@@ -31921,7 +32190,7 @@ function PrepDispatchPage({
   const certNames = React.useMemo(() => new Set(lmCertain.map(c => normalizeText(kbProdName(c.produit)))), [lmCertain]);
   const manquantsHorsCertain = React.useMemo(() => manquants.filter(m => !(m.lastMinute && certNames.has(normalizeText(kbProdName(m.produit))))), [manquants, certNames]);
   const pasArrive = async c => {
-    if (!confirm(`« ${kbProdName(c.produit)} » n'est pas arrivé ?\n\n→ passe en RUPTURE pour ${c.keys.length} client(s) (non livré, non facturé dans cette appli).\n⚠️ Vérifie l'ancienne appli : le produit y était compté présent.`)) return;
+    if (!confirm(`« ${kbProdName(c.produit)} » n'est pas arrivé ?\n\n→ passe en RUPTURE pour ${c.keys.length} client(s) (non livré, non facturé).\nRetiré aussi sur l'ancien site au report automatique du soir.`)) return;
     const who = session.name || 'prépa';
     try {
       for (const k of c.keys) await storage.setDoc(`day_${day}_prep`, 'st|' + encodeURIComponent(k), {
@@ -32849,7 +33118,7 @@ function PrepDispatchPage({
       color: 'var(--ink-soft)',
       margin: '4px 0 10px'
     }
-  }, "Produits sûrs d'arriver (marqués 🟣 à la prépa). ", React.createElement("strong", null, "Comptés présents"), " (ancienne appli + Tampermonkey) et ", React.createElement("strong", null, "déjà attribués aux casiers"), " en distrib : ", React.createElement("strong", null, "pas besoin du camion"), ". S'il n'arrive pas → ", React.createElement("strong", null, "❌ Pas arrivé"), "."), React.createElement("div", {
+  }, "Produits sûrs d'arriver (marqués 🟣 à la prépa). ", React.createElement("strong", null, "Comptés présents"), " (report automatique) et ", React.createElement("strong", null, "déjà attribués aux casiers"), " en distrib : ", React.createElement("strong", null, "pas besoin du camion"), ". S'il n'arrive pas → ", React.createElement("strong", null, "❌ Pas arrivé"), "."), React.createElement("div", {
     style: {
       border: '1px solid var(--line)',
       borderRadius: 10,
@@ -33550,7 +33819,7 @@ function PrepDispatchPage({
         p: p,
         done: done,
         red: true,
-        sub: p.certain ? 'déjà facturé' : 'à rajouter ancienne appli'
+        sub: p.certain ? 'prévu en prépa' : 'arrivé ce matin'
       }))), site === 'DOM' && React.createElement("div", {
         style: {
           fontSize: 13,
@@ -33661,7 +33930,7 @@ function PrepDispatchPage({
           color: 'var(--danger)',
           marginBottom: 3
         }
-      }, "🔴 Dernière minute (🟣 = déjà facturé ; sinon à rajouter dans l'ancienne appli)"), React.createElement("div", {
+      }, "🔴 Dernière minute (🟣 = prévu en prépa)"), React.createElement("div", {
         style: {
           display: 'flex',
           flexDirection: 'column',
@@ -64073,17 +64342,20 @@ function ActiveDayBanner({
       justifyContent: 'space-between',
       alignItems: 'center',
       gap: 10,
-      flexWrap: 'wrap'
+      flexWrap: 'wrap',
+      border: '3px solid #c62828',
+      background: '#fdecea'
     }
   }, React.createElement("div", {
     style: {
-      fontSize: 13
+      fontSize: 16,
+      color: '#8e0000'
     }
-  }, "⚠️ Jour affiché : ", React.createElement("strong", {
+  }, "⚠️ Tu regardes la distribution du ", React.createElement("strong", {
     style: {
       textTransform: 'capitalize'
     }
-  }, label(ad)), " — ", future ? 'distribution à venir' : 'distribution passée', ", ", React.createElement("strong", null, "pas aujourd'hui"), "."), React.createElement("button", {
+  }, label(ad)), ad === addDays(today, 1) ? ' (DEMAIN)' : '', " — ", future ? 'à venir' : 'passée', ", ", React.createElement("strong", null, "pas aujourd'hui"), ". Clients, push et mails = ce jour-là."), React.createElement("button", {
     className: "btn-primary",
     style: {
       fontSize: 13,
@@ -64216,6 +64488,17 @@ const CLIENT_MAIL_TEMPLATES = [{
   body: "Bonjour,\n\nVotre commande est prête et vous attend au point de retrait habituel aux horaires d'ouverture.\n\nÀ très vite,\nL'équipe Kelbongoo"
 }];
 const MAIL_BCC_SELF = 'hg@probon.fr';
+function kbMailDayLbl() {
+  try {
+    return new Date(activeDay() + 'T12:00:00').toLocaleDateString('fr-FR', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long'
+    });
+  } catch (e) {
+    return activeDay();
+  }
+}
 function ClientMailComposer({
   session,
   orders,
@@ -64291,7 +64574,7 @@ function ClientMailComposer({
       return;
     }
     const lots = Math.ceil(list.length / MAIL_BATCH_SIZE);
-    const msg = resume ? `Reprendre l'envoi : ${list.length} client(s) restant(s), ${lots} lot(s) de ${MAIL_BATCH_SIZE} max ?` : `Envoyer ce mail à ${list.length} client(s) en copie cachée (BCC) ?\n${lots} lot(s) de ${MAIL_BATCH_SIZE} max.`;
+    const msg = resume ? `Reprendre l'envoi : ${list.length} client(s) restant(s), ${lots} lot(s) de ${MAIL_BATCH_SIZE} max ?` : `Envoyer ce mail à ${list.length} client(s) de la distribution du ${kbMailDayLbl()} en copie cachée (BCC) ?${activeDay() !== todayKey() ? '\n\n⚠️ ATTENTION : ce n\'est PAS aujourd\'hui.' : ''}\n${lots} lot(s) de ${MAIL_BATCH_SIZE} max.`;
     if (!confirm(msg)) return;
     setBusy(true);
     let sent = 0;
@@ -64331,13 +64614,38 @@ function ClientMailComposer({
       flexDirection: 'column',
       gap: 10
     }
-  }, React.createElement("p", {
+  }, React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 800,
+      padding: '8px 12px',
+      borderRadius: 10,
+      border: '3px solid ' + (activeDay() === todayKey() ? '#2e7d32' : '#c62828'),
+      background: activeDay() === todayKey() ? '#e8f5e9' : '#fdecea',
+      color: activeDay() === todayKey() ? '#1b5e20' : '#8e0000'
+    }
+  }, "📅 Clients de la distribution du ", React.createElement("span", {
+    style: {
+      textTransform: 'capitalize'
+    }
+  }, kbMailDayLbl()), activeDay() === todayKey() ? ' (aujourd\'hui)' : ' — ⚠️ PAS aujourd\'hui', activeDay() !== todayKey() && React.createElement("button", {
+    className: "btn-primary",
+    style: {
+      marginLeft: 8,
+      fontSize: 13,
+      padding: '4px 10px'
+    },
+    onClick: () => {
+      setActiveDay(null);
+      window.location.reload();
+    }
+  }, "↩️ Aujourd'hui")), React.createElement("p", {
     style: {
       color: 'var(--ink-soft)',
       fontSize: 12,
       margin: 0
     }
-  }, "Clients ayant une commande aujourd'hui. Envoi depuis ", React.createElement("strong", null, "contact@kelbongoo.com"), " (Freshdesk), clients en ", React.createElement("strong", null, "copie cachée (BCC)"), " — ils ne voient jamais les adresses des autres (RGPD). Copie cachée aussi à ", React.createElement("strong", null, "hg@probon.fr"), "."), React.createElement("div", {
+  }, "Clients ayant une commande ce jour-là. Envoi depuis ", React.createElement("strong", null, "contact@kelbongoo.com"), " (Freshdesk), clients en ", React.createElement("strong", null, "copie cachée (BCC)"), " — ils ne voient jamais les adresses des autres (RGPD). Copie cachée aussi à ", React.createElement("strong", null, "hg@probon.fr"), "."), React.createElement("div", {
     className: "filter-row",
     style: {
       marginBottom: 0
@@ -65943,6 +66251,10 @@ function App() {
     };
   }, [session && session.name, session && session.role]);
   React.useEffect(() => {
+    if (!session || !session.isMaster || prepMode) return;
+    if (!_activeDayOverride && activeDay() !== todayKey()) setActiveDay(null);
+  }, [session && session.isMaster, prepMode]);
+  React.useEffect(() => {
     if (session && session.role === 'distrib' && !session.isMaster && activeDay() !== todayKey()) setActiveDay(null);
   }, [session && session.role, session && session.isMaster]);
   React.useEffect(() => {
@@ -66633,6 +66945,7 @@ function App() {
     _masterView: true
   } : session;
   const switchView = v => {
+    if (v !== 'prep' && viewAs === 'prep' && activeDay() !== todayKey()) setActiveDay(null);
     setViewAs(v);
     setTab(v === 'prep' ? 'prepajour' : 'clients');
   };
@@ -66906,7 +67219,7 @@ function App() {
     style: {
       fontSize: 13
     }
-  }, "Sortir"))), effSession.isMaster && React.createElement(ManquantsDuJourBanner, null), effSession.role === 'distrib' && !session.isMaster && !myArrival && !isClosed && React.createElement(ArrivedBanner, {
+  }, "Sortir"))), React.createElement(ActiveDayBanner, null), effSession.isMaster && React.createElement(ManquantsDuJourBanner, null), effSession.role === 'distrib' && !session.isMaster && !myArrival && !isClosed && React.createElement(ArrivedBanner, {
     session: effSession,
     onArrived: handleArrived
   }), effSession.role === 'distrib' && !session.isMaster && !isClosed && currentSite && React.createElement(EndOfDayNudge, {
