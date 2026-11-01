@@ -74,8 +74,12 @@ function locEtat_(ddp, day) {
   for (var i = 0; i < LOC.PROBE.length && !first; i++) { try { first = locCall_(ddp, 'globalorders.fetchLocaleDetail', { globalorder_id: G, locale: LOC.PROBE[i] }); } catch (e) {} }
   if (!first || !first.globalorder) throw new Error('détail de la globale ' + G + ' illisible');
   var codes = (first.globalorder.locales || []).map(function (l) { return String(l.locale || l.code || l).toUpperCase(); }).filter(Boolean);
-  var res = ddp.calls(codes.map(function (l) { return ['globalorders.fetchLocaleDetail', [{ globalorder_id: G, locale: l }, {}]]; }));
-  res.forEach(function (r, i) { var g = r && r.result && r.result.globalorderlocale; out.push({ locale: codes[i], name: g ? g.name : '', status: g ? Number(g.status) : null, err: r && r.error ? (r.error.reason || r.error.message || r.error.error) : '' }); });
+  // un appel à la fois : le serveur répond « Réseau occupé » si on les envoie en paquet
+  codes.forEach(function (l) {
+    var g = null, err = '';
+    for (var k = 0; k < 3 && !g; k++) { try { g = locCall_(ddp, 'globalorders.fetchLocaleDetail', { globalorder_id: G, locale: l }).globalorderlocale; } catch (e) { err = String(e.message || e); Utilities.sleep(1500); } }
+    out.push({ locale: l, name: g ? g.name : '', status: g ? Number(g.status) : null, err: g ? '' : err });
+  });
   return { G: G, lieux: out };
 }
 
@@ -143,15 +147,15 @@ function locAuto() {
 function locInstaller() {
   ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'locAuto') ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('locAuto').timeBased().everyHours(1).create();
-  Logger.log('Déclencheur locAuto créé · ' + (locLive_() ? 'RÉEL' : 'SIMULATION'));
+  console.log('Déclencheur locAuto créé · ' + (locLive_() ? 'RÉEL' : 'SIMULATION'));
 }
 /* ── Manuel : changer LOC_MANUEL.day (date de distribution) puis exécuter ── */
-function locManuelEtat() { var d = locConnect_(), E = locEtat_(d, LOC_MANUEL.day); Logger.log(LOC_MANUEL.day + ' · globale ' + E.G + ' · ' + E.lieux.map(function (l) { return l.locale + '=' + (LOC.ST[l.status] || l.err); }).join(' · ')); }
-function locManuelPrepa() { Logger.log(locPrepa_(LOC_MANUEL.day, 'manuel').join('\n') || 'rien à faire'); }
+function locManuelEtat() { var d = locConnect_(), E = locEtat_(d, LOC_MANUEL.day); console.log(LOC_MANUEL.day + ' · globale ' + E.G + ' · ' + E.lieux.map(function (l) { return l.locale + '=' + (LOC.ST[l.status] || l.err); }).join(' · ')); }
+function locManuelPrepa() { console.log(locPrepa_(LOC_MANUEL.day, 'manuel').join('\n') || 'rien à faire'); }
 /** Report ancien site (roue pour tous) de tous les lieux + DOM, puis Terminer la distribution des lieux reportés. */
 function locManuelDistrib() {
   var day = LOC_MANUEL.day, E = locEtat_(locConnect_(), day);
   // roue pour tous les clients de chaque lieu encore en distribution (sans attendre la clôture dans l'appli)
   E.lieux.filter(function (l) { return l.status === 4; }).forEach(function (l) { ancienDistribJour(day, true, l.locale); });
-  Logger.log(locDistrib_(day, 'manuel', false).join('\n') || 'rien à faire');
+  console.log(locDistrib_(day, 'manuel', false).join('\n') || 'rien à faire');
 }
