@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.78';
+    const APP_VERSION = 'V10.79';
+    // V10.79 — (01/11/2026) Chauffeur Rungis : chaque ✅ pris / ❌ pas pris d'une palette Centrale PDP est recopié dans la Centrale (enlevements/<id>/picked/<clé> = {status, at, by, motif}) → 🟫 Suivi palettes (Centrale + Console) : date et heure de récupération par lieu, comptage
     // V10.78 — (31/10/2026) Master › Horaires de commande : ouverture par jour de retrait (mer/jeu dès vendredi, ven/sam dès mardi), heure limite, mode TEST du site (module kbhoraires via kbgReglesCommandes) ; synchro prépa à l'heure limite choisie
     // V10.77 — (31/10/2026) Facturation web à la clôture : TOUTES les commandes du nouveau site du lieu sont facturées (passées ou non récupérées)
     // V10.75 — (29/10/2026) Distrib : ⚖️ fourchette de poids « entre XX et YY g » sous chaque produit (fiche client, ND « à donner en plus », dernière minute) — même source que la prépa (Sheet COMMANDE FL + liste MU)
@@ -24701,14 +24702,14 @@
           const [lbl] = KB_ENL_CATLABEL[cat];
           const qty = Number(it.dollies) > 0 ? (it.dollies + ' dolly' + (it.dollies > 1 ? 's' : '')) : (Number(it.n) > 0 ? (it.n + ' palette' + (it.n > 1 ? 's' : '')) : 'même palette');
           const extra = [it.frais ? '❄️ frais' : '', it.zone === 'froid' ? '❄️ ch. froide' : it.zone === 'sec' ? '▣ sec' : '', it.total ? it.total + ' u.' : '', it.ref ? 'cde ' + it.ref : ''].filter(Boolean).join(' · ');
-          out.push({ id: kbRgSafeId('enl_' + r.id + '_' + i), kind: 'enl', site: code, cat, info: cat === 'kbg', lines: kbEnlLines(it), fast: r.fast || null,
+          out.push({ id: kbRgSafeId('enl_' + r.id + '_' + i), rid: r.id, ikey: String(it.key || ('i' + i)), kind: 'enl', site: code, cat, info: cat === 'kbg', lines: kbEnlLines(it), fast: r.fast || null,
             label: lbl + ' · ' + qty, sub: extra, note: it.note || '', when: r.pickup, liv: kbIsoDay(r.livraison && r.livraison[code]) || r.pickup,
             photo: (kbEnlPhoto(r, it) || {}).src || kbPhotoOf(it), photoHref: (kbEnlPhoto(r, it) || {}).href || '', refused: refused.find(x => String(x.code || '').toUpperCase() === code) || null });
         });
         (Array.isArray(r.lieux) ? r.lieux : []).forEach(L => {
           if (!L || !L.code || !(Number(L.dolly) > 0)) return;
           const code = String(L.code).toUpperCase();
-          out.push({ id: kbRgSafeId('enl_' + r.id + '_dolly_' + code), kind: 'enl', site: code, cat: 'dolly', label: '🧀 ' + L.dolly + ' dolly' + (L.dolly > 1 ? 's' : '') + ' fromage',
+          out.push({ id: kbRgSafeId('enl_' + r.id + '_dolly_' + code), rid: r.id, ikey: 'dolly_' + code, kind: 'enl', site: code, cat: 'dolly', label: '🧀 ' + L.dolly + ' dolly' + (L.dolly > 1 ? 's' : '') + ' fromage',
             sub: '', note: '', when: r.pickup, liv: kbIsoDay(r.livraison && r.livraison[code]) || r.pickup, photo: kbPhotoOf(L), refused: null, fast: r.fast || null });
         });
       });
@@ -25113,13 +25114,26 @@
     }
 
     // ───────── Chauffeur : 📦 à prendre à PDP pour les boutiques ─────────
+    // V10.79 — miroir dans la Centrale PDP (RTDB enlevements/<rid>/picked/<clé>) : suivi palettes Centrale + Console.
+    //   Best effort : une erreur réseau n'empêche jamais le chauffeur de valider (Firestore reste la référence).
+    function kbEnlMirrorPick(l, doc) {
+      try {
+        if (!l || l.kind !== 'enl' || !l.rid) return;
+        const k = kbRgSafeId(l.ikey || l.id);
+        const url = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/enlevements/' + encodeURIComponent(kbRgSafeId(l.rid)) + '/picked/' + encodeURIComponent(k) + '.json';
+        const body = doc.status ? JSON.stringify({ status: doc.status, at: Date.parse(doc.at) || Date.now(), by: String(doc.by || '').slice(0, 60), site: l.site || '', motif: doc.motif || '', note: String(doc.note || '').slice(0, 300), label: String(l.label || '').slice(0, 120) }) : 'null';
+        fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+      } catch (e) {}
+    }
     function RungisLivraisonView({ session, lines, pk, enl }) {
       const showToast = React.useContext(ToastContext);
       const [ask, setAsk] = React.useState(null); // { line, motif, note }
       const [busy, setBusy] = React.useState(false);
       const canWrite = !!(session && kbRgCanWrite());
       const save = async (l, data) => {
-        await storage.setDoc('rungis_picks', l.id, { id: l.id, kind: l.kind, ref: l.id, site: l.site, label: l.label, day: l.when, by: session.name, at: new Date().toISOString(), motif: '', note: '', alertOk: false, ...data });
+        const doc = { id: l.id, kind: l.kind, ref: l.id, site: l.site, label: l.label, day: l.when, by: session.name, at: new Date().toISOString(), motif: '', note: '', alertOk: false, ...data };
+        await storage.setDoc('rungis_picks', l.id, doc);
+        kbEnlMirrorPick(l, doc);
       };
       const taken = async (l) => {
         if (!canWrite) { showToast('Lecture seule'); return; }
