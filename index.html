@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.84) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.85) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.84';
+const APP_VERSION = 'V10.85';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -41942,15 +41942,59 @@ async function kbCentNode(node, sinceMs) {
 }
 async function kbCentAll(sinceMs) {
   const [dispatch, picking, decoupe] = await Promise.all(['dispatch', 'picking', 'decoupe'].map(n => kbCentNode(n, sinceMs)));
-  return {
+  const cent = {
     dispatch,
     picking,
     decoupe
   };
+  await kbCentResolveCodes(cent).catch(() => {});
+  return cent;
 }
-function kbWhoName(v) {
+const KB_CENT_NAME_URL = 'https://script.google.com/macros/s/AKfycbypY1ue7nBesHFhObOan7KOZjGMB3nX5u9N7K-nNSMC2yKAWYfUc1dWRhpgtMmrRz4X/exec';
+const kbCodeNames = {};
+const kbCodeOf = v => {
+  const m = String(v || '').trim().match(/^(?:#|code\s*)?(\d{3,8})$/i);
+  return m ? m[1] : '';
+};
+async function kbCentResolveCodes(cent) {
+  const codes = new Set();
+  const look = v => {
+    const c = kbCodeOf(v);
+    if (c && !(c in kbCodeNames)) codes.add(c);
+  };
+  ['dispatch', 'picking', 'decoupe'].forEach(n => Object.values(cent && cent[n] || {}).forEach(s => {
+    if (!s) return;
+    Object.values(s.state || {}).forEach(x => {
+      if (x) {
+        look(x.doneBy);
+        look(x.lockedBy);
+      }
+    });
+    if (s.arrivee) look(s.arrivee.by);
+    if (s.enlevement) look(s.enlevement.by);
+  }));
+  await Promise.all([...codes].slice(0, 40).map(async c => {
+    try {
+      const r = await fetch(KB_CENT_NAME_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8'
+        },
+        body: JSON.stringify({
+          action: 'resolve-name',
+          code: c
+        })
+      });
+      const j = await r.json();
+      kbCodeNames[c] = j && j.ok && j.name ? String(j.name).trim() : '';
+    } catch (e) {}
+  }));
+}
+function kbWhoName(v, cent) {
   const s = String(v || '').replace(/\s*\((?:cl[oô]ture)[^)]*\)\s*$/i, '').trim();
-  if (!s || /^#/.test(s) || /^code\s*\d+/i.test(s) || /^\d+$/.test(s) || /^op[ée]rateur$/i.test(s)) return 'Sans nom';
+  const c = kbCodeOf(s);
+  if (c) return kbCodeNames[c] || 'Nom inconnu (code hors registre)';
+  if (!s || /^op[ée]rateur$/i.test(s)) return cent ? 'Nom non enregistré (Centrale)' : 'Nom non enregistré';
   return s;
 }
 const kbWhoKey = s => normalizeText(s).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -42006,7 +42050,7 @@ function kbCentEvents(cent, day) {
         ev.push({
           kind: 'dispatch',
           at: x.doneAt,
-          by: kbWhoName(x.doneBy),
+          by: kbWhoName(x.doneBy, true),
           ctx: 'D:' + sid,
           ctxLabel: sup,
           produit: p.designation || k,
@@ -42019,7 +42063,7 @@ function kbCentEvents(cent, day) {
         locks.push({
           kind: 'dispatch',
           at: x.lockedAt,
-          by: kbWhoName(x.lockedBy),
+          by: kbWhoName(x.lockedBy, true),
           ctx: 'D:' + sid,
           ctxLabel: sup,
           produit: p.designation || k,
@@ -42031,7 +42075,7 @@ function kbCentEvents(cent, day) {
     if (s.arrivee && inDay(s.arrivee.at)) ev.push({
       kind: 'arrivee',
       at: s.arrivee.at,
-      by: kbWhoName(s.arrivee.by),
+      by: kbWhoName(s.arrivee.by, true),
       ctx: 'A:' + sid,
       ctxLabel: sup,
       produit: ''
@@ -42055,7 +42099,7 @@ function kbCentEvents(cent, day) {
       ev.push({
         kind: 'picking',
         at: x.doneAt,
-        by: kbWhoName(x.doneBy),
+        by: kbWhoName(x.doneBy, true),
         ctx: 'P:' + sid,
         ctxLabel: store + (s.meta.orderNum ? ' · cde ' + s.meta.orderNum : ''),
         produit: p.designation || k,
@@ -42071,7 +42115,7 @@ function kbCentEvents(cent, day) {
     if (en && inDay(en.at)) ev.push({
       kind: 'enlev',
       at: en.at,
-      by: kbWhoName(en.by),
+      by: kbWhoName(en.by, true),
       ctx: 'E:' + sid,
       ctxLabel: store,
       produit: ''
@@ -42091,7 +42135,7 @@ function kbCentEvents(cent, day) {
       ev.push({
         kind: 'decoupe',
         at: x.doneAt,
-        by: kbWhoName(x.doneBy),
+        by: kbWhoName(x.doneBy, true),
         ctx: 'C:' + sid,
         ctxLabel: s.meta.supplier || 'Découpe',
         produit: p.designation || k.replace(/^d_/, '').replace(/_/g, ' ')
