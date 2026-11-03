@@ -785,7 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.82';
+    const APP_VERSION = 'V10.84';
+    // V10.84 — (03/11/2026) Master › 🟢 Qui fait quoi : en bas, 🗓️ PLANNING de la journée — une ligne par personne depuis ce matin (barres colorées MU / prépa / dispatch / picking / découpe, trait rouge = maintenant) ; toucher une personne = détail À LA SECONDE (début → fin des MU, trous > 10 min signalés). Aussi dans 📜 Historique pour les jours passés.
+    // V10.83 — (03/11/2026) Master › 🟢 Qui fait quoi : onglet « 📜 Historique de la journée » (par personne, date au choix : MU produit/quantité/durée, prépa casiers posés/ruptures/lieux, + Centrale PDP : dispatch palette, picking, découpe fromage, palettes arrivées, enlèvements — blocs « 8h12 → 9h40 ») ; « En direct » : carte 🏭 Centrale PDP (qui dispatche/picke/découpe, sur quoi, avancement de la palette). Lecture seule (Centrale via REST public, comme Rungis/EPAL).
     // V10.81 — (01/11/2026) Dernière minute NON prévue donnée au client (« ✅ C'est fait : donné au client ») → day_<jour>_lmdone/lmadd|<client> : KBG_AncienDistrib v1.3 la « Remet » sur l'ancien site (liste Supprimés → Remettre), facturée
     // V10.80 — (01/11/2026) Mail clients : « notre équipe vient de préparer votre commande de demain — à retirer le … (pas avant) », rappel du jour = détail complet ; Prépa : « 🧺 + Cagette » (n° C1, C2… hors rolls) ; ⚖️ poids réel prépa = vraie remise (transmise distrib / ancien site / mails) ; Distrib : plus de consignes « ancienne appli » (report automatique) ; « Retrait total » → option Retour PDP (client passé) ; Master : toujours sur aujourd'hui hors vue prépa + bandeau jour + jour affiché dans Mail clients
     // V10.79 — (01/11/2026) Chauffeur Rungis : chaque ✅ pris / ❌ pas pris d'une palette Centrale PDP est recopié dans la Centrale (enlevements/<id>/picked/<clé> = {status, at, by, motif}) → 🟫 Suivi palettes (Centrale + Console) : date et heure de récupération par lieu, comptage
@@ -20635,6 +20637,480 @@
     }
 
     // ============================================================
+    // V10.83 — QUI FAIT QUOI : 📜 HISTORIQUE de la journée (MU, prépa casiers) + 🏭 travaux de la CENTRALE PDP
+    //   (dispatch palette, picking, découpe fromage, palettes arrivées, enlèvements préparés) — qui, quoi, de quelle
+    //   heure à quelle heure. Sources en LECTURE SEULE :
+    //   · mu_<jour> (Firestore) : chaque MU terminée = produit, quantité, durée, opérateur
+    //   · day_<distrib>_preplog (Firestore, journal append-only) : actions de prépa faites ce jour-là (distrib J…J+4)
+    //   · Centrale (Firebase RTDB kelbongoo-prep, REST public comme Rungis/EPAL) : dispatch/, picking/, decoupe/
+    //     → chaque ligne validée porte doneBy + doneAt (+ verrou lockedBy/lockedAt pendant qu'on est dessus).
+    // ============================================================
+    const KB_CENT_DB = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/';
+    const kbCentCache = {};
+    function kbDayOfMs(t) { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+    function kbDayStartMs(day) { return new Date(day + 'T00:00:00').getTime(); }
+    // Lit un nœud de la Centrale. Filtre côté serveur sur meta/startedAt si l'index existe, sinon nœud complet.
+    async function kbCentNode(node, sinceMs) {
+      const ck = node + '|' + Math.floor(sinceMs / 3600000);
+      const c = kbCentCache[ck];
+      if (c && Date.now() - c.at < 45000) return c.data;
+      const get = async (q) => {
+        const r = await fetch(KB_CENT_DB + node + '.json' + q, { cache: 'no-store' });
+        if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+        return (await r.json()) || {};
+      };
+      let data;
+      try { data = await get('?orderBy=' + encodeURIComponent('"meta/startedAt"') + '&startAt=' + Math.floor(sinceMs)); }
+      catch (e) { if (e.status === 400) data = await get(''); else throw e; }
+      kbCentCache[ck] = { at: Date.now(), data };
+      return data;
+    }
+    async function kbCentAll(sinceMs) {
+      const [dispatch, picking, decoupe] = await Promise.all(['dispatch', 'picking', 'decoupe'].map(n => kbCentNode(n, sinceMs)));
+      return { dispatch, picking, decoupe };
+    }
+    // Nom affichable : jamais de code salarié ; « Norman (clôture) » → « Norman »
+    function kbWhoName(v) {
+      const s = String(v || '').replace(/\s*\((?:cl[oô]ture)[^)]*\)\s*$/i, '').trim();
+      if (!s || /^#/.test(s) || /^code\s*\d+/i.test(s) || /^\d+$/.test(s) || /^op[ée]rateur$/i.test(s)) return 'Sans nom';
+      return s;
+    }
+    const kbWhoKey = (s) => normalizeText(s).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // Mêmes clés que la Centrale (productKey / frKey)
+    const kbCentPKey = (p, i) => { const c = String((p && p.article) || '').trim(); return c ? 'a_' + c : 'l_' + i; };
+    const kbCentFrKey = (p, i) => { const d = String((p && p.designation) || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''); return d ? 'd_' + d : 'l_' + i; };
+    const KB_WHO_KIND = {
+      mu: ['⚖️', 'MU (mise en unité)', '#6d4c41'],
+      prep: ['🥬', 'Prépa casiers', '#2f5326'],
+      dispatch: ['🏭', 'Dispatch palette', '#1565c0'],
+      picking: ['📦', 'Picking', '#00838f'],
+      decoupe: ['🧀', 'Découpe fromage', '#b8860b'],
+      arrivee: ['📥', 'Palette arrivée', '#546e7a'],
+      enlev: ['🚚', 'Enlèvement préparé', '#7b1fa2'],
+    };
+    const KB_WHO_CENT = { dispatch: 1, picking: 1, decoupe: 1, arrivee: 1, enlev: 1 };
+    // Centrale → événements datés du jour + verrous en cours (pour le direct)
+    function kbCentEvents(cent, day) {
+      const ev = [], locks = [];
+      const inDay = (t) => !!t && kbDayOfMs(t) === day;
+      Object.entries((cent && cent.dispatch) || {}).forEach(([sid, s]) => {
+        if (!s || !s.meta) return;
+        const sup = s.meta.supplier || 'Fournisseur', prods = s.meta.products || [], st = s.state || {};
+        const byK = {}; prods.forEach((p, i) => { byK[kbCentPKey(p, i)] = p; });
+        const doneN = Object.values(st).filter(x => x && x.done).length;
+        Object.entries(st).forEach(([k, x]) => {
+          if (!x) return;
+          const p = byK[k] || {};
+          if (x.done && inDay(x.doneAt)) {
+            const codes = new Set([...Object.keys(p.stores || {}), ...Object.keys(x.qtyStores || {})]);
+            let q = 0; codes.forEach(c => { const v = x.qtyStores && x.qtyStores[c] !== undefined ? x.qtyStores[c] : (p.stores || {})[c]; q += Number(v) || 0; });
+            const ec = Array.isArray(x.ecarts) ? x.ecarts.length : (x.ecarts && typeof x.ecarts === 'object' ? Object.keys(x.ecarts).length : 0);
+            ev.push({ kind: 'dispatch', at: x.doneAt, by: kbWhoName(x.doneBy), ctx: 'D:' + sid, ctxLabel: sup, produit: p.designation || k, qty: q, ecarts: ec, sessDone: doneN, sessTotal: prods.length });
+          } else if (!x.done && x.lockedBy && x.lockedAt) {
+            locks.push({ kind: 'dispatch', at: x.lockedAt, by: kbWhoName(x.lockedBy), ctx: 'D:' + sid, ctxLabel: sup, produit: p.designation || k, sessDone: doneN, sessTotal: prods.length });
+          }
+        });
+        if (s.arrivee && inDay(s.arrivee.at)) ev.push({ kind: 'arrivee', at: s.arrivee.at, by: kbWhoName(s.arrivee.by), ctx: 'A:' + sid, ctxLabel: sup, produit: '' });
+      });
+      Object.entries((cent && cent.picking) || {}).forEach(([sid, s]) => {
+        if (!s || !s.meta) return;
+        const prods = s.meta.products || [], st = s.state || {};
+        const store = s.meta.storeLabel || s.meta.storeCode || 'Magasin';
+        const byK = {}; prods.forEach(p => { if (p && p.k != null) byK[p.k] = p; });
+        const doneN = Object.values(st).filter(x => x && x.done).length;
+        Object.entries(st).forEach(([k, x]) => {
+          if (!x || !x.done || x.auto || !inDay(x.doneAt)) return;
+          const p = byK[k] || {};
+          const want = Number(x.qty != null ? x.qty : p.qty) || 0, got = Number(x.picked) || 0;
+          ev.push({ kind: 'picking', at: x.doneAt, by: kbWhoName(x.doneBy), ctx: 'P:' + sid, ctxLabel: store + (s.meta.orderNum ? ' · cde ' + s.meta.orderNum : ''), produit: p.designation || k, qty: got, want, short: !x.manual && got < want, sup: p.supName || p.supCode || '', sessDone: doneN, sessTotal: prods.length });
+        });
+        const en = s.enlevement;
+        if (en && inDay(en.at)) ev.push({ kind: 'enlev', at: en.at, by: kbWhoName(en.by), ctx: 'E:' + sid, ctxLabel: store, produit: '' });
+      });
+      Object.entries((cent && cent.decoupe) || {}).forEach(([sid, s]) => {
+        if (!s || !s.meta) return;
+        const prods = s.meta.products || [], st = s.state || {};
+        const byK = {}; prods.forEach((p, i) => { byK[kbCentFrKey(p, i)] = p; });
+        Object.entries(st).forEach(([k, x]) => {
+          if (!x || !x.done || !inDay(x.doneAt)) return;
+          const p = byK[k] || {};
+          ev.push({ kind: 'decoupe', at: x.doneAt, by: kbWhoName(x.doneBy), ctx: 'C:' + sid, ctxLabel: s.meta.supplier || 'Découpe', produit: p.designation || k.replace(/^d_/, '').replace(/_/g, ' ') });
+        });
+      });
+      return { ev, locks };
+    }
+    // Kelbongoo (MU + prépa) → événements du jour
+    function kbKbgEvents(muArr, prepEv, day) {
+      const ev = [];
+      (muArr || []).forEach(e => {
+        if (!e || !e.operator || String(e.id || '').startsWith('_')) return;
+        if (e.status === 'done' && e.finishedAt && kbDayOfMs(e.finishedAt) === day) {
+          ev.push({ kind: 'mu', at: e.finishedAt, start: e.durationMs ? e.finishedAt - e.durationMs : (e.startedAt || e.finishedAt), by: kbWhoName(e.operator), ctx: 'M:' + e.id, produit: e.product || '', qty: e.done || 0, unit: e.uv || '', ms: e.durationMs || 0 });
+        } else if ((e.status === 'active' || e.status === 'paused') && e.startedAt && kbDayOfMs(e.startedAt) === day) {
+          ev.push({ kind: 'mu', at: e.startedAt, start: e.startedAt, by: kbWhoName(e.operator), ctx: 'M:' + e.id, produit: e.product || '', qty: e.inProgress || 0, target: e.target || 0, unit: e.uv || '', open: true, paused: e.status === 'paused' });
+        }
+      });
+      (prepEv || []).forEach(e => {
+        if (!e || e.type === 'compteur') return;
+        ev.push({ kind: 'prep', type: e.type, at: e.at, by: kbWhoName(e.by), ctx: 'R:' + (e.distDay || ''), ctxLabel: e.distDay ? 'pour la distrib. du ' + formatDateShort(e.distDay) : '', produit: e.produit || '', site: e.site || '', client: e.client || '', label: e.label || '', lineKey: (e.site || '') + '||' + (e.client || '') + '||' + (e.produit || '') });
+      });
+      return ev;
+    }
+    // Regroupe par personne (« Norman » et « Norman Dupont » = la même personne si c'est le seul Norman)
+    function kbWhoPeople(evs) {
+      const groups = {};
+      evs.forEach(e => { const k = kbWhoKey(e.by) || 'sans nom'; (groups[k] = groups[k] || []).push(e); });
+      const keys = Object.keys(groups);
+      const alias = {};
+      keys.forEach(k => { const longer = keys.filter(o => o !== k && o.startsWith(k + ' ')); if (longer.length === 1) alias[k] = longer[0]; });
+      const out = {};
+      keys.forEach(k => { const t = alias[k] || k; (out[t] = out[t] || []).push(...groups[k]); });
+      return Object.entries(out).map(([k, list]) => {
+        list.sort((a, b) => (a.start || a.at) - (b.start || b.at));
+        const name = list.map(e => e.by).sort((a, b) => b.length - a.length)[0] || 'Sans nom';
+        return { key: k, name, evs: list, first: Math.min(...list.map(e => e.start || e.at)), last: Math.max(...list.map(e => e.at)) };
+      }).sort((a, b) => b.last - a.last);
+    }
+    // Blocs de travail : même activité + même palette / session, sans trou de plus de 30 min
+    function kbWhoBlocks(evs) {
+      const out = []; let cur = null;
+      evs.forEach(e => {
+        const key = e.kind + '|' + (e.ctx || '');
+        if (cur && e.kind !== 'mu' && cur.key === key && e.at - cur.end <= 30 * 60000) { cur.end = Math.max(cur.end, e.at); cur.items.push(e); }
+        else { cur = { key, kind: e.kind, ctxLabel: e.ctxLabel || '', start: e.start || e.at, end: e.at, items: [e] }; out.push(cur); }
+      });
+      return out;
+    }
+    function kbWhoTotals(evs) {
+      const t = { mu: { n: 0, u: 0, ms: 0, open: 0 }, prep: { pose: new Set(), rup: new Set(), part: new Set(), n: 0, sites: new Set(), prods: new Set() }, dispatch: { n: 0, u: 0, ec: 0, sups: new Set() }, picking: { n: 0, short: 0, stores: new Set() }, decoupe: { n: 0 }, arrivee: { n: 0 }, enlev: { n: 0 } };
+      evs.forEach(e => {
+        if (e.kind === 'mu') { if (e.open) t.mu.open++; else { t.mu.n++; t.mu.u += e.qty || 0; t.mu.ms += e.ms || 0; } }
+        else if (e.kind === 'prep') { t.prep.n++; if (e.site) t.prep.sites.add(e.site); if (e.type === 'pose') { t.prep.pose.add(e.lineKey); t.prep.prods.add(e.produit); } if (e.type === 'rupture') t.prep.rup.add(e.lineKey); if (e.type === 'partiel') t.prep.part.add(e.lineKey); }
+        else if (e.kind === 'dispatch') { t.dispatch.n++; t.dispatch.u += e.qty || 0; t.dispatch.ec += e.ecarts || 0; t.dispatch.sups.add(e.ctxLabel); }
+        else if (e.kind === 'picking') { t.picking.n++; if (e.short) t.picking.short++; t.picking.stores.add(e.ctxLabel); }
+        else if (t[e.kind]) t[e.kind].n++;
+      });
+      return t;
+    }
+    function kbWhoChips(t) {
+      const c = [];
+      if (t.mu.n || t.mu.open) c.push(['mu', [t.mu.n ? `${t.mu.n} produit(s) · ${t.mu.u} unité(s)${t.mu.ms ? ' · ' + kbWhoDur(t.mu.ms) : ''}` : '', t.mu.open ? t.mu.open + ' en cours' : ''].filter(Boolean).join(' · ')]);
+      if (t.prep.n) c.push(['prep', `${t.prep.pose.size} ligne(s) posée(s) · ${t.prep.prods.size} produit(s)${t.prep.rup.size ? ' · ' + t.prep.rup.size + ' rupture(s)' : ''}${t.prep.part.size ? ' · ' + t.prep.part.size + ' partiel(s)' : ''}${t.prep.sites.size ? ' · ' + [...t.prep.sites].sort().join(' ') : ''}`]);
+      if (t.dispatch.n) c.push(['dispatch', `${t.dispatch.n} ligne(s) · ${t.dispatch.u} u. · ${t.dispatch.sups.size} palette(s)${t.dispatch.ec ? ' · ' + t.dispatch.ec + ' écart(s)' : ''}`]);
+      if (t.picking.n) c.push(['picking', `${t.picking.n} ligne(s) · ${t.picking.stores.size} commande(s)${t.picking.short ? ' · ' + t.picking.short + ' manquant(s)' : ''}`]);
+      if (t.decoupe.n) c.push(['decoupe', `${t.decoupe.n} fromage(s)`]);
+      if (t.arrivee.n) c.push(['arrivee', `${t.arrivee.n} palette(s) pointée(s)`]);
+      if (t.enlev.n) c.push(['enlev', `${t.enlev.n} enlèvement(s)`]);
+      return c;
+    }
+    function kbWhoDur(ms) { const m = Math.max(0, Math.round((ms || 0) / 60000)); return m < 60 ? m + ' min' : Math.floor(m / 60) + ' h ' + String(m % 60).padStart(2, '0'); }
+    const kbWhoHM = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—';
+    function kbWhoBlockText(b) {
+      const it = b.items, n = it.length;
+      if (b.kind === 'mu') { const e = it[0]; return `${kbProdName(e.produit)} · ${e.qty || 0}${e.target ? '/' + e.target : ''} ${e.unit || 'u.'}${e.open ? (e.paused ? ' · ⏸️ en pause' : ' · en cours') : ''}${e.ms ? ' · ' + kbWhoDur(e.ms) : ''}`; }
+      if (b.kind === 'prep') { const t = kbWhoTotals(it); return `${t.prep.pose.size} posé(s)${t.prep.rup.size ? ' · ' + t.prep.rup.size + ' rupture(s)' : ''}${t.prep.part.size ? ' · ' + t.prep.part.size + ' partiel(s)' : ''} · ${t.prep.prods.size} produit(s)${t.prep.sites.size ? ' · ' + [...t.prep.sites].sort().join(' ') : ''}${b.ctxLabel ? ' · ' + b.ctxLabel : ''}`; }
+      if (b.kind === 'dispatch') { const u = it.reduce((s, e) => s + (e.qty || 0), 0), ec = it.reduce((s, e) => s + (e.ecarts || 0), 0); return `${b.ctxLabel} · ${n} ligne(s) · ${u} u.${ec ? ' · ' + ec + ' écart(s)' : ''}`; }
+      if (b.kind === 'picking') { const sh = it.filter(e => e.short).length; return `${b.ctxLabel} · ${n} ligne(s)${sh ? ' · ' + sh + ' manquant(s)' : ''}`; }
+      if (b.kind === 'decoupe') return `${b.ctxLabel} · ${n} fromage(s)`;
+      return b.ctxLabel;
+    }
+    function kbWhoItemText(e) {
+      if (e.kind === 'prep') return `${e.label}${e.produit ? ' · ' + kbProdName(e.produit) : ''}${e.site ? ' · ' + e.site : ''}${e.client ? ' · ' + e.client : ''}`;
+      if (e.kind === 'dispatch') return `${kbProdName(e.produit)} · ${e.qty || 0} u.${e.ecarts ? ' · ⚠️ ' + e.ecarts + ' écart(s)' : ''}`;
+      if (e.kind === 'picking') return `${kbProdName(e.produit)} · ${e.qty}${e.want ? '/' + e.want : ''}${e.short ? ' ⚠️ manquant' : ''}${e.sup ? ' · ' + e.sup : ''}`;
+      return kbProdName(e.produit) || '';
+    }
+    // Chargement d'une journée (calendrier) : MU + journal de prépa + Centrale
+    function useKbWhoDay(day, tick) {
+      const [st, setSt] = React.useState({ loading: true });
+      React.useEffect(() => {
+        if (!day) return;
+        let stop = false;
+        const live = day === todayKey();
+        const load = async () => {
+          const t0 = kbDayStartMs(day), t1 = kbDayStartMs(addDays(day, 1));
+          const errs = [];
+          const muP = storage.getAll('mu_' + day).catch(() => { errs.push('MU'); return []; });
+          const prepP = (async () => {
+            const out = [];
+            if (!firebaseConfigured || !fb) return out;
+            await Promise.all([0, 1, 2, 3, 4].map(async i => {
+              const d = addDays(day, i);
+              try {
+                const snap = await fb.getDocs(fb.query(fb.collection(fb.db, `day_${d}_preplog`), fb.where('at', '>=', t0), fb.where('at', '<', t1)));
+                snap.docs.forEach(doc => { const x = doc.data() || {}; const e = kbPrepEvent(x.docId, x.data || {}, { orderBy: {}, cas: {} }, x.at, x.by, x.op); if (e && e.at) out.push({ ...e, distDay: d }); });
+              } catch (e) { errs.push('prépa ' + formatDateShort(d)); }
+            }));
+            return out;
+          })();
+          const centP = kbCentAll(t0 - 7 * 86400000).then(c => ({ c, err: '' })).catch(e => ({ c: null, err: kbErrMsg(e) }));
+          const [muArr, prepEv, cent] = await Promise.all([muP, prepP, centP]);
+          if (stop) return;
+          const ce = cent.c ? kbCentEvents(cent.c, day) : { ev: [], locks: [] };
+          setSt({ loading: false, at: Date.now(), errs, centErr: cent.err, evs: [...kbKbgEvents(muArr, prepEv, day), ...ce.ev] });
+        };
+        setSt(s => ({ ...s, loading: true }));
+        load().catch(e => { if (!stop) setSt({ loading: false, errs: [kbErrMsg(e)], evs: [] }); });
+        const iv = live ? setInterval(() => { if (document.visibilityState === 'visible') load().catch(() => {}); }, 120000) : null;
+        return () => { stop = true; iv && clearInterval(iv); };
+      }, [day, tick]);
+      return st;
+    }
+    // 📜 Historique de la journée — par personne, avec les blocs de travail heure par heure
+    function KbWhoDayHistory() {
+      const [day, setDay] = React.useState(todayKey());
+      const [tick, setTick] = React.useState(0);
+      const [filter, setFilter] = React.useState('');
+      const [open, setOpen] = React.useState({});
+      const [detail, setDetail] = React.useState({});
+      const st = useKbWhoDay(day, tick);
+      const people = React.useMemo(() => {
+        const evs = (st.evs || []).filter(e => !filter || (filter === 'centrale' ? KB_WHO_CENT[e.kind] : e.kind === filter));
+        return kbWhoPeople(evs);
+      }, [st.evs, filter]);
+      const all = React.useMemo(() => kbWhoTotals(st.evs || []), [st.evs]);
+      const isToday = day === todayKey();
+      const F = [['', 'Tout'], ['mu', '⚖️ MU'], ['prep', '🥬 Prépa'], ['centrale', '🏭 Centrale']];
+      return (
+        <div className="stack">
+          <div className="card">
+            <h2 style={{ fontSize: 20, margin: 0 }}>📜 Qui a fait quoi — la journée</h2>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 8px' }}>MU, prépa casiers et travaux de la Centrale (dispatch palette, picking, découpe) — par personne, de quelle heure à quelle heure.</p>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button className="btn-secondary" style={{ padding: '6px 12px' }} onClick={() => setDay(addDays(day, -1))}>◀︎</button>
+              <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ fontSize: 15, padding: '5px 8px', borderRadius: 8, border: '1px solid var(--line)' }} />
+              <button className="btn-secondary" style={{ padding: '6px 12px' }} disabled={isToday} onClick={() => setDay(addDays(day, 1))}>▶︎</button>
+              {!isToday && <button className="btn-ghost" onClick={() => setDay(todayKey())}>Aujourd'hui</button>}
+              <button className="btn-ghost" style={{ marginLeft: 'auto' }} onClick={() => setTick(t => t + 1)}>↻ Actualiser</button>
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 700, marginTop: 8, textTransform: 'capitalize' }}>{formatDateFR(day)}</div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+              {F.map(([k, l]) => <button key={k} className={filter === k ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setFilter(k)}>{l}</button>)}
+            </div>
+          </div>
+          {st.centErr && <div className="card" style={{ background: 'var(--warn-soft)', color: 'var(--warn)', fontWeight: 600 }}>🏭 Centrale PDP illisible ({st.centErr}) — MU et prépa affichés quand même.</div>}
+          {st.errs && st.errs.length > 0 && <div className="card" style={{ color: 'var(--ink-soft)', fontSize: 13 }}>⚠️ Non lu : {st.errs.join(', ')}</div>}
+          {st.loading && !st.evs && <div className="card">Chargement de la journée…</div>}
+          {st.evs && (
+            <div className="card" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+              <strong style={{ fontSize: 17 }}>👥 {people.length} personne(s)</strong>
+              {kbWhoChips(all).map(([k, txt]) => <span key={k} className="badge" style={{ background: KB_WHO_KIND[k][2], color: '#fff', fontWeight: 600 }}>{KB_WHO_KIND[k][0]} {txt}</span>)}
+              {st.loading && <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>actualisation…</span>}
+            </div>
+          )}
+          {st.evs && people.length > 0 && <KbWhoPlanning day={day} evs={(st.evs || []).filter(e => !filter || (filter === 'centrale' ? KB_WHO_CENT[e.kind] : e.kind === filter))} />}
+          {st.evs && !people.length && <div className="empty-state"><div className="icon">📭</div><p>Aucune activité enregistrée ce jour-là{filter ? ' pour ce filtre' : ''}.</p></div>}
+          {people.map(p => {
+            const t = kbWhoTotals(p.evs);
+            const blocks = kbWhoBlocks(p.evs);
+            const isOpen = open[p.key] !== undefined ? open[p.key] : people.length <= 3;
+            const recent = isToday && Date.now() - p.last < 15 * 60000;
+            return (
+              <div key={p.key} className="card" style={{ padding: '12px 14px', borderLeft: '6px solid ' + (recent ? '#2e7d32' : '#9e9e9e') }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', cursor: 'pointer' }} onClick={() => setOpen(o => ({ ...o, [p.key]: !isOpen }))}>
+                  <span style={{ fontSize: 18 }}>{isOpen ? '▾' : '▸'}</span>
+                  <strong style={{ fontSize: 18 }}>{p.name}</strong>
+                  {recent && <span className="badge" style={{ background: '#2e7d32', color: '#fff' }}>🟢 actif</span>}
+                  <span style={{ marginLeft: 'auto', fontSize: 14, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{kbWhoHM(p.first)} → {kbWhoHM(p.last)}</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 6 }}>
+                  {kbWhoChips(t).map(([k, txt]) => <div key={k} style={{ fontSize: 14 }}><b style={{ color: KB_WHO_KIND[k][2] }}>{KB_WHO_KIND[k][0]} {KB_WHO_KIND[k][1]}</b> : {txt}</div>)}
+                </div>
+                {isOpen && (
+                  <div style={{ marginTop: 8, borderTop: '1px solid var(--line)' }}>
+                    {blocks.map((b, i) => {
+                      const k = KB_WHO_KIND[b.kind] || ['•', b.kind, '#555'];
+                      const dk = p.key + '|' + i;
+                      const canDetail = b.items.length > 1 || b.kind === 'prep';
+                      return (
+                        <div key={i} style={{ padding: '7px 0', borderBottom: '1px dashed var(--line)' }}>
+                          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap', cursor: canDetail ? 'pointer' : 'default' }} onClick={() => canDetail && setDetail(d => ({ ...d, [dk]: !d[dk] }))}>
+                            <span style={{ fontWeight: 700, fontVariantNumeric: 'tabular-nums', minWidth: 104 }}>{kbWhoHM(b.start)}{b.end - b.start >= 60000 ? ' → ' + kbWhoHM(b.end) : ''}</span>
+                            <span style={{ fontWeight: 700, color: k[2] }}>{k[0]} {k[1]}</span>
+                            <span style={{ fontSize: 14 }}>{kbWhoBlockText(b)}</span>
+                            {canDetail && <span style={{ fontSize: 12, color: 'var(--ink-mute)', marginLeft: 'auto' }}>{detail[dk] ? '▾ masquer' : '▸ détail'}</span>}
+                          </div>
+                          {detail[dk] && (
+                            <div style={{ marginTop: 4, paddingLeft: 12, fontSize: 13, color: 'var(--ink-soft)' }}>
+                              {b.items.slice().sort((x, y) => x.at - y.at).map((e, j) => <div key={j}><span style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>{kbWhoHM(e.at)}</span> {kbWhoItemText(e)}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    // V10.84 — 🗓️ PLANNING de la journée (bas de « Qui fait quoi ») : une ligne par personne depuis le début de la
+    //   journée, barres colorées par activité (MU, prépa, dispatch, picking, découpe…), trait « maintenant ».
+    //   Clic sur une personne → détail à la SECONDE (chaque action, début → fin pour la MU, pauses > 10 min).
+    const kbWhoHMS = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+    function kbWhoDetailText(e) {
+      if (e.kind === 'mu') return `${kbProdName(e.produit)} · ${e.qty || 0}${e.target ? '/' + e.target : ''} ${e.unit || 'u.'}${e.open ? (e.paused ? ' · ⏸️ en pause' : ' · en cours') : ''}${e.ms ? ' · ' + kbWhoDur(e.ms) : ''}`;
+      if (e.kind === 'prep') return kbWhoItemText(e);
+      if (e.kind === 'dispatch' || e.kind === 'picking') return `${e.ctxLabel} · ${kbWhoItemText(e)}`;
+      if (e.kind === 'decoupe') return `${e.ctxLabel} · ${kbProdName(e.produit)}`;
+      return e.ctxLabel || '';
+    }
+    function KbWhoPlanning({ day, evs, title }) {
+      const [sel, setSel] = React.useState(null);
+      const [, force] = React.useState(0);
+      const isToday = day === todayKey();
+      React.useEffect(() => { if (!isToday) return; const t = setInterval(() => force(x => x + 1), 60000); return () => clearInterval(t); }, [isToday]);
+      const people = React.useMemo(() => kbWhoPeople(evs || []).sort((a, b) => a.first - b.first), [evs]);
+      const head = <h3 style={{ margin: 0 }}>{title || '🗓️ Planning de la journée'}</h3>;
+      if (!evs) return <div className="card">{head}<div style={{ marginTop: 6 }}>Chargement…</div></div>;
+      if (!people.length) return <div className="card">{head}<div style={{ marginTop: 6, color: 'var(--ink-soft)' }}>Aucune activité enregistrée{isToday ? ' depuis ce matin' : ' ce jour-là'}.</div></div>;
+      const H = 3600000;
+      const tMin = Math.min(...people.map(p => p.first));
+      const tMax = Math.max(isToday ? Date.now() : 0, ...people.map(p => p.last));
+      const h0 = Math.floor(tMin / H) * H, h1 = Math.max(h0 + H, Math.ceil(tMax / H) * H);
+      const span = h1 - h0, pct = (t) => Math.max(0, Math.min(100, ((t - h0) / span) * 100));
+      const step = span > 8 * H ? 2 * H : H;
+      const ticks = []; for (let t = h0; t <= h1; t += step) ticks.push(t);
+      const kinds = [...new Set((evs || []).map(e => e.kind))].filter(k => KB_WHO_KIND[k]);
+      const NAME_W = 92;
+      const nowPct = isToday ? pct(Date.now()) : null;
+      return (
+        <div className="card" style={{ padding: '12px 10px' }}>
+          {head}
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>Touchez une personne pour le détail à la seconde.</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0' }}>
+            {kinds.map(k => <span key={k} style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 12, height: 12, borderRadius: 3, background: KB_WHO_KIND[k][2], display: 'inline-block' }} />{KB_WHO_KIND[k][0]} {KB_WHO_KIND[k][1]}</span>)}
+          </div>
+          {/* échelle des heures */}
+          <div style={{ display: 'flex' }}>
+            <div style={{ width: NAME_W, flexShrink: 0 }} />
+            <div style={{ position: 'relative', flex: 1, height: 16 }}>
+              {ticks.map(t => <span key={t} style={{ position: 'absolute', left: pct(t) + '%', transform: t === h0 ? 'none' : t === h1 ? 'translateX(-100%)' : 'translateX(-50%)', fontSize: 11, fontWeight: 700, color: 'var(--ink-mute)' }}>{new Date(t).getHours()}h</span>)}
+            </div>
+          </div>
+          {people.map(p => {
+            const blocks = kbWhoBlocks(p.evs);
+            const open = sel === p.key;
+            const active = isToday && Date.now() - p.last < 15 * 60000;
+            return (
+              <div key={p.key} style={{ borderTop: '1px solid var(--line)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', padding: '6px 0' }} onClick={() => setSel(open ? null : p.key)}>
+                  <div style={{ width: NAME_W, flexShrink: 0, paddingRight: 6, overflow: 'hidden' }}>
+                    <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{active ? '🟢 ' : ''}{p.name}</div>
+                    <div style={{ fontSize: 11, color: 'var(--ink-mute)', fontVariantNumeric: 'tabular-nums' }}>{kbWhoHM(p.first)}→{kbWhoHM(p.last)}</div>
+                  </div>
+                  <div style={{ position: 'relative', flex: 1, height: 26, background: 'var(--bg-muted)', borderRadius: 6, overflow: 'hidden', outline: open ? '2px solid var(--accent)' : 'none' }}>
+                    {ticks.map(t => <div key={t} style={{ position: 'absolute', left: pct(t) + '%', top: 0, bottom: 0, width: 1, background: 'var(--line)' }} />)}
+                    {blocks.map((b, i) => {
+                      const k = KB_WHO_KIND[b.kind] || ['•', b.kind, '#555'];
+                      const end = b.items.some(e => e.open) && isToday ? Date.now() : b.end;
+                      const l = pct(b.start), w = Math.max(pct(end) - l, 0.9);
+                      return <div key={i} title={`${kbWhoHM(b.start)}–${kbWhoHM(end)} ${k[1]} · ${kbWhoBlockText(b)}`} style={{ position: 'absolute', left: l + '%', width: w + '%', top: 3, bottom: 3, background: k[2], borderRadius: 3, opacity: b.items.some(e => e.open) ? 0.6 : 1 }} />;
+                    })}
+                    {nowPct != null && <div style={{ position: 'absolute', left: nowPct + '%', top: 0, bottom: 0, width: 2, background: 'var(--danger)' }} />}
+                  </div>
+                </div>
+                {open && (
+                  <div style={{ padding: '4px 0 10px', fontSize: 13 }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                      {kbWhoChips(kbWhoTotals(p.evs)).map(([k, txt]) => <span key={k} className="badge" style={{ background: KB_WHO_KIND[k][2], color: '#fff', fontWeight: 600 }}>{KB_WHO_KIND[k][0]} {txt}</span>)}
+                    </div>
+                    {p.evs.slice().sort((a, b) => (a.start || a.at) - (b.start || b.at)).map((e, j, arr) => {
+                      const k = KB_WHO_KIND[e.kind] || ['•', e.kind, '#555'];
+                      const prev = j > 0 ? arr[j - 1] : null;
+                      const gap = prev ? (e.start || e.at) - prev.at : 0;
+                      return (
+                        <React.Fragment key={j}>
+                          {gap > 10 * 60000 && <div style={{ padding: '3px 0 3px 8px', color: 'var(--ink-mute)', fontStyle: 'italic' }}>⏸️ rien d'enregistré pendant {kbWhoDur(gap)}</div>}
+                          <div style={{ display: 'flex', gap: 8, padding: '3px 0', borderLeft: '4px solid ' + k[2], paddingLeft: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                            <span style={{ fontWeight: 700, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{e.kind === 'mu' && e.start && e.start !== e.at ? kbWhoHMS(e.start) + ' → ' + kbWhoHMS(e.at) : kbWhoHMS(e.at)}</span>
+                            <span style={{ fontWeight: 700, color: k[2], whiteSpace: 'nowrap' }}>{k[0]} {k[1]}</span>
+                            <span>{kbWhoDetailText(e)}</span>
+                          </div>
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    function KbWhoPlanningToday() {
+      const st = useKbWhoDay(todayKey(), 0);
+      return <KbWhoPlanning day={todayKey()} evs={st.evs} title="🗓️ Planning de la journée — qui a fait quoi depuis ce matin" />;
+    }
+
+    // 🏭 Centrale PDP — en ce moment (dans « En direct ») : qui dispatche / picke / découpe, sur quoi, avancement
+    function KbCentraleLive({ now }) {
+      const [d, setD] = React.useState(null);
+      const [err, setErr] = React.useState('');
+      React.useEffect(() => {
+        let stop = false;
+        const load = () => kbCentAll(kbDayStartMs(todayKey()) - 7 * 86400000).then(c => { if (!stop) { setD(c); setErr(''); } }).catch(e => { if (!stop) setErr(kbErrMsg(e)); });
+        load();
+        const iv = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 60000);
+        return () => { stop = true; clearInterval(iv); };
+      }, []);
+      const day = todayKey();
+      const rows = React.useMemo(() => {
+        if (!d) return [];
+        const { ev, locks } = kbCentEvents(d, day);
+        const fresh = locks.filter(l => now - l.at < 90000);
+        return kbWhoPeople([...ev, ...fresh.map(l => ({ ...l, lock: true }))]).map(p => {
+          const real = p.evs.filter(e => !e.lock);
+          const lock = p.evs.filter(e => e.lock).sort((a, b) => b.at - a.at)[0] || null;
+          const last = real.slice().sort((a, b) => b.at - a.at)[0] || null;
+          const cur = lock || last;
+          return { ...p, real, lock, lastReal: last, cur, active: !!lock || (last && now - last.at < 15 * 60000) };
+        }).sort((a, b) => (b.active - a.active) || (b.last - a.last));
+      }, [d, now, day]);
+      const ago = (t) => { const s = Math.max(0, Math.round((now - (t || 0)) / 1000)); return s < 60 ? s + ' s' : s < 3600 ? Math.floor(s / 60) + ' min' : Math.floor(s / 3600) + ' h ' + String(Math.floor((s % 3600) / 60)).padStart(2, '0'); };
+      const active = rows.filter(r => r.active), done = rows.filter(r => !r.active);
+      return (
+        <div className="card" style={{ borderTop: '5px solid #1565c0' }}>
+          <h3 style={{ margin: 0 }}>🏭 Centrale PDP — dispatch palette · picking · découpe</h3>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>Lu toutes les minutes dans l'appli Centrale. « En ce moment » = produit tenu en main ou ligne validée il y a moins de 15 min.</div>
+          {err && <div style={{ marginTop: 8, color: 'var(--danger)', fontWeight: 600 }}>Centrale illisible ({err}).</div>}
+          {!d && !err && <div style={{ marginTop: 8 }}>Chargement…</div>}
+          {d && !rows.length && <div style={{ marginTop: 8, color: 'var(--ink-soft)' }}>Rien de validé à la Centrale aujourd'hui.</div>}
+          {active.map(r => {
+            const k = KB_WHO_KIND[r.cur.kind] || ['•', '', '#555'];
+            return (
+              <div key={r.key} style={{ marginTop: 10, padding: '10px 12px', borderRadius: 10, borderLeft: '6px solid ' + k[2], background: 'var(--bg-muted)' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 20 }}>🟢</span><strong style={{ fontSize: 18 }}>{r.name}</strong>
+                  <span className="badge" style={{ background: k[2], color: '#fff', fontWeight: 700 }}>{k[0]} {k[1]}</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--ink-mute)' }}>{r.lastReal ? 'dernière validation il y a ' + ago(r.lastReal.at) : 'vient de commencer'}</span>
+                </div>
+                <div style={{ marginTop: 6, fontSize: 16, fontWeight: 700 }}>
+                  {r.cur.ctxLabel}{r.lock ? <span style={{ fontWeight: 600 }}> · ✋ sur : {kbProdName(r.lock.produit)}</span> : ''}
+                  {r.cur.sessTotal > 0 && <span style={{ marginLeft: 8, fontSize: 15, color: 'var(--accent-dark)' }}>{r.cur.sessDone}/{r.cur.sessTotal} lignes</span>}
+                </div>
+                {r.cur.sessTotal > 0 && <div style={{ height: 8, background: 'var(--line)', borderRadius: 6, overflow: 'hidden', marginTop: 6 }}><div style={{ width: Math.round(100 * r.cur.sessDone / r.cur.sessTotal) + '%', height: '100%', background: k[2] }} /></div>}
+                <div style={{ fontSize: 13, marginTop: 6, color: 'var(--ink-soft)' }}>Aujourd'hui : {kbWhoChips(kbWhoTotals(r.real)).map(([kk, t]) => KB_WHO_KIND[kk][0] + ' ' + t).join('  ·  ') || '—'}</div>
+              </div>
+            );
+          })}
+          {done.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-soft)' }}>Passés à la Centrale aujourd'hui</div>
+              {done.map(r => (
+                <div key={r.key} style={{ fontSize: 14, padding: '5px 0', borderTop: '1px solid var(--line)' }}>
+                  ⚪ <b>{r.name}</b> <span style={{ color: 'var(--ink-mute)' }}>{kbWhoHM(r.first)} → {kbWhoHM(r.last)}</span> · {kbWhoChips(kbWhoTotals(r.real)).map(([kk, t]) => KB_WHO_KIND[kk][0] + ' ' + t).join('  ·  ')}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
     // V10.02 (+) — 🟢 QUI FAIT QUOI (live) — Master › Pilotage
     //   Lit kb_presence (battement 60 s de chaque appareil + tâche en cours : produit de prépa, retraits distrib,
     //   retours PDP) et ~prep_<jour> (avancement prépa par lieu), + les dernières actions de prépa (journal
@@ -20646,6 +21122,7 @@
       const [feed, setFeed] = React.useState([]);
       const [now, setNow] = React.useState(Date.now());
       const [showOff, setShowOff] = React.useState(false);
+      const [mode, setMode] = React.useState('live'); // V10.83 — 'live' | 'hist'
       React.useEffect(() => { const t = setInterval(() => setNow(Date.now()), 5000); return () => clearInterval(t); }, []);
       React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
       React.useEffect(() => { let stop = false; kbFindPrepDay().then(d => { if (!stop) setPrepDay(d || null); }).catch(() => {}); return () => { stop = true; }; }, []);
@@ -20699,11 +21176,20 @@
           </div>
         );
       };
+      // V10.83 — bascule En direct / Historique de la journée
+      const Toggle = () => (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button className={mode === 'live' ? 'btn-primary' : 'btn-secondary'} style={{ flex: 1, fontSize: 15, fontWeight: 700 }} onClick={() => setMode('live')}>🟢 En direct</button>
+          <button className={mode === 'hist' ? 'btn-primary' : 'btn-secondary'} style={{ flex: 1, fontSize: 15, fontWeight: 700 }} onClick={() => setMode('hist')}>📜 Historique de la journée</button>
+        </div>
+      );
+      if (mode === 'hist') return <div className="stack"><Toggle /><KbWhoDayHistory /></div>;
       return (
         <div className="stack">
+          <Toggle />
           <div className="card">
             <h2 style={{ fontSize: 20, margin: 0 }}>🟢 Qui fait quoi — en direct</h2>
-            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 0' }}>Chaque appareil connecté se signale toutes les 60 s ; la tâche (produit en prépa, retraits, retours PDP) se met à jour dès qu'elle change.</p>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '4px 0 0' }}>Chaque appareil connecté se signale toutes les 60 s ; la tâche (produit en prépa, retraits, retours PDP) se met à jour dès qu'elle change. Centrale PDP (dispatch, picking, découpe) plus bas ; tout ce qui a été fait dans la journée : « 📜 Historique ».</p>
           </div>
           {agg && agg.t > 0 && (
             <div className="card">
@@ -20736,6 +21222,7 @@
               {showOff && <div className="stack" style={{ marginTop: 8 }}>{offline.map(p => <Person key={p.id || p.name} p={p} off />)}</div>}
             </div>
           )}
+          <KbCentraleLive now={now} />{/* V10.83 — travaux d'entrepôt de la Centrale PDP */}
           {feed.length > 0 && (
             <div className="card" style={{ padding: 0 }}>
               <h3 style={{ margin: 0, padding: '10px 12px' }}>⚡ Dernières actions de prépa</h3>
@@ -20751,6 +21238,7 @@
               ))}
             </div>
           )}
+          <KbWhoPlanningToday />{/* V10.84 — planning de la journée, détail à la seconde */}
         </div>
       );
     }
