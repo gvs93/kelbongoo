@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.86';
+    const APP_VERSION = 'V10.87';
+    // V10.87 — (03/11/2026) Remplacement en prépa : mail à rr@pribon.org + hg@probon.fr, objet « 🔄 Remplacement · NOM a remplacé « X » par « Y » · lieux · nb clients · remise · distrib date » + détail (poids, contrôle IA/auto) — UN SEUL mail par produit remplacé (doc rm|produit||remplaçant dans day_<jour>_prep), même si plusieurs opérateurs/lieux.
     // V10.86 — (03/11/2026) Prépa : « 🔄 Remplacer » un produit indisponible (ex. Poire Harrow → Poire Williams) — recherche dans le catalogue (même produit d'abord), contrôle IA (Apps Script KBG_IA_Remplacement → Claude) + contrôle auto : refus si pas similaire (salade ≠ poire) ou poids trop différent (−30 % / +60 %), pesée demandée si poids inconnu ; plus léger (>10 %) ou moins cher → remise auto « Remplacement » ; tous les lieux ou un seul. Bandeau orange en prépa, badge « Remplacé par » en distrib, encadré + ligne « REMPLACEMENT » dans les mails clients. Doc rp|site||produit dans day_<jour>_prep.
     // V10.85 — (03/11/2026) Qui fait quoi : plus de « Sans nom » pour la Centrale — les lignes enregistrées avec un code (« #1234 », « Code 1234 ») sont traduites en Prénom Nom via le registre des codes salariés (resolve-name, même serveur que la Centrale) ; le code n'est jamais affiché. Ligne réellement sans nom = « Nom non enregistré (Centrale) » (corrigé à la source par Centrale v5.25).
     // V10.84 — (03/11/2026) Master › 🟢 Qui fait quoi : en bas, 🗓️ PLANNING de la journée — une ligne par personne depuis ce matin (barres colorées MU / prépa / dispatch / picking / découpe, trait rouge = maintenant) ; toucher une personne = détail À LA SECONDE (début → fin des MU, trous > 10 min signalés). Aussi dans 📜 Historique pour les jours passés.
@@ -2114,6 +2115,30 @@
     // ===== V10.86 — Remplacement de produit en prépa =====
     // URL du web app Apps Script « KBG_IA_Remplacement » (vide = contrôle automatique sans IA)
     const KB_IA_URL = '';
+    // V10.87 — mail interne « remplacement » : UNE fois par produit remplacé (et par remplaçant) et par jour de prépa
+    const KB_REPL_TO = 'rr@pribon.org, hg@probon.fr';
+    async function kbReplMail(day, x) {
+      const id = 'rm|' + encodeURIComponent(x.from + '||' + x.to);
+      try { if (await storage.getDoc(`day_${day}_prep`, id)) return false; } catch (_) {}
+      try { await storage.setDoc(`day_${day}_prep`, id, { from: x.from, to: x.to, by: x.by, sites: x.sites, at: Date.now() }, { replace: true }); } catch (_) {}
+      const dist = formatDateShort(day);
+      const subject = `🔄 Remplacement · ${x.by} a remplacé « ${x.from} » par « ${x.to} » · ${x.sites.join(', ')} · ${x.nCli} client${x.nCli > 1 ? 's' : ''}${x.pct ? ' · remise −' + x.pct + ' %' : ''} · distrib ${dist}`;
+      const ia = x.ia === 'ok' ? '🤖 Validé par l\'IA' : x.ia === 'auto' ? '⚙️ Contrôle automatique (IA non branchée)' : '⚙️ Contrôle automatique';
+      const row = (k, v) => `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:15px;color:#666;white-space:nowrap">${k}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:16px"><b>${v}</b></td></tr>`;
+      const htmlBody = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
+        + `<div style="background:#ea580c;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:15px;font-weight:700">🔄 REMPLACEMENT EN PRÉPA · distrib ${kbEsc(dist)}</div>`
+        + `<div style="font-size:24px;font-weight:900;margin-top:4px"><s style="opacity:.8">${kbEsc(x.from)}</s><br>→ ${kbEsc(x.to)}</div></div>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:12px">`
+        + row('Par', kbEsc(x.by)) + row('Lieux', kbEsc(x.sites.join(', '))) + row('Clients', `${x.nCli} (${x.nArt} article${x.nArt > 1 ? 's' : ''})`)
+        + row('Remplaçant', kbEsc(x.to) + (x.toProducer ? ' · ' + kbEsc(x.toProducer) : ''))
+        + row('Poids', kbEsc((x.poidsFrom || '?') + ' prévu → ' + (x.poidsTo ? x.poidsTo + ' g pesé' : (x.poidsTxt || '?'))))
+        + row('Remise client', x.pct ? '−' + x.pct + ' % (« Remplacement »)' : 'aucune')
+        + row('Contrôle', kbEsc(ia)) + `</table>`
+        + (x.why ? `<div style="margin-top:10px;background:#fff7ed;border-left:6px solid #ea580c;padding:10px 12px;font-size:14px">${kbEsc(x.why)}</div>` : '')
+        + `<div style="margin-top:12px;font-size:13px;color:#777">Les clients sont prévenus dans le mail de clôture de la prépa. Un seul mail par produit remplacé.</div></div>`;
+      const body = `${x.by} a remplacé « ${x.from} » par « ${x.to} »${x.toProducer ? ' (' + x.toProducer + ')' : ''}.\nDistrib : ${dist}\nLieux : ${x.sites.join(', ')}\nClients : ${x.nCli} (${x.nArt} articles)\nRemise : ${x.pct ? '-' + x.pct + ' %' : 'aucune'}\nContrôle : ${ia}\n${x.why || ''}\n\n— Appli Kelbongoo`;
+      try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_REPL_TO, subject, body, htmlBody }); return true; } catch (_) { return false; }
+    }
     function kbPoidsRange(t) {
       const s = String(t || '').replace(/,/g, '.');
       const m = s.match(/(\d+(?:\.\d+)?)\s*(kg|g|gr)?\b\s*(?:[-–à]\s*(\d+(?:\.\d+)?)\s*(kg|g|gr)?\b)?/i);
@@ -15530,6 +15555,11 @@
             reason: 'Remplacement'
           });else if (ra0 && ra0.reason === 'Remplacement') wRemAll(pk, null);
         });
+        const lines = rows.filter(r => r.product === b.product && sites.includes(r.site));
+        kbReplMail(day, { from: b.product, to: b.pick.name, toProducer: b.pick.producer || '', by: user, sites,
+          nCli: new Set(lines.map(r => r.site + '||' + r.client)).size, nArt: lines.reduce((a, r) => a + (r.qty || 1), 0),
+          pct, ia: b.ia ? b.ia.verdict : 'auto', why: (b.ia && b.ia.raison ? b.ia.raison + ' · ' : '') + b.local.why.join(' '),
+          poidsFrom: replFrom(b.product).poids, poidsTo: kbParseGrams(b.poidsReel) || 0, poidsTxt: to.poids || '' }).catch(() => {});
         showToast(`🔄 ${b.product} → ${b.pick.name} (${sites.length} lieu${sites.length > 1 ? 'x' : ''})${pct ? ` · remise −${pct} %` : ''}`);
         setReplBox(null);
       };
