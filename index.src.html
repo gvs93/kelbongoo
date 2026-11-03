@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.91';
+    const APP_VERSION = 'V10.92';
+    // V10.92 — (03/11/2026) 📆 HORAIRES EXCEPTIONNELS (Master › Pilotage › 📍 Lieux & horaires) : date(s) au calendrier (du … au …), lieux (ou Tous), ⛔ Fermé ou 🕑 horaires spéciaux, note ; enregistré tout de suite, supprimé seul une fois la date passée. Prioritaire sur les horaires habituels : calendrier des distributions (sitesForDate : fermé = retiré, ouverture spéciale = ajoutée), horaires du jour (kbLieuHours → distrib, rappel mail client, fin de distribution). Données : app_config/lieux › sites[c].exc.
     // V10.91 — (03/11/2026) 📅 PRÉPA LE JOUR MÊME (ex. mer. 11/11 férié → commandes du jeudi préparées jeudi matin) : Master › Pilotage › 📍 Lieux & horaires › « 📅 Prépa le jour même » (dates). Ce jour-là, tant que la prépa du jour n'est pas clôturée : Prépa + MU sur la distribution DU JOUR (avant : basculait sur le lendemain, MU du vendredi), poste synchro autorisé sur aujourd'hui, pas de rajout F&L Rungis auto ; après clôture → retour au lendemain. La veille, rien ne change (prépa du lendemain).
     // V10.90 — (03/11/2026) Remplacement PARTIEL / une seule boutique : « Combien de X as-tu ? » → casiers servis dans l'ordre (lieu puis casier), cases à cocher par client + boutons lieu (BIC 3/5…) ; doc rp| avec only:[clients] si partiel ; badge 🔄 / « garde … » sur chaque casier ; remise « Remplacement » posée seulement sur les clients remplacés ; distrib + mails clients seulement pour eux ; mail interne « Remplacement PARTIEL · … X clients sur Y ».
     // V10.89 — (03/11/2026) Prépa & distrib : écran « 🔒 Qui est là ? » après 1 h sans activité (au lieu de 10 min) ; plus de déconnexion auto en parallèle pour ces rôles (le code redemandé suffit). Master et autres : déconnexion après 60 min inchangée.
@@ -1248,6 +1249,19 @@
       return [...ds].sort();
     }
     let __kbLieuxSig = '';
+    // V10.92 — HORAIRES EXCEPTIONNELS par lieu : sites[c].exc = { 'AAAA-MM-JJ': { closed:true } | { hours:'10:00-14:00' }, note }
+    //   (dates passées supprimées automatiquement à la lecture et à l'enregistrement)
+    let KB_LIEUX_EXC = {};
+    function kbExcClean(exc) {
+      const t = todayKey(), out = {};
+      Object.keys(exc || {}).forEach(d => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d < t) return;
+        const e = exc[d] || {}, note = String(e.note || '').slice(0, 60);
+        if (e.closed) out[d] = { closed: true, note };
+        else { const p = kbSlotParse(e.hours || ''); if (p) out[d] = { hours: p.start + '-' + p.end, note }; }
+      });
+      return out;
+    }
     function kbApplyLieux(lx) {
       if (!lx || !lx.sites || !Object.keys(lx.sites).length) return false;
       const codes = Object.keys(lx.sites).sort();
@@ -1255,9 +1269,11 @@
       codes.forEach(c => kbLieuDays(c, lx.sites[c]).forEach(d => sched[d].push(c)));
       const bout = codes.filter(c => (lx.sites[c] || {}).type === 'boutique');
       const names = codes.map(c => String((lx.sites[c] || {}).name || '').trim());
-      const sig = JSON.stringify([codes, sched, bout, names]);
+      const exc = {}; codes.forEach(c => { const e = kbExcClean((lx.sites[c] || {}).exc); if (Object.keys(e).length) exc[c] = e; });
+      const sig = JSON.stringify([codes, sched, bout, names, exc]);
       if (sig === __kbLieuxSig) return false;
       __kbLieuxSig = sig;
+      KB_LIEUX_EXC = exc;
       SITES.splice(0, SITES.length, ...codes);
       BOUTIQUES.splice(0, BOUTIQUES.length, ...bout);
       for (let d = 0; d < 7; d++) DISTRIB_SCHEDULE[d] = sched[d];
@@ -1273,7 +1289,10 @@
     // Locaux distribuant à une dayKey donnée
     function sitesForDate(dayKey) {
       const d = new Date(dayKey + 'T12:00:00');
-      return DISTRIB_SCHEDULE[d.getDay()] || [];
+      // V10.92 — exceptions : lieu fermé ce jour-là retiré, lieu ouvert exceptionnellement ajouté
+      const out = (DISTRIB_SCHEDULE[d.getDay()] || []).filter(c => !(KB_LIEUX_EXC[c] && KB_LIEUX_EXC[c][dayKey] && KB_LIEUX_EXC[c][dayKey].closed));
+      Object.keys(KB_LIEUX_EXC).forEach(c => { const e = KB_LIEUX_EXC[c][dayKey]; if (e && !e.closed && !out.includes(c)) out.push(c); });
+      return out;
     }
     // Y a-t-il une distribution ce jour-là ?
     function isDistribDay(dayKey) {
@@ -10080,6 +10099,74 @@
         </div>
       );
     }
+    // V10.92 — 📆 Horaires exceptionnels (comme Google) : date au calendrier, lieux, fermé / horaires spéciaux, note.
+    //   Enregistré tout de suite ; les dates passées disparaissent toutes seules.
+    function KbExcCard({ lieux, codes, onSave }) {
+      const t = todayKey();
+      const [f, setF] = React.useState({ date: '', end: '', sites: {}, closed: true, hours: '', note: '' });
+      const all = [];
+      codes.forEach(c => Object.entries((lieux.sites[c] || {}).exc || {}).forEach(([d, e]) => { if (d >= t) all.push({ d, c, ...e }); }));
+      const byDay = {}; all.forEach(x => { (byDay[x.d] = byDay[x.d] || []).push(x); });
+      const dayKeys = Object.keys(byDay).sort();
+      const lbl = d => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return d; } };
+      const regular = (c, d) => { const L = lieux.sites[c] || {}; const dow = new Date(d + 'T12:00:00').getDay(); if (!(L.days || []).includes(dow)) return 'fermé d\'habitude'; const h = kbSlotParse((L.hours || {})[dow] || ''); return h ? 'd\'habitude ' + h.start.replace(':', 'h') + '–' + h.end.replace(':', 'h') : 'ouvert d\'habitude'; };
+      const selCodes = codes.filter(c => f.sites[c]);
+      const hoursOk = f.closed || !!kbSlotParse(f.hours);
+      const dates = (() => { if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date)) return []; const e = /^\d{4}-\d{2}-\d{2}$/.test(f.end) && f.end > f.date ? f.end : f.date; const out = []; let d = f.date; for (let i = 0; i < 62 && d <= e; i++) { out.push(d); d = addDays(d, 1); } return out; })();
+      const canAdd = dates.length && dates[0] >= t && selCodes.length && hoursOk;
+      const add = () => {
+        if (!canAdd) return;
+        const p = f.closed ? null : kbSlotParse(f.hours);
+        const sites = { ...lieux.sites };
+        selCodes.forEach(c => { const exc = { ...(sites[c].exc || {}) }; dates.forEach(d => { exc[d] = f.closed ? { closed: true, note: f.note.trim() } : { hours: p.start + '-' + p.end, note: f.note.trim() }; }); sites[c] = { ...sites[c], exc }; });
+        onSave({ ...lieux, sites });
+        setF({ date: '', end: '', sites: {}, closed: true, hours: '', note: '' });
+      };
+      const del = (c, d) => { const sites = { ...lieux.sites }; const exc = { ...(sites[c].exc || {}) }; delete exc[d]; sites[c] = { ...sites[c], exc }; onSave({ ...lieux, sites }); };
+      const inp = { padding: '8px 10px', border: '1px solid var(--line)', borderRadius: 8, fontSize: 15, boxSizing: 'border-box' };
+      const chip = on => ({ cursor: 'pointer', borderRadius: 16, padding: '6px 12px', fontSize: 14, fontWeight: 700, border: '2px solid ' + (on ? '#1565c0' : 'var(--line)'), background: on ? '#1565c0' : '#fff', color: on ? '#fff' : 'var(--ink)' });
+      return (
+        <div className="card" style={{ padding: '12px 14px', border: '2px solid #1565c0' }}>
+          <strong style={{ fontSize: 16 }}>📆 Horaires exceptionnels</strong>
+          <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '4px 0 10px' }}>Jour férié, fermeture, ouverture spéciale… Prioritaire sur les horaires habituels pour la distrib, le calendrier et les mails clients. Enregistré tout de suite ; supprimé automatiquement une fois la date passée.</p>
+          {dayKeys.length > 0 && (
+            <div className="stack" style={{ gap: 6, marginBottom: 12 }}>
+              {dayKeys.map(d => (
+                <div key={d} style={{ borderRadius: 10, background: '#f1f6fd', padding: '8px 10px' }}>
+                  <div style={{ fontSize: 15, fontWeight: 800, textTransform: 'capitalize' }}>📅 {lbl(d)}{d === t ? ' · aujourd\'hui' : ''}</div>
+                  {byDay[d].sort((a, b) => a.c.localeCompare(b.c)).map(x => (
+                    <div key={x.c} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                      <span style={{ background: kbSiteColor(x.c), color: '#fff', fontWeight: 800, borderRadius: 6, padding: '1px 7px', fontSize: 13 }}>{x.c}</span>
+                      <span style={{ flex: 1, fontSize: 15, fontWeight: 700, color: x.closed ? '#c62828' : '#1565c0' }}>{x.closed ? '⛔ Fermé' : '🕑 ' + x.hours.replace(/:/g, 'h').replace('-', ' – ')}{x.note ? <span style={{ fontWeight: 400, color: 'var(--ink-mute)' }}> · {x.note}</span> : null}</span>
+                      <span style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{regular(x.c, d)}</span>
+                      <button className="btn-secondary" style={{ fontSize: 13, padding: '3px 9px' }} onClick={() => del(x.c, d)}>🗑</button>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="stack" style={{ gap: 8, borderTop: dayKeys.length ? '1px solid var(--line)' : 'none', paddingTop: dayKeys.length ? 10 : 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 800 }}>➕ Ajouter</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <label style={{ fontSize: 13 }}>Du <input type="date" min={t} value={f.date} onChange={e => setF(x => ({ ...x, date: e.target.value }))} style={inp} /></label>
+              <label style={{ fontSize: 13 }}>au (facultatif) <input type="date" min={f.date || t} value={f.end} onChange={e => setF(x => ({ ...x, end: e.target.value }))} style={inp} /></label>
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <span style={chip(selCodes.length === codes.length)} onClick={() => setF(x => ({ ...x, sites: selCodes.length === codes.length ? {} : Object.fromEntries(codes.map(c => [c, true])) }))}>Tous</span>
+              {codes.map(c => <span key={c} style={chip(!!f.sites[c])} onClick={() => setF(x => ({ ...x, sites: { ...x.sites, [c]: !x.sites[c] } }))}>{c}</span>)}
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <span style={chip(f.closed)} onClick={() => setF(x => ({ ...x, closed: true }))}>⛔ Fermé</span>
+              <span style={chip(!f.closed)} onClick={() => setF(x => ({ ...x, closed: false }))}>🕑 Horaires spéciaux</span>
+            </div>
+            {!f.closed && <input value={f.hours} onChange={e => setF(x => ({ ...x, hours: e.target.value }))} placeholder="ex : 10:00-14:00" style={{ ...inp, borderColor: f.hours && !hoursOk ? 'var(--danger)' : 'var(--line)' }} />}
+            <input value={f.note} onChange={e => setF(x => ({ ...x, note: e.target.value }))} placeholder="Note (ex : 11 novembre férié)" style={inp} />
+            <button className="btn-primary" disabled={!canAdd} onClick={add}>📆 Enregistrer{dates.length > 1 ? ` (${dates.length} jours)` : ''}{selCodes.length ? ` · ${selCodes.join(', ')}` : ''}</button>
+          </div>
+        </div>
+      );
+    }
     function KbSheet({ title, onClose, children }) {
       return (
         <div className="modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }} style={{ zIndex: 1000 }}>
@@ -14647,7 +14734,7 @@
       const out = {};
       Object.keys(s).forEach(c => {
         const L = s[c] || {};
-        out[c] = { ...L, name: L.name || SITE_NAMES[c] || c, type: L.type || 'camion', adresse: L.adresse || '', hours: { ...(L.hours || {}) }, days: kbLieuDays(c, L) };
+        out[c] = { ...L, name: L.name || SITE_NAMES[c] || c, type: L.type || 'camion', adresse: L.adresse || '', hours: { ...(L.hours || {}) }, days: kbLieuDays(c, L), exc: kbExcClean(L.exc) };
       });
       return { sites: out, depots: kbDepotsMerge(saved.depots) };
     }
@@ -14662,6 +14749,9 @@
     // Horaires d'un lieu pour un jour donné → { start:'14:00', end:'20:00' } ou null
     function kbLieuHours(lieux, site, dayKey) {
       const L = lieux && lieux.sites && lieux.sites[site]; if (!L) return null;
+      const ex = L.exc && L.exc[dayKey]; // V10.92 — horaire exceptionnel prioritaire
+      if (ex && ex.closed) return null;
+      if (ex && ex.hours) return kbSlotParse(ex.hours);
       const dow = new Date(dayKey + 'T12:00:00').getDay();
       if (Array.isArray(L.days) && !L.days.includes(dow)) return null; // V10.31 — jour non distribué
       return kbSlotParse((L.hours || {})[dow] || '');
@@ -14682,7 +14772,10 @@
       const updH = (c, dow, v) => edit(l => ({ ...l, sites: { ...l.sites, [c]: { ...l.sites[c], hours: { ...(l.sites[c].hours || {}), [dow]: v } } } }));
       const togDay = (c, dow) => edit(l => { const L = l.sites[c]; const ds = new Set(L.days || []); if (ds.has(dow)) ds.delete(dow); else ds.add(dow); return { ...l, sites: { ...l.sites, [c]: { ...L, days: [...ds].sort() } } }; });
       const updD = (k, patch) => edit(l => ({ ...l, depots: { ...l.depots, [k]: { ...l.depots[k], ...patch } } }));
-      const save = async () => {
+      const lieuxState = lieux;
+      const save = async (lxArg) => {
+        const lieux = (lxArg && lxArg.sites) ? lxArg : lieuxState;
+        const codes = Object.keys(lieux.sites);
         const bad = [];
         codes.forEach(c => { const L = lieux.sites[c]; (L.days || []).forEach(d => { const v = String((L.hours || {})[d] || '').trim(); if (v && !kbSlotParse(v)) bad.push(`${c} ${KB_LIEUX_DOW_ALL.find(x => x[0] === d)[1]} « ${v} »`); }); });
         if (bad.length) { showToast('Horaire invalide (ex : 14:00-20:00) : ' + bad.slice(0, 3).join(', ')); return; }
@@ -14703,7 +14796,7 @@
             let L = lieux.sites[c]; const days = [...new Set(L.days || [])].sort(); const h = {};
             days.forEach(d => { const p = kbSlotParse((L.hours || {})[d] || ''); if (p) h[d] = p.start + '-' + p.end; });
             if (L.rungis) L = await locate(L, c);
-            sites[c] = { name: String(L.name || c).trim() || c, type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h, days,
+            sites[c] = { name: String(L.name || c).trim() || c, type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h, days, exc: kbExcClean(L.exc),
               rungis: L.rungis || '', lat: L.lat != null ? Number(L.lat) : null, lng: L.lng != null ? Number(L.lng) : null, geoAddr: L.geoAddr || '', gpsManual: !!L.gpsManual };
           }
           const depots = {};
@@ -14732,6 +14825,7 @@
             <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '6px 0 0' }}>Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format <b>14:00-20:00</b> (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.</p>
           </div>
           <KbSameDayCard />
+          <KbExcCard lieux={lieux} codes={codes} onSave={next => { setLieux(next); save(next); }} />
           <div className="card" style={{ padding: '10px 12px', border: '2px solid #0277bd' }}>
             <strong style={{ fontSize: 15 }}>🚚 Camion Rungis — points fixes</strong>
             <p style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '4px 0 8px' }}>Servent à savoir quand le camion est à Rungis ou à l'entrepôt (et combien de temps). Les magasins livrés se cochent plus bas, sur chaque lieu.</p>

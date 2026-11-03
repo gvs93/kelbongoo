@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.91) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.92) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.91';
+const APP_VERSION = 'V10.92';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -753,6 +753,27 @@ function kbLieuDays(code, L) {
   return [...ds].sort();
 }
 let __kbLieuxSig = '';
+let KB_LIEUX_EXC = {};
+function kbExcClean(exc) {
+  const t = todayKey(),
+    out = {};
+  Object.keys(exc || {}).forEach(d => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d < t) return;
+    const e = exc[d] || {},
+      note = String(e.note || '').slice(0, 60);
+    if (e.closed) out[d] = {
+      closed: true,
+      note
+    };else {
+      const p = kbSlotParse(e.hours || '');
+      if (p) out[d] = {
+        hours: p.start + '-' + p.end,
+        note
+      };
+    }
+  });
+  return out;
+}
 function kbApplyLieux(lx) {
   if (!lx || !lx.sites || !Object.keys(lx.sites).length) return false;
   const codes = Object.keys(lx.sites).sort();
@@ -761,9 +782,15 @@ function kbApplyLieux(lx) {
   codes.forEach(c => kbLieuDays(c, lx.sites[c]).forEach(d => sched[d].push(c)));
   const bout = codes.filter(c => (lx.sites[c] || {}).type === 'boutique');
   const names = codes.map(c => String((lx.sites[c] || {}).name || '').trim());
-  const sig = JSON.stringify([codes, sched, bout, names]);
+  const exc = {};
+  codes.forEach(c => {
+    const e = kbExcClean((lx.sites[c] || {}).exc);
+    if (Object.keys(e).length) exc[c] = e;
+  });
+  const sig = JSON.stringify([codes, sched, bout, names, exc]);
   if (sig === __kbLieuxSig) return false;
   __kbLieuxSig = sig;
+  KB_LIEUX_EXC = exc;
   SITES.splice(0, SITES.length, ...codes);
   BOUTIQUES.splice(0, BOUTIQUES.length, ...bout);
   for (let d = 0; d < 7; d++) DISTRIB_SCHEDULE[d] = sched[d];
@@ -786,7 +813,12 @@ function kbLieuxPublish(lx) {
 }
 function sitesForDate(dayKey) {
   const d = new Date(dayKey + 'T12:00:00');
-  return DISTRIB_SCHEDULE[d.getDay()] || [];
+  const out = (DISTRIB_SCHEDULE[d.getDay()] || []).filter(c => !(KB_LIEUX_EXC[c] && KB_LIEUX_EXC[c][dayKey] && KB_LIEUX_EXC[c][dayKey].closed));
+  Object.keys(KB_LIEUX_EXC).forEach(c => {
+    const e = KB_LIEUX_EXC[c][dayKey];
+    if (e && !e.closed && !out.includes(c)) out.push(c);
+  });
+  return out;
 }
 function isDistribDay(dayKey) {
   return sitesForDate(dayKey).length > 0;
@@ -16768,6 +16800,321 @@ function KbSameDayCard() {
     }
   }, "➕ Ajouter"))));
 }
+function KbExcCard({
+  lieux,
+  codes,
+  onSave
+}) {
+  const t = todayKey();
+  const [f, setF] = React.useState({
+    date: '',
+    end: '',
+    sites: {},
+    closed: true,
+    hours: '',
+    note: ''
+  });
+  const all = [];
+  codes.forEach(c => Object.entries((lieux.sites[c] || {}).exc || {}).forEach(([d, e]) => {
+    if (d >= t) all.push({
+      d,
+      c,
+      ...e
+    });
+  }));
+  const byDay = {};
+  all.forEach(x => {
+    (byDay[x.d] = byDay[x.d] || []).push(x);
+  });
+  const dayKeys = Object.keys(byDay).sort();
+  const lbl = d => {
+    try {
+      return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long'
+      });
+    } catch (e) {
+      return d;
+    }
+  };
+  const regular = (c, d) => {
+    const L = lieux.sites[c] || {};
+    const dow = new Date(d + 'T12:00:00').getDay();
+    if (!(L.days || []).includes(dow)) return 'fermé d\'habitude';
+    const h = kbSlotParse((L.hours || {})[dow] || '');
+    return h ? 'd\'habitude ' + h.start.replace(':', 'h') + '–' + h.end.replace(':', 'h') : 'ouvert d\'habitude';
+  };
+  const selCodes = codes.filter(c => f.sites[c]);
+  const hoursOk = f.closed || !!kbSlotParse(f.hours);
+  const dates = (() => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date)) return [];
+    const e = /^\d{4}-\d{2}-\d{2}$/.test(f.end) && f.end > f.date ? f.end : f.date;
+    const out = [];
+    let d = f.date;
+    for (let i = 0; i < 62 && d <= e; i++) {
+      out.push(d);
+      d = addDays(d, 1);
+    }
+    return out;
+  })();
+  const canAdd = dates.length && dates[0] >= t && selCodes.length && hoursOk;
+  const add = () => {
+    if (!canAdd) return;
+    const p = f.closed ? null : kbSlotParse(f.hours);
+    const sites = {
+      ...lieux.sites
+    };
+    selCodes.forEach(c => {
+      const exc = {
+        ...(sites[c].exc || {})
+      };
+      dates.forEach(d => {
+        exc[d] = f.closed ? {
+          closed: true,
+          note: f.note.trim()
+        } : {
+          hours: p.start + '-' + p.end,
+          note: f.note.trim()
+        };
+      });
+      sites[c] = {
+        ...sites[c],
+        exc
+      };
+    });
+    onSave({
+      ...lieux,
+      sites
+    });
+    setF({
+      date: '',
+      end: '',
+      sites: {},
+      closed: true,
+      hours: '',
+      note: ''
+    });
+  };
+  const del = (c, d) => {
+    const sites = {
+      ...lieux.sites
+    };
+    const exc = {
+      ...(sites[c].exc || {})
+    };
+    delete exc[d];
+    sites[c] = {
+      ...sites[c],
+      exc
+    };
+    onSave({
+      ...lieux,
+      sites
+    });
+  };
+  const inp = {
+    padding: '8px 10px',
+    border: '1px solid var(--line)',
+    borderRadius: 8,
+    fontSize: 15,
+    boxSizing: 'border-box'
+  };
+  const chip = on => ({
+    cursor: 'pointer',
+    borderRadius: 16,
+    padding: '6px 12px',
+    fontSize: 14,
+    fontWeight: 700,
+    border: '2px solid ' + (on ? '#1565c0' : 'var(--line)'),
+    background: on ? '#1565c0' : '#fff',
+    color: on ? '#fff' : 'var(--ink)'
+  });
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: '12px 14px',
+      border: '2px solid #1565c0'
+    }
+  }, React.createElement("strong", {
+    style: {
+      fontSize: 16
+    }
+  }, "📆 Horaires exceptionnels"), React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      margin: '4px 0 10px'
+    }
+  }, "Jour férié, fermeture, ouverture spéciale… Prioritaire sur les horaires habituels pour la distrib, le calendrier et les mails clients. Enregistré tout de suite ; supprimé automatiquement une fois la date passée."), dayKeys.length > 0 && React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 6,
+      marginBottom: 12
+    }
+  }, dayKeys.map(d => React.createElement("div", {
+    key: d,
+    style: {
+      borderRadius: 10,
+      background: '#f1f6fd',
+      padding: '8px 10px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      textTransform: 'capitalize'
+    }
+  }, "📅 ", lbl(d), d === t ? ' · aujourd\'hui' : ''), byDay[d].sort((a, b) => a.c.localeCompare(b.c)).map(x => React.createElement("div", {
+    key: x.c,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      marginTop: 4
+    }
+  }, React.createElement("span", {
+    style: {
+      background: kbSiteColor(x.c),
+      color: '#fff',
+      fontWeight: 800,
+      borderRadius: 6,
+      padding: '1px 7px',
+      fontSize: 13
+    }
+  }, x.c), React.createElement("span", {
+    style: {
+      flex: 1,
+      fontSize: 15,
+      fontWeight: 700,
+      color: x.closed ? '#c62828' : '#1565c0'
+    }
+  }, x.closed ? '⛔ Fermé' : '🕑 ' + x.hours.replace(/:/g, 'h').replace('-', ' – '), x.note ? React.createElement("span", {
+    style: {
+      fontWeight: 400,
+      color: 'var(--ink-mute)'
+    }
+  }, " · ", x.note) : null), React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ink-mute)'
+    }
+  }, regular(x.c, d)), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 13,
+      padding: '3px 9px'
+    },
+    onClick: () => del(x.c, d)
+  }, "🗑")))))), React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 8,
+      borderTop: dayKeys.length ? '1px solid var(--line)' : 'none',
+      paddingTop: dayKeys.length ? 10 : 0
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 800
+    }
+  }, "➕ Ajouter"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      alignItems: 'center'
+    }
+  }, React.createElement("label", {
+    style: {
+      fontSize: 13
+    }
+  }, "Du ", React.createElement("input", {
+    type: "date",
+    min: t,
+    value: f.date,
+    onChange: e => setF(x => ({
+      ...x,
+      date: e.target.value
+    })),
+    style: inp
+  })), React.createElement("label", {
+    style: {
+      fontSize: 13
+    }
+  }, "au (facultatif) ", React.createElement("input", {
+    type: "date",
+    min: f.date || t,
+    value: f.end,
+    onChange: e => setF(x => ({
+      ...x,
+      end: e.target.value
+    })),
+    style: inp
+  }))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("span", {
+    style: chip(selCodes.length === codes.length),
+    onClick: () => setF(x => ({
+      ...x,
+      sites: selCodes.length === codes.length ? {} : Object.fromEntries(codes.map(c => [c, true]))
+    }))
+  }, "Tous"), codes.map(c => React.createElement("span", {
+    key: c,
+    style: chip(!!f.sites[c]),
+    onClick: () => setF(x => ({
+      ...x,
+      sites: {
+        ...x.sites,
+        [c]: !x.sites[c]
+      }
+    }))
+  }, c))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6
+    }
+  }, React.createElement("span", {
+    style: chip(f.closed),
+    onClick: () => setF(x => ({
+      ...x,
+      closed: true
+    }))
+  }, "⛔ Fermé"), React.createElement("span", {
+    style: chip(!f.closed),
+    onClick: () => setF(x => ({
+      ...x,
+      closed: false
+    }))
+  }, "🕑 Horaires spéciaux")), !f.closed && React.createElement("input", {
+    value: f.hours,
+    onChange: e => setF(x => ({
+      ...x,
+      hours: e.target.value
+    })),
+    placeholder: "ex : 10:00-14:00",
+    style: {
+      ...inp,
+      borderColor: f.hours && !hoursOk ? 'var(--danger)' : 'var(--line)'
+    }
+  }), React.createElement("input", {
+    value: f.note,
+    onChange: e => setF(x => ({
+      ...x,
+      note: e.target.value
+    })),
+    placeholder: "Note (ex : 11 novembre férié)",
+    style: inp
+  }), React.createElement("button", {
+    className: "btn-primary",
+    disabled: !canAdd,
+    onClick: add
+  }, "📆 Enregistrer", dates.length > 1 ? ` (${dates.length} jours)` : '', selCodes.length ? ` · ${selCodes.join(', ')}` : '')));
+}
 function KbSheet({
   title,
   onClose,
@@ -28432,7 +28779,8 @@ function kbLieuxMerge(saved) {
       hours: {
         ...(L.hours || {})
       },
-      days: kbLieuDays(c, L)
+      days: kbLieuDays(c, L),
+      exc: kbExcClean(L.exc)
     };
   });
   return {
@@ -28461,6 +28809,9 @@ function kbLieuxCached() {
 function kbLieuHours(lieux, site, dayKey) {
   const L = lieux && lieux.sites && lieux.sites[site];
   if (!L) return null;
+  const ex = L.exc && L.exc[dayKey];
+  if (ex && ex.closed) return null;
+  if (ex && ex.hours) return kbSlotParse(ex.hours);
   const dow = new Date(dayKey + 'T12:00:00').getDay();
   if (Array.isArray(L.days) && !L.days.includes(dow)) return null;
   return kbSlotParse((L.hours || {})[dow] || '');
@@ -28545,7 +28896,10 @@ function KbLieuxPage({
       }
     }
   }));
-  const save = async () => {
+  const lieuxState = lieux;
+  const save = async lxArg => {
+    const lieux = lxArg && lxArg.sites ? lxArg : lieuxState;
+    const codes = Object.keys(lieux.sites);
     const bad = [];
     codes.forEach(c => {
       const L = lieux.sites[c];
@@ -28594,6 +28948,7 @@ function KbLieuxPage({
           adresse: String(L.adresse || '').trim(),
           hours: h,
           days,
+          exc: kbExcClean(L.exc),
           rungis: L.rungis || '',
           lat: L.lat != null ? Number(L.lat) : null,
           lng: L.lng != null ? Number(L.lng) : null,
@@ -28708,7 +29063,14 @@ function KbLieuxPage({
       color: 'var(--ink-mute)',
       margin: '6px 0 0'
     }
-  }, "Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format ", React.createElement("b", null, "14:00-20:00"), " (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.")), React.createElement(KbSameDayCard, null), React.createElement("div", {
+  }, "Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format ", React.createElement("b", null, "14:00-20:00"), " (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.")), React.createElement(KbSameDayCard, null), React.createElement(KbExcCard, {
+    lieux: lieux,
+    codes: codes,
+    onSave: next => {
+      setLieux(next);
+      save(next);
+    }
+  }), React.createElement("div", {
     className: "card",
     style: {
       padding: '10px 12px',
