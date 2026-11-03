@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.81) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.82) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.81';
+const APP_VERSION = 'V10.82';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -3892,7 +3892,18 @@ function ToastProvider({
   return React.createElement(ToastContext.Provider, {
     value: show
   }, children, msg && React.createElement("div", {
-    className: "toast"
+    className: "toast",
+    style: (() => {
+      try {
+        const vv = window.visualViewport;
+        return vv && vv.height < window.innerHeight - 120 ? {
+          bottom: 'auto',
+          top: (vv.offsetTop || 0) + 12
+        } : undefined;
+      } catch (_) {
+        return undefined;
+      }
+    })()
   }, msg));
 }
 function KbIdleLockOverlay({
@@ -12190,6 +12201,7 @@ function InventoryPage({
   const [eanMap, setEanMap] = React.useState({});
   const [counts, setCounts] = React.useState({});
   const [countMeta, setCountMeta] = React.useState({});
+  const [invSaveErr, setInvSaveErr] = React.useState(null);
   const [search, setSearch] = React.useState('');
   const [invSort, setInvSortRaw] = React.useState(() => {
     try {
@@ -12513,13 +12525,28 @@ function InventoryPage({
       return;
     }
     const q = Math.max(0, parseInt(qty, 10) || 0);
-    await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
-      id: productId,
-      qty: q,
-      produit: prodById[productId]?.name || '',
-      countedBy: session.name,
-      countedAt: new Date().toISOString()
-    });
+    setCounts(prev => ({
+      ...prev,
+      [productId]: q
+    }));
+    try {
+      await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
+        id: productId,
+        qty: q,
+        produit: prodById[productId]?.name || '',
+        countedBy: session.name || '',
+        countedAt: new Date().toISOString()
+      });
+      setInvSaveErr(null);
+    } catch (e) {
+      console.error('inventaire setCount', e);
+      const denied = /permission|unauthenticated|insufficient/i.test(e && (e.code || e.message) || '');
+      setInvSaveErr({
+        name: prodById[productId]?.name || productId,
+        msg: denied ? 'connexion au serveur perdue sur cette tablette' : kbErrMsg(e)
+      });
+      return;
+    }
     try {
       await storage.setDoc('inventory_meta', invDate, {
         date: invDate,
@@ -13655,7 +13682,65 @@ function InventoryPage({
     }
   }, "+"))))))) : React.createElement("div", {
     className: "card"
+  }, invSaveErr && React.createElement("div", {
+    style: {
+      marginBottom: 10,
+      padding: '12px 14px',
+      borderRadius: 12,
+      background: '#ffebee',
+      border: '3px solid #c62828'
+    }
   }, React.createElement("div", {
+    style: {
+      fontSize: 19,
+      fontWeight: 800,
+      color: '#c62828'
+    }
+  }, "❌ Comptage NON enregistré"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginTop: 2
+    }
+  }, "« ", invSaveErr.name, " » : ", invSaveErr.msg, "."), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 4
+    }
+  }, "👉 Touche « Sortir » en haut, reconnecte-toi avec ton code, puis recompte ce produit."), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginTop: 8,
+      fontSize: 14
+    },
+    onClick: () => window.location.reload()
+  }, "🔄 Recharger l'appli")), invLocked && React.createElement("div", {
+    style: {
+      marginBottom: 10,
+      padding: '12px 14px',
+      borderRadius: 12,
+      background: '#fff3e0',
+      border: '3px solid #ef6c00'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 19,
+      fontWeight: 800,
+      color: '#e65100'
+    }
+  }, "🔒 Inventaire déjà clôturé", closedInfo && closedInfo.closedBy ? ' par ' + closedInfo.closedBy : ''), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginTop: 2
+    }
+  }, "Le comptage est verrouillé : les touches ne comptent plus."), React.createElement("button", {
+    className: "btn-primary btn-block",
+    style: {
+      marginTop: 8,
+      fontSize: 17
+    },
+    onClick: reopenInventory
+  }, "🔓 Rouvrir pour compter")), React.createElement("div", {
     style: {
       position: 'relative',
       marginBottom: 8
@@ -27239,6 +27324,7 @@ function KbMiseEnPlace() {
   const [fc, setFc] = React.useState(undefined);
   const [calib, setCalib] = React.useState(null);
   const [fcTick, setFcTick] = React.useState(0);
+  const [ordTick, setOrdTick] = React.useState(0);
   React.useEffect(() => {
     let stop = false;
     kbUpcomingDays(7).then(l => {
@@ -27329,13 +27415,35 @@ function KbMiseEnPlace() {
     return () => {
       stop = true;
     };
-  }, [day, cur && cur.exact]);
+  }, [day, cur && cur.exact, ordTick]);
+  const fcFor = d => (fc && fc.days || []).find(x => x && x.day === d) || null;
+  const emptyLoaded = !!(cur && cur.exact && orders && orders.length === 0);
+  React.useEffect(() => {
+    if (!emptyLoaded) return;
+    const t = setTimeout(() => setOrdTick(x => x + 1), 120000);
+    return () => clearTimeout(t);
+  }, [emptyLoaded, ordTick]);
+  const fcZero = f => !!(f && !(f.total && (f.total.n || f.total.nEst) || 0));
+  let eff = emptyLoaded ? fcFor(day) ? {
+    day,
+    exact: false,
+    f: fcFor(day)
+  } : {
+    day,
+    exact: false,
+    waiting: true
+  } : cur;
+  if (eff && !eff.exact && eff.f && fcZero(eff.f)) eff = {
+    day,
+    exact: false,
+    waiting: true
+  };
   let rows = [],
     totN = null,
     totSol = null,
     totNow = null,
     est = false;
-  if (cur && cur.exact && orders) {
+  if (eff && eff.exact && orders) {
     const by = {};
     orders.forEach(o => {
       const s = String(o.site || '?').toUpperCase();
@@ -27356,18 +27464,18 @@ function KbMiseEnPlace() {
     }));
     totN = orders.length;
     totSol = rows.reduce((a, r) => a + r.sol, 0);
-  } else if (cur && !cur.exact) {
-    est = !cur.f.closed;
-    rows = Object.entries(cur.f.sites || {}).map(([c, r]) => ({
+  } else if (eff && !eff.exact && eff.f) {
+    est = !eff.f.closed;
+    rows = Object.entries(eff.f.sites || {}).map(([c, r]) => ({
       c,
       n: r.nEst,
       now: r.n,
       sol: r.solEst != null ? r.solEst : r.sol,
       cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c)))
     }));
-    totN = cur.f.total.nEst;
-    totNow = cur.f.total.n;
-    totSol = cur.f.total.solEst != null ? cur.f.total.solEst : cur.f.total.sol;
+    totN = eff.f.total.nEst;
+    totNow = eff.f.total.n;
+    totSol = eff.f.total.solEst != null ? eff.f.total.solEst : eff.f.total.sol;
   }
   rows.forEach(r => {
     r.rolls = r.c === 'DOM' ? 0 : Math.ceil(r.cont / KB_CASIERS_PAR_ROLL);
@@ -27375,10 +27483,10 @@ function KbMiseEnPlace() {
   rows.sort((a, b) => kbPrintSite(a.c).localeCompare(kbPrintSite(b.c), 'fr'));
   const totRolls = rows.reduce((a, r) => a + r.rolls, 0);
   const dom = rows.find(r => r.c === 'DOM');
-  const ap = est ? '≈ ' : '';
+  const ap = est || eff && !eff.exact && eff.f ? '≈ ' : '';
   const loading = days === null || fc === undefined;
   const first = allDays[0];
-  const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir' : cur && cur.day === day ? `${cur.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`;
+  const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir' : eff && eff.waiting ? `⏳ Distrib. du ${formatDateShort(day)} : commandes pas encore chargées` : cur && cur.day === day ? `${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`;
   const Card = ({
     bg,
     lbl,
@@ -27495,7 +27603,41 @@ function KbMiseEnPlace() {
       marginTop: 8,
       textTransform: 'capitalize'
     }
-  }, "Distribution du ", React.createElement("b", null, formatDateFR(day))), cur && !cur.exact && (cur.f.closed ? React.createElement("div", {
+  }, "Distribution du ", React.createElement("b", null, formatDateFR(day))), eff && eff.waiting && React.createElement("div", {
+    style: {
+      marginTop: 8,
+      padding: '12px 14px',
+      borderRadius: 12,
+      background: '#fff8e1',
+      border: '3px solid #f9a825'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 20,
+      fontWeight: 800,
+      color: '#8d6e00'
+    }
+  }, "⏳ En attente du chargement des commandes"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginTop: 2
+    }
+  }, "Les commandes de cette distribution ne sont pas encore chargées (normalement vers ", React.createElement("b", null, "10h"), ", parfois plus tard). Ce n'est pas « 0 commande » : les chiffres s'afficheront tout seuls dès le chargement."), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "Vérifié toutes les 2 min · ", React.createElement("span", {
+    style: {
+      textDecoration: 'underline',
+      cursor: 'pointer'
+    },
+    onClick: () => {
+      setOrdTick(t => t + 1);
+      setFcTick(t => t + 1);
+    }
+  }, "vérifier maintenant"))), eff && !eff.exact && eff.f && (eff.f.closed ? React.createElement("div", {
     style: {
       marginTop: 8,
       padding: '8px 12px',
@@ -27522,7 +27664,7 @@ function KbMiseEnPlace() {
     style: {
       fontSize: 14
     }
-  }, "Fin des commandes le ", React.createElement("b", null, cur.f.closeAt), ". Déjà ", React.createElement("b", null, totNow), " commande", totNow > 1 ? 's' : '', " → estimé à 10h : ", React.createElement("b", null, "≈ ", totN), " (d'après ", cur.f.basis, ")."), React.createElement("div", {
+  }, "Fin des commandes le ", React.createElement("b", null, eff.f.closeAt), ". Déjà ", React.createElement("b", null, totNow), " commande", totNow > 1 ? 's' : '', " → estimé à 10h : ", React.createElement("b", null, "≈ ", totN), " (d'après ", eff.f.basis, ")."), React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-mute)',
@@ -27537,7 +27679,7 @@ function KbMiseEnPlace() {
       cursor: 'pointer'
     },
     onClick: () => setFcTick(t => t + 1)
-  }, "actualiser")))), cur && cur.exact && React.createElement("div", {
+  }, "actualiser")))), eff && eff.exact && orders && orders.length > 0 && React.createElement("div", {
     style: {
       marginTop: 6,
       fontSize: 13,
@@ -27561,7 +27703,7 @@ function KbMiseEnPlace() {
     v: totN == null ? '…' : ap + totRolls,
     col: "#4527a0",
     note: `${KB_CASIERS_PAR_ROLL} casiers par roll`
-  }), dom && React.createElement(Card, {
+  }), dom && !(eff && eff.waiting) && React.createElement(Card, {
     bg: "#e0f2f1",
     lbl: "📦 Cartons DOM",
     v: ap + dom.cont,
@@ -27632,7 +27774,7 @@ function KbMiseEnPlace() {
       fontWeight: 700,
       color: r.sol ? '#e65100' : 'var(--ink-mute)'
     }
-  }, "🧺 ", ap, r.sol, " panier", r.sol > 1 ? 's' : '', " solidaire", r.sol > 1 ? 's' : '')))), cur && !cur.exact && React.createElement("div", {
+  }, "🧺 ", ap, r.sol, " panier", r.sol > 1 ? 's' : '', " solidaire", r.sol > 1 ? 's' : '')))), eff && !eff.exact && eff.f && React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-mute)',
