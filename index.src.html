@@ -785,11 +785,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.81';
+    const APP_VERSION = 'V10.82';
     // V10.81 — (01/11/2026) Dernière minute NON prévue donnée au client (« ✅ C'est fait : donné au client ») → day_<jour>_lmdone/lmadd|<client> : KBG_AncienDistrib v1.3 la « Remet » sur l'ancien site (liste Supprimés → Remettre), facturée
     // V10.80 — (01/11/2026) Mail clients : « notre équipe vient de préparer votre commande de demain — à retirer le … (pas avant) », rappel du jour = détail complet ; Prépa : « 🧺 + Cagette » (n° C1, C2… hors rolls) ; ⚖️ poids réel prépa = vraie remise (transmise distrib / ancien site / mails) ; Distrib : plus de consignes « ancienne appli » (report automatique) ; « Retrait total » → option Retour PDP (client passé) ; Master : toujours sur aujourd'hui hors vue prépa + bandeau jour + jour affiché dans Mail clients
     // V10.79 — (01/11/2026) Chauffeur Rungis : chaque ✅ pris / ❌ pas pris d'une palette Centrale PDP est recopié dans la Centrale (enlevements/<id>/picked/<clé> = {status, at, by, motif}) → 🟫 Suivi palettes (Centrale + Console) : date et heure de récupération par lieu, comptage
     // V10.78 — (31/10/2026) Master › Horaires de commande : ouverture par jour de retrait (mer/jeu dès vendredi, ven/sam dès mardi), heure limite, mode TEST du site (module kbhoraires via kbgReglesCommandes) ; synchro prépa à l'heure limite choisie
+    // V10.82 — (03/11/2026) Prépa › Mise en place : jour connu mais 0 commande chargée = « ⏳ En attente du chargement » (prévision admin si dispo), relu toutes les 2 min — plus de faux « 0 ». Inventaire : comptage affiché tout de suite ; refus serveur (tablette déconnectée) = bandeau rouge EN HAUT ; verrou « clôturé » en haut avec « Rouvrir » ; toasts en haut quand le clavier est ouvert.
     // V10.77 — (31/10/2026) Facturation web à la clôture : TOUTES les commandes du nouveau site du lieu sont facturées (passées ou non récupérées)
     // V10.75 — (29/10/2026) Distrib : ⚖️ fourchette de poids « entre XX et YY g » sous chaque produit (fiche client, ND « à donner en plus », dernière minute) — même source que la prépa (Sheet COMMANDE FL + liste MU)
     // V10.74 — (29/10/2026) Prépa › 📦 Mise en place : PRÉVISION « ≈ environ » dès la veille (vente encore ouverte sur admin.kelbongoo.com, lue toutes les 30 min par KBG_MEP.gs, projetée à 10h d'après les 3 dernières ventes du même jour) : par lieu ≈ commandes, ≈ casiers / cagettes / cartons DOM, ≈ rolls (16 casiers), paniers solidaires ; exact dès le chargement des commandes. Espace Rungis : menu 🟫 Palettes EPAL = ce que chaque boutique doit (envoyées − rendues, depuis quand, derniers mouvements)
@@ -3475,7 +3476,7 @@
       return (
         <ToastContext.Provider value={show}>
           {children}
-          {msg && <div className="toast">{msg}</div>}
+          {msg && <div className="toast" style={(() => { try { const vv = window.visualViewport; return vv && vv.height < window.innerHeight - 120 ? { bottom: 'auto', top: (vv.offsetTop || 0) + 12 } : undefined; } catch (_) { return undefined; } })()}>{msg}</div>}{/* V10.82 — clavier ouvert : toast en haut (sinon caché) */}
         </ToastContext.Provider>
       );
     }
@@ -7792,6 +7793,7 @@
       const [eanMap, setEanMap] = React.useState({});
       const [counts, setCounts] = React.useState({});
       const [countMeta, setCountMeta] = React.useState({}); // {id: {by, at}} — qui a compté (multi-utilisateur)
+      const [invSaveErr, setInvSaveErr] = React.useState(null); // V10.82 — dernier comptage refusé par le serveur
       const [search, setSearch] = React.useState('');
       // V10.25 — tri mémorisé sur l'appareil ; le périmètre 🧀 Fromage passe en ordre alphabétique.
       const [invSort, setInvSortRaw] = React.useState(() => { try { return localStorage.getItem('kbg_inv_sort') || 'fournisseur'; } catch (e) { return 'fournisseur'; } }); // 'nom' | 'famille' | 'fournisseur'
@@ -8066,11 +8068,21 @@
       const setCount = async (productId, qty) => {
         if (invLocked) { showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier'); return; }
         const q = Math.max(0, parseInt(qty,10) || 0);
-        await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
-          id: productId, qty: q,
-          produit: prodById[productId]?.name || '',
-          countedBy: session.name, countedAt: new Date().toISOString(),
-        });
+        setCounts(prev => ({ ...prev, [productId]: q })); // V10.82 — affiché tout de suite (le serveur confirme ensuite)
+        try {
+          await storage.setDoc(`inventory_${invDate}_${mode}`, productId, {
+            id: productId, qty: q,
+            produit: prodById[productId]?.name || '',
+            countedBy: session.name || '', countedAt: new Date().toISOString(),
+          });
+          setInvSaveErr(null);
+        } catch (e) {
+          // V10.82 — avant : refus silencieux (tablette déconnectée du serveur) → « l'inventaire est bloqué »
+          console.error('inventaire setCount', e);
+          const denied = /permission|unauthenticated|insufficient/i.test((e && (e.code || e.message)) || '');
+          setInvSaveErr({ name: prodById[productId]?.name || productId, msg: denied ? 'connexion au serveur perdue sur cette tablette' : kbErrMsg(e) });
+          return;
+        }
         // Indexe la date (fusion : ne touche pas au type/périmètre éventuellement déjà posés)
         try {
           await storage.setDoc('inventory_meta', invDate, {
@@ -8621,6 +8633,22 @@
             </div>
           ) : (
             <div className="card">
+              {/* V10.82 — états bloquants visibles EN HAUT (avant : toast caché par le clavier, bandeau tout en bas) */}
+              {invSaveErr && (
+                <div style={{marginBottom:10,padding:'12px 14px',borderRadius:12,background:'#ffebee',border:'3px solid #c62828'}}>
+                  <div style={{fontSize:19,fontWeight:800,color:'#c62828'}}>❌ Comptage NON enregistré</div>
+                  <div style={{fontSize:15,marginTop:2}}>« {invSaveErr.name} » : {invSaveErr.msg}.</div>
+                  <div style={{fontSize:15,fontWeight:700,marginTop:4}}>👉 Touche « Sortir » en haut, reconnecte-toi avec ton code, puis recompte ce produit.</div>
+                  <button className="btn-secondary" style={{marginTop:8,fontSize:14}} onClick={()=>window.location.reload()}>🔄 Recharger l'appli</button>
+                </div>
+              )}
+              {invLocked && (
+                <div style={{marginBottom:10,padding:'12px 14px',borderRadius:12,background:'#fff3e0',border:'3px solid #ef6c00'}}>
+                  <div style={{fontSize:19,fontWeight:800,color:'#e65100'}}>🔒 Inventaire déjà clôturé{closedInfo && closedInfo.closedBy ? ' par ' + closedInfo.closedBy : ''}</div>
+                  <div style={{fontSize:15,marginTop:2}}>Le comptage est verrouillé : les touches ne comptent plus.</div>
+                  <button className="btn-primary btn-block" style={{marginTop:8,fontSize:17}} onClick={reopenInventory}>🔓 Rouvrir pour compter</button>
+                </div>
+              )}
               <div style={{position:'relative',marginBottom:8}}>
                 <input value={search} onChange={e=>setSearch(e.target.value)}
                   placeholder={invType==='tournant' ? "Filtrer dans le périmètre…" : "Filtrer (nom, producteur)…"}
@@ -14161,6 +14189,7 @@
       const [fc, setFc] = React.useState(undefined);  // V10.74 — prévision serveur (admin)
       const [calib, setCalib] = React.useState(null);
       const [fcTick, setFcTick] = React.useState(0);
+      const [ordTick, setOrdTick] = React.useState(0); // V10.82 — relecture tant que rien n'est chargé
       React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; setDays((l || []).filter(x => x.count > 0)); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
       React.useEffect(() => {
         let stop = false;
@@ -14180,30 +14209,39 @@
       const cur = allDays.find(d => d.day === day) || null;
       React.useEffect(() => { if (!day || !cur || !cur.exact) { setOrders(null); return; } let stop = false; setOrders(null);
         storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
-        return () => { stop = true; }; }, [day, cur && cur.exact]);
+        return () => { stop = true; }; }, [day, cur && cur.exact, ordTick]);
+      // V10.82 — jour connu mais 0 commande chargée (chargement à 10h, parfois plus tard) : ce n'est PAS « 0 commande ».
+      //   On montre la prévision admin si elle existe, sinon « en attente du chargement », et on relit toutes les 2 min.
+      const fcFor = d => ((fc && fc.days) || []).find(x => x && x.day === d) || null;
+      const emptyLoaded = !!(cur && cur.exact && orders && orders.length === 0);
+      React.useEffect(() => { if (!emptyLoaded) return; const t = setTimeout(() => setOrdTick(x => x + 1), 120000); return () => clearTimeout(t); }, [emptyLoaded, ordTick]);
+      const fcZero = f => !!(f && !((f.total && (f.total.n || f.total.nEst)) || 0)); // prévision vide = rien de lu, pas « 0 »
+      let eff = emptyLoaded ? (fcFor(day) ? { day, exact: false, f: fcFor(day) } : { day, exact: false, waiting: true }) : cur;
+      if (eff && !eff.exact && eff.f && fcZero(eff.f)) eff = { day, exact: false, waiting: true };
 
       // lignes par lieu : { c, n, sol, cont, rolls, now } — exact (JSON) ou estimé (admin)
       let rows = [], totN = null, totSol = null, totNow = null, est = false;
-      if (cur && cur.exact && orders) {
+      if (eff && eff.exact && orders) {
         const by = {};
         orders.forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0, cont: 0 }; r.n++; r.cont += kbMepOrderCont(o);
           r.sol += (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); });
         rows = Object.entries(by).map(([c, r]) => ({ c, n: r.n, sol: r.sol, cont: r.cont }));
         totN = orders.length; totSol = rows.reduce((a, r) => a + r.sol, 0);
-      } else if (cur && !cur.exact) {
-        est = !cur.f.closed;
-        rows = Object.entries(cur.f.sites || {}).map(([c, r]) => ({ c, n: r.nEst, now: r.n, sol: r.solEst != null ? r.solEst : r.sol, cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c))) }));
-        totN = cur.f.total.nEst; totNow = cur.f.total.n; totSol = cur.f.total.solEst != null ? cur.f.total.solEst : cur.f.total.sol;
+      } else if (eff && !eff.exact && eff.f) {
+        est = !eff.f.closed;
+        rows = Object.entries(eff.f.sites || {}).map(([c, r]) => ({ c, n: r.nEst, now: r.n, sol: r.solEst != null ? r.solEst : r.sol, cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c))) }));
+        totN = eff.f.total.nEst; totNow = eff.f.total.n; totSol = eff.f.total.solEst != null ? eff.f.total.solEst : eff.f.total.sol;
       }
       rows.forEach(r => { r.rolls = r.c === 'DOM' ? 0 : Math.ceil(r.cont / KB_CASIERS_PAR_ROLL); });
       rows.sort((a, b) => kbPrintSite(a.c).localeCompare(kbPrintSite(b.c), 'fr'));
       const totRolls = rows.reduce((a, r) => a + r.rolls, 0);
       const dom = rows.find(r => r.c === 'DOM');
-      const ap = est ? '≈ ' : '';
+      const ap = est || (eff && !eff.exact && eff.f) ? '≈ ' : '';
       const loading = days === null || fc === undefined;
       const first = allDays[0];
       const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir'
-        : (cur && cur.day === day ? `${cur.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`);
+        : (eff && eff.waiting ? `⏳ Distrib. du ${formatDateShort(day)} : commandes pas encore chargées`
+        : cur && cur.day === day ? `${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`);
       const Card = ({ bg, lbl, v, col, note }) => (
         <div style={{ flex: 1, minWidth: 140, background: bg, borderRadius: 12, padding: '10px 12px' }}>
           <div style={{ fontSize: 14, fontWeight: 600 }}>{lbl}</div>
@@ -14227,18 +14265,23 @@
                 {allDays.map(d => <button key={d.day} onClick={() => setDay(d.day)} className={d.day === day ? 'btn-primary' : 'btn-secondary'} style={{ fontSize: 15, fontWeight: 700, padding: '8px 12px' }}>{d.exact ? '' : '≈ '}Distrib. du {formatDateShort(d.day)}</button>)}
               </div>
               <div style={{ fontSize: 16, marginTop: 8, textTransform: 'capitalize' }}>Distribution du <b>{formatDateFR(day)}</b></div>
-              {cur && !cur.exact && (cur.f.closed
+              {eff && eff.waiting && <div style={{ marginTop: 8, padding: '12px 14px', borderRadius: 12, background: '#fff8e1', border: '3px solid #f9a825' }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: '#8d6e00' }}>⏳ En attente du chargement des commandes</div>
+                  <div style={{ fontSize: 15, marginTop: 2 }}>Les commandes de cette distribution ne sont pas encore chargées (normalement vers <b>10h</b>, parfois plus tard). Ce n'est pas « 0 commande » : les chiffres s'afficheront tout seuls dès le chargement.</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 4 }}>Vérifié toutes les 2 min · <span style={{ textDecoration: 'underline', cursor: 'pointer' }} onClick={() => { setOrdTick(t => t + 1); setFcTick(t => t + 1); }}>vérifier maintenant</span></div>
+                </div>}
+              {eff && !eff.exact && eff.f && (eff.f.closed
                 ? <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 10, background: '#e8f5e9', fontSize: 14, fontWeight: 600 }}>✅ Commandes clôturées (admin) — pas encore chargées dans l'appli. Les {kbMepWord('BIC', 2)} restent une estimation.</div>
                 : <div style={{ marginTop: 8, padding: '10px 12px', borderRadius: 10, background: '#fff3e0', border: '2px solid #ef6c00' }}>
                     <div style={{ fontSize: 18, fontWeight: 700, color: '#e65100' }}>≈ ENVIRON — commandes encore ouvertes</div>
-                    <div style={{ fontSize: 14 }}>Fin des commandes le <b>{cur.f.closeAt}</b>. Déjà <b>{totNow}</b> commande{totNow > 1 ? 's' : ''} → estimé à 10h : <b>≈ {totN}</b> (d'après {cur.f.basis}).</div>
+                    <div style={{ fontSize: 14 }}>Fin des commandes le <b>{eff.f.closeAt}</b>. Déjà <b>{totNow}</b> commande{totNow > 1 ? 's' : ''} → estimé à 10h : <b>≈ {totN}</b> (d'après {eff.f.basis}).</div>
                     <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>Mis à jour {fc && fc.at ? new Date(fc.at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—'}{fc && fc.refreshing ? ' · actualisation en cours…' : ''} · <span style={{ textDecoration: 'underline', cursor: 'pointer' }} onClick={() => setFcTick(t => t + 1)}>actualiser</span></div>
                   </div>)}
-              {cur && cur.exact && <div style={{ marginTop: 6, fontSize: 13, fontWeight: 600, color: '#2e7d32' }}>✅ Commandes chargées : chiffres exacts.</div>}
+              {eff && eff.exact && orders && orders.length > 0 && <div style={{ marginTop: 6, fontSize: 13, fontWeight: 600, color: '#2e7d32' }}>✅ Commandes chargées : chiffres exacts.</div>}
               <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
                 <Card bg="#e3f2fd" lbl="Commandes totales" v={totN == null ? '…' : ap + totN} />
                 <Card bg="#ede7f6" lbl="🛒 Rolls (hors DOM)" v={totN == null ? '…' : ap + totRolls} col="#4527a0" note={`${KB_CASIERS_PAR_ROLL} casiers par roll`} />
-                {dom && <Card bg="#e0f2f1" lbl="📦 Cartons DOM" v={ap + dom.cont} col="#00695c" note={`${ap}${dom.n} livraison${dom.n > 1 ? 's' : ''} à domicile`} />}
+                {dom && !(eff && eff.waiting) && <Card bg="#e0f2f1" lbl="📦 Cartons DOM" v={ap + dom.cont} col="#00695c" note={`${ap}${dom.n} livraison${dom.n > 1 ? 's' : ''} à domicile`} />}
                 <Card bg="#fff3e0" lbl="🧺 Paniers solidaires" v={totSol == null ? '…' : ap + totSol} col="#e65100" note="cagette à part — jamais en casier" />
               </div>
               {totN != null && rows.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(160px,1fr))', gap: 8, marginTop: 10 }}>
@@ -14252,7 +14295,7 @@
                   </div>
                 ))}
               </div>}
-              {cur && !cur.exact && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 8 }}>Casiers / cagettes / cartons estimés d'après les {calib && calib.nDays ? calib.nDays + ' derniers jours chargés' : 'habitudes'} (nb moyen par commande, lieu par lieu). Les vrais numéros arrivent avec le chargement des commandes.</div>}
+              {eff && !eff.exact && eff.f && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 8 }}>Casiers / cagettes / cartons estimés d'après les {calib && calib.nDays ? calib.nDays + ' derniers jours chargés' : 'habitudes'} (nb moyen par commande, lieu par lieu). Les vrais numéros arrivent avec le chargement des commandes.</div>}
             </>)}
         </div>
       );
