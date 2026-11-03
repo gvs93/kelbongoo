@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.85) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.87) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.85';
+const APP_VERSION = 'V10.87';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2070,6 +2070,163 @@ function kbNameGrams(name) {
   let v = parseFloat(m[1].replace(',', '.'));
   if (/kg/i.test(m[2])) v *= 1000;
   return Math.round(v);
+}
+const KB_IA_URL = '';
+const KB_REPL_TO = 'rr@pribon.org, hg@probon.fr';
+async function kbReplMail(day, x) {
+  const id = 'rm|' + encodeURIComponent(x.from + '||' + x.to);
+  try {
+    if (await storage.getDoc(`day_${day}_prep`, id)) return false;
+  } catch (_) {}
+  try {
+    await storage.setDoc(`day_${day}_prep`, id, {
+      from: x.from,
+      to: x.to,
+      by: x.by,
+      sites: x.sites,
+      at: Date.now()
+    }, {
+      replace: true
+    });
+  } catch (_) {}
+  const dist = formatDateShort(day);
+  const subject = `🔄 Remplacement · ${x.by} a remplacé « ${x.from} » par « ${x.to} » · ${x.sites.join(', ')} · ${x.nCli} client${x.nCli > 1 ? 's' : ''}${x.pct ? ' · remise −' + x.pct + ' %' : ''} · distrib ${dist}`;
+  const ia = x.ia === 'ok' ? '🤖 Validé par l\'IA' : x.ia === 'auto' ? '⚙️ Contrôle automatique (IA non branchée)' : '⚙️ Contrôle automatique';
+  const row = (k, v) => `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:15px;color:#666;white-space:nowrap">${k}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:16px"><b>${v}</b></td></tr>`;
+  const htmlBody = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#ea580c;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:15px;font-weight:700">🔄 REMPLACEMENT EN PRÉPA · distrib ${kbEsc(dist)}</div>` + `<div style="font-size:24px;font-weight:900;margin-top:4px"><s style="opacity:.8">${kbEsc(x.from)}</s><br>→ ${kbEsc(x.to)}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:12px">` + row('Par', kbEsc(x.by)) + row('Lieux', kbEsc(x.sites.join(', '))) + row('Clients', `${x.nCli} (${x.nArt} article${x.nArt > 1 ? 's' : ''})`) + row('Remplaçant', kbEsc(x.to) + (x.toProducer ? ' · ' + kbEsc(x.toProducer) : '')) + row('Poids', kbEsc((x.poidsFrom || '?') + ' prévu → ' + (x.poidsTo ? x.poidsTo + ' g pesé' : x.poidsTxt || '?'))) + row('Remise client', x.pct ? '−' + x.pct + ' % (« Remplacement »)' : 'aucune') + row('Contrôle', kbEsc(ia)) + `</table>` + (x.why ? `<div style="margin-top:10px;background:#fff7ed;border-left:6px solid #ea580c;padding:10px 12px;font-size:14px">${kbEsc(x.why)}</div>` : '') + `<div style="margin-top:12px;font-size:13px;color:#777">Les clients sont prévenus dans le mail de clôture de la prépa. Un seul mail par produit remplacé.</div></div>`;
+  const body = `${x.by} a remplacé « ${x.from} » par « ${x.to} »${x.toProducer ? ' (' + x.toProducer + ')' : ''}.\nDistrib : ${dist}\nLieux : ${x.sites.join(', ')}\nClients : ${x.nCli} (${x.nArt} articles)\nRemise : ${x.pct ? '-' + x.pct + ' %' : 'aucune'}\nContrôle : ${ia}\n${x.why || ''}\n\n— Appli Kelbongoo`;
+  try {
+    await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'send_mail',
+      to: KB_REPL_TO,
+      subject,
+      body,
+      htmlBody
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+function kbPoidsRange(t) {
+  const s = String(t || '').replace(/,/g, '.');
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(kg|g|gr)?\b\s*(?:[-–à]\s*(\d+(?:\.\d+)?)\s*(kg|g|gr)?\b)?/i);
+  if (!m) return null;
+  const u = (m[4] || m[2] || '').toLowerCase();
+  if (!u) return null;
+  const f = u === 'kg' ? 1000 : 1;
+  let a = parseFloat(m[1]) * f,
+    b = m[3] ? parseFloat(m[3]) * f : a;
+  if (m[2] && m[4] && m[2].toLowerCase() !== m[4].toLowerCase()) a = parseFloat(m[1]) * (m[2].toLowerCase() === 'kg' ? 1000 : 1);
+  if (!(a > 0) || !(b > 0)) return null;
+  return {
+    min: Math.min(a, b),
+    max: Math.max(a, b),
+    mid: (a + b) / 2
+  };
+}
+const KB_REPL_STOP = new Set(['bio', 'de', 'du', 'des', 'la', 'le', 'les', 'l', 'd', 'en', 'au', 'aux', 'a', 'sachet', 'botte', 'barquette', 'filet', 'kg', 'g', 'gr', 'mini', 'gros', 'grosse', 'petit', 'petite', 'test', 'vrac', 'piece', 'pieces', 'lot', 'colis', 'cagette', 'extra', 'france']);
+const KB_REPL_BIGRAM = ['pomme de terre', 'chou fleur', 'patate douce', 'pois chiche', 'haricot vert', 'chou rouge', 'chou blanc', 'chou kale', 'oignon rouge', 'oignon blanc', 'fruit de la passion', 'noix de coco', 'citron vert', 'feuille de chene', 'pousse epinard'];
+function kbReplEspece(name) {
+  let t = normalizeText(String(name || '').replace(/^\[TEST\]\s*/, '')).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  t = t.split(' ').map(w => w.length > 3 ? w.replace(/(s|x)$/, '') : w).join(' ');
+  const ws = t.split(' '),
+    i0 = ws.findIndex(x => x && !KB_REPL_STOP.has(x) && !/^\d/.test(x));
+  if (i0 < 0) return '';
+  const rest = ws.slice(i0).join(' ') + ' ';
+  for (const b of KB_REPL_BIGRAM) if (rest.indexOf(b + ' ') === 0) return b;
+  return ws[i0];
+}
+function kbReplCheckLocal(from, to) {
+  const out = {
+    verdict: 'ok',
+    why: [],
+    pct: 0,
+    poidsPct: 0,
+    prixPct: 0,
+    needPoids: false
+  };
+  const ef = kbReplEspece(from.name),
+    et = kbReplEspece(to.name);
+  const fam = x => normalizeText(String(x || '')).trim();
+  const sameFam = from.family && to.family ? fam(from.family) === fam(to.family) : null;
+  const sameCat = from.category && to.category ? fam(from.category) === fam(to.category) : null;
+  if (normalizeText(from.name) === normalizeText(to.name)) {
+    out.verdict = 'non';
+    out.simNon = true;
+    out.why.push('C\'est le même produit.');
+    return out;
+  }
+  if (sameCat === false) {
+    out.verdict = 'non';
+    out.simNon = true;
+    out.why.push(`Pas le même rayon (${from.category} ≠ ${to.category}).`);
+  } else if (ef && et && ef !== et) {
+    out.verdict = 'non';
+    out.simNon = true;
+    out.why.push(`Pas le même produit : « ${ef} » ≠ « ${et} ».`);
+  } else if (sameFam === false && !(ef && et && ef === et)) {
+    out.verdict = 'non';
+    out.simNon = true;
+    out.why.push(`Pas la même famille (${from.family} ≠ ${to.family}).`);
+  } else out.why.push(ef ? `Même produit (${ef}).` : 'Produits proches.');
+  const rf = from.poids ? kbPoidsRange(from.poids) : null;
+  const rt = to.poidsReel ? {
+    mid: to.poidsReel
+  } : to.poids ? kbPoidsRange(to.poids) : null;
+  if (rf && !rt) out.needPoids = true;
+  if (rf && rt) {
+    const ratio = rt.mid / rf.mid;
+    if (ratio < 0.7 || ratio > 1.6) {
+      out.verdict = 'non';
+      out.poidsNon = true;
+      out.why.push(`Poids trop différent : ${Math.round(rt.mid)} g au lieu de ${Math.round(rf.mid)} g.`);
+    } else if (ratio < 0.9) {
+      out.poidsPct = Math.max(1, Math.min(99, Math.round((1 - ratio) * 100)));
+      out.why.push(`Plus léger : ${Math.round(rt.mid)} g au lieu de ${Math.round(rf.mid)} g → remise −${out.poidsPct} %.`);
+    } else out.why.push(`Poids OK : ${Math.round(rt.mid)} g pour ${Math.round(rf.mid)} g prévus.`);
+  }
+  if (from.prix > 0 && to.prix > 0 && to.prix < from.prix) {
+    out.prixPct = Math.max(1, Math.min(99, Math.round((1 - to.prix / from.prix) * 100)));
+    out.why.push(`Moins cher (${to.prix.toFixed(2)} € au lieu de ${from.prix.toFixed(2)} €) → remise −${out.prixPct} %.`);
+  }
+  out.pct = Math.max(out.poidsPct, out.prixPct);
+  return out;
+}
+async function kbReplAskIA(from, to) {
+  if (!KB_IA_URL) return null;
+  try {
+    const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const tm = setTimeout(() => {
+      try {
+        ctl && ctl.abort();
+      } catch (e) {}
+    }, 15000);
+    const r = await fetch(KB_IA_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify({
+        action: 'ia-remplacement',
+        from,
+        to
+      }),
+      ...(ctl ? {
+        signal: ctl.signal
+      } : {})
+    });
+    clearTimeout(tm);
+    const j = await r.json();
+    if (!j || !j.ok || !/^(ok|non)$/.test(j.verdict || '')) return null;
+    return {
+      verdict: j.verdict,
+      raison: String(j.raison || '').slice(0, 300)
+    };
+  } catch (e) {
+    return null;
+  }
 }
 function kbPoidsPct(reel, prevu) {
   return reel > 0 && prevu > 0 && reel < prevu ? Math.max(1, Math.min(99, Math.round((1 - reel / prevu) * 100))) : 0;
@@ -3503,7 +3660,8 @@ function parsePrepDocs(arr) {
     lm = {},
     lmKo = {},
     ndForce = {},
-    ndOff = {};
+    ndOff = {},
+    repl = {};
   for (const d of arr || []) {
     const id = d.id;
     if (!id || id === 'counters' || id === 'meta') continue;
@@ -3524,7 +3682,7 @@ function parsePrepDocs(arr) {
       reason: d.reason
     };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'nd') {
       if (d.v !== 'done' && key.split('||').length === 2) ndForce[key] = true;
-    } else if (pfx === 'nx') ndOff[key] = true;
+    } else if (pfx === 'nx') ndOff[key] = true;else if (pfx === 'rp' && d.to) repl[key] = d;
   }
   return {
     status,
@@ -3535,7 +3693,8 @@ function parsePrepDocs(arr) {
     lm,
     lmKo,
     ndForce,
-    ndOff
+    ndOff,
+    repl
   };
 }
 function kbPartMiss(prep, k, qty) {
@@ -3598,7 +3757,8 @@ function applyPrepToOrder(o, prep) {
   const hasLm = prep.lm && Object.keys(prep.lm).length;
   const isDom = String(site || '').toUpperCase() === 'DOM';
   const hasNdx = prep.ndOff && Object.keys(prep.ndOff).length || prep.ndForce && Object.keys(prep.ndForce).length || isDom && (o.items || []).some(i => i && i.cat === 'nd');
-  if (!hasStatus && !hasRem && !hasLm && !hasNdx) return o;
+  const hasRepl = prep.repl && Object.keys(prep.repl).length;
+  if (!hasStatus && !hasRem && !hasLm && !hasNdx && !hasRepl) return o;
   const items = [],
     removed = [...(o.removed || [])],
     reduced = [...(o.reduced || [])];
@@ -3660,6 +3820,13 @@ function applyPrepToOrder(o, prep) {
       _lm: true
     };
     const pkn = String(site || '').toUpperCase() + '||' + it.produit;
+    if (prep.repl && prep.repl[pkn]) it = {
+      ...it,
+      _repl: {
+        to: prep.repl[pkn].to,
+        producer: prep.repl[pkn].toProducer || ''
+      }
+    };
     if (it.cat === 'nd' && !it.solidaire && (isDom || prep.ndOff && prep.ndOff[pkn] && !(prep.ndForce && prep.ndForce[pkn]))) it = {
       ...it,
       cat: 'frais',
@@ -6471,7 +6638,9 @@ function ClientsPage({
         color: 'var(--ink)',
         lineHeight: 1.2
       }
-    }, "🥬 ", kbProdName(p.produit), React.createElement(KbPoids, {
+    }, "🥬 ", kbProdName(p.produit), React.createElement(KbReplTag, {
+      p: p
+    }), React.createElement(KbPoids, {
       idx: wIdx,
       p: p,
       block: true
@@ -6543,7 +6712,9 @@ function ClientsPage({
         fontWeight: 700,
         fontSize: 17
       }
-    }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit)))), React.createElement(KbAckBtn, {
+    }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit), React.createElement(KbReplTag, {
+      p: p
+    })))), React.createElement(KbAckBtn, {
       label: "✅ C'est noté : pas donné au client",
       onClick: () => kbAckSet('ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo), true, session.name)
     })), lmItems.length > 0 && !kbAckOk(lmDone, 'lm', kbClientKey(o), lmItems) && React.createElement("div", {
@@ -7711,7 +7882,9 @@ function ClientDetailV4({
         lineHeight: 1.2,
         wordBreak: 'break-word'
       }
-    }, kbProdName(p.produit)), React.createElement(KbPoids, {
+    }, kbProdName(p.produit)), React.createElement(KbReplTag, {
+      p: p
+    }), React.createElement(KbPoids, {
       idx: wIdx,
       p: p,
       block: true
@@ -8093,7 +8266,9 @@ function ClientDetailV4({
       fontWeight: 700,
       fontSize: 18
     }
-  }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit), p.producteur ? ` · ${p.producteur}` : ''))), React.createElement(KbAckBtn, {
+  }, Number(p.qty || p.quantity) || 1, "×"), React.createElement("span", null, kbProdName(p.produit), p.producteur ? ` · ${p.producteur}` : '', React.createElement(KbReplTag, {
+    p: p
+  })))), React.createElement(KbAckBtn, {
     label: "✅ C'est noté : pas donné au client",
     onClick: () => kbAckSet('ko', kbClientKey(o), (o.removed || []).filter(r => r._lmKo), true, session.name)
   })), lm.length > 0 && kbAckOk(acks, 'lm', kbClientKey(o), lm) && React.createElement("div", {
@@ -16414,6 +16589,24 @@ function AncienDistribPanel({
     disabled: busy,
     onClick: send
   }, busy ? 'Envoi…' : `✉️ Envoyer à ${KB_RECAP_TO}`)));
+}
+function KbReplTag({
+  p
+}) {
+  if (!p || !p._repl) return null;
+  return React.createElement("span", {
+    style: {
+      display: 'block',
+      marginTop: 4,
+      fontSize: 16,
+      fontWeight: 800,
+      color: '#fff',
+      background: '#ea580c',
+      borderRadius: 8,
+      padding: '3px 8px',
+      lineHeight: 1.25
+    }
+  }, "🔄 Remplacé par : ", p._repl.to);
 }
 function KbSheet({
   title,
@@ -28621,6 +28814,7 @@ function kbParsePrepDocs(arr) {
     remCli: {},
     remAll: {},
     ndOff: {},
+    repl: {},
     meta: null,
     cmails: null
   };
@@ -28641,7 +28835,7 @@ function kbParsePrepDocs(arr) {
     if (pfx === 'st') {
       P.status[key] = d.v;
       if (d.v === 'partiel') P.posedN[key] = d.n || 0;
-    } else if (pfx === 'nd') P.nd[key] = d;else if (pfx === 'lm') P.lm[key] = true;else if (pfx === 'cs') P.casiers[key] = (d.nums || []).map(String);else if (pfx === 'rc') P.remCli[key] = d;else if (pfx === 'ra') P.remAll[key] = d;else if (pfx === 'nx') P.ndOff[key] = true;
+    } else if (pfx === 'nd') P.nd[key] = d;else if (pfx === 'lm') P.lm[key] = true;else if (pfx === 'cs') P.casiers[key] = (d.nums || []).map(String);else if (pfx === 'rc') P.remCli[key] = d;else if (pfx === 'ra') P.remAll[key] = d;else if (pfx === 'nx') P.ndOff[key] = true;else if (pfx === 'rp' && d.to) P.repl[key] = d;
   });
   return P;
 }
@@ -28711,8 +28905,13 @@ function kbClientMailsClients(day, data) {
       const K = c.site + '||' + c.name + '||' + it.product,
         PK = c.site + '||' + it.product;
       const rem = prep.remCli[K] || prep.remAll[PK];
+      const rp = prep.repl && prep.repl[PK];
       const line = {
         ...it,
+        repl: rp ? {
+          to: rp.to,
+          producer: rp.toProducer || ''
+        } : null,
         rem: rem ? {
           pct: rem.pct,
           reason: rem.reason,
@@ -28778,7 +28977,7 @@ function kbMailHtml(kind, day, c, lieu, hours) {
     jour = kbCmDate(day);
   const first = c.firstname || String(c.name).split(' ')[0];
   const lieuNom = lieu && lieu.name || SITE_NAMES[c.site] || c.site;
-  const qte = l => `${l.qty > 1 ? `<b>${l.qty} ×</b> ` : ''}${kbEsc(l.product)}${l.type ? ` <span style="color:#777">· ${kbEsc(l.type)}</span>` : ''}`;
+  const qte = l => l.repl ? `${l.qty > 1 ? `<b>${l.qty} ×</b> ` : ''}<b>${kbEsc(l.repl.to)}</b> <span style="display:inline-block;background:#ea580c;color:#fff;font-weight:800;font-size:12px;border-radius:6px;padding:1px 6px">🔄 REMPLACEMENT</span><br><span style="color:#9a3412;font-size:13px">à la place de <s>${kbEsc(l.product)}</s> (indisponible)</span>` : `${l.qty > 1 ? `<b>${l.qty} ×</b> ` : ''}${kbEsc(l.product)}${l.type ? ` <span style="color:#777">· ${kbEsc(l.type)}</span>` : ''}`;
   const rem = l => l.rem ? ` <span style="color:#a3125b;font-weight:700">· remise -${l.rem.pct}%${l.rem.n ? ' sur ' + l.rem.n : ''}${l.rem.reason ? ' (' + kbEsc(l.rem.reason) + ')' : ''}</span>` : '';
   const list = (arr, fn) => arr.map(l => `<tr><td style="padding:7px 0;border-bottom:1px solid #eee;font-size:15px;line-height:1.35">${fn(l)}</td></tr>`).join('');
   const section = (title, color, sub, rows) => rows ? `<tr><td style="padding:18px 0 4px"><div style="font-size:16px;font-weight:800;color:${color}">${title}</div>${sub ? `<div style="font-size:13px;color:#666;margin-top:2px">${sub}</div>` : ''}<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:6px">${rows}</table></td></tr>` : '';
@@ -28797,6 +28996,8 @@ function kbMailHtml(kind, day, c, lieu, hours) {
   if (kind === 'cloture') {
     const when = kbCmWhen(day);
     intro = isDom ? `Bonjour ${kbEsc(first)},<br><br>Notre équipe vient de préparer votre commande${when.rel ? ' de <b>' + when.rel + '</b>' : ''}. Elle vous sera livrée le <b>${kbEsc(jour)}</b>${horaire ? ` entre <b>${horaire}</b>` : ''}. Voici le récapitulatif.` : `Bonjour ${kbEsc(first)},<br><br>Notre équipe vient de préparer votre commande${when.rel ? ' de <b>' + when.rel + '</b>' : ''}. Elle sera à retirer le <b>${kbEsc(jour)}</b>${horaire ? ` entre <b>${horaire}</b>` : ''} à <b>${kbEsc(lieuNom)}</b>${when.future ? ' — <b>pas avant</b>' : ''}. Voici le récapitulatif.`;
+    const nRepl = [...c.casier, ...c.hors].filter(l => l.repl).length;
+    if (nRepl) sections += `<tr><td style="padding:14px 0 0"><div style="background:#fff7ed;border:2px solid #ea580c;border-radius:12px;padding:10px 14px;font-size:15px;color:#7c2d12"><b>🔄 ${nRepl > 1 ? nRepl + ' produits remplacés' : '1 produit remplacé'}</b><br>Un produit de votre commande n'était pas disponible : nous l'avons remplacé par un produit équivalent (même usage, poids équivalent). Si le remplaçant est plus léger ou moins cher, la différence est déduite.</div></td></tr>`;
     sections += section(`🧺 Dans votre casier (${c.casier.reduce((a, l) => a + l.qty, 0)} article${c.casier.reduce((a, l) => a + l.qty, 0) > 1 ? 's' : ''})`, '#222', '', list(c.casier, l => qte(l) + rem(l)));
     sections += section('🤲 Hors casier', '#7a3a12', 'Remis en main propre par le distributeur.', list(c.hors, l => qte(l) + ' <span style="color:#7a3a12">(hors casier)</span>' + rem(l)));
     sections += section('🟣 Dernière minute (probable)', '#7c3aed', 'Produits attendus le jour de la distribution : ajoutés s\'ils arrivent, sinon non facturés.', list(c.lm, lmLabel));
@@ -28831,7 +29032,7 @@ function kbMailText(kind, day, c, lieu, hours) {
       arr.forEach(l => L.push('- ' + fn(l)));
     }
   };
-  const q = l => `${l.qty > 1 ? l.qty + ' x ' : ''}${l.product}`;
+  const q = l => l.repl ? `${l.qty > 1 ? l.qty + ' x ' : ''}${l.repl.to} (REMPLACEMENT de ${l.product}, indisponible)` : `${l.qty > 1 ? l.qty + ' x ' : ''}${l.product}`;
   sec(c.site === 'DOM' ? 'Votre commande :' : 'Dans votre casier :', c.casier, l => q(l) + (l.rem ? ` (remise -${l.rem.pct}%)` : ''));
   sec('Hors casier (remis par le distributeur) :', c.hors, l => q(l) + ' (hors casier)');
   sec('Dernière minute :', c.lm, l => q(l) + (kind === 'cloture' || l.lmState === 'attente' ? ' - ajouté si reçu' : l.lmState === 'ok' ? ' - reçu, dans votre casier' : l.lmState === 'nd' ? ' - remis par le distributeur selon arrivage' : ' - indisponible, non facturé'));
@@ -29372,7 +29573,8 @@ function PrepaDuJourPage({
     counters: {},
     closed: false,
     closedBy: '',
-    ndOff: {}
+    ndOff: {},
+    repl: {}
   });
   const [mode, setMode] = React.useState('produits');
   const [curSite, setCurSite] = React.useState(null);
@@ -29381,6 +29583,7 @@ function PrepaDuJourPage({
   const [clientFilter, setClientFilter] = React.useState('');
   const [moreOpen, setMoreOpen] = React.useState({});
   const [remAllOpen, setRemAllOpen] = React.useState({});
+  const [replBox, setReplBox] = React.useState(null);
   const [remCliOpen, setRemCliOpen] = React.useState({});
   const [openClient, setOpenClient] = React.useState(null);
   const [ancienOpen, setAncienOpen] = React.useState(false);
@@ -29562,7 +29765,8 @@ function PrepaDuJourPage({
         nx = {},
         sb = {},
         pr = {},
-        pc = {};
+        pc = {},
+        rp = {};
       let counters = {},
         closed = false,
         closedBy = '',
@@ -29607,7 +29811,7 @@ function PrepaDuJourPage({
           placed: d.placed,
           alloc: d.alloc || [],
           shortage: d.shortage || []
-        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') cs[key] = d.nums || [];else if (pfx === 'nx') nx[key] = true;
+        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') cs[key] = d.nums || [];else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
       });
       setPrep({
         status: st,
@@ -29624,7 +29828,8 @@ function PrepaDuJourPage({
         statusBy: sb,
         presence: pr,
         count: pc,
-        dom
+        dom,
+        repl: rp
       });
     });
     return unsub;
@@ -29985,6 +30190,392 @@ function PrepaDuJourPage({
     }));
     showToast(`🏷️ Remise poids −${pct} % enregistrée (${rs.length} client${rs.length > 1 ? 's' : ''})`);
   };
+  const replCatOf = (name, id) => catalog && id && catalog[id] || catByName[muStrip(String(name || '').replace(/^\[TEST\]\s*/, '').toLowerCase()).replace(/[^a-z0-9]+/g, ' ').trim()] || null;
+  const replFrom = product => {
+    const r0 = rows.find(r => r.product === product) || {};
+    const c = replCatOf(product, r0.id) || {};
+    const ng = kbNameGrams(product);
+    return {
+      name: String(product).replace(/^\[TEST\]\s*/, ''),
+      producer: r0.producer || c.producer || '',
+      family: c.family || '',
+      category: c.category || '',
+      uv: r0.type || c.uv || '',
+      poids: weightOf(r0) || (kbPoidsRange(r0.type) ? r0.type : '') || (ng ? ng + ' g' : ''),
+      prix: c.priceTTC || 0
+    };
+  };
+  const replToOf = c => {
+    const ng = kbNameGrams(c.name);
+    const w = kbPoidsOf(wIdx, {
+      produit: c.name,
+      id: c.id
+    });
+    return {
+      name: c.name,
+      producer: c.producer || '',
+      family: c.family || '',
+      category: c.category || '',
+      uv: c.uv || '',
+      poids: w || (kbPoidsRange(c.uv) ? c.uv : '') || (ng ? ng + ' g' : ''),
+      prix: c.priceTTC || 0
+    };
+  };
+  const openRepl = (site, product) => {
+    const ps = [...new Set(rows.filter(r => r.product === product).map(r => r.site))].sort();
+    setReplBox({
+      product,
+      site,
+      allSites: ps,
+      all: ps.length > 1,
+      q: '',
+      pick: null,
+      poidsReel: '',
+      local: null,
+      ia: null,
+      iaBusy: false
+    });
+    setMoreOpen(m => ({
+      ...m,
+      [PK(site, product)]: false
+    }));
+  };
+  const replCands = React.useMemo(() => {
+    if (!replBox) return [];
+    const esp = kbReplEspece(replBox.product);
+    const q = replBox.q.trim();
+    const seen = new Set();
+    const out = [];
+    Object.entries(catalog || {}).forEach(([id, c]) => {
+      if (!c || !c.name || c.active === false) return;
+      const nk = normalizeText(c.name);
+      if (nk === normalizeText(replBox.product) || seen.has(nk + '|' + (c.producer || ''))) return;
+      const same = esp && kbReplEspece(c.name) === esp;
+      if (q ? !kbSearchMatch(c.name + ' ' + (c.producer || ''), q) : !same) return;
+      seen.add(nk + '|' + (c.producer || ''));
+      out.push({
+        id,
+        ...c,
+        _same: same
+      });
+    });
+    return out.sort((a, b) => (b._same ? 1 : 0) - (a._same ? 1 : 0) || a.name.localeCompare(b.name)).slice(0, 40);
+  }, [replBox && replBox.q, replBox && replBox.product, catalog]);
+  const runReplCheck = (box, pick, poidsReel) => {
+    const from = replFrom(box.product);
+    const to = {
+      ...replToOf(pick),
+      poidsReel: kbParseGrams(poidsReel) || 0
+    };
+    return kbReplCheckLocal(from, to);
+  };
+  const pickRepl = async c => {
+    const box = replBox;
+    const local = runReplCheck(box, c, '');
+    setReplBox(b => ({
+      ...b,
+      pick: c,
+      poidsReel: '',
+      local,
+      ia: null,
+      iaBusy: !!KB_IA_URL
+    }));
+    if (!KB_IA_URL) return;
+    const from = replFrom(box.product),
+      to = replToOf(c);
+    const ia = await kbReplAskIA(from, to);
+    setReplBox(b => b && b.pick === c ? {
+      ...b,
+      ia,
+      iaBusy: false
+    } : b);
+  };
+  const setReplPoids = v => setReplBox(b => b ? {
+    ...b,
+    poidsReel: v,
+    local: b.pick ? runReplCheck(b, b.pick, v) : b.local
+  } : b);
+  const replBlocked = b => {
+    if (!b || !b.pick || !b.local) return 'Choisis le produit de remplacement.';
+    if (b.iaBusy) return 'L\'IA vérifie…';
+    if (b.local.needPoids && !kbParseGrams(b.poidsReel)) return 'Pèse 1 article du remplaçant et indique son poids.';
+    if (b.local.poidsNon) return 'Poids trop différent : pas de remplacement possible.';
+    if (b.ia) return b.ia.verdict === 'non' ? 'L\'IA refuse : produit pas similaire.' : '';
+    return b.local.simNon ? 'Produit pas similaire : pas de remplacement possible.' : '';
+  };
+  const applyRepl = () => {
+    const b = replBox;
+    if (!b || replBlocked(b)) return;
+    const sites = b.all ? b.allSites : [b.site];
+    const pct = b.local.pct || 0;
+    const to = replToOf(b.pick);
+    if (!confirm(`🔄 Remplacer « ${b.product} »\npar « ${b.pick.name} »\n\nLieux : ${sites.join(', ')}${pct ? `\nRemise client : −${pct} %` : ''}\n\nLes clients seront prévenus dans le mail de clôture de la prépa. Valider ?`)) return;
+    sites.forEach(site => {
+      const pk = PK(site, b.product);
+      storage.setDoc(`day_${day}_prep`, 'rp|' + encId(pk), {
+        to: b.pick.name,
+        toId: b.pick.id || '',
+        toProducer: b.pick.producer || '',
+        from: b.product,
+        poidsTo: kbParseGrams(b.poidsReel) || 0,
+        poidsTxt: to.poids || '',
+        pct,
+        ia: b.ia ? b.ia.verdict : 'auto',
+        why: (b.ia && b.ia.raison ? b.ia.raison + ' · ' : '') + b.local.why.join(' '),
+        by: user,
+        at: Date.now()
+      }, {
+        replace: true
+      });
+      rows.filter(r => r.site === site && r.product === b.product).forEach(r => {
+        const x = prep.status[K(r)];
+        if (x === 'rupture' || x === 'partiel') wStatus(K(r), null);
+      });
+      if (prep.lm[pk]) wLM(pk, false);
+      const ra0 = prep.remiseAll[pk];
+      if (pct > 0) wRemAll(pk, {
+        pct,
+        reason: 'Remplacement'
+      });else if (ra0 && ra0.reason === 'Remplacement') wRemAll(pk, null);
+    });
+    const lines = rows.filter(r => r.product === b.product && sites.includes(r.site));
+    kbReplMail(day, {
+      from: b.product,
+      to: b.pick.name,
+      toProducer: b.pick.producer || '',
+      by: user,
+      sites,
+      nCli: new Set(lines.map(r => r.site + '||' + r.client)).size,
+      nArt: lines.reduce((a, r) => a + (r.qty || 1), 0),
+      pct,
+      ia: b.ia ? b.ia.verdict : 'auto',
+      why: (b.ia && b.ia.raison ? b.ia.raison + ' · ' : '') + b.local.why.join(' '),
+      poidsFrom: replFrom(b.product).poids,
+      poidsTo: kbParseGrams(b.poidsReel) || 0,
+      poidsTxt: to.poids || ''
+    }).catch(() => {});
+    showToast(`🔄 ${b.product} → ${b.pick.name} (${sites.length} lieu${sites.length > 1 ? 'x' : ''})${pct ? ` · remise −${pct} %` : ''}`);
+    setReplBox(null);
+  };
+  const cancelRepl = (site, product) => {
+    if (!confirm(`Annuler le remplacement de « ${product} » à ${site} ?\nLe client recevra à nouveau ${product} (ou rupture si absent).`)) return;
+    const pk = PK(site, product);
+    storage.deleteDoc(`day_${day}_prep`, 'rp|' + encId(pk)).catch(() => {});
+    const ra0 = prep.remiseAll[pk];
+    if (ra0 && ra0.reason === 'Remplacement') wRemAll(pk, null);
+    showToast('🔄 Remplacement annulé');
+  };
+  const replPopup = replBox && (() => {
+    const b = replBox;
+    const from = replFrom(b.product);
+    const blk = replBlocked(b);
+    const big = {
+      fontSize: 18
+    };
+    return React.createElement(KbSheet, {
+      title: "🔄 Remplacer un produit",
+      onClose: () => setReplBox(null)
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      }
+    }, React.createElement("div", {
+      style: {
+        background: '#f3f1ec',
+        borderRadius: 12,
+        padding: '10px 12px'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: '#777'
+      }
+    }, "Indisponible"), React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 800
+      }
+    }, b.product), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: '#555'
+      }
+    }, from.producer, from.poids ? ' · ⚖️ ' + from.poids : '', from.prix ? ' · ' + from.prix.toFixed(2) + ' €' : '')), !b.pick && React.createElement(React.Fragment, null, React.createElement("input", {
+      className: "pdj-cfilter",
+      autoFocus: true,
+      placeholder: "🔍 Chercher le remplaçant (ex : poire williams)",
+      value: b.q,
+      onChange: e => {
+        const v = e.target.value;
+        setReplBox(x => ({
+          ...x,
+          q: v
+        }));
+      }
+    }), !b.q && React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: '#777'
+      }
+    }, "Suggestions : même produit, autre variété."), React.createElement("div", {
+      style: {
+        maxHeight: '46vh',
+        overflowY: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6
+      }
+    }, catalog === null && React.createElement("div", null, "Chargement du catalogue…"), catalog && !replCands.length && React.createElement("div", {
+      style: {
+        fontSize: 16,
+        color: '#777',
+        padding: 8
+      }
+    }, b.q ? 'Aucun produit trouvé.' : 'Tape le nom du produit reçu.'), replCands.map(c => {
+      const t = replToOf(c);
+      return React.createElement("div", {
+        key: c.id,
+        onClick: () => pickRepl(c),
+        style: {
+          border: '2px solid ' + (c._same ? '#ea580c' : '#cfc8bb'),
+          borderRadius: 12,
+          padding: '10px 12px',
+          cursor: 'pointer',
+          background: '#fff'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 19,
+          fontWeight: 700
+        }
+      }, c.name), React.createElement("div", {
+        style: {
+          fontSize: 14,
+          color: '#666'
+        }
+      }, c.producer, t.poids ? ' · ⚖️ ' + t.poids : '', c.priceTTC ? ' · ' + c.priceTTC.toFixed(2) + ' €' : ''));
+    }))), b.pick && React.createElement(React.Fragment, null, React.createElement("div", {
+      style: {
+        background: '#fff7ed',
+        border: '3px solid #ea580c',
+        borderRadius: 12,
+        padding: '10px 12px'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: '#9a3412'
+      }
+    }, "Remplacé par"), React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 800,
+        color: '#7c2d12'
+      }
+    }, b.pick.name), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: '#7c2d12'
+      }
+    }, replToOf(b.pick).producer, replToOf(b.pick).poids ? ' · ⚖️ ' + replToOf(b.pick).poids : '', b.pick.priceTTC ? ' · ' + b.pick.priceTTC.toFixed(2) + ' €' : ''), React.createElement("button", {
+      className: "pdj-btn",
+      style: {
+        marginTop: 6
+      },
+      onClick: () => setReplBox(x => ({
+        ...x,
+        pick: null,
+        local: null,
+        ia: null,
+        iaBusy: false
+      }))
+    }, "↩ Changer")), b.local && (b.local.needPoids || b.poidsReel) && React.createElement("div", null, React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700,
+        marginBottom: 4
+      }
+    }, "⚖️ Poids réel d'1 article du remplaçant (prévu : ", from.poids, ")"), React.createElement("input", {
+      className: "pdj-cfilter",
+      inputMode: "decimal",
+      placeholder: "ex : 180 g",
+      value: b.poidsReel,
+      onChange: e => setReplPoids(e.target.value)
+    })), React.createElement("div", {
+      style: {
+        borderRadius: 12,
+        padding: '10px 12px',
+        background: blk ? '#fdecea' : '#e8f5e9',
+        border: '2px solid ' + (blk ? '#c62828' : '#2e7d32')
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 18,
+        fontWeight: 800,
+        color: blk ? '#c62828' : '#2e7d32'
+      }
+    }, b.iaBusy ? '🤖 L\'IA vérifie…' : blk ? '⛔ ' + blk : '✅ Remplacement accepté'), b.ia && React.createElement("div", {
+      style: {
+        fontSize: 15,
+        marginTop: 4
+      }
+    }, "🤖 ", b.ia.raison), !KB_IA_URL && React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: '#777',
+        marginTop: 4
+      }
+    }, "Contrôle automatique (IA pas encore branchée)."), KB_IA_URL && !b.iaBusy && !b.ia && React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: '#777',
+        marginTop: 4
+      }
+    }, "IA injoignable : contrôle automatique."), React.createElement("ul", {
+      style: {
+        margin: '6px 0 0',
+        paddingLeft: 18,
+        fontSize: 15
+      }
+    }, (b.local ? b.local.why : []).map((w, i) => React.createElement("li", {
+      key: i
+    }, w))))), b.allSites.length > 1 && React.createElement("label", {
+      style: {
+        ...big,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        fontWeight: 700
+      }
+    }, React.createElement("input", {
+      type: "checkbox",
+      checked: b.all,
+      style: {
+        width: 26,
+        height: 26
+      },
+      onChange: e => {
+        const v = e.target.checked;
+        setReplBox(x => ({
+          ...x,
+          all: v
+        }));
+      }
+    }), "Tous les lieux (", b.allSites.join(', '), ")"), b.pick && React.createElement("button", {
+      className: "pdj-go",
+      disabled: !!blk,
+      style: {
+        width: '100%',
+        minHeight: 64,
+        fontSize: 21,
+        background: blk ? '#bbb' : '#ea580c',
+        borderColor: blk ? '#bbb' : '#ea580c'
+      },
+      onClick: applyRepl
+    }, "🔄 Valider le remplacement")));
+  })();
   const setPoids1 = r => setPoidsRows([r], prep.poids[K(r)] || '', true);
   const setPoidsProd = (site, product) => setPoidsRows(rows.filter(r => r.site === site && r.product === product), '', false);
   const ndSavedAt = React.useRef({});
@@ -30542,13 +31133,40 @@ function PrepaDuJourPage({
     const total = po.reduce((s, r) => s + r.qty, 0);
     const nd = ndOn(pk) ? ndData(pk) : null,
       lm = prep.lm[pk],
-      ra = prep.remiseAll[pk];
+      ra = prep.remiseAll[pk],
+      rp = prep.repl && prep.repl[pk];
     const allDone = po.every(handled);
     return React.createElement("div", {
       key: pk,
       style: kbSiteVars(site),
       className: "pdj-card sc" + (allDone ? " done" : "") + (nd ? " nd" : "") + (lm ? " lm" : "")
+    }, rp && React.createElement("div", {
+      className: "pdj-repl"
     }, React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 700
+      }
+    }, "🔄 REMPLACEMENT · mettre à la place :"), React.createElement("div", {
+      style: {
+        fontSize: 26,
+        fontWeight: 900,
+        lineHeight: 1.15
+      }
+    }, rp.to), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        opacity: .9
+      }
+    }, rp.toProducer || '', rp.pct ? ` · remise client −${rp.pct} %` : '', rp.by ? ` · par ${String(rp.by).split(' ')[0]}` : ''), !prep.closed && React.createElement("button", {
+      className: "pdj-btn",
+      style: {
+        marginTop: 6,
+        background: '#fff',
+        color: '#9a3412'
+      },
+      onClick: () => cancelRepl(site, product)
+    }, "Annuler le remplacement")), React.createElement("div", {
       className: "pdj-pname"
     }, product, nd && React.createElement("span", {
       className: "pdj-badge nd"
@@ -30760,6 +31378,9 @@ function PrepaDuJourPage({
       className: "pdj-act lm" + (lm ? " on" : ""),
       onClick: () => toggleLM(pk)
     }, "🟣 Dispatch dern. min."), React.createElement("div", {
+      className: "pdj-act repl" + (rp ? " on" : ""),
+      onClick: () => rp ? cancelRepl(site, product) : openRepl(site, product)
+    }, rp ? "🔄 Remplacé ✓" : "🔄 Remplacer"), React.createElement("div", {
       className: "pdj-act rupt",
       onClick: () => ruptAll(site, product)
     }, "🚫 Rupture tout"), React.createElement("div", {
@@ -30921,7 +31542,7 @@ function PrepaDuJourPage({
         marginTop: 12
       },
       onClick: () => setAncienOpen(true)
-    }, "🚫 Ruptures ancien site")), rgPopup, React.createElement("div", {
+    }, "🚫 Ruptures ancien site")), rgPopup, replPopup, React.createElement("div", {
       style: {
         maxWidth: 520,
         margin: '12px auto'
@@ -31634,7 +32255,7 @@ function PrepaDuJourPage({
         marginTop: 8
       }
     }, "Un numéro = un seul client par lieu. Casier pas utilisé ? ✕ pour le supprimer : son n° redevient libre.")));
-  })(), rgPopup, React.createElement("div", {
+  })(), rgPopup, replPopup, React.createElement("div", {
     className: "pdj-topbar"
   }, React.createElement("div", {
     className: "pdj-modebar"
@@ -32024,6 +32645,8 @@ function PdjStyle() {
 .pdj-act.nd{border-color:var(--nd);color:var(--nd);background:var(--nd-s)}.pdj-act.nd.on{background:var(--nd);color:#fff}
 .pdj-act.lm{border-color:var(--lm);color:var(--lm);background:var(--lm-s)}.pdj-act.lm.on{background:var(--lm);color:#fff}
 .pdj-act.rupt{border-color:var(--warn);color:#7a5a06;background:var(--warn-s)}
+.pdj-act.repl{border-color:#ea580c;color:#9a3412;background:#fff7ed}.pdj-act.repl.on{background:#ea580c;color:#fff}
+.pdj-repl{background:#ea580c;color:#fff;border-radius:12px;padding:10px 12px;margin-bottom:8px}
 .pdj-menu{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:2px dashed #e8e3da}
 .pdj-mact{flex:1 1 160px;min-height:56px;display:flex;align-items:center;justify-content:center;padding:8px 12px;border-radius:12px;border:2px solid #cfc8bb;background:#fff;font-size:18px;font-weight:700;cursor:pointer}
 .pdj-mact.rem{border-color:var(--rem);color:var(--rem);background:var(--rem-s)}
