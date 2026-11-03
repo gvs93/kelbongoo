@@ -785,7 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.92';
+    const APP_VERSION = 'V10.94';
+    // V10.94 — (03/11/2026) Distrib : sur chaque ligne produit, « ⏳ Remise prépa en cours −X% ×N » quand l'ancien site de prépa a refusé la remise (HTTP 500 sur « Ajuster le poids », Firestore day_<jour>_prepremko écrit par KBG_Ancien v1.9) ; KBG_AncienDistrib v1.4 l'applique en % au report distrib. « ✅ Remise prépa faite sur l'ancien site » quand une relance a réussi.
+    // V10.93 — (03/11/2026) Qui fait quoi : un code Centrale n'est plus marqué « hors registre » quand le serveur du registre est en erreur (réponse non mémorisée, nouvel essai) ; libellé « Nom en attente (registre injoignable) ». Va avec Apps Script « Enlèvement Rungis » v9.4 (resolve-name réparé).
     // V10.92 — (03/11/2026) 📆 HORAIRES EXCEPTIONNELS (Master › Pilotage › 📍 Lieux & horaires) : date(s) au calendrier (du … au …), lieux (ou Tous), ⛔ Fermé ou 🕑 horaires spéciaux, note ; enregistré tout de suite, supprimé seul une fois la date passée. Prioritaire sur les horaires habituels : calendrier des distributions (sitesForDate : fermé = retiré, ouverture spéciale = ajoutée), horaires du jour (kbLieuHours → distrib, rappel mail client, fin de distribution). Données : app_config/lieux › sites[c].exc.
     // V10.91 — (03/11/2026) 📅 PRÉPA LE JOUR MÊME (ex. mer. 11/11 férié → commandes du jeudi préparées jeudi matin) : Master › Pilotage › 📍 Lieux & horaires › « 📅 Prépa le jour même » (dates). Ce jour-là, tant que la prépa du jour n'est pas clôturée : Prépa + MU sur la distribution DU JOUR (avant : basculait sur le lendemain, MU du vendredi), poste synchro autorisé sur aujourd'hui, pas de rajout F&L Rungis auto ; après clôture → retour au lendemain. La veille, rien ne change (prépa du lendemain).
     // V10.90 — (03/11/2026) Remplacement PARTIEL / une seule boutique : « Combien de X as-tu ? » → casiers servis dans l'ordre (lieu puis casier), cases à cocher par client + boutons lieu (BIC 3/5…) ; doc rp| avec only:[clients] si partiel ; badge 🔄 / « garde … » sur chaque casier ; remise « Remplacement » posée seulement sur les clients remplacés ; distrib + mails clients seulement pour eux ; mail interne « Remplacement PARTIEL · … X clients sur Y ».
@@ -5616,6 +5618,21 @@
         });
         return () => { u && u(); };
       }, [o.orderId, dayKey]);
+      // V10.94 — remises de prépa refusées par l'ancien site de prépa (KBG_Ancien v1.9 → day_<jour>_prepremko) :
+      //   « en cours » tant qu'elles ne sont pas faites (ko:true) ; KBG_AncienDistrib v1.4 les applique en % au report distrib.
+      const [prepRemKo, setPrepRemKo] = React.useState([]);
+      React.useEffect(() => {
+        const u = storage.subscribe(`day_${dayKey}_prepremko`, (arr) => {
+          setPrepRemKo((arr || []).filter(r => orderIds.includes(String(r.orderId))));
+        });
+        return () => { u && u(); };
+      }, [o.orderId, dayKey]);
+      const remEnCours = {};
+      for (const r of prepRemKo) {
+        const k = String(r.productId || '');
+        const m = remEnCours[k] || (remEnCours[k] = { ko: 0, ok: 0, pct: Number(r.pct) || 0 });
+        if (r.ko === true) m.ko += Number(r.qty) || 1; else m.ok += Number(r.qty) || 1;
+      }
       const refundByProd = {};
       for (const r of refunds) refundByProd[r.productId || r.produit] = r;
       const totalRefund = refunds.reduce((s, r) => s + (r.refundCents || 0), 0);
@@ -5650,7 +5667,11 @@
                       <span style={{ display: 'block', fontSize: 18, fontWeight: 700, lineHeight: 1.2, wordBreak: 'break-word' }}>{kbProdName(p.produit)}</span><KbReplTag p={p} />
                       <KbPoids idx={wIdx} p={p} block />
                       {pct > 0 && (() => { const rr = remByKey[p.id || p.produit] || {}; return <span style={{ display: 'inline-block', marginTop: 4, fontSize: 15, fontWeight: 700, color: '#fff', background: '#a3125b', borderRadius: 8, padding: '2px 8px' }}>🏷️ −{pct}%{rr.remOf > 1 ? ` sur ${rr.qty} / ${rr.remOf}` : ''}{rr.remReason ? ` · ${rr.remReason}` : ''}{rr._prepRem ? ' (prépa)' : ''}</span>; })()}
-                      {p.producteur && <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>{p.producteur}</span>}
+{(() => { const ec = remEnCours[String(p.id || '')]; if (!ec || (!ec.ko && !ec.ok)) return null;
+                        return ec.ko > 0
+                          ? <span style={{ display: 'block', marginTop: 4, fontSize: 15, fontWeight: 700, color: '#7a4b00', background: '#ffe9b3', border: '2px solid #e0a100', borderRadius: 8, padding: '3px 8px' }}>⏳ Remise prépa en cours −{ec.pct}% ×{ec.ko} · appliquée automatiquement sur l'ancien site au report de la distrib</span>
+                          : <span style={{ display: 'block', marginTop: 4, fontSize: 13, fontWeight: 700, color: '#2e7d32' }}>✅ Remise prépa faite sur l'ancien site</span>; })()}
+                                            {p.producteur && <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>{p.producteur}</span>}
                     </span>
                     <span style={{ flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ color: 'var(--ink-mute)', fontSize: 13 }}>{lineEuro(p)}</span>
@@ -21482,7 +21503,10 @@
         try {
           const r = await fetch(KB_CENT_NAME_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'resolve-name', code: c }) });
           const j = await r.json();
-          kbCodeNames[c] = (j && j.ok && j.name) ? String(j.name).trim() : '';
+          // V10.93 — on ne mémorise que les réponses sûres (nom trouvé / code vraiment absent du registre).
+          // Erreur serveur (registre illisible, trop de tentatives…) → pas mémorisé, nouvel essai au prochain chargement.
+          if (j && j.ok && j.name) kbCodeNames[c] = String(j.name).trim();
+          else if (j && j.error === 'inconnu') kbCodeNames[c] = '';
         } catch (e) { /* serveur injoignable : on réessaiera au prochain chargement */ }
       }));
     }
@@ -21490,7 +21514,7 @@
     function kbWhoName(v, cent) {
       const s = String(v || '').replace(/\s*\((?:cl[oô]ture)[^)]*\)\s*$/i, '').trim();
       const c = kbCodeOf(s);
-      if (c) return kbCodeNames[c] || 'Nom inconnu (code hors registre)';
+      if (c) return kbCodeNames[c] ? kbCodeNames[c] : (c in kbCodeNames ? 'Nom inconnu (code hors registre)' : 'Nom en attente (registre injoignable)');
       if (!s || /^op[ée]rateur$/i.test(s)) return cent ? 'Nom non enregistré (Centrale)' : 'Nom non enregistré';
       return s;
     }
