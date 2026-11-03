@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V10.90) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V10.91) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V10.90';
+const APP_VERSION = 'V10.91';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -3526,12 +3526,41 @@ function addDays(dayKey, n) {
   d.setDate(d.getDate() + n);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+let _kbSameDay = {},
+  _kbSameDayAt = 0;
+function kbIsSameDay(d) {
+  return !!(d && _kbSameDay && _kbSameDay[d]);
+}
+async function kbSameDayLoad(force) {
+  if (!force && _kbSameDayAt && Date.now() - _kbSameDayAt < 60000) return _kbSameDay;
+  try {
+    const d = await storage.getDoc('app_config', 'prep_jour_meme');
+    _kbSameDay = d && d.days || {};
+  } catch (_) {}
+  _kbSameDayAt = Date.now();
+  return _kbSameDay;
+}
+async function kbSameDayOpen(day) {
+  await kbSameDayLoad();
+  if (!kbIsSameDay(day)) return false;
+  const m = await storage.getDoc(`day_${day}_prep`, 'meta').catch(() => null);
+  return !(m && m.closed);
+}
 async function kbUpcomingDays(maxDays) {
   const out = [];
   const t = todayKey();
   const days = [];
   for (let i = 0; i <= (maxDays || 7); i++) days.push(addDays(t, i));
-  const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+  const [docs, sameOpen] = await Promise.all([Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null))), kbSameDayOpen(t)]);
+  if (sameOpen) {
+    const n0 = docs[0] && docs[0].orders && docs[0].orders.length || 0;
+    out.push({
+      day: t,
+      count: n0,
+      today: true,
+      sameDay: true
+    });
+  }
   days.forEach((d, i) => {
     if (i === 0) return;
     const n = docs[i] && docs[i].orders && docs[i].orders.length || 0;
@@ -3545,7 +3574,7 @@ async function kbUpcomingDays(maxDays) {
 }
 async function kbFindPrepDay() {
   const list = await kbUpcomingDays(7);
-  const f = list.find(x => !x.today && x.count > 0);
+  const f = list.find(x => (!x.today || x.sameDay) && x.count > 0);
   return f ? f.day : null;
 }
 function formatDateFR(d = new Date()) {
@@ -16608,6 +16637,137 @@ function KbReplTag({
     }
   }, "🔄 Remplacé par : ", p._repl.to);
 }
+function KbSameDayCard() {
+  const showToast = React.useContext(ToastContext);
+  const [days, setDays] = React.useState(null);
+  const [nd, setNd] = React.useState('');
+  React.useEffect(() => {
+    kbSameDayLoad(true).then(d => setDays({
+      ...(d || {})
+    })).catch(() => setDays({}));
+  }, []);
+  const save = async next => {
+    try {
+      await storage.setDoc('app_config', 'prep_jour_meme', {
+        days: next,
+        at: Date.now()
+      }, {
+        replace: true
+      });
+      _kbSameDay = next;
+      _kbSameDayAt = Date.now();
+      setDays({
+        ...next
+      });
+      window.dispatchEvent(new CustomEvent('active-day-change', {
+        detail: {
+          dayKey: activeDay()
+        }
+      }));
+      showToast('📅 Prépa le jour même enregistrée');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    }
+  };
+  const t = todayKey();
+  const list = Object.keys(days || {}).filter(d => days[d]).sort();
+  const lbl = d => {
+    try {
+      return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long'
+      });
+    } catch (e) {
+      return d;
+    }
+  };
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: '12px 14px',
+      border: '2px solid #ea580c'
+    }
+  }, React.createElement("strong", {
+    style: {
+      fontSize: 15
+    }
+  }, "📅 Prépa le jour même"), React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      margin: '4px 0 8px'
+    }
+  }, "Quand la prépa est fermée la veille (jour férié), les commandes d'un jour sont préparées ", React.createElement("b", null, "le matin même"), ". Ce jour-là, tant que sa prépa n'est pas clôturée, la Prépa et la MU travaillent sur la distribution ", React.createElement("b", null, "du jour"), " (pas le lendemain). Après la clôture, elles repassent sur le lendemain. Pas de rajout F&L Rungis automatique ce jour-là."), days === null ? React.createElement("div", null, "Chargement…") : React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 6
+    }
+  }, !list.length && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "Aucune date."), list.map(d => React.createElement("div", {
+    key: d,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      justifyContent: 'space-between',
+      background: d < t ? '#f3f3f3' : '#fff7ed',
+      borderRadius: 8,
+      padding: '6px 10px'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      textTransform: 'capitalize',
+      opacity: d < t ? .6 : 1
+    }
+  }, lbl(d), d === t ? ' · aujourd\'hui' : ''), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 13,
+      padding: '4px 10px'
+    },
+    onClick: () => {
+      const n = {
+        ...days
+      };
+      delete n[d];
+      save(n);
+    }
+  }, "🗑"))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, React.createElement("input", {
+    type: "date",
+    value: nd,
+    min: t,
+    onChange: e => setNd(e.target.value),
+    style: {
+      flex: 1,
+      padding: '7px 8px',
+      border: '1px solid var(--line)',
+      borderRadius: 8,
+      fontSize: 15
+    }
+  }), React.createElement("button", {
+    className: "btn-primary",
+    disabled: !/^\d{4}-\d{2}-\d{2}$/.test(nd),
+    onClick: () => {
+      save({
+        ...days,
+        [nd]: true
+      });
+      setNd('');
+    }
+  }, "➕ Ajouter"))));
+}
 function KbSheet({
   title,
   onClose,
@@ -16938,7 +17098,7 @@ function KbAncienSyncRunner({
       try {
         const pd = await kbFindPrepDay();
         if (stop) return;
-        if (!pd || pd <= todayKey()) {
+        if (!pd || pd < todayKey() || pd === todayKey() && !kbIsSameDay(pd)) {
           const r0 = {
             v: 2,
             day: pd || '',
@@ -20038,7 +20198,7 @@ function muStockOfSnap(snap, k) {
 }
 function muTargetDay(dateKey) {
   const ad = activeDay();
-  return ad && ad > dateKey ? ad : muShiftDate(dateKey, 1);
+  return ad && (ad > dateKey || ad === dateKey && kbIsSameDay(ad)) ? ad : muShiftDate(dateKey, 1);
 }
 function muSheetStock(flIdx) {
   const stock = {};
@@ -28548,7 +28708,7 @@ function KbLieuxPage({
       color: 'var(--ink-mute)',
       margin: '6px 0 0'
     }
-  }, "Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format ", React.createElement("b", null, "14:00-20:00"), " (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.")), React.createElement("div", {
+  }, "Cette liste fait foi partout : choix du lieu à la connexion, calendrier des distributions, boutiques à casiers, noms dans les mails. Touchez un jour pour l'activer (🟢) ; horaire au format ", React.createElement("b", null, "14:00-20:00"), " (facultatif). 🗑 retire un lieu. Rien n'est appliqué avant 💾 Enregistrer.")), React.createElement(KbSameDayCard, null), React.createElement("div", {
     className: "card",
     style: {
       padding: '10px 12px',
@@ -31220,7 +31380,7 @@ function PrepaDuJourPage({
         showToast('⚠️ Mail Rungis : ' + e.message);
       }
     }
-    try {
+    if (day === todayKey()) showToast('🥬 Prépa le jour même : pas de rajout F&L Rungis (il arriverait après la distribution)');else try {
       const rj = await kbAutoRajoutRungis(day, user);
       if (rj.skipped) showToast('🥬 Rajout F&L Rungis : déjà envoyé pour ce jour');else if (rj.empty) showToast('🥬 Aucun rajout F&L à demander à Rungis' + (rj.todo ? ` (${rj.todo} produit(s) à rapprocher — Henry/Raimbaud prévenus)` : ''));else showToast(rj.ok ? `🥬 Rajout F&L envoyé à Rungis : ${rj.count} produit(s) · ${rj.colis} colis${rj.todo ? ` · ${rj.todo} à rapprocher (Master › F&L)` : ''}` : '⚠️ Rajout F&L Rungis non envoyé : ' + rj.error + ' — Master › Fruits & légumes');
     } catch (e) {
@@ -66539,7 +66699,7 @@ function PrepDayBanner() {
     style: {
       textTransform: 'capitalize'
     }
-  }, lbl(ad)), cur ? ` · ${cur.count} commande${cur.count > 1 ? 's' : ''}` : '', isToday ? ' — ⚠️ c\'est AUJOURD\'HUI' : ''), React.createElement("button", {
+  }, lbl(ad)), cur ? ` · ${cur.count} commande${cur.count > 1 ? 's' : ''}` : '', isToday ? kbIsSameDay(ad) ? ' — 📅 PRÉPA LE JOUR MÊME (prévu par le Master)' : ' — ⚠️ c\'est AUJOURD\'HUI' : ''), React.createElement("button", {
     onClick: kbToggleFullscreen,
     title: "Plein écran",
     style: {
@@ -66581,7 +66741,7 @@ function PrepDayBanner() {
       color: x.day === ad ? '#fff' : '#2f5326',
       textTransform: 'capitalize'
     }
-  }, short(x.day), " · ", x.count))));
+  }, x.sameDay ? '📅 ' : '', short(x.day), " · ", x.count))));
 }
 function ActiveDayBanner({
   mode
@@ -68485,9 +68645,29 @@ function App() {
   React.useEffect(() => {
     if (!prepMode) return;
     let stop = false;
-    const check = () => {
-      if (stop || activeDay() > todayKey()) return;
-      if (activeDay() <= todayKey()) setActiveDay(addDays(todayKey(), 1));
+    let first = true;
+    const check = async () => {
+      if (stop) return;
+      const t = todayKey();
+      let open = false;
+      try {
+        await kbSameDayLoad(first);
+        open = await kbSameDayOpen(t);
+      } catch (_) {}
+      if (stop) return;
+      const ad = activeDay();
+      if (open) {
+        if (ad < t) setActiveDay(t);else if (ad === t && first) window.dispatchEvent(new CustomEvent('active-day-change', {
+          detail: {
+            dayKey: t
+          }
+        }));
+        first = false;
+        return;
+      }
+      first = false;
+      if (ad > t) return;
+      setActiveDay(addDays(t, 1));
     };
     check();
     const t = setInterval(check, 5 * 60000);
