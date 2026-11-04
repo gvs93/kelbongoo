@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.95';
+    const APP_VERSION = 'V10.96';
+    // V10.96 — (04/11/2026) Distrib : un article déjà remisé en prépa peut être retiré ou remisé plus (la nouvelle remise REMPLACE celle de la prépa, remboursement = la différence) ; ancien site : remise prépa annulée (unreduce) puis nouvelle remise (KBG_AncienDistrib v1.6).
     // V10.95 — (04/11/2026) Distrib : ligne ×2 ou plus = articles un par un (« Article 1 · Article 2 »), chacun sa remise (% directe, 📅 DLC courte, poids, lot d'œufs, retrait) ; article remisé en prépa verrouillé ; facturation site et report ancien site par article (KBG_AncienDistrib v1.5).
     // V10.94 — (03/11/2026) Distrib : sur chaque ligne produit, « ⏳ Remise prépa en cours −X% ×N » quand l'ancien site de prépa a refusé la remise (HTTP 500 sur « Ajuster le poids », Firestore day_<jour>_prepremko écrit par KBG_Ancien v1.9) ; KBG_AncienDistrib v1.4 l'applique en % au report distrib. « ✅ Remise prépa faite sur l'ancien site » quand une relance a réussi.
     // V10.93 — (03/11/2026) Qui fait quoi : un code Centrale n'est plus marqué « hors registre » quand le serveur du registre est en erreur (réponse non mémorisée, nouvel essai) ; libellé « Nom en attente (registre injoignable) ». Va avec Apps Script « Enlèvement Rungis » v9.4 (resolve-name réparé).
@@ -5335,15 +5336,17 @@
     }
     // V10.95 — remise ARTICLE PAR ARTICLE : sur une ligne ×2 ou plus, chaque article a sa propre remise (ex. 1 poulet déjà
     //   remisé en prépa, l'autre en DLC courte). unit = n° de l'article (1…qté) → document day_<jour>_refunds
-    //   « <commande>__<produit>__u<n> », qty 1. Les articles remisés en prépa (prepN premiers) restent verrouillés :
-    //   sur l'ancien site ils ne sont plus « normaux », une 2e remise ne pourrait pas y être reportée.
+    //   « <commande>__<produit>__u<n> », qty 1. V10.96 : un article remisé en prépa (prepN premiers) peut être retiré ou
+    //   remisé plus : pct = % total, remboursement = différence ; l'ancien site annule la remise prépa (unreduce) puis applique.
     function RefundModal({ order, product, session, existing, onClose, unit, prepPct, prepN }) {
       const showToast = React.useContext(ToastContext);
       const lineCents = (product.consumer_price || 0) * (product.qty || 1);
       const name = product.produit || '';
       const unitHint = (() => { const m = name.match(/(?:x|par\s*)(\d{1,3})\b/i) || name.match(/(\d{1,3})\s*(?:oeufs|œufs|pi[èe]ces?|pcs|unit[ée]s?)/i); return m ? +m[1] : ''; })();
       const weightHint = (() => { const m = name.match(/(\d+(?:[.,]\d+)?)\s*(kg|g|gr|grammes?)\b/i); if (!m) return ''; let v = parseFloat(m[1].replace(',', '.')); if (/kg/i.test(m[2])) v *= 1000; return Math.round(v); })();
-      const [mode, setMode] = React.useState(existing ? existing.mode : (unit ? 'pct' : 'units'));
+      // V10.96 — article déjà remisé en prépa : la nouvelle remise est le % TOTAL de l'article et remplace celle de la prépa
+      const onPrep = !!(unit && Number(prepPct) > 0 && unit <= (Number(prepN) || 0));
+      const [mode, setMode] = React.useState(existing ? existing.mode : (onPrep ? 'total' : unit ? 'pct' : 'units'));
       const [brokenN, setBrokenN] = React.useState('1');
       const [totalN, setTotalN] = React.useState(unitHint ? String(unitHint) : '');
       const [wTarget, setWTarget] = React.useState(weightHint ? String(weightHint) : '');
@@ -5366,7 +5369,7 @@
       else if (mode === 'dlc') pct = Math.max(0, Math.min(100, Math.round(+pctDlc || 0)));
       const partQ = unit ? 1 : (mode !== 'units' && lineQ > 1 ? onN : lineQ);
       const baseCents = (product.consumer_price || 0) * partQ;
-      const refundCents = Math.round(baseCents * pct / 100);
+      const refundCents = onPrep ? Math.max(0, Math.round(baseCents * (pct - Number(prepPct)) / 100)) : Math.round(baseCents * pct / 100);
 
       const MODES = [
         { id: 'pct', label: '% Remise directe' },
@@ -5381,6 +5384,7 @@
 
       const save = async () => {
         if (pct <= 0) { showToast("Indique d'abord la remise"); return; }
+        if (onPrep && pct <= Number(prepPct)) { showToast(`Déjà −${prepPct}% en prépa : choisis plus, ou Retrait total`); return; }
         const wantRet = mode === 'total' && retPdp;
         if (wantRet && !retDlc) { showToast('Retour PDP : indique la DLC du produit'); return; }
         const dayKey = activeDay();
@@ -5395,6 +5399,7 @@
           status: 'a_qualifier', reason: '', createdBy: (session && session.name) || '', createdAt: new Date().toISOString(),
           retourPdp: wantRet, retourDlc: wantRet ? retDlc : '',
           unit: unit || 0, prepPct: Number(prepPct) || 0, prepN: Number(prepN) || 0, dlc: mode === 'dlc' ? dlcDate : '', // V10.95
+          onPrep, // V10.96 — remplace la remise prépa de cet article (pct = % total de l'article)
         });
         let retMsg = '';
         try { retMsg = await kbRefundRetourPdp(id, order, product, partQ, wantRet ? retDlc : '', session, dayKey); }
@@ -5419,6 +5424,7 @@
               <button className="modal-close" onClick={onClose}>×</button>
             </div>
             <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginBottom: 10 }}>
+              {onPrep && <div style={{ marginBottom: 8, border: '2px solid #a3125b', borderRadius: 10, background: '#fbe6f0', color: '#a3125b', padding: '8px 10px', fontSize: 15, fontWeight: 700 }}>🏷️ Déjà −{prepPct}% en prépa. La nouvelle remise REMPLACE celle de la prépa (ex. Retrait total = article enlevé). Le client récupère seulement la différence.</div>}
               {unit ? <>Prix de cet article : <strong>{fmtEuro(product.consumer_price || 0)}</strong></> : <>Prix de la ligne : <strong>{fmtEuro(lineCents)}</strong> ({product.qty || 1} × {fmtEuro(product.consumer_price || 0)})</>}
             </div>
 
@@ -5721,16 +5727,17 @@
                         <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-soft)', marginBottom: 4 }}>Article par article — touche celui à remiser :</div>
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                           {Array.from({ length: Math.min(q, 12) }, (_, i) => i + 1).map(n => {
-                            const u = ur[n], isPrep = !u && n <= pN;
+                            const u = ur[n], isPrep = !u && n <= pN, wasPrep = n <= pN;
                             const bg = u ? '#1565c0' : isPrep ? '#a3125b' : '#fff', fg = u || isPrep ? '#fff' : 'var(--ink)';
                             const txt = u ? (Number(u.pct) >= 100 ? '🗑️ retiré' : `−${u.pct}%${u.mode === 'dlc' ? ' DLC' : ''}`) : isPrep ? `−${pP}% prépa` : '✓ normal';
                             return (
-                              <button key={n} disabled={isPrep} title={isPrep ? 'Déjà remisé en prépa' : 'Remise sur cet article seulement'}
+                              <button key={n} title={isPrep ? 'Remisé en prépa — toucher pour retirer ou remiser plus' : 'Remise sur cet article seulement'}
                                 onClick={() => setRefundFor({ p, unit: n, prepPct: pP, prepN: pN })}
-                                style={{ minWidth: 92, minHeight: 52, borderRadius: 10, padding: '4px 8px', cursor: isPrep ? 'default' : 'pointer', textAlign: 'center', lineHeight: 1.15,
-                                  border: u ? '2px solid #0d47a1' : isPrep ? '2px solid #a3125b' : '2px dashed var(--border)', background: bg, color: fg, opacity: isPrep ? 0.9 : 1 }}>
+                                style={{ minWidth: 92, minHeight: 52, borderRadius: 10, padding: '4px 8px', cursor: 'pointer', textAlign: 'center', lineHeight: 1.15,
+                                  border: u ? '2px solid #0d47a1' : isPrep ? '2px solid #a3125b' : '2px dashed var(--border)', background: bg, color: fg }}>
                                 <div style={{ fontSize: 12, fontWeight: 700 }}>Article {n}</div>
                                 <div style={{ fontSize: 15, fontWeight: 700 }}>{txt}</div>
+                                {u && wasPrep && <div style={{ fontSize: 11, fontWeight: 600 }}>(remplace prépa −{pP}%)</div>}
                               </button>);
                           })}
                         </div>
@@ -22242,7 +22249,7 @@
         }
         const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
         if (rc && rc.pct && q - manque > 0) { pct = Number(rc.pct) || 0; rq = rc.n ? Math.min(rc.n, q - manque) : q - manque; }
-        // V10.95 — remises article par article (unit ≥ 1, jamais sur un article déjà remisé en prépa) : chaque article garde son %,
+        // V10.95/V10.96 — remises article par article (unit ≥ 1 ; sur un article remisé en prépa, le % = total et remplace la prépa) : chaque article garde son %,
         //   puis un seul écart par produit = nb d'articles remisés + % moyen (même montant total remisé).
         const unitDocs = refunds.filter(r => r.orderId === o.orderId && r.produit === produit && Number(r.unit) > 0);
         if (unitDocs.length) {
