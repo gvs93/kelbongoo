@@ -1,12 +1,24 @@
 /**
- * KBG_Ancien.gs — v1.7 (01/11/2026) — v1.7 : fin du report (terminé, réel) → KBG_Locaux : Terminer la préparation +
+ * KBG_Ancien.gs — v1.9 (03/11/2026) — v1.9 : REMISE REFUSÉE PAR L'ANCIEN SITE → GARDÉE POUR LA DISTRIB. Le 03/11 le serveur
+ *   de preparations.kelbongoo.com répond HTTP 500 à « Ajuster le poids », même cliqué à la main sur le site (requête relevée
+ *   au téléphone : identique à celle du script). Chaque remise refusée est enregistrée dans Firestore
+ *   day_<jour>_prepremko/<commande|produit|article> { orderId, productId, produit, qty, pct, site, ko:true } ; si une relance
+ *   réussit plus tard, le document passe à ko:false. KBG_AncienDistrib v1.4 applique les ko:true en remise % au client sur
+ *   distributions.kelbongoo.com (raison Autre), au report de la distrib.
+ * v1.8 (03/11/2026) — v1.8 : CORRECTIF REMISES — l'ancien site n'accepte « Ajuster le poids »
+ *   (globalorderlocales/update-order-item-weight) que sur un article DÉJÀ posé dans son bac (HTTP 500 sinon).
+ *   Avant : ajustement envoyé AVANT la pose (et pour un article déjà posé : retiré → ajusté → reposé) → toutes les
+ *   remises de prépa refusées le 03/11 (Brocoli, Coing, Yaourt coco…). Désormais : poser d'abord, puis ajuster ;
+ *   un article déjà posé est ajusté sans être retiré. • Compteur « Remises (poids) » = remises RÉUSSIES (avant :
+ *   remises prévues, même refusées). Relance sans risque : un bac déjà ajusté (adjustment) n'est pas retouché.
+ * v1.7 (01/11/2026) : fin du report (terminé, réel) → KBG_Locaux : Terminer la préparation +
  *   Lancer la distribution sur locaux.kelbongoo.com pour chaque lieu.
- * v1.6 (01/11/2026) — v1.6 : • appels réseau via KBG_Reseau (kbFetch_ / kbFetchAll_ : relance auto sur coupure
+ * v1.6 (01/11/2026) : • appels réseau via KBG_Reseau (kbFetch_ / kbFetchAll_ : relance auto sur coupure
  *   réseau Google, ex. « Adresse non disponible ») ; • DOM confirmé (v1.5, jamais déployée avant) : sur l'ancien site DOM a
  *   des ND comme les autres lieux, mais dans l'appli DOM n'a PAS de cagette ND : tout est dans les cartons de la prépa DOM.
  *   → ND de DOM sur l'ancien site : quantité reçue = commandé − rupture des commandes DOM de l'appli (cartons), puis coche.
  * v1.5 (28/10/2026) : ND de DOM traités (DOM était exclu de la lecture « Réception ND »).
- * v1.4 (27/10/2026) — v1.4 : ND d'un lieu SANS commande dans l'appli → laissé tel quel (avant : reçu mis à 0) ;
+ * v1.4 (27/10/2026) : ND d'un lieu SANS commande dans l'appli → laissé tel quel (avant : reçu mis à 0) ;
  *   contrôle des coches ND après report : un lieu resté « pas fini » est recoché seul (comme le site : autres lieux exclus).
  * v1.3 : CORRECTIF coches — « toggle-golpps-completed » agit sur TOUS les lieux non exclus :
  *   avant, 1 appel par lieu → un produit ND sur 2 ou 4 lieux était coché puis décoché. Désormais 1 seul appel par produit,
@@ -24,11 +36,13 @@
  *   • globalorders/get-dispatch                → bacs d'un produit dans un lieu : order_id, n° de bac, articles à poser / posés
  *   • globalorderlocaleproducerproducts/dispatch-one    → poser 1 article dans son bac (= toucher le casier)
  *   • globalorderlocaleproducerproducts/undispatch-one  → retirer 1 article posé par erreur
+ *   • globalorderlocales/update-order-item-weight       → « Ajuster le poids » d'un article POSÉ (remise prépa)
  *   • globalorders/toggle-golpps-completed     → coche « Fini » (horloge → ✓) du produit dans le lieu
  *
  * Déroulé : à la clôture de la prépa, l'appli envoie « rungis_ancien_run » { day, products:[{ id (producerproduct), cat, done,
- *   orders:[{ oid, site, q, miss }] }] } (commandes de l'ANCIEN site seulement). Ici, pour chaque produit et chaque lieu :
- *   posés voulus par commande = q − miss (rupture) ; on pose ce qui manque, on retire ce qui est en trop, puis on coche Fini.
+ *   orders:[{ oid, site, q, miss, rem, remN }] }] } (commandes de l'ANCIEN site seulement). Ici, pour chaque produit et chaque lieu :
+ *   posés voulus par commande = q − miss (rupture) ; on pose ce qui manque, on ajuste le poids des articles remisés,
+ *   on retire ce qui est en trop, puis on coche Fini.
  *   Pivot = ID produit (producerproduct_id) et ID commande (order_id) : jamais de rapprochement par nom.
  *   Produit pas terminé dans l'appli → laissé tel quel (signalé). Relance possible sans risque : tout est recalculé
  *   d'après l'état réel de l'ancien site (déjà fait = rien à refaire).
@@ -41,6 +55,7 @@
  *   ANC_ND   = true          : (option) fait aussi la « Réception non-dispatch » (quantités ND reçues). Par défaut : non.
  */
 
+
 var ANC_API     = 'https://preparations-new.kelbongoo.com/';
 var ANC_FB_KEY  = 'AIzaSyApzz9odc0DMgHTwcwLQ69lP58n1njIWKI';      // clé publique Firebase de preparations.kelbongoo.com (dans la page)
 var ANC_USER_ID = '2W8X2SaMhytesy4ne';                             // userId fixe envoyé par le site lui-même
@@ -48,6 +63,8 @@ var ANC_TAB     = 'ANCIEN SITE';
 var ANC_MAIL_TO = 'hg@probon.fr';
 var ANC_SLICE_MS = 270000;                                         // 4 min 30 de travail par passage
 var ANC_LANES   = 8;                                               // produits traités en parallèle (1 seul appel à la fois par produit)
+var ANC_VERSION = 'v1.9';
+
 
 /* ═════════════════════════════ ROUTAGE (appelé par kbRungisRoute_) ═════════════════════════════ */
 function kbAncRoute_(p) {
@@ -56,6 +73,7 @@ function kbAncRoute_(p) {
   if (p.action === 'rungis_ancien_stop') { ancJobDel_(); ancTriggersDel_(); return { ok: true }; }
   return { ok: false, error: 'action ancien inconnue' };
 }
+
 
 /* ═════════════════════════════ CONNEXION ═════════════════════════════ */
 function ancProps_() { return PropertiesService.getScriptProperties(); }
@@ -90,6 +108,7 @@ function ancAll_(reqs) {
   return rs.map(function (r) { try { return { ok: true, j: ancParse_(r) }; } catch (e) { return { ok: false, err: String(e.message || e) }; } });
 }
 
+
 /* ═════════════════════════════ DONNÉES ANCIEN SITE ═════════════════════════════ */
 /** globalorder (distribution) du jour : trouvé par la liste des produits, en essayant les globalorders récents de l'admin. */
 function ancGlobalOrder_(day) {
@@ -100,7 +119,6 @@ function ancGlobalOrder_(day) {
   ancProps_().setProperty('ANC_GO_' + day, g._id);
   return g._id;
 }
-/** Tous les produits de la distribution (frais = couloir 0, sec = couloir 1) : { ppId: {name, couloir, prog:{locale:{ord, done, completed}}} } */
 /** v1.1 — Réception non-dispatch (ND) : par lieu, produits sans dispatch → { ppId: { locale: {ord, rec, completed} } } */
 function ancProductsND_(G, locales) {
   var out = {};
@@ -119,6 +137,7 @@ function ancProductsND_(G, locales) {
 // v1.5 — DOM inclus : sur l'ancien site, les produits ND livrés à domicile sont en « Réception ND » de DOM ;
 //   dans l'appli ils sont dans les cartons DOM (pas de cagette ND) → reçu = commandé − rupture DOM.
 function ancLocales_(job) { var m = { BIC: 1, BOR: 1, PDP: 1, STB: 1, TOL: 1, DOM: 1 }; (job.todo || []).forEach(function (x) { (x.orders || []).forEach(function (o) { if (o.site) m[o.site] = 1; }); }); return Object.keys(m); }
+/** Tous les produits de la distribution (frais = couloir 0, sec = couloir 1) : { ppId: {name, couloir, prog:{locale:{ord, done, completed}}} } */
 function ancProducts_(G) {
   var out = {};
   [0, 1].forEach(function (cl) {
@@ -137,9 +156,11 @@ function ancProducts_(G) {
   return out;
 }
 
+
 /* ═════════════════════════════ PLAN D'UN PRODUIT (fonction pure, testée hors Apps Script) ═════════════════════════════
  * want : { orderId: articles à poser } ; dispatch : réponse get-dispatch d'UN lieu ([{order_id, number, items:[ids à poser], done:[ids posés]}])
- * → { calls:[{route, params}], lines:[…détail…], unknown:[order_id présents sur l'ancien site mais pas dans l'appli] } */
+ * → { calls:[{route, params}], lines:[…détail…], unknown:[order_id présents sur l'ancien site mais pas dans l'appli] }
+ * v1.8 — ordre des appels d'un bac : poses → ajustements de poids (sur articles posés) → retraits en trop. */
 function ancPlanLocale_(G, ppId, locale, want, dispatch, rem, uw, couloir) {
   var calls = [], lines = [], unknown = [];
   rem = rem || {};
@@ -149,22 +170,29 @@ function ancPlanLocale_(G, ppId, locale, want, dispatch, rem, uw, couloir) {
     if (w == null) { unknown.push(oid); return; }                     // commande inconnue de l'appli : on n'y touche pas
     var loc = e.locale || locale, P = function (id) { return { dispatch_id: id, globalorder_id: G, locale: loc, producerproduct_id: ppId, userId: ANC_USER_ID }; };
     var ln = { bac: e.number, locale: loc, oid: oid, total: total, deja: done.length, voulu: w, pose: 0, retire: 0, remise: 0 };
-    // v1.2 — REMISE prépa : poids réel = poids unitaire × (1 − %), sur k articles du bac (avant de les poser)
+    // REMISE prépa : poids réel = poids unitaire × (1 − %), sur k articles du bac. Bac déjà ajusté (e.adjustment) → rien.
     var r = rem[oid], k = (r && r.pct > 0 && uw > 0 && !e.adjustment) ? Math.max(0, Math.min(w, r.n || w)) : 0;
     var poids = k ? Math.floor(uw * (1 - r.pct / 100) * 1000) / 1000 : 0;
-    var wt = function (id) { return { route: 'globalorderlocales/update-order-item-weight', params: { order_id: oid, weight: poids, couloir: couloir ? 'sec' : 'frais', dispatch_id: id, globalorder_id: G, locale: loc, producerproduct_id: ppId, userId: ANC_USER_ID }, rem: true }; };
+    var wt = function (id) { return { route: 'globalorderlocales/update-order-item-weight', params: { order_id: oid, weight: poids, couloir: couloir ? 'sec' : 'frais', dispatch_id: id, globalorder_id: G, locale: loc, producerproduct_id: ppId, userId: ANC_USER_ID }, rem: true, pct: r.pct }; };
     var keepDone = done.slice(0, Math.min(done.length, w)), extraDone = done.slice(Math.min(done.length, w));
     var toPose = items.slice(0, Math.max(0, w - done.length));
-    // articles à remiser : d'abord ceux qu'on va poser, sinon des déjà posés (retirés → ajustés → reposés)
+    // articles à remiser : d'abord ceux qu'on va poser, sinon des déjà posés (gardés)
     var remPose = toPose.slice(0, k), remDone = keepDone.slice(0, Math.max(0, k - remPose.length));
-    remDone.forEach(function (id) { calls.push({ route: 'globalorderlocaleproducerproducts/undispatch-one', params: P(id) }); calls.push(wt(id)); calls.push({ route: 'globalorderlocaleproducerproducts/dispatch-one', params: P(id) }); });
-    toPose.forEach(function (id) { if (remPose.indexOf(id) >= 0) calls.push(wt(id)); calls.push({ route: 'globalorderlocaleproducerproducts/dispatch-one', params: P(id) }); ln.pose++; });
+    // 1. poser (et ajuster tout de suite après la pose si l'article est remisé)
+    toPose.forEach(function (id) {
+      calls.push({ route: 'globalorderlocaleproducerproducts/dispatch-one', params: P(id) }); ln.pose++;
+      if (remPose.indexOf(id) >= 0) calls.push(wt(id));
+    });
+    // 2. articles déjà posés à remiser : ajustés sur place (plus de retrait / repose)
+    remDone.forEach(function (id) { calls.push(wt(id)); });
+    // 3. articles posés en trop
     extraDone.forEach(function (id) { calls.push({ route: 'globalorderlocaleproducerproducts/undispatch-one', params: P(id) }); ln.retire++; });
     ln.remise = remPose.length + remDone.length; if (ln.remise) { ln.pct = r.pct; ln.poids = poids; }
     lines.push(ln);
   });
   return { calls: calls, lines: lines, unknown: unknown };
 }
+
 
 /* ═════════════════════════════ TRAVAIL (file + reprise) ═════════════════════════════ */
 function ancJobFile_() {
@@ -176,6 +204,7 @@ function ancJobPut_(job) { var f = ancJobFile_(), s = JSON.stringify(job); if (f
 function ancJobDel_() { var f = ancJobFile_(); if (f) f.setTrashed(true); }
 function ancTriggersDel_() { ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'ancienContinue') ScriptApp.deleteTrigger(t); }); }
 
+
 /** p : { day, products, by, dry } — appelé par l'appli à la clôture de la prépa (ou bouton Master). */
 function ancStart_(p) {
   var day = String(p.day || ''); if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { ok: false, error: 'jour invalide' };
@@ -186,11 +215,15 @@ function ancStart_(p) {
     var job = { v: 1, day: day, by: String(p.by || '').slice(0, 60), dry: dry, startedAt: new Date().toISOString(), state: 'en cours',
       todo: prods.map(function (x) { return { id: String(x.id), produit: String(x.produit || '').slice(0, 120), cat: String(x.cat || ''), done: !!x.done,
         orders: (x.orders || []).map(function (o) { return { oid: String(o.oid), site: String(o.site || '').toUpperCase(), q: Number(o.q) || 0, miss: Number(o.miss) || 0, rem: Math.max(0, Math.min(100, Number(o.rem) || 0)), remN: Number(o.remN) || 0 }; }) }; }),
-      i: 0, res: { faits: 0, deja: 0, attente: [], absents: [], erreurs: [], inconnus: [], nd: [], ndFaits: 0, poses: 0, retires: 0, remises: 0, coches: 0, appels: 0, detail: [] } };
+      i: 0, res: { faits: 0, deja: 0, attente: [], absents: [], erreurs: [], inconnus: [], nd: [], ndFaits: 0, poses: 0, retires: 0, remises: 0, remisesKo: 0, coches: 0, appels: 0, detail: [] } };
     ancJobPut_(job); ancTriggersDel_();
     ancWork_(job);
     return { ok: true, result: ancPublic_(ancJobGet_() || job) };
-  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+  } catch (e) {
+    // v1.8 — un échec au lancement n'est plus silencieux : mail
+    try { MailApp.sendEmail({ to: ANC_MAIL_TO, subject: '⚠️ Ancien site ' + rgFr_(day) + ' : report non lancé', body: String(e && e.stack || e), name: 'Kelbongoo' }); } catch (e2) {}
+    return { ok: false, error: String(e.message || e) };
+  }
   finally { lock.releaseLock(); }
 }
 /** Déclencheur de reprise (nom sans « _ » : appelable par un déclencheur). */
@@ -245,8 +278,9 @@ function ancNdFix_(G, job) {
  *  v1.1 : les lieux où le produit est en ND passent par la Réception ND (quantité reçue = commandé − rupture, puis coche). */
 function ancDoLane_(G, A, N, lane, job) {
   var R = job.res, work = [], queues = {}, D = R.detail || (R.detail = []);
+  if (R.remisesKo == null) R.remisesKo = 0;
   var log = function (q, txt) { (q.d = q.d || []).push(txt); };
-  var allBy = {}, Q = function (x) { return queues[x.id] || (queues[x.id] = { x: x, calls: [], locs: [], d: [], all: allBy[x.id] || [] }); };
+  var allBy = {}, Q = function (x) { return queues[x.id] || (queues[x.id] = { x: x, calls: [], locs: [], d: [], all: allBy[x.id] || [], remPlan: 0, remOk: 0, remKo: 0 }); };
   lane.forEach(function (x) {
     var a = A[x.id], nd = N[x.id];
     // v1.3 — tous les lieux connus du produit (pour exclure ceux qu'on ne coche pas)
@@ -282,7 +316,7 @@ function ancDoLane_(G, A, N, lane, job) {
       var pl = ancPlanLocale_(G, w.x.id, w.loc, w.want, (g.j && g.j.dispatch) || [], w.rem, w.a.uw, w.a.couloir);
       if (pl.unknown.length) R.inconnus.push(w.x.produit + ' (' + w.loc + ') : ' + pl.unknown.length + ' commande(s) de l\'ancien site absente(s) de l\'appli — laissée(s) telle(s) quelle(s)');
       pl.calls.forEach(function (c) { q.calls.push(c); });
-      var po = 0, re = 0, rm = []; pl.lines.forEach(function (l) { R.poses += l.pose; R.retires += l.retire; R.remises = (R.remises || 0) + l.remise; po += l.pose; re += l.retire; if (l.remise) rm.push('remise −' + l.pct + '% ×' + l.remise + ' bac ' + l.bac + ' (' + String(l.poids).replace('.', ',') + ' kg)'); });
+      var po = 0, re = 0, rm = []; pl.lines.forEach(function (l) { R.poses += l.pose; R.retires += l.retire; q.remPlan += l.remise; po += l.pose; re += l.retire; if (l.remise) rm.push('remise −' + l.pct + '% ×' + l.remise + ' bac ' + l.bac + ' (' + String(l.poids).replace('.', ',') + ' kg)'); });
       var tick = !pl.unknown.length && (!w.pr.completed || pl.calls.length > 0);
       if (pl.unknown.length) q.noTick = true;
       else if (tick) q.locs.push(w.loc);
@@ -292,14 +326,25 @@ function ancDoLane_(G, A, N, lane, job) {
   }
   var ids = Object.keys(queues);
   if (!job.dry) {
-    // Écritures : tour par tour, 1 appel par produit et par tour (parallèle entre produits)
+    // Écritures : tour par tour, 1 appel par produit et par tour (parallèle entre produits) — l'ordre des appels d'un produit est respecté
     var more = true;
     while (more) {
       more = false; var batch = [], who = [];
       ids.forEach(function (id) { var q = queues[id]; if (q.calls.length) { var c = q.calls.shift(); batch.push(ancReq_(c.route, c.params)); who.push({ q: q, c: c }); more = more || q.calls.length > 0; } });
       if (!batch.length) break;
       var rs = ancAll_(batch); R.appels += rs.length;
-      rs.forEach(function (r, k) { var q = who[k].q; if (!r.ok) { q.err = (q.err || 0) + 1; if (q.err <= 2) R.erreurs.push(q.x.produit + ' : ' + r.err); } else if (who[k].c.nd) R.coches += who[k].c.nd; });
+      rs.forEach(function (r, k) {
+        var q = who[k].q, c = who[k].c;
+        if (!r.ok) {
+          q.err = (q.err || 0) + 1;
+          if (c.rem) { q.remKo++; R.remisesKo++; ancRemKo_(job.day, q.x.produit, c, true); }
+          var quoi = c.rem ? 'remise bac (' + c.params.locale + ')' : c.route.split('/').pop() + ' (' + (c.params.locale || '') + ')';
+          if (q.err <= 3) R.erreurs.push(q.x.produit + ' : ' + quoi + ' ' + r.err);
+        } else {
+          if (c.nd) R.coches += c.nd;
+          if (c.rem) { q.remOk++; R.remises++; ancRemKo_(job.day, q.x.produit, c, false); }
+        }
+      });
     }
     // Coche « Fini » par lieu (dispatch) — seulement si aucune erreur sur le produit
     var ticks = [], tw = [];
@@ -308,16 +353,18 @@ function ancDoLane_(G, A, N, lane, job) {
     ids.forEach(function (id) { var q = queues[id]; if (q.err) return; var ex = (q.all || []).filter(function (l) { return q.locs.indexOf(l) < 0; }); q.locs.forEach(function (loc) { ticks.push(ancReq_('globalorders/toggle-golpps-completed', { globalorder_id: G, locale: loc, producerproduct_id: id, userId: ANC_USER_ID, completed: true, excludedLocales: ex, isND: false })); tw.push(q); }); });
     var tr = ancAll_(ticks); R.appels += tr.length;
     tr.forEach(function (r, k) { if (r.ok) R.coches++; else { tw[k].err = (tw[k].err || 0) + 1; R.erreurs.push(tw[k].x.produit + ' : coche Fini ' + r.err); } });
-  } else ids.forEach(function (id) { var q = queues[id]; R.coches += q.locs.length + q.calls.reduce(function (s, c) { return s + (c.nd || 0); }, 0); });
+  } else ids.forEach(function (id) { var q = queues[id]; R.coches += q.locs.length + q.calls.reduce(function (s, c) { return s + (c.nd || 0); }, 0); R.remises += q.remPlan; });
   ids.forEach(function (id) {
     var q = queues[id];
-    if (q.err) { D.push({ p: q.x.produit, s: 'err', d: q.d.join(' · ') + ' · ⚠️ erreur', at: Date.now() }); return; }
+    var remTxt = q.remPlan && !job.dry ? ' · 🏷️ remises ' + q.remOk + '/' + q.remPlan + (q.remKo ? ' (' + q.remKo + ' refusée' + (q.remKo > 1 ? 's' : '') + ')' : '') : '';
+    if (q.err) { D.push({ p: q.x.produit, s: 'err', d: q.d.join(' · ') + remTxt + ' · ⚠️ erreur (pas de coche Fini)', at: Date.now() }); return; }
     if (q.fresh) { R.faits++; if (q.ndDone) R.ndFaits++; } else R.deja++;
-    D.push({ p: q.x.produit, s: q.fresh ? (job.dry ? 'afaire' : 'ok') : 'deja', d: q.d.join(' · '), at: Date.now() });
+    D.push({ p: q.x.produit, s: q.fresh ? (job.dry ? 'afaire' : 'ok') : 'deja', d: q.d.join(' · ') + remTxt, at: Date.now() });
   });
   if (D.length > 700) R.detail = D.slice(-700);
 }
-/** Relit l'ancien site : chaque produit terminé dans l'appli doit être coché partout, avec le bon nombre d'articles posés. */
+/** Relit l'ancien site : chaque produit terminé dans l'appli doit être coché partout, avec le bon nombre d'articles posés.
+ *  (Ne contrôle pas les poids : les remises refusées sont comptées à part, R.remisesKo.) */
 function ancVerify_(G, job) {
   var A = ancProducts_(G), N = ancProductsND_(G, ancLocales_(job)), bad = [];
   job.todo.forEach(function (x) {
@@ -333,15 +380,27 @@ function ancVerify_(G, job) {
   return { ok: !bad.length, bad: bad.slice(0, 80), nBad: bad.length, at: new Date().toISOString() };
 }
 
+
+/** v1.9 — remise de prépa refusée (ko=true) ou finalement faite (ko=false) → Firestore, pour KBG_AncienDistrib.
+ *  Un document par article (commande | produit | article posé) : une relance ne crée jamais de doublon. */
+function ancRemKo_(day, produit, c, ko) {
+  try {
+    var p = c.params, id = [p.order_id, p.producerproduct_id, p.dispatch_id].join('|');
+    if (!ko && !fsDoc_('day_' + day + '_prepremko', id)) return;   // réussi du premier coup : rien à garder
+    fsPatch_('day_' + day + '_prepremko', id, { orderId: String(p.order_id), productId: String(p.producerproduct_id), produit: String(produit || ''),
+      qty: 1, pct: Number(c.pct) || 0, site: String(p.locale || ''), ko: !!ko, poids: Number(p.weight) || 0, at: new Date().toISOString() });
+  } catch (e) { console.log('prepremko : ' + (e.message || e)); }
+}
+
 /* ═════════════════════════════ ÉTAT / JOURNAL / MAIL ═════════════════════════════ */
 function ancPublic_(job) {
   if (!job) return null;
   var R = job.res || {};
   return { day: job.day, dry: !!job.dry, state: job.state, by: job.by, startedAt: job.startedAt, endedAt: job.endedAt || '', error: job.error || '',
-    n: (job.todo || []).length, i: job.i || 0, faits: R.faits || 0, deja: R.deja || 0, poses: R.poses || 0, retires: R.retires || 0, remises: R.remises || 0, coches: R.coches || 0, appels: R.appels || 0,
+    n: (job.todo || []).length, i: job.i || 0, faits: R.faits || 0, deja: R.deja || 0, poses: R.poses || 0, retires: R.retires || 0, remises: R.remises || 0, remisesKo: R.remisesKo || 0, coches: R.coches || 0, appels: R.appels || 0,
     attente: (R.attente || []).slice(0, 50), absents: (R.absents || []).slice(0, 50), nd: (R.nd || []).slice(0, 50), ndFaits: R.ndFaits || 0, erreurs: (R.erreurs || []).slice(0, 50), inconnus: (R.inconnus || []).slice(0, 30),
     detail: (R.detail || []).slice(-700),
-    verif: job.verif || null, live: ancLive_() };
+    verif: job.verif || null, live: ancLive_(), version: ANC_VERSION };
 }
 function ancStatus_(day) {
   var job = ancJobGet_();
@@ -356,23 +415,24 @@ function ancLog_(job) {
   if (!sh) { sh = ss.insertSheet(ANC_TAB); sh.getRange(1, 1, 1, 7).setValues([['DISTRIBUTION', 'LANCÉ', 'FINI', 'MODE', 'RÉSULTAT', 'DÉTAIL', 'DONNÉES']]).setFontWeight('bold').setBackground('#1a4d2e').setFontColor('#fff'); sh.setFrozenRows(1); }
   var P = ancPublic_(job), js = JSON.stringify(P);
   if (js.length > 49000) { var P2 = JSON.parse(js); P2.detail = (P2.detail || []).filter(function (d) { return d.s !== 'deja'; }).slice(-250); js = JSON.stringify(P2); if (js.length > 49000) { delete P2.detail; js = JSON.stringify(P2); } }
-  sh.appendRow([job.day, job.startedAt, job.endedAt || '', job.dry ? 'SIMULATION' : 'RÉEL', job.state === 'erreur' ? '⚠️ ERREUR' : (P.verif && P.verif.ok ? '✅ OK' : '⚠️ À VÉRIFIER'),
-    P.faits + ' produit(s) · ' + P.poses + ' posé(s) · ' + P.retires + ' retiré(s) · ' + P.coches + ' coche(s) · ' + P.ndFaits + ' ND' + (P.erreurs.length ? ' · ' + P.erreurs.length + ' erreur(s)' : ''), js]);
+  sh.appendRow([job.day, job.startedAt, job.endedAt || '', job.dry ? 'SIMULATION' : 'RÉEL', job.state === 'erreur' ? '⚠️ ERREUR' : (P.verif && P.verif.ok && !P.remisesKo ? '✅ OK' : '⚠️ À VÉRIFIER'),
+    P.faits + ' produit(s) · ' + P.poses + ' posé(s) · ' + P.retires + ' retiré(s) · ' + P.coches + ' coche(s) · ' + P.ndFaits + ' ND · ' + P.remises + ' remise(s)' + (P.remisesKo ? ' · ' + P.remisesKo + ' remise(s) refusée(s)' : '') + (P.erreurs.length ? ' · ' + P.erreurs.length + ' erreur(s)' : ''), js]);
 }
 function ancMail_(job) {
-  var P = ancPublic_(job), ok = job.state !== 'erreur' && P.verif && P.verif.ok && !P.erreurs.length;
+  var P = ancPublic_(job), ok = job.state !== 'erreur' && P.verif && P.verif.ok && !P.erreurs.length && !P.remisesKo;
   var li = function (t, a, c) { return a && a.length ? '<div style="margin-top:12px"><div style="font-size:15px;font-weight:800;color:' + c + '">' + t + ' (' + a.length + ')</div><ul style="margin:4px 0;padding-left:18px;font-size:13px">' + a.map(function (x) { return '<li>' + rgEsc_(x) + '</li>'; }).join('') + '</ul></div>' : ''; };
   var html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:680px;color:#1b1b1b">'
     + '<div style="background:' + (ok ? '#2e7d32' : '#c62828') + ';color:#fff;border-radius:14px;padding:16px 20px"><div style="font-size:23px;font-weight:900">' + (ok ? '✅' : '⚠️') + ' Ancien site — prépa du ' + rgEsc_(rgLong_(job.day)) + (job.dry ? ' (SIMULATION)' : '') + '</div>'
     + '<div style="font-size:16px;margin-top:4px">' + (job.state === 'erreur' ? 'Arrêté : ' + rgEsc_(job.error) : P.faits + ' produit(s) reporté(s) · ' + P.deja + ' déjà à jour') + '</div></div>'
-    + '<p style="font-size:15px;margin:12px 2px"><b>' + P.poses + '</b> article(s) posé(s) · <b>' + P.retires + '</b> retiré(s) · <b>' + P.coches + '</b> coche(s) « Fini » · <b>' + P.ndFaits + '</b> ND reçu(s) · <b>' + P.remises + '</b> remise(s) (poids ajusté)' + (job.dry ? ' — <b>à faire</b> (rien n\'a été écrit)' : '') + '</p>'
-    + (P.verif ? '<p style="font-size:15px;margin:4px 2px">' + (P.verif.ok ? '🔎 Vérification : l\'ancien site correspond à la prépa de l\'appli.' : '🔎 Vérification : <b>' + P.verif.nBad + ' écart(s)</b> avec la prépa de l\'appli') + '</p>' : '')
+    + '<p style="font-size:15px;margin:12px 2px"><b>' + P.poses + '</b> article(s) posé(s) · <b>' + P.retires + '</b> retiré(s) · <b>' + P.coches + '</b> coche(s) « Fini » · <b>' + P.ndFaits + '</b> ND reçu(s) · <b>' + P.remises + '</b> remise(s) (poids ajusté)' + (P.remisesKo ? ' · <b style="color:#c62828">' + P.remisesKo + ' remise(s) refusée(s)</b>' : '') + (job.dry ? ' — <b>à faire</b> (rien n\'a été écrit)' : '') + '</p>'
+    + (P.verif ? '<p style="font-size:15px;margin:4px 2px">' + (P.verif.ok ? '🔎 Vérification : quantités et coches de l\'ancien site = prépa de l\'appli.' : '🔎 Vérification : <b>' + P.verif.nBad + ' écart(s)</b> avec la prépa de l\'appli') + '</p>' : '')
     + li('🔎 Écarts après report', P.verif && P.verif.bad, '#c62828') + li('⚠️ Erreurs', P.erreurs, '#c62828')
     + li('⏳ Pas terminés dans l\'appli (non reportés)', P.attente, '#b45309') + li('❔ Introuvables sur l\'ancien site', P.absents, '#616161')
     + li('ℹ️ Commandes de l\'ancien site inconnues de l\'appli', P.inconnus, '#616161')
-    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien v1.7 · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
-  MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
+    + '<p style="color:#999;font-size:12px;margin-top:16px">Report automatique KBG_Ancien ' + ANC_VERSION + ' · ' + (job.dry ? 'simulation (ANC_LIVE ≠ true)' : 'réel') + ' · ' + rgEsc_(job.by || '') + ' · ' + P.appels + ' appel(s)</p></div>';
+  MailApp.sendEmail({ to: ANC_MAIL_TO, subject: (ok ? '✅' : '⚠️') + ' Ancien site ' + rgFr_(job.day) + (job.dry ? ' (simulation)' : '') + ' : ' + P.faits + ' produit(s) reporté(s)' + (P.remisesKo ? ' · ' + P.remisesKo + ' remise(s) refusée(s)' : '') + (P.verif && !P.verif.ok ? ' · ' + P.verif.nBad + ' écart(s)' : ''), htmlBody: html, name: 'Kelbongoo' });
 }
+
 
 /* ═════════════════════════════ ESSAIS ÉDITEUR ═════════════════════════════ */
 /** Vérifie la connexion et la distribution du jour suivant (lecture seule). */
@@ -381,4 +441,10 @@ function ancienTestConnexion() {
   var G = ancGlobalOrder_(day), A = ancProducts_(G), L = Object.keys(A).map(function (k) { return A[k]; });
   var withOrd = L.filter(function (a) { return Object.keys(a.prog).some(function (l) { return a.prog[l].ord > 0; }); });
   Logger.log('Distribution ' + day + ' · globalorder ' + G + ' · ' + L.length + ' produits (' + withOrd.length + ' commandés) · écriture ' + (ancLive_() ? 'ACTIVÉE' : 'désactivée (simulation)'));
+}
+/** v1.8 — Test du plan d'un bac remisé (hors réseau) : pose AVANT ajustement. Voir le journal d'exécution. */
+function ancienTestPlanRemise() {
+  var pl = ancPlanLocale_('G', 'PP', 'BOR', { O1: 1 }, [{ order_id: 'O1', number: 29, items: ['d1'], done: [] }], { O1: { pct: 50, n: 1 } }, 0.25, 0);
+  Logger.log(pl.calls.map(function (c) { return c.route.split('/').pop() + (c.params.weight ? ' ' + c.params.weight : ''); }).join(' → '));
+  // attendu : dispatch-one → update-order-item-weight 0.125
 }
