@@ -785,7 +785,7 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V10.96';
+    const APP_VERSION = 'V11.02';
     // V10.96 — (04/11/2026) Distrib : un article déjà remisé en prépa peut être retiré ou remisé plus (la nouvelle remise REMPLACE celle de la prépa, remboursement = la différence) ; ancien site : remise prépa annulée (unreduce) puis nouvelle remise (KBG_AncienDistrib v1.6).
     // V10.95 — (04/11/2026) Distrib : ligne ×2 ou plus = articles un par un (« Article 1 · Article 2 »), chacun sa remise (% directe, 📅 DLC courte, poids, lot d'œufs, retrait) ; article remisé en prépa verrouillé ; facturation site et report ancien site par article (KBG_AncienDistrib v1.5).
     // V10.94 — (03/11/2026) Distrib : sur chaque ligne produit, « ⏳ Remise prépa en cours −X% ×N » quand l'ancien site de prépa a refusé la remise (HTTP 500 sur « Ajuster le poids », Firestore day_<jour>_prepremko écrit par KBG_Ancien v1.9) ; KBG_AncienDistrib v1.4 l'applique en % au report distrib. « ✅ Remise prépa faite sur l'ancien site » quand une relance a réussi.
@@ -2386,6 +2386,26 @@
       if (modeSwitch) keep = [];
       const list = (json && json.orders) || [];
       const inJson = new Set(list.map(po => String(po.id_order)));
+      // V11.02 — lieu corrigé côté site (ex. retrait STB exporté à tort en DOM) : la commande déjà chargée suit le nouveau lieu.
+      const poById = {};
+      list.forEach(po => { poById[String(po.id_order)] = po; });
+      let siteFix = 0;
+      const siteFixes = [];
+      for (const o of keep) {
+        const po = poById[psIdOf(o)];
+        if (!po) continue;
+        const ns = String(po.site || 'PS').trim().toUpperCase();
+        if (ns && ns !== o.site) {
+          siteFixes.push({ ref: o.psRef, client: o.name, from: o.site, to: ns });
+          o.siteChangedFrom = o.site;
+          o.site = ns;
+          o.psMode = po.mode || o.psMode;
+          o.psSlot = po.slot || o.psSlot;
+          o.casiersFrais = [];
+          o.casiersSec = [];
+          siteFix++;
+        }
+      }
       const known = new Set(keep.map(psIdOf));
       const gone = keep.filter(o => !inJson.has(psIdOf(o))).length;
       const offsetBySite = {};
@@ -2396,8 +2416,8 @@
       const renum = psRenumberCasiers(base, psFinal);
       const bySite = {}; psFinal.forEach(o => { bySite[o.site] = (bySite[o.site] || 0) + 1; });
       const unknown = Object.keys(bySite).filter(k => /^PS\d+$/.test(k));
-      const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, renum, written: false };
-      if (!fresh.length && !modeSwitch && !renum) return res;
+      const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, renum, siteFix, siteFixes, written: false };
+      if (!fresh.length && !modeSwitch && !renum && !siteFix) return res;
       if (!existing && !psFinal.length) return res;
       const now = new Date().toISOString();
       const src0 = existing && existing.source ? String(existing.source).replace(/\+?prestashop(-test)?/g, '') : '';
@@ -14382,9 +14402,71 @@
       }
       return res;
     }
-    function PainPribonPage({ session, setTab, catalogue }) {
+    function MasterPainPage({
+      session,
+      catalogue
+    }) {
+      const [v, setV] = React.useState(() => {
+        try {
+          return localStorage.getItem('kbg_mpain_v') || 'bdp';
+        } catch (e) {
+          return 'bdp';
+        }
+      });
+      const [todo, setTodo] = React.useState(null);
+      React.useEffect(() => storage.subscribe('pain_pribon', arr => {
+        const t = (arr || []).filter(d => d.type === 'order' && !d.invoiced);
+        setTodo({
+          n: t.length,
+          eur: t.reduce((s, o) => s + (o.total || 0), 0)
+        });
+      }), []);
+      const pick = x => {
+        setV(x);
+        try {
+          localStorage.setItem('kbg_mpain_v', x);
+        } catch (e) {}
+      };
+      return React.createElement("div", {
+        className: "stack"
+      }, React.createElement("div", {
+        className: "seg",
+        style: {
+          alignSelf: 'flex-start',
+          flexWrap: 'wrap'
+        }
+      }, React.createElement("button", {
+        className: v === 'bdp' ? 'active' : '',
+        onClick: () => pick('bdp')
+      }, "🍞 Commande Brut de pain"), React.createElement("button", {
+        className: v === 'pribon' ? 'active' : '',
+        onClick: () => pick('pribon')
+      }, "🥖 Pain Pribon · facturation", todo && todo.n > 0 && React.createElement("span", {
+        style: {
+          marginLeft: 6,
+          background: 'var(--danger)',
+          color: '#fff',
+          borderRadius: 10,
+          padding: '1px 7px',
+          fontSize: 12,
+          fontWeight: 800
+        }
+      }, todo.eur.toLocaleString('fr-FR', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }), " €"))), v === 'bdp' ? React.createElement(PrintPainPage, {
+        session: session,
+        master: true
+      }) : React.createElement(PainPribonPage, {
+        session: session,
+        catalogue: catalogue,
+        embedded: true,
+        initialView: 'fact'
+      }));
+    }
+    function PainPribonPage({ session, setTab, catalogue, embedded, initialView }) {
       const showToast = React.useContext(ToastContext);
-      const [view, setView] = React.useState('cmd'); // cmd | fact
+      const [view, setView] = React.useState(initialView || 'cmd'); // cmd | fact
       const [day, setDay] = React.useState(() => activeDay());
       const [store, setStore] = React.useState(PRIBON_STORES[0].code);
       const [qty, setQty] = React.useState({});
@@ -14470,10 +14552,14 @@
           {PRIBON_STORES.map(s => <option key={s.code} value={s.code}>{s.label}</option>)}
         </select>
       );
+      // V10.97 — liste des livraisons à refacturer (toutes périodes, non facturées)
+      const aRefact = orders.filter(o => !o.invoiced).slice().sort((a, b) => a.date.localeCompare(b.date));
+      const aRefactEur = aRefact.reduce((t, o) => t + (o.total || 0), 0);
+      const aRefactNb = aRefact.reduce((t, o) => t + (o.nb || 0), 0);
       return (
         <div className="stack">
-          <KbBackToHub setTab={setTab} />
-          <h1 style={{ margin: 0 }}>🥖 Commande pain — magasins Pribon</h1>
+          {!embedded && <KbBackToHub setTab={setTab} />}
+          <h1 style={{ margin: 0, fontSize: embedded ? 22 : undefined }}>🥖 Commande pain — magasins Pribon</h1>
           <div className="seg" style={{ alignSelf: 'flex-start' }}>
             <button className={view === 'cmd' ? 'active' : ''} onClick={() => setView('cmd')}>🥖 Commande</button>
             <button className={view === 'fact' ? 'active' : ''} onClick={() => setView('fact')}>💶 Facturation</button>
@@ -14520,6 +14606,122 @@
             <div className="card" style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}><StoreSel />
               <span style={{ fontSize: 14 }}>À facturer : <b style={{ color: 'var(--danger)', fontSize: 18 }}>{eur(orders.filter(o => !o.invoiced).reduce((t, o) => t + (o.total || 0), 0))}</b></span>
             </div>
+            {/* V10.97 — À refacturer */}{React.createElement("div", {
+    className: "card",
+    style: {
+      borderLeft: '6px solid ' + (aRefact.length ? 'var(--danger)' : '#2e7d32'),
+      background: aRefact.length ? '#fff5f5' : '#f1f8e9'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 19,
+      fontWeight: 800,
+      marginBottom: 6
+    }
+  }, "🧾 À refacturer à ", (PRIBON_STORES.find(s => s.code === store) || {}).label), aRefact.length === 0 ? React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#2e7d32'
+    }
+  }, "✅ Rien à refacturer : tout est facturé.") : React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: 15
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      textAlign: 'left',
+      color: 'var(--ink-mute)',
+      fontSize: 12
+    }
+  }, React.createElement("th", {
+    style: {
+      padding: '4px 6px'
+    }
+  }, "LIVRAISON"), React.createElement("th", {
+    style: {
+      padding: '4px 6px'
+    }
+  }, "DÉTAIL"), React.createElement("th", {
+    style: {
+      padding: '4px 6px',
+      textAlign: 'right'
+    }
+  }, "PAINS"), React.createElement("th", {
+    style: {
+      padding: '4px 6px',
+      textAlign: 'right'
+    }
+  }, "MONTANT"))), React.createElement("tbody", null, aRefact.map(o => React.createElement("tr", {
+    key: o.id,
+    style: {
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: '6px',
+      fontWeight: 700,
+      whiteSpace: 'nowrap',
+      textTransform: 'capitalize'
+    }
+  }, kbDateLong(o.date)), React.createElement("td", {
+    style: {
+      padding: '6px',
+      fontSize: 13,
+      color: 'var(--ink-soft)'
+    }
+  }, (o.lines || []).map(l => `${l.qty}× ${l.name}`).join(' · ')), React.createElement("td", {
+    style: {
+      padding: '6px',
+      textAlign: 'right',
+      fontWeight: 700
+    }
+  }, o.nb || 0), React.createElement("td", {
+    style: {
+      padding: '6px',
+      textAlign: 'right',
+      fontWeight: 700,
+      whiteSpace: 'nowrap'
+    }
+  }, eur(o.total))))), React.createElement("tfoot", null, React.createElement("tr", {
+    style: {
+      borderTop: '2px solid var(--ink)'
+    }
+  }, React.createElement("td", {
+    colSpan: 2,
+    style: {
+      padding: '8px 6px',
+      fontWeight: 800,
+      fontSize: 16
+    }
+  }, "TOTAL À REFACTURER (", aRefact.length, " livraison", aRefact.length > 1 ? 's' : '', ")"), React.createElement("td", {
+    style: {
+      padding: '8px 6px',
+      textAlign: 'right',
+      fontWeight: 800
+    }
+  }, aRefactNb), React.createElement("td", {
+    style: {
+      padding: '8px 6px',
+      textAlign: 'right',
+      fontWeight: 800,
+      fontSize: 18,
+      color: 'var(--danger)',
+      whiteSpace: 'nowrap'
+    }
+  }, eur(aRefactEur)))))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 6
+    }
+  }, "Une fois la facture faite : « ✅ Marquer facturé » sur le mois ci-dessous. Récap envoyé chaque lundi à 8h à rr@pribon.org.")))}
             {Object.keys(months).length === 0 && <div className="card"><p style={{ margin: 0 }}>Aucune commande enregistrée.</p></div>}
             {Object.entries(months).map(([m, list]) => {
               const tot = list.reduce((t, o) => t + (o.total || 0), 0), nbm = list.reduce((t, o) => t + (o.nb || 0), 0);
@@ -14709,6 +14911,657 @@
         </div>
       );
     }
+    const KB_RDU_URL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/epal/rungis';
+    const KB_RDU_ENL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/enlevements';
+    const KB_RDU_START = '2026-11-05';
+    const KB_RDU_MATS = [['epal', '🟫', 'Palettes EPAL']];
+    async function kbRduGet(url) {
+      const r = await fetch(url + '.json?t=' + Date.now());
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return (await r.json()) || {};
+    }
+    async function kbRduPost(obj) {
+      const r = await fetch(KB_RDU_URL + '.json', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(obj)
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 401 ? ' (règle RTDB « epal/rungis » à autoriser)' : ''));
+    }
+    async function kbRduCancel(id) {
+      const r = await fetch(KB_RDU_URL + '/' + encodeURIComponent(id) + '.json', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          cancelled: true,
+          cancelledAt: Date.now()
+        })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    }
+    const kbRduIso = t => {
+      try {
+        return new Date(t).toLocaleDateString('sv-SE', {
+          timeZone: 'Europe/Paris'
+        });
+      } catch (e) {
+        return new Date(t).toISOString().slice(0, 10);
+      }
+    };
+    const kbRduKey = k => String(k || '').replace(/[\/#\[\]\.$]/g, '_').slice(0, 140);
+    function kbRduEnvois(enl, start, today) {
+      const out = [];
+      Object.keys(enl || {}).forEach(id => {
+        const r = enl[id];
+        if (!r || r.status === 'annule') return;
+        const items = Array.isArray(r.items) ? r.items : r.items && typeof r.items === 'object' ? Object.values(r.items) : [];
+        const picked = r.picked || {},
+          refused = r.refused || {};
+        items.forEach((it, i) => {
+          if (!it || String(it.code || '').toUpperCase() !== 'RUNGIS') return;
+          const n = Math.round(Number(it.epalN != null ? it.epalN : it.epal ? it.n : 0) || 0);
+          if (n <= 0) return;
+          const k = kbRduKey(it.key || 'i' + i),
+            pk = picked[k];
+          let st = 'prevu',
+            day = r.pickup || r.date || kbRduIso(r.at || Date.now());
+          if (pk && pk.status === 'ok') {
+            st = 'parti';
+            day = kbRduIso(pk.at || Date.now());
+          } else if (pk && pk.status) st = 'paspris';else if (refused[k]) st = 'paspris';else if ((r.status === 'valide' || r.fast) && r.pickup && r.pickup < today) st = 'parti';
+          if (day < start) return;
+          out.push({
+            id: id + '|' + k,
+            n,
+            st,
+            day,
+            by: r.by || '',
+            what: it.contenu || (it.express ? 'Ajout express' : 'Enlèvement')
+          });
+        });
+      });
+      return out.sort((a, b) => b.day.localeCompare(a.day));
+    }
+    function kbRduCompute(rdu, epal, enl, start, today) {
+      start = start || KB_RDU_START;
+      today = today || todayKey();
+      const due = {
+          epal: 0
+        },
+        ans = {};
+      const mv = Object.keys(rdu || {}).map(k => ({
+        id: k,
+        ...rdu[k]
+      })).filter(m => m && !m.cancelled);
+      mv.filter(m => m.type === 'recu' || m.type === 'ko').sort((a, b) => (a.at || 0) - (b.at || 0)).forEach(m => {
+        ans[m.ref] = m;
+      });
+      const pickups = Object.keys(epal || {}).map(k => ({
+        id: k,
+        ...epal[k]
+      })).filter(m => m && !m.cancelled && m.type === 'retour' && String(m.day || '') >= start && Math.round(Number(m.n) || 0) > 0).map(p => {
+        const n = Math.round(Number(p.n) || 0),
+          a = ans[p.id] || null;
+        return {
+          ...p,
+          code: String(p.code || '?').toUpperCase(),
+          n,
+          ans: a,
+          recu: a && a.type === 'recu' ? Math.min(n, Math.round(Number(a.n) || 0)) : 0
+        };
+      });
+      // regroupement par jour de récupération
+      const byDay = {};
+      pickups.forEach(p => {
+        const g = byDay[p.day] || (byDay[p.day] = {
+          day: p.day,
+          list: [],
+          n: 0,
+          recu: 0,
+          open: 0,
+          by: {}
+        });
+        g.list.push(p);
+        g.n += p.n;
+        g.recu += p.recu;
+        if (!p.ans) g.open += p.n;
+        g.by[p.code] = (g.by[p.code] || 0) + p.n;
+      });
+      const days = Object.values(byDay).sort((a, b) => b.day.localeCompare(a.day));
+      let aConf = 0,
+        ko = 0;
+      pickups.forEach(p => {
+        due.epal += p.n - p.recu;
+        if (!p.ans) aConf += p.n;else ko += p.n - p.recu;
+      });
+      const envois = kbRduEnvois(enl, start, today);
+      envois.forEach(e => {
+        if (e.st === 'parti') due.epal += e.n;
+      });
+      mv.forEach(m => {
+        const n = Math.round(Number(m.n) || 0);
+        if (m.mat !== 'epal' || !n) return;
+        if (m.type === 'retour') due.epal -= n;else if (m.type === 'ajust' || m.type === 'envoi') due.epal += n;
+      });
+      const hist = mv.filter(m => m.type === 'retour' || m.type === 'ajust' || m.type === 'envoi').sort((a, b) => (b.at || 0) - (a.at || 0));
+      return {
+        due,
+        days,
+        aConf,
+        ko,
+        envois,
+        hist
+      };
+    }
+    function useKbRungisDu() {
+      const [st, setSt] = React.useState({
+        rdu: undefined,
+        epal: undefined,
+        enl: undefined,
+        err: ''
+      });
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        Promise.all([kbRduGet(KB_RDU_URL), kbRduGet(KB_EPAL_URL), kbRduGet(KB_RDU_ENL).catch(() => ({}))]).then(([rdu, epal, enl]) => {
+          if (!stop) setSt({
+            rdu,
+            epal,
+            enl,
+            err: ''
+          });
+        }).catch(e => {
+          if (!stop) setSt(s => ({
+            ...s,
+            rdu: s.rdu || null,
+            err: e.message || String(e)
+          }));
+        });
+        return () => {
+          stop = true;
+        };
+      }, [tick]);
+      React.useEffect(() => {
+        const t = setInterval(() => setTick(x => x + 1), 120000);
+        return () => clearInterval(t);
+      }, []);
+      const c = React.useMemo(() => kbRduCompute(st.rdu || {}, st.epal || {}, st.enl || {}), [st.rdu, st.epal, st.enl]);
+      return {
+        ...c,
+        ready: st.rdu !== undefined,
+        err: st.err,
+        reload: () => setTick(x => x + 1)
+      };
+    }
+    const kbRduPl = n => n > 1 ? 's' : '';
+    const kbRduFrom = by => Object.keys(by).sort().map(c => `${by[c]} de ${c}`).join(' et ').replace(/ et (?=.* et )/g, ', ');
+    function KbRduCounters({
+      R,
+      big
+    }) {
+      const v = R.due.epal || 0;
+      return React.createElement("div", {
+        style: {
+          textAlign: 'center',
+          padding: big ? '12px 6px' : '8px 4px',
+          borderRadius: 12,
+          border: '3px solid ' + (v > 0 ? '#c62828' : '#2e7d32'),
+          background: v > 0 ? '#fdecea' : '#e8f5e9'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: big ? 16 : 13,
+          fontWeight: 700
+        }
+      }, "🟫 Palettes EPAL que Rungis nous doit"), React.createElement("div", {
+        style: {
+          fontSize: big ? 56 : 32,
+          fontWeight: 900,
+          lineHeight: 1.1,
+          color: v > 0 ? '#c62828' : '#2e7d32'
+        }
+      }, v));
+    }
+    function KbRduRetourForm({
+      session,
+      onDone
+    }) {
+      const showToast = React.useContext(ToastContext);
+      const [n, setN] = React.useState(0);
+      const [busy, setBusy] = React.useState(false);
+      const go = async () => {
+        if (!n) return;
+        if (!window.confirm(`Rungis nous a rendu ${n} palette${kbRduPl(n)} EPAL à PDP ?`)) return;
+        setBusy(true);
+        try {
+          await kbRduPost({
+            type: 'retour',
+            mat: 'epal',
+            n,
+            day: todayKey(),
+            at: Date.now(),
+            by: String(session && session.name || '').slice(0, 80)
+          });
+          setN(0);
+          showToast('✓ Retour enregistré : compteur Rungis baissé');
+          onDone();
+        } catch (e) {
+          showToast('Erreur : ' + e.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+      return React.createElement("div", {
+        className: "card",
+        style: {
+          borderLeft: '6px solid #2e7d32'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 800
+        }
+      }, "📥 Rungis nous rend des palettes EPAL"), React.createElement("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--ink-mute)',
+          margin: '2px 0 8px'
+        }
+      }, "Palettes rapportées par Rungis à PDP (hors récupérations en boutique ci-dessus) : le compteur baisse."), React.createElement("div", {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10
+        }
+      }, React.createElement("span", {
+        style: {
+          flex: 1,
+          fontSize: 17,
+          fontWeight: 700
+        }
+      }, "🟫 Palettes EPAL"), React.createElement("button", {
+        disabled: !n,
+        onClick: () => setN(x => Math.max(0, x - 1)),
+        style: {
+          width: 46,
+          height: 46,
+          fontSize: 24,
+          fontWeight: 700,
+          borderRadius: 10,
+          border: '2px solid var(--line)',
+          background: '#fff'
+        }
+      }, "−"), React.createElement("input", {
+        value: n || '',
+        placeholder: "0",
+        inputMode: "numeric",
+        onChange: e => setN(Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0))),
+        style: {
+          width: 60,
+          textAlign: 'center',
+          fontSize: 22,
+          fontWeight: 700,
+          padding: '6px 4px'
+        }
+      }), React.createElement("button", {
+        onClick: () => setN(x => Math.min(999, x + 1)),
+        style: {
+          width: 46,
+          height: 46,
+          fontSize: 24,
+          fontWeight: 700,
+          borderRadius: 10,
+          border: 'none',
+          background: '#2e7d32',
+          color: '#fff'
+        }
+      }, "+")), React.createElement("button", {
+        className: "btn-primary btn-lg",
+        disabled: busy || !n,
+        onClick: go,
+        style: {
+          marginTop: 8,
+          width: '100%',
+          fontSize: 17,
+          background: '#2e7d32',
+          borderColor: '#2e7d32'
+        }
+      }, busy ? 'Enregistrement…' : '📥 Enregistrer le retour'));
+    }
+    function KbRduMasterCard() {
+      const R = useKbRungisDu();
+      return React.createElement("div", {
+        className: "card",
+        style: {
+          marginBottom: 12,
+          border: '2px solid #5d4037'
+        }
+      }, R.ready ? React.createElement(KbRduCounters, {
+        R: R
+      }) : React.createElement("p", {
+        style: {
+          margin: 0
+        }
+      }, "Chargement…"), React.createElement("div", {
+        style: {
+          fontSize: 12,
+          color: 'var(--ink-mute)',
+          marginTop: 6
+        }
+      }, R.aConf ? `${R.aConf} récupérée(s) en boutique, arrivée à PDP pas encore confirmée · ` : '', R.ko ? `${R.ko} jamais arrivée(s) à PDP · ` : '', "Saisie : Prépa › Suivi › 🟫 Palettes EPAL Rungis"));
+    }
+    function RungisDuPage({
+      session,
+      setTab
+    }) {
+      const showToast = React.useContext(ToastContext);
+      const R = useKbRungisDu();
+      const [busy, setBusy] = React.useState('');
+      const who = String(session && session.name || '').slice(0, 80);
+      // confirme un jour : n reçues au total → réparti sur les récupérations du jour (boutique par boutique)
+      const confirmDay = async (g, mode) => {
+        const open = g.list.filter(p => !p.ans);
+        const tot = open.reduce((t, p) => t + p.n, 0);
+        let recu = tot;
+        if (mode === 'part') {
+          const v = window.prompt(`Le ${kbEnlDay(g.day)} : ${tot} palette${kbRduPl(tot)} EPAL récupérée${kbRduPl(tot)} par le chauffeur.\nCombien sont VRAIMENT arrivées à PDP ?`, String(tot));
+          if (v === null) return;
+          recu = Math.max(0, Math.min(tot, parseInt(v, 10) || 0));
+        } else if (mode === 'ko') {
+          if (!window.confirm(`Aucune des ${tot} palette${kbRduPl(tot)} du ${kbEnlDay(g.day)} n'est arrivée à PDP ?\nRungis nous les doit.`)) return;
+          recu = 0;
+        }
+        setBusy(g.day);
+        try {
+          let rest = recu;
+          for (const p of open) {
+            const r = Math.min(p.n, rest);
+            rest -= r;
+            await kbRduPost({
+              type: r > 0 ? 'recu' : 'ko',
+              mat: 'epal',
+              ref: p.id,
+              n: r,
+              code: p.code,
+              day: todayKey(),
+              at: Date.now(),
+              by: who
+            });
+          }
+          showToast(recu >= tot ? `✓ ${tot} palette${kbRduPl(tot)} bien arrivée${kbRduPl(tot)} à PDP` : `⚠️ ${tot - recu} palette${kbRduPl(tot - recu)} ajoutée${kbRduPl(tot - recu)} au compteur Rungis`);
+          R.reload();
+        } catch (e) {
+          showToast('Erreur : ' + e.message);
+        } finally {
+          setBusy('');
+        }
+      };
+      const undoDay = async g => {
+        if (!window.confirm(`Annuler la confirmation du ${kbEnlDay(g.day)} ?`)) return;
+        setBusy(g.day);
+        try {
+          for (const p of g.list) if (p.ans) await kbRduCancel(p.ans.id);
+          R.reload();
+        } catch (e) {
+          showToast('Erreur : ' + e.message);
+        } finally {
+          setBusy('');
+        }
+      };
+      const cancelMv = async m => {
+        if (!window.confirm('Annuler ce retour ?')) return;
+        try {
+          await kbRduCancel(m.id);
+          R.reload();
+        } catch (e) {
+          showToast('Erreur : ' + e.message);
+        }
+      };
+      const todo = R.days.filter(g => g.open > 0),
+        done = R.days.filter(g => !g.open);
+      const stLbl = {
+        parti: ['✅ partie à Rungis', '#c62828'],
+        prevu: ['⏳ pas encore partie', '#ef6c00'],
+        paspris: ['❌ pas prise par le chauffeur', '#777']
+      };
+      return React.createElement("div", {
+        className: "stack"
+      }, setTab && React.createElement(KbBackToHub, {
+        setTab: setTab
+      }), React.createElement("h1", {
+        style: {
+          margin: 0
+        }
+      }, "🟫 Palettes EPAL Rungis"), React.createElement("div", {
+        className: "card"
+      }, !R.ready ? React.createElement("p", {
+        style: {
+          margin: 0
+        }
+      }, "Chargement…") : React.createElement(KbRduCounters, {
+        R: R,
+        big: true
+      }), R.ready && (R.aConf > 0 || R.ko > 0) && React.createElement("div", {
+        style: {
+          fontSize: 13,
+          marginTop: 8,
+          color: '#b71c1c',
+          fontWeight: 700,
+          textAlign: 'center'
+        }
+      }, R.aConf ? `${R.aConf} à confirmer` : '', R.aConf && R.ko ? ' · ' : '', R.ko ? `${R.ko} jamais arrivée${kbRduPl(R.ko)} à PDP` : ''), R.err && React.createElement("div", {
+        className: "alert-info",
+        style: {
+          marginTop: 8,
+          fontSize: 13
+        }
+      }, "⚠️ ", R.err, " ", React.createElement("button", {
+        className: "btn-secondary",
+        onClick: R.reload
+      }, "Réessayer"))), React.createElement("div", {
+        className: "card",
+        style: {
+          borderLeft: '6px solid ' + (todo.length ? '#c62828' : '#2e7d32')
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 800
+        }
+      }, "🚚 Récupérées en boutique par le chauffeur"), React.createElement("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--ink-mute)',
+          margin: '2px 0 8px'
+        }
+      }, "Déjà déduites des boutiques. Le chauffeur doit les déposer à PDP, pas à Rungis : vérifie qu'elles sont bien arrivées."), R.ready && !R.days.length && React.createElement("p", {
+        style: {
+          margin: 0,
+          fontSize: 14
+        }
+      }, "Aucune récupération depuis le ", kbEnlDay(KB_RDU_START), "."), todo.map(g => {
+        const open = g.list.filter(p => !p.ans),
+          tot = open.reduce((t, p) => t + p.n, 0),
+          by = {};
+        open.forEach(p => {
+          by[p.code] = (by[p.code] || 0) + p.n;
+        });
+        return React.createElement("div", {
+          key: g.day,
+          style: {
+            padding: '12px 0',
+            borderTop: '1px solid var(--line)'
+          }
+        }, React.createElement("div", {
+          style: {
+            fontSize: 18,
+            lineHeight: 1.35
+          }
+        }, "Normalement vous avez reçu le ", React.createElement("b", null, kbEnlDay(g.day)), " ", React.createElement("b", {
+          style: {
+            fontSize: 22,
+            color: '#5d4037'
+          }
+        }, tot, " palette", kbRduPl(tot), " EPAL"), ", en provenance de ", React.createElement("b", null, kbRduFrom(by)), "."), React.createElement("div", {
+          style: {
+            display: 'flex',
+            gap: 8,
+            flexWrap: 'wrap',
+            marginTop: 8
+          }
+        }, React.createElement("button", {
+          disabled: busy === g.day,
+          onClick: () => confirmDay(g, 'ok'),
+          className: "btn-primary",
+          style: {
+            fontSize: 15,
+            padding: '10px 14px',
+            background: '#2e7d32',
+            borderColor: '#2e7d32'
+          }
+        }, "✅ Oui, toutes reçues"), React.createElement("button", {
+          disabled: busy === g.day,
+          onClick: () => confirmDay(g, 'part'),
+          className: "btn-secondary",
+          style: {
+            fontSize: 15,
+            padding: '10px 14px'
+          }
+        }, "✏️ Pas toutes"), React.createElement("button", {
+          disabled: busy === g.day,
+          onClick: () => confirmDay(g, 'ko'),
+          className: "btn-primary",
+          style: {
+            fontSize: 15,
+            padding: '10px 14px',
+            background: '#c62828',
+            borderColor: '#c62828'
+          }
+        }, "❌ Rien reçu")));
+      }), done.length > 0 && React.createElement("details", {
+        style: {
+          marginTop: 8
+        }
+      }, React.createElement("summary", {
+        style: {
+          cursor: 'pointer',
+          fontSize: 14,
+          fontWeight: 700
+        }
+      }, "Déjà vérifiées (", done.length, " jour", kbRduPl(done.length), ")"), done.slice(0, 40).map(g => React.createElement("div", {
+        key: g.day,
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          fontSize: 14,
+          padding: '6px 0',
+          borderTop: '1px solid var(--line)'
+        }
+      }, React.createElement("span", {
+        style: {
+          flex: 1
+        }
+      }, kbEnlDay(g.day), " · ", g.n, " EPAL (", kbRduFrom(g.by), ") → ", g.recu >= g.n ? React.createElement("b", {
+        style: {
+          color: '#2e7d32'
+        }
+      }, "✅ reçues") : React.createElement("b", {
+        style: {
+          color: '#c62828'
+        }
+      }, "❌ ", g.n - g.recu, " pas arrivée", kbRduPl(g.n - g.recu), g.recu ? ` (${g.recu} reçue${kbRduPl(g.recu)})` : '')), React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          fontSize: 12,
+          padding: '3px 8px'
+        },
+        disabled: busy === g.day,
+        onClick: () => undoDay(g)
+      }, "Annuler"))))), React.createElement("div", {
+        className: "card",
+        style: {
+          borderLeft: '6px solid #ef6c00'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 800
+        }
+      }, "📤 Envoyées à Rungis (Ajout express)"), React.createElement("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--ink-mute)',
+          margin: '2px 0 8px'
+        }
+      }, "Automatique : La Centrale › Ajout express, destination RUNGIS, sur palette EPAL (ex. cagettes en bois à détruire). Comptées dès que le chauffeur les a prises."), R.ready && !R.envois.length && React.createElement("p", {
+        style: {
+          margin: 0,
+          fontSize: 14
+        }
+      }, "Aucune palette EPAL envoyée à Rungis depuis le ", kbEnlDay(KB_RDU_START), "."), R.envois.slice(0, 30).map(e => React.createElement("div", {
+        key: e.id,
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          fontSize: 14,
+          padding: '6px 0',
+          borderTop: '1px solid var(--line)'
+        }
+      }, React.createElement("span", {
+        style: {
+          flex: 1
+        }
+      }, React.createElement("b", null, kbEnlDay(e.day)), " · ", e.n, " EPAL · ", e.what, e.by ? ' · ' + e.by : ''), React.createElement("b", {
+        style: {
+          color: stLbl[e.st][1],
+          fontSize: 13
+        }
+      }, stLbl[e.st][0])))), React.createElement(KbRduRetourForm, {
+        session: session,
+        onDone: R.reload
+      }), R.hist.length > 0 && React.createElement("div", {
+        className: "card"
+      }, React.createElement("div", {
+        style: {
+          fontSize: 16,
+          fontWeight: 800,
+          marginBottom: 4
+        }
+      }, "📜 Retours saisis"), R.hist.slice(0, 30).map(m => React.createElement("div", {
+        key: m.id,
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          fontSize: 14,
+          padding: '5px 0',
+          borderTop: '1px solid var(--line)'
+        }
+      }, React.createElement("span", {
+        style: {
+          flex: 1
+        }
+      }, kbEnlDay(m.day), " · ", m.type === 'retour' ? '📥 rendues par Rungis' : '⚙️ ajustement', " · ", m.n, " EPAL", m.by ? ' · ' + m.by : ''), React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          fontSize: 12,
+          padding: '3px 8px'
+        },
+        onClick: () => cancelMv(m)
+      }, "Annuler")))), React.createElement("p", {
+        style: {
+          fontSize: 12,
+          color: 'var(--ink-mute)',
+          margin: 0
+        }
+      }, "Compteur depuis le ", kbEnlDay(KB_RDU_START), " = palettes récupérées en boutique non arrivées à PDP + palettes EPAL envoyées à Rungis (Ajout express) − palettes rendues par Rungis. Actualisé toutes les 2 min."));
+    }
     function PrepSuiviHub({ setTab }) {
       const board = useDlcBoard();
       const pdp = useKbPdpBoard();
@@ -14727,6 +15580,9 @@
         ...(kbIsSecure() ? [{ title: '🔐 Magasins Pribon', items: [
           { key:'painpribon', icon:'🥖', label:'Commande pain des magasins Pribon', desc:'Pribon Bichat · ajoutée au dispatch pain · suivi facturation' },
         ]}] : []),
+        { title: '🟫 Palettes EPAL Rungis', items: [
+          { key:'rungisdu', icon:'🟫', label:'Suivi des palettes EPAL retournées & compteur Rungis', desc:'Palettes récupérées par le chauffeur : reçues à PDP ? · envois / retours de palettes EPAL' },
+        ]},
       ];
       return (
         <div className="stack">
@@ -14862,7 +15718,8 @@
         const codes = Object.keys(lieux.sites);
         const bad = [];
         codes.forEach(c => { const L = lieux.sites[c]; (L.days || []).forEach(d => { const v = String((L.hours || {})[d] || '').trim(); if (v && !kbSlotParse(v)) bad.push(`${c} ${KB_LIEUX_DOW_ALL.find(x => x[0] === d)[1]} « ${v} »`); }); });
-        if (bad.length) { showToast('Horaire invalide (ex : 14:00-20:00) : ' + bad.slice(0, 3).join(', ')); return; }
+        codes.forEach(c => { String(lieux.sites[c].email || '').split(/[,;\s]+/).filter(Boolean).forEach(m => { if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(m)) bad.push(`${c} mail « ${m} »`); }); });
+        if (bad.length) { showToast('Horaire ou mail invalide (ex : 14:00-20:00) : ' + bad.slice(0, 3).join(', ')); return; }
         if (!codes.length) { showToast('Il faut au moins un lieu'); return; }
         setSaving(true);
         try {
@@ -14880,7 +15737,9 @@
             let L = lieux.sites[c]; const days = [...new Set(L.days || [])].sort(); const h = {};
             days.forEach(d => { const p = kbSlotParse((L.hours || {})[d] || ''); if (p) h[d] = p.start + '-' + p.end; });
             if (L.rungis) L = await locate(L, c);
-            sites[c] = { name: String(L.name || c).trim() || c, type: L.type || 'camion', adresse: String(L.adresse || '').trim(), hours: h, days, exc: kbExcClean(L.exc),
+            sites[c] = { name: String(L.name || c).trim() || c, type: L.type || 'camion', adresse: String(L.adresse || '').trim(),
+              email: String(L.email || '').replace(/[;\s]+/g, ',').split(',').filter(Boolean).join(', '), // V10.98
+              hours: h, days, exc: kbExcClean(L.exc),
               rungis: L.rungis || '', lat: L.lat != null ? Number(L.lat) : null, lng: L.lng != null ? Number(L.lng) : null, geoAddr: L.geoAddr || '', gpsManual: !!L.gpsManual };
           }
           const depots = {};
@@ -14940,6 +15799,7 @@
                   </div>
                 )}
                 <input style={{ ...inp, marginTop: 6 }} value={L.adresse || ''} onChange={e => upd(c, { adresse: e.target.value, gpsManual: false })} placeholder="Adresse (affichée dans le mail client)" />
+                {L.type !== 'domicile' && <input style={{ ...inp, marginTop: 6 }} type="email" value={L.email || ''} onChange={e => upd(c, { email: e.target.value })} placeholder="✉️ Mail de la boutique (alerte « distribution non clôturée ») — plusieurs : séparer par des virgules" />}
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 6, fontSize: 13 }}>
                   <span style={{ fontWeight: 700 }}>🚚 Livré par le camion Rungis :</span>
                   {[['', 'Non'], ['veille', 'La veille'], ['midi', 'Le midi même']].map(([v, lb]) => (
@@ -22259,10 +23119,14 @@
           let legMiss = leg.reduce((t, r) => t + (parseInt(r.qty, 10) || 1), 0);
           for (let i = arr.length - 1; i >= 0 && legMiss > 0; i--) if (arr[i] < 100) { arr[i] = 100; legMiss--; }
           manque += arr.filter(x => x >= 100).length;
-          const part = arr.filter(x => x > 0 && x < 100);
-          rq = part.length; pct = rq ? Math.round(part.reduce((t, x) => t + x, 0) / rq) : 0;
+          // V11.01 — une ligne d'écart PAR taux de remise (plus de % moyen arrondi : 30 % + 15 % ≠ 2 × 23 %)
+          const grp = {};
+          for (const x of arr) if (x > 0 && x < 100) grp[x] = (grp[x] || 0) + 1;
           manque = Math.min(manque, q);
-          if (manque > 0 || (pct > 0 && rq > 0)) out.push({ ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), manque, remise_pct: pct, remise_qte: rq, qty: q, prix: it.consumer_price || 0 });
+          const base = { ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), qty: q, prix: it.consumer_price || 0 };
+          const taux = Object.keys(grp).map(Number).sort((x, y) => y - x);
+          if (!taux.length) { if (manque > 0) out.push({ ...base, manque, remise_pct: 0, remise_qte: 0 }); continue; }
+          taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: grp[t] }));
           continue;
         }
         for (const r of refunds) {
@@ -26889,7 +27753,7 @@
           {page === 'bl' && <RungisBlPage />}
           {page === 'enl' && <RungisEnlClearPage session={session} />}
           {page === 'trucks' && <RungisTrucksPage />}
-          {page === 'epal' && <RungisEpalBureauPage />}
+          {page === 'epal' && <><KbRduMasterCard /><RungisEpalBureauPage /></>}
         </div>
       );
     }
@@ -27848,7 +28712,7 @@
               </div>
               {psResult && (
                 <div className={psResult.unknown.length ? 'alert-red' : 'alert-success'} style={{marginTop:8,fontSize:12}}>
-                  ✓ +{psResult.added} nouvelle(s) · {psResult.total} commande(s) PrestaShop{psResult.test ? ' · TEST' : ''} · {psResult.date} — à côté de {psResult.base} commande(s) Mongo{psResult.modeSwitch ? ' · reconstruites (changement test/réel)' : ''}
+                  ✓ +{psResult.added} nouvelle(s) · {psResult.total} commande(s) PrestaShop{psResult.test ? ' · TEST' : ''} · {psResult.date} — à côté de {psResult.base} commande(s) Mongo{psResult.modeSwitch ? ' · reconstruites (changement test/réel)' : ''}{psResult.siteFix ? ' · 📍 lieu corrigé : ' + (psResult.siteFixes || []).map(f => f.from + ' → ' + f.to).join(', ') : ''}
                   <div style={{marginTop:3}}>{Object.entries(psResult.bySite).map(([k, v]) => k + ' ' + v).join(' · ') || '—'}</div>
                   {psResult.unknown.length > 0 && <div style={{marginTop:3,fontWeight:600}}>⚠️ Lieu(x) sans code site : {psResult.unknown.join(', ')} → compléter la table « Lieux de retrait » du module.</div>}
                 </div>
@@ -32349,6 +33213,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             {tab === 'losses' && <LossesPage session={effSession} catalogue={catalogue} catalogueMeta={catalogueMeta} />}
             {tab === 'suivi' && <PrepSuiviHub setTab={setTab} />}
             {tab === 'printpain' && <PrintPainPage session={effSession} setTab={setTab} />}
+            {tab === 'rungisdu' && <RungisDuPage session={effSession} setTab={setTab} />}
             {tab === 'printlabels' && <PrintLabelsPage session={effSession} setTab={setTab} />}
             {tab === 'painpribon' && (kbIsSecure()
               ? <PainPribonPage session={effSession} setTab={setTab} catalogue={catalogue} />
@@ -32459,7 +33324,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
           {/* V10.61 — poste synchro Tampermonkey retiré : le report est fait par le serveur (KBG_Ancien) */}
           {tab === 'today' && effSession.isMaster && <KbTodayPage session={effSession} setTab={setTab} />}
-          {tab === 'mpain' && effSession.isMaster && <PrintPainPage session={effSession} master />}
+          {tab === 'mpain' && effSession.isMaster && <MasterPainPage session={effSession} catalogue={catalogue} />}
           {tab === 'mdom' && effSession.isMaster && <PrintLabelsPage session={effSession} embedded />}
           {/* anciennes routes conservées (compat liens internes), regroupées désormais sous « Suivi général » */}
           {tab === 'casuivi' && effSession.isMaster && <CaSuiviPage session={effSession} />}
