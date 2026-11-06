@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.02) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.03) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.02';
+const APP_VERSION = 'V11.03';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -3759,7 +3759,10 @@ function parsePrepDocs(arr) {
     } else if (pfx === 'cs') casiers[key] = (d.nums || []).map(String).filter(Boolean);else if (pfx === 'rc') remiseCli[key] = {
       pct: d.pct,
       reason: d.reason,
-      n: d.n || 0
+      n: d.n || 0,
+      ...(Array.isArray(d.arts) ? {
+        arts: d.arts
+      } : {})
     };else if (pfx === 'ra') remiseAll[key] = {
       pct: d.pct,
       reason: d.reason
@@ -3785,6 +3788,44 @@ function kbPartMiss(prep, k, qty) {
   const q = qty || 1,
     n = Math.min(q, Math.max(0, prep.posedN && prep.posedN[k] || 0));
   return q - n;
+}
+// V11.03 — remise prépa ARTICLE PAR ARTICLE (ex. poids réel d'un seul sachet sur 3).
+//   doc rc : { pct, reason, n } (compatible) + arts : [ {pct, reason, poids} | null, … ] indexé par article.
+//   → tableau des % par article, longueur q (0 = article normal).
+function kbRcArr(rc, q) {
+  q = Math.max(0, parseInt(q, 10) || 0);
+  if (!rc) return Array.from({
+    length: q
+  }, () => 0);
+  if (Array.isArray(rc.arts) && rc.arts.some(a => a && Number(a.pct) > 0)) return Array.from({
+    length: q
+  }, (_, i) => rc.arts[i] && Number(rc.arts[i].pct) > 0 ? Math.min(100, Number(rc.arts[i].pct)) : 0);
+  const pct = Math.min(100, Number(rc.pct) || 0),
+    n = rc.n ? Math.min(Number(rc.n), q) : q;
+  return Array.from({
+    length: q
+  }, (_, i) => pct > 0 && i < n ? pct : 0);
+}
+function kbRcGroups(rc, q) {
+  const arr = kbRcArr(rc, q),
+    g = {};
+  arr.forEach((p, i) => {
+    if (p > 0) {
+      const x = g[p] || (g[p] = {
+        pct: p,
+        n: 0,
+        reasons: []
+      });
+      x.n++;
+      const a = rc && Array.isArray(rc.arts) ? rc.arts[i] : null,
+        rs = a && a.reason || rc && rc.reason || '';
+      if (rs && !x.reasons.includes(rs)) x.reasons.push(rs);
+    }
+  });
+  return {
+    arr,
+    groups: Object.values(g).sort((a, b) => b.pct - a.pct)
+  };
 }
 function parseDistribFix(arr) {
   const m = {};
@@ -3841,11 +3882,20 @@ function applyPrepToOrder(o, prep) {
   const isDom = String(site || '').toUpperCase() === 'DOM';
   const hasNdx = prep.ndOff && Object.keys(prep.ndOff).length || prep.ndForce && Object.keys(prep.ndForce).length || isDom && (o.items || []).some(i => i && i.cat === 'nd');
   const hasRepl = prep.repl && Object.keys(prep.repl).length;
-  if (!hasStatus && !hasRem && !hasLm && !hasNdx && !hasRepl) return o;
+  // V11.03 — distrib « ➕ Rajouter » : un produit en rupture DANS LE JSON (ancien site, manquant) peut aussi être rajouté
+  const ovPfx = site + '||' + client + '||';
+  const ovRm = prep.overrides ? (o.removed || []).filter(r => r && prep.overrides[ovPfx + r.produit]) : [];
+  if (!hasStatus && !hasRem && !hasLm && !hasNdx && !hasRepl && !ovRm.length) return o;
   const items = [],
-    removed = [...(o.removed || [])],
+    removed = (o.removed || []).filter(r => !ovRm.includes(r)),
     reduced = [...(o.reduced || [])];
-  for (let it of o.items || []) {
+  const srcItems = [...(o.items || []), ...ovRm.map(r => ({
+    ...r,
+    reason: undefined,
+    cat: r.cat || DISPATCH_TYPE[r.dispatchType] || 'frais',
+    _restored: true
+  }))];
+  for (let it of srcItems) {
     const k = site + '||' + client + '||' + it.produit;
     const lmK = String(site || '').toUpperCase() + '||' + it.produit;
     const lmWins = prep.lm && prep.lm[lmK] && !(prep.lmKo && prep.lmKo[k]) && prep.status && (prep.status[k] === 'rupture' || prep.status[k] === 'partiel');
@@ -3885,18 +3935,21 @@ function applyPrepToOrder(o, prep) {
       };
     }
     const rc = prep.remiseCli && prep.remiseCli[k] || prep.remiseAll && prep.remiseAll[site + '||' + it.produit];
-    if (rc && rc.pct) {
-      const qq = Number(it.qty || it.quantity) || 1,
-        rn = rc.n ? Math.min(rc.n, qq) : qq;
-      reduced.push({
+    if (rc && (rc.pct || rc.arts)) {
+      const qq = Number(it.qty || it.quantity) || 1;
+      const RG = kbRcGroups(rc, qq);
+      RG.groups.forEach(g => reduced.push({
         ...it,
-        qty: rn,
-        quantity: rn,
-        percentage: rc.pct,
+        qty: g.n,
+        quantity: g.n,
+        percentage: g.pct,
         _prepRem: true,
-        remReason: rc.reason || '',
-        remOf: qq
-      });
+        remReason: g.reasons.join(' + '),
+        remOf: qq,
+        ...(rc.arts ? {
+          _prepArts: RG.arr
+        } : {})
+      }));
     }
     if (prep.lm && prep.lm[String(site || '').toUpperCase() + '||' + it.produit]) it = {
       ...it,
@@ -7932,7 +7985,8 @@ function ClientDetailV4({
   const dayKey = activeDay();
   const showToast = React.useContext(ToastContext);
   const restoreItem = async r => {
-    const key = o.site + '||' + o.name + '||' + r.produit;
+    if (!window.confirm(`➕ Rajouter « ${kbProdName(r.produit)} » ×${Number(r.qty || r.quantity) || 1} ?\nFinalement présent : il sera donné et facturé au client.`)) return;
+    const key = String(o.site || '').toUpperCase() + '||' + (o.name || '(client)') + '||' + r.produit;
     await storage.setDoc(`day_${dayKey}_distribfix`, 'add|' + encodeURIComponent(key), {
       restore: true,
       produit: r.produit,
@@ -8162,8 +8216,10 @@ function ClientDetailV4({
       }
     }, "Remboursement ", fmtEuro(rf.refundCents), " (", rf.detail, ") · ", rf.status === 'qualified' ? `qualifié : ${rf.reason}` : '🕒 à qualifier en Qualité'), q > 1 && (() => {
       const rr = remByKey[p.id || p.produit] || {};
+      const pArts = rr._prepRem && Array.isArray(rr._prepArts) ? rr._prepArts : null;
       const pN = rr._prepRem ? Math.min(q, Number(rr.qty) || q) : 0,
         pP = rr._prepRem ? Number(rr.percentage) || 0 : 0;
+      const artPct = n => pArts ? Number(pArts[n - 1]) || 0 : n <= pN ? pP : 0;
       const ur = unitRf[p.id || p.produit] || {};
       return React.createElement("div", {
         style: {
@@ -8187,19 +8243,20 @@ function ClientDetailV4({
         length: Math.min(q, 12)
       }, (_, i) => i + 1).map(n => {
         const u = ur[n],
-          isPrep = !u && n <= pN,
-          wasPrep = n <= pN;
+          aP = artPct(n),
+          isPrep = !u && aP > 0,
+          wasPrep = aP > 0;
         const bg = u ? '#1565c0' : isPrep ? '#a3125b' : '#fff',
           fg = u || isPrep ? '#fff' : 'var(--ink)';
-        const txt = u ? Number(u.pct) >= 100 ? '🗑️ retiré' : `−${u.pct}%${u.mode === 'dlc' ? ' DLC' : ''}` : isPrep ? `−${pP}% prépa` : '✓ normal';
+        const txt = u ? Number(u.pct) >= 100 ? '🗑️ retiré' : `−${u.pct}%${u.mode === 'dlc' ? ' DLC' : ''}` : isPrep ? `−${aP}% prépa` : '✓ normal';
         return React.createElement("button", {
           key: n,
           title: isPrep ? 'Remisé en prépa — toucher pour retirer ou remiser plus' : 'Remise sur cet article seulement',
           onClick: () => setRefundFor({
             p,
             unit: n,
-            prepPct: pP,
-            prepN: pN
+            prepPct: pArts ? aP : pP,
+            prepN: pArts ? aP > 0 ? n : 0 : pN
           }),
           style: {
             minWidth: 92,
@@ -8228,7 +8285,7 @@ function ClientDetailV4({
             fontSize: 11,
             fontWeight: 600
           }
-        }, "(remplace prépa −", pP, "%)"));
+        }, "(remplace prépa −", aP, "%)"));
       })), Object.values(ur).map(u => React.createElement("div", {
         key: u.id || u.unit,
         style: {
@@ -8688,11 +8745,13 @@ function ClientDetailV4({
       color: 'var(--ink-mute)',
       textDecoration: 'line-through'
     }
-  }, lineEuro(r)), (r.reason === 'rupture_prepa' || r.reason === 'rupture_prepa_partielle') && React.createElement("button", {
+  }, lineEuro(r)), !r._lmKo && React.createElement("button", {
     className: "btn-secondary",
     style: {
-      fontSize: 11,
-      padding: '3px 8px'
+      fontSize: 15,
+      fontWeight: 700,
+      padding: '8px 12px',
+      minHeight: 44
     },
     onClick: () => restoreItem(r)
   }, "➕ Rajouter"))))))), refundFor && React.createElement(RefundModal, {
@@ -15995,7 +16054,13 @@ async function kbAncienRuptures(day) {
       }
       if (ps) continue;
       const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
-      if (rc && rc.pct) remises.push({
+      if (rc && rc.arts) kbRcGroups(rc, base.qty).groups.forEach(g => remises.push({
+        ...base,
+        qty: g.n,
+        remOf: base.qty,
+        pct: g.pct,
+        reason: g.reasons.join(' + ')
+      }));else if (rc && rc.pct) remises.push({
         ...base,
         ...(rc.n ? {
           qty: Math.min(rc.n, base.qty),
@@ -17479,8 +17544,9 @@ async function kbAncienJob(day) {
       });
       if (!done) p.done = false;
       const rc = d._prep.remiseCli && d._prep.remiseCli[k] || d._prep.remiseAll && d._prep.remiseAll[site + '||' + it.produit];
-      const rem = rc && Number(rc.pct) > 0 ? Math.min(100, Number(rc.pct)) : 0,
-        remN = rem ? Math.min(q - miss, Number(rc.n) || q - miss) : 0;
+      const rA = rc && rc.arts ? kbRcArr(rc, q - miss).filter(x => x > 0) : null;
+      const rem = rA ? rA.length ? Math.round(rA.reduce((a, b) => a + b, 0) / rA.length) : 0 : rc && Number(rc.pct) > 0 ? Math.min(100, Number(rc.pct)) : 0,
+        remN = rA ? rA.length : rem ? Math.min(q - miss, Number(rc.n) || q - miss) : 0;
       if (o.orderId) p.orders.push(Object.assign({
         oid: String(o.orderId),
         site,
@@ -31215,6 +31281,7 @@ function PrepaDuJourPage({
   const [remAllOpen, setRemAllOpen] = React.useState({});
   const [replBox, setReplBox] = React.useState(null);
   const [remCliOpen, setRemCliOpen] = React.useState({});
+  const [artOpen, setArtOpen] = React.useState({});
   const [openClient, setOpenClient] = React.useState(null);
   const [ancienOpen, setAncienOpen] = React.useState(false);
   const [prodFilter, setProdFilter] = React.useState('');
@@ -31304,7 +31371,8 @@ function PrepaDuJourPage({
           if (cs.display === 'none' || cs.position !== 'sticky' && cs.position !== 'fixed') return;
           stick = Math.max(stick, (parseFloat(cs.top) || 0) + el.offsetHeight);
         });
-        wrap.style.setProperty('--pdj-stick', Math.round(stick) + 'px');
+        const sv = Math.round(stick) + 'px';
+        if (wrap.style.getPropertyValue('--pdj-stick') !== sv) wrap.style.setProperty('--pdj-stick', sv);
         const h = wrap.querySelector('.pdj-dhead');
         if (h) h.classList.toggle('stuck', window.scrollY > 4 && h.getBoundingClientRect().top <= stick + 1);
       } catch (e) {}
@@ -31433,7 +31501,10 @@ function PrepaDuJourPage({
         } else if (pfx === 'pd') pd[key] = d.v;else if (pfx === 'rc') rc[key] = {
           pct: d.pct,
           reason: d.reason,
-          n: d.n || 0
+          n: d.n || 0,
+          ...(Array.isArray(d.arts) ? {
+            arts: d.arts
+          } : {})
         };else if (pfx === 'ra') ra[key] = {
           pct: d.pct,
           reason: d.reason
@@ -31697,7 +31768,11 @@ function PrepaDuJourPage({
       });
     }, 1100);
   };
-  const isHidden = r => st(r) === 'done' && !recent[K(r)];
+  // V11.03 — tout ce qui est TRAITÉ sort de l'écran (casier ✓, rupture 🚫, partiel) → « ✅ Traités » pour corriger
+  const isHidden = r => {
+    const x = st(r);
+    return (x === 'done' || x === 'rupture' || x === 'partiel') && !recent[K(r)];
+  };
   const posed = r => st(r) === 'done' ? r.qty || 1 : (prep.count || {})[K(r)] || 0;
   const qtyLabel = (r, x) => {
     const q = r.qty || 1;
@@ -31770,15 +31845,36 @@ function PrepaDuJourPage({
       wStatus(k, 'partiel', {
         n
       });
+      markRecent(k);
       showToast(`⚠️ Rupture partielle : ${n} posé${n > 1 ? 's' : ''} · manque ${q - n}`);
       return;
     }
     wStatus(k, 'rupture');
+    markRecent(k);
+    setRemCliOpen(o => ({
+      ...o,
+      [k]: undefined
+    }));
+    setArtOpen(o => ({
+      ...o,
+      [k]: false
+    }));
   };
   const ruptAll = (site, product) => {
+    const pk = PK(site, product);
     const po = rows.filter(r => r.site === site && r.product === product);
     const all = po.every(r => st(r) === 'rupture');
+    if (ndOn(pk) && site !== 'DOM') {
+      if (all) resetND(site, product);else saveND(site, product, 0);
+      return;
+    }
+    if (!all && !window.confirm(`🚫 Rupture TOTALE de « ${String(product).replace(/^\[TEST\]\s*/, '')} » pour ${po.length} client${po.length > 1 ? 's' : ''} (${site}) ?`)) return;
     po.forEach(r => wStatus(K(r), all ? null : 'rupture'));
+    if (!all) showToast('🚫 Rupture totale — les lignes passent dans « ✅ Traités » (corrigeable)');
+    setRemAllOpen(o => ({
+      ...o,
+      [pk]: undefined
+    }));
   };
   const setPoidsRows = (rs, cur, perClient) => {
     if (!rs.length) return;
@@ -32413,9 +32509,165 @@ function PrepaDuJourPage({
       onClick: applyRepl
     }, "🔄 Valider le remplacement")));
   })();
-  const setPoids1 = r => setPoidsRows([r], prep.poids[K(r)] || '', true);
+  // V11.03 — poids / remise ARTICLE PAR ARTICLE (q > 1) : chaque article garde sa propre remise
+  const rcArts = (k, q) => {
+    const rc = prep.remiseCli[k];
+    if (!rc) return Array.from({
+      length: q
+    }, () => null);
+    if (Array.isArray(rc.arts)) return Array.from({
+      length: q
+    }, (_, i) => rc.arts[i] && Number(rc.arts[i].pct) > 0 ? rc.arts[i] : null);
+    const n = rc.n ? Math.min(rc.n, q) : q;
+    return Array.from({
+      length: q
+    }, (_, i) => Number(rc.pct) > 0 && i < n ? {
+      pct: Number(rc.pct),
+      reason: rc.reason || ''
+    } : null);
+  };
+  const wArts = (k, q, arts) => {
+    const a = Array.from({
+      length: q
+    }, (_, i) => arts[i] && Number(arts[i].pct) > 0 ? {
+      pct: Math.min(100, Number(arts[i].pct)),
+      reason: arts[i].reason || '',
+      ...(arts[i].poids ? {
+        poids: String(arts[i].poids)
+      } : {})
+    } : null);
+    const on = a.filter(Boolean);
+    const pw = a.map((x, i) => x && x.poids ? `A${i + 1} ${x.poids}` : '').filter(Boolean).join(' · ');
+    wPoids(k, pw || null);
+    if (!on.length) return wRemCli(k, null);
+    const reasons = [...new Set(on.map(x => x.reason).filter(Boolean))];
+    return storage.setDoc(`day_${day}_prep`, 'rc|' + encId(k), {
+      pct: Math.round(on.reduce((t, x) => t + x.pct, 0) / on.length),
+      reason: reasons.join(' + '),
+      n: on.length,
+      arts: a,
+      by: user
+    }, {
+      replace: true
+    });
+  };
+  const poidsArt = (r, i) => {
+    const k = K(r),
+      q = Math.max(1, r.qty || 1),
+      arts = rcArts(k, q),
+      cur = arts[i] && arts[i].poids || '';
+    let prevu = kbNameGrams(r.product);
+    const v = prompt(`⚖️ Article ${i + 1} sur ${q} — poids réel ?${prevu ? ` Prévu : ${prevu} g.` : ''} (vide = effacer) — ex : 320g`, cur);
+    if (v === null) return;
+    if (!v.trim()) {
+      arts[i] = null;
+      wArts(k, q, arts);
+      showToast(`Article ${i + 1} : remis normal`);
+      return;
+    }
+    const reel = kbParseGrams(v);
+    if (!prevu) {
+      const p2 = prompt('Poids prévu (étiquette / commande) ? — ex : 500g', '');
+      if (p2 === null) return;
+      prevu = kbParseGrams(p2);
+    }
+    const pct = kbPoidsPct(reel, prevu);
+    if (!pct) {
+      showToast(reel && prevu ? '⚖️ Poids ≥ prévu : pas de remise' : '⚖️ Poids illisible');
+      return;
+    }
+    arts[i] = {
+      pct,
+      reason: 'Poids réel',
+      poids: reel + ' g'
+    };
+    wArts(k, q, arts);
+    showToast(`⚖️ Article ${i + 1} : ${reel} g → −${pct} %`);
+  };
+  const setPoids1 = r => {
+    const q = Math.max(1, r.qty || 1),
+      k = K(r);
+    if (q > 1) {
+      setArtOpen(o => ({
+        ...o,
+        [k]: !o[k]
+      }));
+      setRemCliOpen(o => ({
+        ...o,
+        [k]: undefined
+      }));
+      return;
+    }
+    setPoidsRows([r], prep.poids[k] || '', true);
+  };
+  const artPanel = r => {
+    const k = K(r),
+      q = Math.max(1, r.qty || 1),
+      arts = rcArts(k, q);
+    return React.createElement("div", {
+      className: "pdj-panel rem sm"
+    }, React.createElement("div", {
+      style: {
+        fontWeight: 800,
+        color: '#a3125b',
+        fontSize: 16
+      }
+    }, "⚖️ Article par article — touche celui à peser"), React.createElement("div", {
+      className: "pdj-row wrap",
+      style: {
+        marginTop: 6
+      }
+    }, arts.slice(0, 24).map((a, i) => React.createElement("span", {
+      key: i,
+      className: "pdj-pick" + (a ? " on" : ""),
+      style: {
+        minWidth: 96,
+        textAlign: 'center',
+        lineHeight: 1.15,
+        padding: '8px 10px'
+      },
+      onClick: () => poidsArt(r, i)
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700
+      }
+    }, "Article ", i + 1), React.createElement("div", {
+      style: {
+        fontSize: 17,
+        fontWeight: 800
+      }
+    }, a ? `${a.poids ? a.poids + ' ' : ''}−${a.pct}%` : '✓ normal')))), React.createElement("div", {
+      className: "pdj-row",
+      style: {
+        marginTop: 8
+      }
+    }, React.createElement("button", {
+      className: "pdj-remgo",
+      onClick: () => setArtOpen(o => ({
+        ...o,
+        [k]: false
+      }))
+    }, "✓ Fini")));
+  };
   const setPoidsProd = (site, product) => setPoidsRows(rows.filter(r => r.site === site && r.product === product), '', false);
   const ndSavedAt = React.useRef({});
+  // V11.03 — annuler une mise en cagette ND (erreur de bouton) : statuts remis à « à faire »
+  const resetND = (site, product) => {
+    const pk = PK(site, product);
+    rows.filter(r => r.site === site && r.product === product).forEach(r => {
+      const x = prep.status[K(r)];
+      if (x === 'done' || x === 'rupture' || x === 'partiel') wStatus(K(r), null);
+      if ((prep.count || {})[K(r)]) wCount(K(r), null);
+    });
+    if (prep.nd[pk]) wND(pk, {
+      placed: null,
+      alloc: [],
+      shortage: []
+    });
+    ndSavedAt.current[pk] = 0;
+    showToast('↩️ Annulé : à refaire');
+  };
   const toggleND = pk => {
     if (kbIsSolidaire(String(pk).split('||').pop())) {
       showToast('🧺 Panier solidaire : cagette à part, jamais en casier');
@@ -32431,6 +32683,10 @@ function PrepaDuJourPage({
         return;
       }
       if (!window.confirm('Repasser « ' + String(pk).split('||').pop() + ' » EN CASIER ?\n\nIl ne sera plus dans la cagette ND : le distributeur le cherchera dans le casier du client.')) return;
+      if (prep.nd[pk] && prep.nd[pk].placed != null) rows.filter(r => PK(r.site, r.product) === pk).forEach(r => {
+        const x = prep.status[K(r)];
+        if (x === 'done' || x === 'rupture' || x === 'partiel') wStatus(K(r), null);
+      });
       if (prep.nd[pk]) wND(pk, null);
       if (ndAuto.has(pk)) wNdOff(pk, true);
     } else {
@@ -32605,7 +32861,7 @@ function PrepaDuJourPage({
     showToast(`Casier ${n} retiré — n° ${n} libre`);
   };
   const removeCasier = (client, idx) => removeCasierFor(curSite, client, idx);
-  const openRemAll = pk => setRemAllOpen(o => o[pk] ? {
+  const openRemAll = pk => (setRemCliOpen({}), setArtOpen({}), setRemAllOpen(o => o[pk] ? {
     ...o,
     [pk]: undefined
   } : {
@@ -32614,20 +32870,56 @@ function PrepaDuJourPage({
       reason: prep.remiseAll[pk] && prep.remiseAll[pk].reason || 'DLC courte',
       pct: prep.remiseAll[pk] && prep.remiseAll[pk].pct || 10
     }
-  });
-  const openRemCli = (key, q) => setRemCliOpen(o => o[key] ? {
+  }));
+  const openRemCli = (key, q) => (setArtOpen(o => ({
+    ...o,
+    [key]: false
+  })), setRemCliOpen(o => o[key] ? {
     ...o,
     [key]: undefined
   } : {
     ...o,
     [key]: {
-      reason: prep.remiseCli[key] && prep.remiseCli[key].reason || 'Abîmé / écrasé',
+      reason: prep.remiseCli[key] && prep.remiseCli[key].reason && prep.remiseCli[key].reason !== 'Poids réel' && !/ \+ /.test(prep.remiseCli[key].reason) ? prep.remiseCli[key].reason : 'Abîmé / écrasé',
       pct: prep.remiseCli[key] && prep.remiseCli[key].pct || 10,
       q: Math.max(1, q || 1),
       n: prep.remiseCli[key] && prep.remiseCli[key].n || Math.max(1, q || 1)
     }
-  });
-  const remTag = rc => `🏷️-${rc.pct}%${rc.n ? ' ×' + rc.n : ''}`;
+  }));
+  const hasPoidsArts = k => {
+    const rc = prep.remiseCli[k];
+    return !!(rc && Array.isArray(rc.arts) && rc.arts.some(a => a && a.reason === 'Poids réel'));
+  };
+  // valider la remise d'un client : si des articles sont déjà pesés, ils gardent leur remise poids
+  const saveRemCli = (k, o) => {
+    if (!hasPoidsArts(k)) return wRemCli(k, o);
+    const q = Math.max(1, o.q || 1),
+      arts = rcArts(k, q).map(a => a && a.reason === 'Poids réel' ? a : null);
+    let left = Math.max(1, o.n || q);
+    for (let i = 0; i < q && left > 0; i++) if (!arts[i]) {
+      arts[i] = {
+        pct: o.pct,
+        reason: o.reason
+      };
+      left--;
+    }
+    return wArts(k, q, arts);
+  };
+  const clearRemCli = (k, q) => {
+    if (!hasPoidsArts(k)) return wRemCli(k, null);
+    const qq = Math.max(1, q || 1);
+    return wArts(k, qq, rcArts(k, qq).map(a => a && a.reason === 'Poids réel' ? a : null));
+  };
+  const remTag = rc => {
+    if (rc && Array.isArray(rc.arts)) {
+      const g = {};
+      rc.arts.forEach(a => {
+        if (a && Number(a.pct) > 0) g[a.pct] = (g[a.pct] || 0) + 1;
+      });
+      return '🏷️' + Object.keys(g).sort((a, b) => b - a).map(p => `-${p}%×${g[p]}`).join(' ');
+    }
+    return `🏷️-${rc.pct}%${rc.n ? ' ×' + rc.n : ''}`;
+  };
   const askAutre = cb => {
     const v = prompt('Remise personnalisée (%) :', '');
     const n = parseInt(v, 10);
@@ -32706,22 +32998,29 @@ function PrepaDuJourPage({
   }, React.createElement("button", {
     className: "pdj-remgo",
     onClick: () => {
-      wRemCli(k, remCliOpen[k]);
+      saveRemCli(k, remCliOpen[k]);
       setRemCliOpen(o => ({
         ...o,
         [k]: undefined
       }));
+      showToast(`🏷️ Remise −${remCliOpen[k].pct} % enregistrée${remCliOpen[k].q > 1 ? ` (${remCliOpen[k].n}/${remCliOpen[k].q})` : ''}`);
     }
   }, "Valider"), prep.remiseCli[k] && React.createElement("button", {
     className: "pdj-btn",
     onClick: () => {
-      wRemCli(k, null);
+      clearRemCli(k, remCliOpen[k].q);
       setRemCliOpen(o => ({
         ...o,
         [k]: undefined
       }));
     }
-  }, "Retirer")));
+  }, "Retirer"), React.createElement("button", {
+    className: "pdj-btn",
+    onClick: () => setRemCliOpen(o => ({
+      ...o,
+      [k]: undefined
+    }))
+  }, "Fermer")));
   const rollSites = React.useMemo(() => {
     const out = {};
     sites.filter(s => s !== 'DOM').forEach(s => {
@@ -33061,7 +33360,46 @@ function PrepaDuJourPage({
       className: "pdj-line"
     }, React.createElement("span", null, "Casier ", s.casier, " — ", s.client), React.createElement("span", {
       className: "ko"
-    }, "manque ", s.need, " → rupture"))))) : lm ? React.createElement("div", {
+    }, "manque ", s.need, " → rupture")))), !prep.closed && React.createElement("div", {
+      className: "pdj-row wrap",
+      style: {
+        marginTop: 10,
+        gap: 8
+      }
+    }, nd.placed == null && React.createElement("button", {
+      className: "pdj-btn",
+      style: {
+        minHeight: 56,
+        fontSize: 18,
+        fontWeight: 800,
+        background: '#fdecea',
+        color: '#b71c1c',
+        border: '2px solid #b71c1c'
+      },
+      onClick: () => {
+        if (window.confirm(`🚫 Rien reçu : rupture pour les ${po.length} client${po.length > 1 ? 's' : ''} ?`)) saveND(site, product, 0);
+      }
+    }, "🚫 Rupture (rien reçu)"), nd.placed != null && React.createElement("button", {
+      className: "pdj-btn",
+      style: {
+        minHeight: 56,
+        fontSize: 18,
+        fontWeight: 800
+      },
+      onClick: () => {
+        if (window.confirm('↩️ Annuler ce qui a été validé pour ce produit (cagette / rupture) ?')) resetND(site, product);
+      }
+    }, "↩️ Annuler / corriger"), site !== 'DOM' && !painPk.has(pk) && !kbIsSolidaire(product) && React.createElement("button", {
+      className: "pdj-btn",
+      style: {
+        minHeight: 56,
+        fontSize: 18,
+        fontWeight: 800,
+        color: '#c2410c',
+        border: '2px solid #c2410c'
+      },
+      onClick: () => toggleND(pk)
+    }, "🧺 Pas en ND : repasser en casier"))) : lm ? React.createElement("div", {
       className: "pdj-panel lm"
     }, React.createElement("div", {
       style: {
@@ -33074,7 +33412,7 @@ function PrepaDuJourPage({
       className: "pdj-chips"
     }, po.filter(r => !isHidden(r)).length === 0 && React.createElement("div", {
       className: "pdj-alldone"
-    }, "✅ Tout est dans les casiers"), [...po.filter(r => !isHidden(r)), ...(doneOpen[pk] ? po.filter(isHidden) : [])].map((r, ix, arr) => {
+    }, "✅ Tout est traité (casiers, ruptures)"), [...po.filter(r => !isHidden(r)), ...(doneOpen[pk] ? po.filter(isHidden) : [])].map((r, ix, arr) => {
       const k = K(r),
         x = st(r),
         rc = prep.remiseCli[k] || prep.remiseAll[pk],
@@ -33084,7 +33422,7 @@ function PrepaDuJourPage({
         key: k
       }, firstDone && React.createElement("div", {
         className: "pdj-donehint"
-      }, "Toucher un casier pour annuler le dépôt (erreur)"), React.createElement("div", {
+      }, "Erreur ? Casier = annuler le dépôt · 🚫 = annuler la rupture"), React.createElement("div", {
         className: "pdj-chip" + (x === 'done' ? " done" : x === 'rupture' ? " rupt" : x === 'partiel' ? " prt" : (prep.count || {})[k] ? " part" : "")
       }, React.createElement("div", {
         className: "pdj-cbody",
@@ -33134,19 +33472,25 @@ function PrepaDuJourPage({
       }, "⚖️"), React.createElement("button", {
         className: "pdj-xr rem" + (prep.remiseCli[k] ? " on" : ""),
         title: "Remise ce client",
-        onClick: () => openRemCli(k, r.qty)
+        onClick: () => {
+          setRemAllOpen(o => ({
+            ...o,
+            [pk]: undefined
+          }));
+          openRemCli(k, r.qty);
+        }
       }, "🏷️"), React.createElement("button", {
         className: "pdj-xr",
         title: "Nouveau casier pour ce client",
         onClick: () => addCasierFor(r.site, r.client)
-      }, "➕")), remCliOpen[k] && remCliInline(k, r.client.split(' ')[0]));
+      }, "➕")), remCliOpen[k] && remCliInline(k, r.client.split(' ')[0]), artOpen[k] && artPanel(r));
     }), po.some(isHidden) && React.createElement("button", {
       className: "pdj-donebar" + (doneOpen[pk] ? " on" : ""),
       onClick: () => setDoneOpen(m => ({
         ...m,
         [pk]: !m[pk]
       }))
-    }, "✅ Dispatch fait (", po.filter(isHidden).length, ") ", React.createElement("span", null, doneOpen[pk] ? '▲ masquer' : '▼ voir / corriger'))), remAllOpen[pk] && React.createElement("div", {
+    }, "✅ Traités (", po.filter(isHidden).length, ") ", React.createElement("span", null, doneOpen[pk] ? '▲ masquer' : '▼ voir / corriger'))), remAllOpen[pk] && React.createElement("div", {
       className: "pdj-panel rem"
     }, React.createElement("div", {
       style: {
@@ -33203,6 +33547,7 @@ function PrepaDuJourPage({
           ...o,
           [pk]: undefined
         }));
+        showToast(`🏷️ Remise produit −${remAllOpen[pk].pct} % enregistrée`);
       }
     }, "Valider"), prep.remiseAll[pk] && React.createElement("button", {
       className: "pdj-btn",
@@ -33213,7 +33558,13 @@ function PrepaDuJourPage({
           [pk]: undefined
         }));
       }
-    }, "Retirer"))), React.createElement("div", {
+    }, "Retirer"), React.createElement("button", {
+      className: "pdj-btn",
+      onClick: () => setRemAllOpen(o => ({
+        ...o,
+        [pk]: undefined
+      }))
+    }, "Fermer"))), React.createElement("div", {
       className: "pdj-arow"
     }, site !== 'DOM' && !nd && React.createElement("div", {
       className: "pdj-act nd",
@@ -33929,7 +34280,7 @@ function PrepaDuJourPage({
         className: "pdj-clines"
       }, ords.filter(r => !isHidden(r)).length === 0 && React.createElement("div", {
         className: "pdj-alldone"
-      }, "✅ Tout est dans le casier"), [...ords.filter(r => !isHidden(r)), ...(doneOpen['c|' + c] ? ords.filter(isHidden) : [])].map(r => {
+      }, "✅ Tout est traité"), [...ords.filter(r => !isHidden(r)), ...(doneOpen['c|' + c] ? ords.filter(isHidden) : [])].map(r => {
         const k = K(r),
           x = st(r),
           pk = PK(r.site, r.product),
@@ -33968,14 +34319,14 @@ function PrepaDuJourPage({
           className: "pdj-xr",
           title: "Nouveau casier pour ce client",
           onClick: () => addCasierFor(r.site, r.client)
-        }, "➕")), remCliOpen[k] && remCliInline(k));
+        }, "➕")), remCliOpen[k] && remCliInline(k), artOpen[k] && artPanel(r));
       }), ords.some(isHidden) && React.createElement("button", {
         className: "pdj-donebar" + (doneOpen['c|' + c] ? " on" : ""),
         onClick: () => setDoneOpen(m => ({
           ...m,
           ['c|' + c]: !m['c|' + c]
         }))
-      }, "✅ Dispatch fait (", ords.filter(isHidden).length, ") ", React.createElement("span", null, doneOpen['c|' + c] ? '▲ masquer' : '▼ voir / corriger'))));
+      }, "✅ Traités (", ords.filter(isHidden).length, ") ", React.createElement("span", null, doneOpen['c|' + c] ? '▲ masquer' : '▼ voir / corriger'))));
     }) : React.createElement("div", {
       className: "pdj-no"
     }, "Aucun client ne correspond."));
@@ -34424,13 +34775,8 @@ function PdjStyle() {
 /* fiche produit : liste des casiers */
 .pdj-detail{max-width:900px;margin:0 auto}
 .pdj-dhead{display:flex;align-items:center;gap:12px;background:#fff;border:2px solid #e8e3da;border-radius:14px;padding:12px}
-.pdj-detail .pdj-dhead{position:sticky;top:var(--pdj-stick,0px);z-index:8;transition:padding .12s}
-.pdj-detail .pdj-dhead.stuck{padding:6px 10px;border-color:var(--acc);box-shadow:0 4px 10px rgba(0,0,0,.14)}
-.pdj-detail .pdj-dhead.stuck .pdj-back{flex-basis:48px;height:48px;font-size:26px}
-.pdj-detail .pdj-dhead.stuck .pdj-dname{font-size:23px}
-.pdj-detail .pdj-dhead.stuck .pdj-dprod{font-size:16px}
-.pdj-detail .pdj-dhead.stuck .pdj-pres{display:none}
-.pdj-detail .pdj-dhead.stuck .pdj-dcount{font-size:28px}
+.pdj-detail .pdj-dhead{position:sticky;top:var(--pdj-stick,0px);z-index:8}
+.pdj-detail .pdj-dhead.stuck{border-color:var(--acc);box-shadow:0 4px 10px rgba(0,0,0,.14)}
 .pdj-back{flex:0 0 64px;height:64px;border-radius:14px;border:2px solid var(--blue);background:#fff;color:var(--blue);font-size:32px;font-weight:700;cursor:pointer}
 .pdj-dname{font-size:26px;font-weight:700;line-height:1.15;color:#111}
 .pdj-dprod{font-size:19px;font-style:italic;color:#444;margin-top:2px}
@@ -46219,9 +46565,10 @@ function kbFactuEcarts(o, data) {
       rq = rc.n ? Math.min(rc.n, q - manque) : q - manque;
     }
     const unitDocs = refunds.filter(r => r.orderId === o.orderId && r.produit === produit && Number(r.unit) > 0);
-    if (unitDocs.length) {
+    const artsArr = rc && rc.arts && q - manque > 0 ? kbRcArr(rc, q - manque) : null;
+    if (unitDocs.length || artsArr) {
       const n = q - manque,
-        arr = Array.from({
+        arr = artsArr ? [...artsArr] : Array.from({
           length: Math.max(0, n)
         }, (_, i) => i < rq ? pct : 0);
       for (const r of unitDocs) {
