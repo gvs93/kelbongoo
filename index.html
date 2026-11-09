@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.04) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.06) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.04';
+const APP_VERSION = 'V11.06';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -1402,6 +1402,14 @@ function kbCasiersShown(o) {
 }
 function kbCasiersOf(o) {
   return [...(o.casiersFrais || []), ...(o.casiersSec || []), ...(o.casiersJson || [])].map(String);
+}
+function kbNeedsCasier(o) {
+  if (!o || String(o.site || '').toUpperCase() === 'DOM') return false;
+  if (!Array.isArray(o.items)) return true;
+  return o.items.some(it => {
+    const c = String(it && it.cat || 'frais').toLowerCase();
+    return c !== 'pain' && c !== 'nd' && !(it && it.solidaire) && !kbIsSolidaire(it && it.produit);
+  });
 }
 function kbLmAttribution(lastminute, site, clients) {
   const lines = [],
@@ -2428,9 +2436,10 @@ async function psMergeDay(dayKey, json, opts) {
   if (modeSwitch) keep = [];
   const list = json && json.orders || [];
   const inJson = new Set(list.map(po => String(po.id_order)));
-  // V11.02 — lieu corrigé côté site (ex. retrait STB exporté à tort en DOM) : la commande déjà chargée suit le nouveau lieu.
   const poById = {};
-  list.forEach(po => { poById[String(po.id_order)] = po; });
+  list.forEach(po => {
+    poById[String(po.id_order)] = po;
+  });
   let siteFix = 0;
   const siteFixes = [];
   for (const o of keep) {
@@ -2438,7 +2447,12 @@ async function psMergeDay(dayKey, json, opts) {
     if (!po) continue;
     const ns = String(po.site || 'PS').trim().toUpperCase();
     if (ns && ns !== o.site) {
-      siteFixes.push({ ref: o.psRef, client: o.name, from: o.site, to: ns });
+      siteFixes.push({
+        ref: o.psRef,
+        client: o.name,
+        from: o.site,
+        to: ns
+      });
       o.siteChangedFrom = o.site;
       o.site = ns;
       o.psMode = po.mode || o.psMode;
@@ -3789,9 +3803,6 @@ function kbPartMiss(prep, k, qty) {
     n = Math.min(q, Math.max(0, prep.posedN && prep.posedN[k] || 0));
   return q - n;
 }
-// V11.03 — remise prépa ARTICLE PAR ARTICLE (ex. poids réel d'un seul sachet sur 3).
-//   doc rc : { pct, reason, n } (compatible) + arts : [ {pct, reason, poids} | null, … ] indexé par article.
-//   → tableau des % par article, longueur q (0 = article normal).
 function kbRcArr(rc, q) {
   q = Math.max(0, parseInt(q, 10) || 0);
   if (!rc) return Array.from({
@@ -3882,7 +3893,6 @@ function applyPrepToOrder(o, prep) {
   const isDom = String(site || '').toUpperCase() === 'DOM';
   const hasNdx = prep.ndOff && Object.keys(prep.ndOff).length || prep.ndForce && Object.keys(prep.ndForce).length || isDom && (o.items || []).some(i => i && i.cat === 'nd');
   const hasRepl = prep.repl && Object.keys(prep.repl).length;
-  // V11.03 — distrib « ➕ Rajouter » : un produit en rupture DANS LE JSON (ancien site, manquant) peut aussi être rajouté
   const ovPfx = site + '||' + client + '||';
   const ovRm = prep.overrides ? (o.removed || []).filter(r => r && prep.overrides[ovPfx + r.produit]) : [];
   if (!hasStatus && !hasRem && !hasLm && !hasNdx && !hasRepl && !ovRm.length) return o;
@@ -5324,6 +5334,68 @@ function ProductPicker({
     }
   }, "OK")))));
 }
+const _kbDayOrdCache = {};
+function kbDayOrders(day) {
+  const c = _kbDayOrdCache[day];
+  if (c && Date.now() - c.t < 120000) return c.p;
+  const pr = storage.getDoc(`day_${day}_orders`, 'data').then(d => (d && d.orders || []).filter(o => o && !o._test)).catch(() => []);
+  _kbDayOrdCache[day] = {
+    t: Date.now(),
+    p: pr
+  };
+  return pr;
+}
+function useKbClientOrders(site, email, name, nDays) {
+  const [st, setSt] = React.useState({
+    loading: false,
+    list: []
+  });
+  React.useEffect(() => {
+    if (!site || !email && !name) {
+      setSt({
+        loading: false,
+        list: []
+      });
+      return;
+    }
+    let stop = false;
+    setSt({
+      loading: true,
+      list: []
+    });
+    const t = todayKey(),
+      days = [];
+    for (let i = 0; i <= (nDays || 21); i++) days.push(addDays(t, -i));
+    const em = String(email || '').trim().toLowerCase(),
+      nm = normalizeText(name || '');
+    Promise.all(days.map(d => kbDayOrders(d).then(list => ({
+      d,
+      list
+    })))).then(res => {
+      if (stop) return;
+      const out = [];
+      res.forEach(({
+        d,
+        list
+      }) => list.forEach(o => {
+        if (String(o.site || '').toUpperCase() !== String(site).toUpperCase()) return;
+        const oe = String(o.email || '').trim().toLowerCase();
+        if (em && oe && oe === em || (!em || !oe) && nm && normalizeText(displayName(o)) === nm) out.push({
+          day: d,
+          order: o
+        });
+      }));
+      setSt({
+        loading: false,
+        list: out
+      });
+    });
+    return () => {
+      stop = true;
+    };
+  }, [site, email, name, nDays]);
+  return st;
+}
 function AnomalyForm({
   orders,
   products,
@@ -5349,6 +5421,30 @@ function AnomalyForm({
   const [swapKey, setSwapKey] = React.useState(editing?.swapKey || '');
   const [wholeCas, setWholeCas] = React.useState(!!editing?.wholeCasier);
   const [busy, setBusy] = React.useState(false);
+  const [coDay, setCoDay] = React.useState('');
+  const [coPick, setCoPick] = React.useState({});
+  const coAll = useKbClientOrders(currentSite, clientEmail, clientName, 21);
+  React.useEffect(() => {
+    setCoDay('');
+    setCoPick({});
+  }, [clientEmail, clientName]);
+  React.useEffect(() => {
+    if (!coDay && coAll.list.length) {
+      const days = [...new Set(coAll.list.map(x => x.day))];
+      if (days.length === 1) setCoDay(days[0]);
+    }
+  }, [coAll.list]);
+  const coLines = React.useMemo(() => {
+    const out = [];
+    coAll.list.filter(x => x.day === coDay).forEach(({
+      order
+    }) => (order.items || []).forEach((it, idx) => out.push({
+      key: order.orderId + '__' + (it.id || idx),
+      it,
+      order
+    })));
+    return out.sort((a, b) => String(a.it.produit).localeCompare(String(b.it.produit), 'fr'));
+  }, [coAll.list, coDay]);
   const isRetourPdp = anomalyTypes.includes('retour_pdp');
   const isInversion = anomalyTypes.includes('erreur_produit');
   const isDlcCourte = anomalyTypes.includes('dlc_courte');
@@ -5356,6 +5452,7 @@ function AnomalyForm({
   const isEnTrop = anomalyTypes.includes('en_trop');
   const isOubli = anomalyTypes.includes('oubli_casier');
   const isWhole = isOubli && wholeCas;
+  const orderMode = !editing && !!clientName && !!(selectedKey || clientEmail) && !isEnTrop && !isWhole && (coAll.loading || coAll.list.length > 0);
   const needsDlc = isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion;
   const isOrphan = isRetourPdp || isEnTrop;
   const isQualityIssue = anomalyTypes.some(t => ['pourri', 'casse', 'dlc'].includes(t));
@@ -5372,6 +5469,199 @@ function AnomalyForm({
     setClientName(info.name);
     setClientEmail(info.email || '');
   };
+  const saveOne = async L => {
+    const id = L.id || `anom_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const productKey = L.productKey,
+      retourDlc = L.dlc || '',
+      retourQty = String(L.qty || 1);
+    const dlcBeforePickup = retourDlc && nextDelivForSite && retourDlc < nextDelivForSite;
+    const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
+    const isPerteSeche = needsDlc && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
+    let productLabel = '';
+    let prodName = '',
+      prodProducer = '';
+    if (productKey.startsWith('FREE:')) {
+      productLabel = productKey.substring(5);
+      prodName = productLabel;
+    } else {
+      const [prod, name] = productKey.split('|');
+      productLabel = `${name} (${prod})`;
+      prodProducer = prod;
+      prodName = name;
+    }
+    let retKey = productKey,
+      retLabel = productLabel,
+      retName = prodName,
+      retProducer = prodProducer;
+    if (isInversion && swapKey) {
+      retKey = swapKey;
+      if (swapKey.startsWith('FREE:')) {
+        retLabel = swapKey.substring(5);
+        retName = retLabel;
+        retProducer = '';
+      } else {
+        const [sp, sn] = swapKey.split('|');
+        retLabel = `${sn} (${sp})`;
+        retName = sn;
+        retProducer = sp;
+      }
+    }
+    const effName = clientName || (isOrphan ? 'Produit non attribué' : '');
+    const safeOrderId = selectedOrder ? selectedOrder.orderId : clientEmail || selectedKey || id;
+    const data = {
+      orderId: safeOrderId,
+      site: currentSite,
+      clientName: effName,
+      clientEmail: clientEmail,
+      clientPhone: selectedOrder?.telephone || '',
+      hasOrderToday: !!selectedOrder,
+      productKey,
+      productLabel,
+      distribDate: L.day || '',
+      fromOrderDay: L.day || '',
+      orderLineId: L.lineId || '',
+      swapKey: isInversion ? swapKey : '',
+      swapLabel: isInversion ? retLabel : '',
+      day: activeDay(),
+      anomalyTypes,
+      actions,
+      wholeCasier: !!isWhole,
+      amountRefund: parseFloat(amountRefund) || 0,
+      amountCredit: parseFloat(amountCredit) || 0,
+      retourQty: parseInt(retourQty, 10) || 1,
+      retourDlc: needsDlc ? retourDlc : '',
+      retourPerteSeche: !!isPerteSeche,
+      retourRecupPerso: !!(isPerteSeche && perteRecupPerso),
+      remark,
+      createdBy: session.name,
+      createdAt: L.id && editing?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await storage.setDoc(`day_${activeDay()}_anomalies`, id, data);
+    L.label = productLabel;
+    let oubliMsg = '';
+    if (anomalyTypes.includes('oubli_casier')) {
+      const forgottenId = `forg_${id}`;
+      await storage.setDoc('forgotten_items', forgottenId, {
+        id: forgottenId,
+        anomalyId: id,
+        orderId: safeOrderId,
+        site: currentSite,
+        clientName: data.clientName,
+        clientEmail: data.clientEmail,
+        productKey,
+        productLabel,
+        wholeCasier: !!isWhole,
+        remark,
+        day: activeDay(),
+        status: 'pending',
+        createdBy: session.name,
+        createdAt: L.id && editing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      const prevF = await storage.getDoc('forgotten_items', forgottenId).catch(() => null);
+      if (!L.noMail && !(prevF && prevF.mailSentAt)) {
+        if (clientEmail) {
+          const mr = await kbSendOubliMail({
+            email: clientEmail,
+            clientName: data.clientName,
+            site: currentSite,
+            productLabel: L.mailLabel || productLabel,
+            whole: !!isWhole,
+            casiers: isWhole ? kbCasiersShown(selectedOrder || {}) : []
+          });
+          if (mr.ok) {
+            await storage.setDoc('forgotten_items', forgottenId, {
+              mailSentAt: new Date().toISOString(),
+              mailSentBy: session.name
+            });
+            oubliMsg = ' · ✉️ mail envoyé au client';
+          } else oubliMsg = ' · ⚠️ mail client non envoyé (' + mr.error + ')';
+        } else oubliMsg = " · ⚠️ pas d'email client : mail non envoyé";
+      }
+    } else if (editing && editing.anomalyTypes && editing.anomalyTypes.includes('oubli_casier')) {
+      await storage.deleteDoc('forgotten_items', `forg_${id}`);
+    }
+    if (needsDlc) {
+      const qty = parseInt(retourQty, 10) || 1;
+      const lossReason = anomalyTypes.includes('pourri') || anomalyTypes.includes('casse') ? 'abime' : isEnTrop ? 'non_vendu' : 'dlc';
+      const anomalyLabel = isInversion ? `Inversion produit (à la place de ${prodName || productLabel})` : isDlcDepassee ? 'DLC dépassée' : isDlcCourte ? 'DLC courte' : isEnTrop ? 'En trop' : 'Retour PDP';
+      if (isPerteSeche) {
+        await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
+        await storage.setDoc('losses', `lossret_${id}`, {
+          id: `lossret_${id}`,
+          productKey: retKey,
+          producteur: retProducer,
+          produit: retName,
+          unite: '',
+          destination: 'jete',
+          reason: lossReason,
+          usingWeight: false,
+          quantity: qty,
+          weight: 0,
+          unitPrice: 0,
+          totalValue: 0,
+          dlc: retourDlc,
+          recupPerso: !!perteRecupPerso,
+          remark: `${anomalyLabel} distrib ${currentSite}${perteRecupPerso ? ' · récupéré par le distributeur' : ''}${remark ? ' · ' + remark : ''}`,
+          day: activeDay(),
+          fromReturn: true,
+          fromDistrib: true,
+          createdBy: session.name,
+          createdAt: L.id && editing?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        showToast(isDlcDepassee ? '🔴 DLC dépassée → perte sèche (jetée) — ajoutée aux pertes prépa.' : isQualityIssue ? '⚠️ Perte sèche (qualité) — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi si consommable.' : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi.');
+      } else {
+        await storage.deleteDoc('losses', `lossret_${id}`);
+        await storage.setDoc('pdp_returns', `pdpret_${id}`, {
+          id: `pdpret_${id}`,
+          anomalyId: id,
+          site: currentSite,
+          productKey: retKey,
+          productLabel: retLabel,
+          produit: retName,
+          producteur: retProducer,
+          qty,
+          clientName: effName,
+          dlc: retourDlc,
+          pickupDate: nextDelivForSite || '',
+          anomalyLabel,
+          remark,
+          day: activeDay(),
+          status: 'pending',
+          createdBy: session.name,
+          createdAt: L.id && editing?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        if (retourDlc) {
+          try {
+            await storage.setDoc('dlc_watch', `pdpret_${id}`, {
+              id: `pdpret_${id}`,
+              produit: retName,
+              producteur: retProducer,
+              qty,
+              dlc: retourDlc,
+              status: 'watch',
+              source: 'retour_pdp',
+              site: currentSite,
+              createdBy: session.name,
+              createdAt: new Date().toISOString()
+            });
+          } catch (e) {}
+        }
+      }
+    } else if (editing && editing.anomalyTypes && editing.anomalyTypes.some(t => ['retour_pdp', 'dlc_courte', 'dlc', 'en_trop', 'erreur_produit'].includes(t))) {
+      await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
+      try {
+        await storage.deleteDoc('losses', `lossret_${id}`);
+      } catch (e) {}
+      try {
+        await storage.deleteDoc('dlc_watch', `pdpret_${id}`);
+      } catch (e) {}
+    }
+    return oubliMsg;
+  };
   const handleSubmit = async () => {
     if (!isOrphan && (!selectedKey || !clientName)) {
       showToast('Choisis un client');
@@ -5379,12 +5669,6 @@ function AnomalyForm({
     }
     if (isWhole && !selectedKey) {
       showToast('Choisis le client dont le casier a été oublié');
-      return;
-    }
-    const casW = isWhole && selectedOrder ? kbCasiersShown(selectedOrder) : [];
-    const productKey = isWhole ? 'FREE:📦 Tout le casier' + (casW.length ? ' n° ' + casW.join(', ') : '') : productKey0;
-    if (!productKey) {
-      showToast('Choisis un produit');
       return;
     }
     if (anomalyTypes.length === 0) {
@@ -5395,193 +5679,64 @@ function AnomalyForm({
       showToast('Inversion : choisis le produit mis à la place');
       return;
     }
-    if (needsDlc && !retourDlc) {
-      showToast('Indique la DLC du produit');
-      return;
+    let list;
+    if (isWhole) {
+      const casW = selectedOrder ? kbCasiersShown(selectedOrder) : [];
+      list = [{
+        id: editing?.id,
+        productKey: 'FREE:📦 Tout le casier' + (casW.length ? ' n° ' + casW.join(', ') : ''),
+        qty: 1,
+        dlc: retourDlc
+      }];
+    } else if (orderMode && !editing) {
+      if (!coDay) {
+        showToast('Choisis la date de distribution');
+        return;
+      }
+      const sel = coLines.filter(l => coPick[l.key] && coPick[l.key].on);
+      if (!sel.length) {
+        showToast('Coche au moins un produit de la commande');
+        return;
+      }
+      if (needsDlc) {
+        const noD = sel.find(l => !coPick[l.key].dlc);
+        if (noD) {
+          showToast('Indique la DLC de « ' + noD.it.produit + ' »');
+          return;
+        }
+      }
+      const labels = sel.map(l => l.it.produit + ((coPick[l.key].qty || 1) > 1 ? ' ×' + coPick[l.key].qty : ''));
+      list = sel.map((l, i) => ({
+        productKey: (l.it.producteur || '') + '|' + l.it.produit,
+        qty: coPick[l.key].qty || 1,
+        dlc: coPick[l.key].dlc || '',
+        day: coDay,
+        lineId: String(l.it.id || l.key),
+        noMail: i > 0,
+        mailLabel: labels.join(', ')
+      }));
+    } else {
+      if (!productKey0) {
+        showToast('Choisis un produit');
+        return;
+      }
+      if (needsDlc && !retourDlc) {
+        showToast('Indique la DLC du produit');
+        return;
+      }
+      list = [{
+        id: editing?.id,
+        productKey: productKey0,
+        qty: parseInt(retourQty, 10) || 1,
+        dlc: retourDlc,
+        day: editing?.distribDate || ''
+      }];
     }
     setBusy(true);
     try {
-      const id = editing?.id || `anom_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      let productLabel = '';
-      let prodName = '',
-        prodProducer = '';
-      if (productKey.startsWith('FREE:')) {
-        productLabel = productKey.substring(5);
-        prodName = productLabel;
-      } else {
-        const [prod, name] = productKey.split('|');
-        productLabel = `${name} (${prod})`;
-        prodProducer = prod;
-        prodName = name;
-      }
-      let retKey = productKey,
-        retLabel = productLabel,
-        retName = prodName,
-        retProducer = prodProducer;
-      if (isInversion && swapKey) {
-        retKey = swapKey;
-        if (swapKey.startsWith('FREE:')) {
-          retLabel = swapKey.substring(5);
-          retName = retLabel;
-          retProducer = '';
-        } else {
-          const [sp, sn] = swapKey.split('|');
-          retLabel = `${sn} (${sp})`;
-          retName = sn;
-          retProducer = sp;
-        }
-      }
-      const effName = clientName || (isOrphan ? 'Produit non attribué' : '');
-      const safeOrderId = selectedOrder ? selectedOrder.orderId : clientEmail || selectedKey || id;
-      const data = {
-        orderId: safeOrderId,
-        site: currentSite,
-        clientName: effName,
-        clientEmail: clientEmail,
-        clientPhone: selectedOrder?.telephone || '',
-        hasOrderToday: !!selectedOrder,
-        productKey,
-        productLabel,
-        swapKey: isInversion ? swapKey : '',
-        swapLabel: isInversion ? retLabel : '',
-        day: activeDay(),
-        anomalyTypes,
-        actions,
-        wholeCasier: !!isWhole,
-        amountRefund: parseFloat(amountRefund) || 0,
-        amountCredit: parseFloat(amountCredit) || 0,
-        retourQty: parseInt(retourQty, 10) || 1,
-        retourDlc: needsDlc ? retourDlc : '',
-        retourPerteSeche: !!isPerteSeche,
-        retourRecupPerso: !!(isPerteSeche && perteRecupPerso),
-        remark,
-        createdBy: session.name,
-        createdAt: editing?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-      await storage.setDoc(`day_${activeDay()}_anomalies`, id, data);
-      let oubliMsg = '';
-      if (anomalyTypes.includes('oubli_casier')) {
-        const forgottenId = `forg_${id}`;
-        await storage.setDoc('forgotten_items', forgottenId, {
-          id: forgottenId,
-          anomalyId: id,
-          orderId: safeOrderId,
-          site: currentSite,
-          clientName: data.clientName,
-          clientEmail: data.clientEmail,
-          productKey,
-          productLabel,
-          wholeCasier: !!isWhole,
-          remark,
-          day: activeDay(),
-          status: 'pending',
-          createdBy: session.name,
-          createdAt: editing?.createdAt || new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
-        const prevF = await storage.getDoc('forgotten_items', forgottenId).catch(() => null);
-        if (!(prevF && prevF.mailSentAt)) {
-          if (clientEmail) {
-            const mr = await kbSendOubliMail({
-              email: clientEmail,
-              clientName: data.clientName,
-              site: currentSite,
-              productLabel,
-              whole: !!isWhole,
-              casiers: isWhole ? kbCasiersShown(selectedOrder || {}) : []
-            });
-            if (mr.ok) {
-              await storage.setDoc('forgotten_items', forgottenId, {
-                mailSentAt: new Date().toISOString(),
-                mailSentBy: session.name
-              });
-              oubliMsg = ' · ✉️ mail envoyé au client';
-            } else oubliMsg = ' · ⚠️ mail client non envoyé (' + mr.error + ')';
-          } else oubliMsg = " · ⚠️ pas d'email client : mail non envoyé";
-        }
-      } else if (editing && editing.anomalyTypes && editing.anomalyTypes.includes('oubli_casier')) {
-        await storage.deleteDoc('forgotten_items', `forg_${id}`);
-      }
-      if (needsDlc) {
-        const qty = parseInt(retourQty, 10) || 1;
-        const lossReason = anomalyTypes.includes('pourri') || anomalyTypes.includes('casse') ? 'abime' : isEnTrop ? 'non_vendu' : 'dlc';
-        const anomalyLabel = isInversion ? `Inversion produit (à la place de ${prodName || productLabel})` : isDlcDepassee ? 'DLC dépassée' : isDlcCourte ? 'DLC courte' : isEnTrop ? 'En trop' : 'Retour PDP';
-        if (isPerteSeche) {
-          await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
-          await storage.setDoc('losses', `lossret_${id}`, {
-            id: `lossret_${id}`,
-            productKey: retKey,
-            producteur: retProducer,
-            produit: retName,
-            unite: '',
-            destination: 'jete',
-            reason: lossReason,
-            usingWeight: false,
-            quantity: qty,
-            weight: 0,
-            unitPrice: 0,
-            totalValue: 0,
-            dlc: retourDlc,
-            recupPerso: !!perteRecupPerso,
-            remark: `${anomalyLabel} distrib ${currentSite}${perteRecupPerso ? ' · récupéré par le distributeur' : ''}${remark ? ' · ' + remark : ''}`,
-            day: activeDay(),
-            fromReturn: true,
-            fromDistrib: true,
-            createdBy: session.name,
-            createdAt: editing?.createdAt || new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          });
-          showToast(isDlcDepassee ? '🔴 DLC dépassée → perte sèche (jetée) — ajoutée aux pertes prépa.' : isQualityIssue ? '⚠️ Perte sèche (qualité) — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi si consommable.' : '⚠️ DLC trop courte → perte sèche — ajoutée aux pertes prépa. Tu peux le récupérer pour chez toi.');
-        } else {
-          await storage.deleteDoc('losses', `lossret_${id}`);
-          await storage.setDoc('pdp_returns', `pdpret_${id}`, {
-            id: `pdpret_${id}`,
-            anomalyId: id,
-            site: currentSite,
-            productKey: retKey,
-            productLabel: retLabel,
-            produit: retName,
-            producteur: retProducer,
-            qty,
-            clientName: effName,
-            dlc: retourDlc,
-            pickupDate: nextDelivForSite || '',
-            anomalyLabel,
-            remark,
-            day: activeDay(),
-            status: 'pending',
-            createdBy: session.name,
-            createdAt: editing?.createdAt || new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          });
-          if (retourDlc) {
-            try {
-              await storage.setDoc('dlc_watch', `pdpret_${id}`, {
-                id: `pdpret_${id}`,
-                produit: retName,
-                producteur: retProducer,
-                qty,
-                dlc: retourDlc,
-                status: 'watch',
-                source: 'retour_pdp',
-                site: currentSite,
-                createdBy: session.name,
-                createdAt: new Date().toISOString()
-              });
-            } catch (e) {}
-          }
-        }
-      } else if (editing && editing.anomalyTypes && editing.anomalyTypes.some(t => ['retour_pdp', 'dlc_courte', 'dlc', 'en_trop', 'erreur_produit'].includes(t))) {
-        await storage.deleteDoc('pdp_returns', `pdpret_${id}`);
-        try {
-          await storage.deleteDoc('losses', `lossret_${id}`);
-        } catch (e) {}
-        try {
-          await storage.deleteDoc('dlc_watch', `pdpret_${id}`);
-        } catch (e) {}
-      }
-      showToast((editing ? '✓ Mise à jour' : '✓ Anomalie enregistrée') + oubliMsg);
+      let msg = '';
+      for (const L of list) msg = (await saveOne(L)) || msg;
+      showToast((editing ? '✓ Mise à jour' : list.length > 1 ? `✓ ${list.length} produits enregistrés` : '✓ Anomalie enregistrée') + msg);
       onClose();
     } catch (err) {
       showToast('Erreur : ' + err.message);
@@ -5661,9 +5816,200 @@ function AnomalyForm({
       color: 'var(--ink-soft)',
       marginTop: 6
     }
-  }, "Pas besoin de lister les produits : toute la commande", selectedOrder && kbCasiersShown(selectedOrder).length ? ` (casier ${kbCasiersShown(selectedOrder).join(', ')})` : '', " est notée oubliée et le client reçoit un mail.")), !isWhole && React.createElement("div", {
+  }, "Pas besoin de lister les produits : toute la commande", selectedOrder && kbCasiersShown(selectedOrder).length ? ` (casier ${kbCasiersShown(selectedOrder).join(', ')})` : '', " est notée oubliée et le client reçoit un mail.")), !isWhole && orderMode && (() => {
+    const days = [...new Set(coAll.list.map(x => x.day))].sort().reverse();
+    const nOn = coLines.filter(l => coPick[l.key] && coPick[l.key].on).length;
+    const upd = (k, patch) => setCoPick(p => ({
+      ...p,
+      [k]: {
+        qty: 1,
+        dlc: '',
+        ...(p[k] || {}),
+        ...patch
+      }
+    }));
+    return React.createElement("div", {
+      className: "field",
+      style: {
+        border: '2px solid var(--accent-dark)',
+        borderRadius: 12,
+        padding: 10
+      }
+    }, React.createElement("label", {
+      style: {
+        fontWeight: 700,
+        fontSize: 16
+      }
+    }, "📅 Date de distribution de la commande"), coAll.loading ? React.createElement("p", {
+      style: {
+        fontSize: 14
+      }
+    }, "⏳ Recherche des commandes de ", clientName, "…") : React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 8,
+        flexWrap: 'wrap',
+        marginBottom: 8
+      }
+    }, days.map(d => React.createElement("button", {
+      key: d,
+      type: "button",
+      onClick: () => {
+        setCoDay(d);
+        setCoPick({});
+      },
+      style: {
+        minHeight: 52,
+        padding: '6px 14px',
+        fontSize: 16,
+        fontWeight: 700,
+        borderRadius: 12,
+        cursor: 'pointer',
+        border: '3px solid ' + (coDay === d ? 'var(--accent-dark)' : 'var(--border)'),
+        background: coDay === d ? 'var(--accent-soft)' : '#fff',
+        color: 'var(--ink)'
+      }
+    }, coDay === d ? '✓ ' : '', dayLabelShort(d), d === todayKey() ? " (aujourd'hui)" : ''))), coDay && React.createElement(React.Fragment, null, React.createElement("label", {
+      style: {
+        fontWeight: 700,
+        fontSize: 16,
+        marginTop: 4
+      }
+    }, "☑️ Produits concernés ", React.createElement("span", {
+      style: {
+        fontWeight: 600,
+        color: 'var(--ink-soft)'
+      }
+    }, "(", nOn, " coché", nOn > 1 ? 's' : '', ")")), React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6
+      }
+    }, coLines.map(l => {
+      const c = coPick[l.key] || {},
+        q = Math.max(1, Number(l.it.qty) || 1);
+      return React.createElement("div", {
+        key: l.key,
+        style: {
+          borderRadius: 12,
+          border: '2px solid ' + (c.on ? 'var(--accent-dark)' : 'var(--border)'),
+          background: c.on ? 'var(--accent-soft)' : '#fff',
+          padding: '8px 10px'
+        }
+      }, React.createElement("div", {
+        onClick: () => upd(l.key, {
+          on: !c.on,
+          qty: c.qty || q
+        }),
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          cursor: 'pointer',
+          minHeight: 40
+        }
+      }, React.createElement("span", {
+        style: {
+          fontSize: 24
+        }
+      }, c.on ? '☑️' : '⬜'), React.createElement("span", {
+        style: {
+          flex: 1,
+          fontSize: 16,
+          fontWeight: 700
+        }
+      }, l.it.produit, q > 1 ? React.createElement("span", {
+        style: {
+          color: 'var(--danger)'
+        }
+      }, " ×", q) : '', React.createElement("div", {
+        style: {
+          fontSize: 12,
+          fontWeight: 400,
+          color: 'var(--ink-mute)'
+        }
+      }, l.it.producteur || ''))), c.on && (q > 1 || needsDlc) && React.createElement("div", {
+        style: {
+          display: 'flex',
+          gap: 10,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          marginTop: 6
+        }
+      }, q > 1 && React.createElement("span", {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          fontWeight: 700
+        }
+      }, "Quantité", React.createElement("button", {
+        type: "button",
+        className: "btn-secondary",
+        style: {
+          minWidth: 40,
+          minHeight: 40
+        },
+        onClick: () => upd(l.key, {
+          qty: Math.max(1, (c.qty || q) - 1)
+        })
+      }, "−"), React.createElement("span", {
+        style: {
+          fontSize: 18,
+          minWidth: 24,
+          textAlign: 'center'
+        }
+      }, c.qty || q), React.createElement("button", {
+        type: "button",
+        className: "btn-secondary",
+        style: {
+          minWidth: 40,
+          minHeight: 40
+        },
+        onClick: () => upd(l.key, {
+          qty: Math.min(q, (c.qty || q) + 1)
+        })
+      }, "+"), " / ", q), needsDlc && React.createElement("label", {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          fontWeight: 700
+        }
+      }, "DLC ", React.createElement("span", {
+        style: {
+          color: 'var(--danger)'
+        }
+      }, "*"), React.createElement("input", {
+        type: "date",
+        value: c.dlc || '',
+        onChange: e => upd(l.key, {
+          dlc: e.target.value
+        }),
+        style: {
+          minHeight: 40
+        }
+      })), needsDlc && c.dlc && (() => {
+        const perte = isDlcToday(c.dlc, activeDay()) || nextDelivForSite && c.dlc < nextDelivForSite || isQualityIssue;
+        return React.createElement("span", {
+          style: {
+            fontSize: 13,
+            fontWeight: 700,
+            color: perte ? '#e65100' : '#2e7d32'
+          }
+        }, perte ? '🟠 perte sèche (pas de retour PDP)' : '✅ part en Retour PDP');
+      })()));
+    }))));
+  })(), !isWhole && !orderMode && React.createElement("div", {
     className: "field"
-  }, React.createElement("label", null, "Produit concerné"), React.createElement(ProductPicker, {
+  }, React.createElement("label", null, "Produit concerné"), !editing && clientName && !isEnTrop && !coAll.loading && React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: 'var(--warn)',
+      margin: '0 0 4px'
+    }
+  }, "Aucune commande de ", clientName, " à ", currentSite, " ces 3 dernières semaines : choisis le produit dans la liste."), React.createElement(ProductPicker, {
     products: products,
     value: productKey0,
     onChange: setProductKey,
@@ -5691,7 +6037,7 @@ function AnomalyForm({
       color: '#8a4b00',
       marginTop: 4
     }
-  }, "Ce produit part automatiquement en ", React.createElement("strong", null, "Retour PDP"), " (ou en perte si DLC trop courte).")), needsDlc && React.createElement("div", {
+  }, "Ce produit part automatiquement en ", React.createElement("strong", null, "Retour PDP"), " (ou en perte si DLC trop courte).")), needsDlc && !orderMode && React.createElement("div", {
     className: "field"
   }, React.createElement("label", null, isInversion ? 'Quantité du produit mis à la place' : 'Quantité concernée'), React.createElement("input", {
     type: "text",
@@ -5705,7 +6051,7 @@ function AnomalyForm({
       color: 'var(--ink-mute)',
       marginTop: 4
     }
-  }, "Sera renvoyée à PDP ou comptée en perte selon la DLC.")), needsDlc && React.createElement("div", {
+  }, "Sera renvoyée à PDP ou comptée en perte selon la DLC.")), needsDlc && !orderMode && React.createElement("div", {
     className: "field"
   }, React.createElement("label", null, "DLC du produit ", React.createElement("span", {
     style: {
@@ -6337,7 +6683,7 @@ function ClientsPage({
       });
     }
   };
-  const casierHit = (o, q) => [...(o.casiersFrais || []), ...(o.casiersSec || [])].some(c => String(c).trim().replace(/^0+/, '') === q);
+  const casierHit = (o, q) => kbNeedsCasier(o) && [...(o.casiersFrais || []), ...(o.casiersSec || [])].some(c => String(c).trim().replace(/^0+/, '') === q);
   const searchNum = /^\s*\d+\s*$/.test(search) ? search.trim().replace(/^0+/, '') : '';
   const filtered = visible.filter(o => {
     const passed = isPassed(o);
@@ -6641,7 +6987,7 @@ function ClientsPage({
     const cd = !isV4 && dispatch ? buildClientDispatch(o, dispatch.master, dispatch.frais, dispatch.sec) : null;
     const casiersFrais = isV4 ? o.casiersFrais || [] : cd ? cd.frais.map(f => f.casier) : [];
     const casiersSec = isV4 ? o.casiersSec || [] : cd ? cd.sec.map(s => s.casier) : [];
-    const pains = kbAlpha(isV4 ? o.pains || [] : cd ? cd.sec.flatMap(s => s.produits) : []);
+    const pains = kbAlpha(isV4 ? (o.pains || []).filter(p => !p._lm) : cd ? cd.sec.flatMap(s => s.produits) : []);
     const ndItems = isV4 ? kbAlpha((o.nds || []).filter(p => !p._lm)) : [];
     const fraisItems = isV4 ? o.frais || [] : cd ? cd.frais.flatMap(f => f.produits) : [];
     const lmItems = lmAttr.byClient[kbClientKey(o)] || [];
@@ -6652,6 +6998,8 @@ function ClientsPage({
       c,
       t: 'S'
     }))];
+    const needCas = isV4 ? kbNeedsCasier(o) : true;
+    const casList = needCas ? (casiersFrais.length ? casiersFrais : casiersSec).map(String).filter(c => c && c !== '?') : [];
     const clickable = isV4 || cd;
     const nbArt = (o.items || []).reduce((t, it) => t + (Number(it.qty || it.quantity) || 1), 0);
     return React.createElement("div", {
@@ -6756,7 +7104,7 @@ function ClientsPage({
         color: 'var(--accent-dark)',
         marginBottom: 6
       }
-    }, "👐 À donner en plus du casier"), ndItems.map((p, k) => React.createElement("div", {
+    }, needCas ? '👐 À donner en plus du casier' : '👐 À donner à la main — pas de casier'), ndItems.map((p, k) => React.createElement("div", {
       key: 'nd' + k,
       style: {
         display: 'flex',
@@ -6960,7 +7308,48 @@ function ClientsPage({
         flex: '0 0 auto',
         minWidth: 96
       }
-    }, [['F', casiersFrais.length ? casiersFrais : casiersSec]].filter(([, l]) => l.length).map(([t, l]) => React.createElement("div", {
+    }, needCas && !casList.length && React.createElement("div", {
+      onClick: () => clickable && setSelectedClient(o),
+      title: "Ce client a des produits en casier mais aucun n° de casier",
+      style: {
+        textAlign: 'center',
+        cursor: clickable ? 'pointer' : 'default',
+        borderRadius: 12,
+        padding: '3px 6px 4px',
+        lineHeight: 1.05,
+        maxWidth: 120,
+        border: '3px solid var(--danger)',
+        background: 'var(--danger-soft)',
+        color: 'var(--danger)'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 11,
+        fontWeight: 700
+      }
+    }, "🧊 casier"), React.createElement("div", {
+      style: {
+        fontSize: 30,
+        fontWeight: 700
+      }
+    }, "?"), React.createElement("div", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700
+      }
+    }, "voir détail")), !needCas && isV4 && (pains.length > 0 || ndItems.length > 0 || lmItems.length > 0) && React.createElement("div", {
+      style: {
+        textAlign: 'center',
+        borderRadius: 12,
+        padding: '4px 6px',
+        lineHeight: 1.1,
+        maxWidth: 120,
+        border: '2px dashed var(--line-strong)',
+        color: 'var(--ink-soft)',
+        fontSize: 12,
+        fontWeight: 700
+      }
+    }, "🚫 pas de", React.createElement("br", null), "casier"), [['F', casList]].filter(([, l]) => l.length).map(([t, l]) => React.createElement("div", {
       key: t,
       onClick: () => clickable && setSelectedClient(o),
       style: {
@@ -8036,7 +8425,7 @@ function ClientDetailV4({
   const totalRefund = refunds.reduce((s, r) => s + (r.refundCents || 0), 0);
   const amt = orderAmounts(o);
   const reelNet = amt.reel - totalRefund;
-  const casiers = kbCasiersShown(o).map(c => ({
+  const casiers = (kbNeedsCasier(o) ? kbCasiersShown(o).filter(c => c && c !== '?') : []).map(c => ({
     c,
     t: '🧊'
   }));
@@ -8380,7 +8769,7 @@ function ClientDetailV4({
       fontWeight: 700,
       color: 'var(--ink-mute)'
     }
-  }, "Pas de casier (cagette / carton)")), React.createElement("div", {
+  }, kbNeedsCasier(o) ? "⚠️ Casier non attribué — demander à la prépa" : "Pas de casier (pain / ND à la main, cagette ou carton)")), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 12,
@@ -9540,6 +9929,296 @@ function generateNonRecupSheetPDF(f, info) {
   doc.text(kbPdfTxt('Ne rien laisser dans les rolls Kelbongoo : tout dans ce casier.'), L, 200);
   return doc;
 }
+const KB_NR_REASONS = ['Récupéré par le client', 'Abîmé / jeté', 'DLC dépassée', 'Partage équipe', 'Introuvable', 'Déjà parti en retour PDP'];
+async function kbApplyPdpReturn(f, sel, notRet, by) {
+  const now = new Date().toISOString();
+  const all = Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : f.items || [];
+  const patch = {
+    forceReturnPdp: true,
+    forceReturnPdpBy: by,
+    forceReturnPdpAt: now,
+    itemsInit: all,
+    items: sel,
+    pdpNotReturned: notRet,
+    pdpChoiceBy: by,
+    pdpChoiceAt: now,
+    updatedBy: by,
+    updatedAt: now
+  };
+  await storage.setDoc('followups', f.id || f.orderId, patch);
+  await kbPickupWrite({
+    ...f,
+    ...patch
+  });
+  return patch;
+}
+function KbPdpReturnPicker({
+  f,
+  by,
+  onClose,
+  onDone,
+  extra
+}) {
+  const showToast = React.useContext(ToastContext);
+  const all = Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : f.items || [];
+  const lk = (it, i) => String(it.id || '') + '__' + i;
+  const [pick, setPick] = React.useState(() => {
+    const o = {};
+    all.forEach((it, i) => {
+      o[lk(it, i)] = {
+        q: 0,
+        why: '',
+        txt: ''
+      };
+    });
+    return o;
+  });
+  const [busy, setBusy] = React.useState(false);
+  const upd = (k, patch) => setPick(p => ({
+    ...p,
+    [k]: {
+      ...p[k],
+      ...patch
+    }
+  }));
+  const rows = all.map((it, i) => {
+    const k = lk(it, i),
+      q = Math.max(1, Number(it.qty) || 1),
+      c = pick[k];
+    return {
+      it,
+      k,
+      q,
+      c,
+      rest: q - (c.q || 0)
+    };
+  });
+  const nRet = rows.reduce((t, r) => t + (r.c.q || 0), 0);
+  const missing = rows.filter(r => r.rest > 0 && !r.c.why && !String(r.c.txt || '').trim());
+  const save = async () => {
+    if (!nRet) {
+      showToast('Coche au moins un produit retourné (sinon : raison partout et « Résolu »)');
+      return;
+    }
+    if (missing.length) {
+      showToast('Raison obligatoire pour : ' + missing.map(r => r.it.produit).slice(0, 3).join(', '));
+      return;
+    }
+    setBusy(true);
+    try {
+      const sel = rows.filter(r => r.c.q > 0).map(r => ({
+        ...r.it,
+        qty: r.c.q
+      }));
+      const notRet = rows.filter(r => r.rest > 0).map(r => ({
+        id: r.it.id || '',
+        produit: r.it.produit,
+        producteur: r.it.producteur || '',
+        qty: r.rest,
+        reason: [r.c.why, String(r.c.txt || '').trim()].filter(Boolean).join(' · ')
+      }));
+      await kbApplyPdpReturn(f, sel, notRet, by);
+      if (extra) await extra();
+      showToast(`↩️ Retour PDP : ${nRet} article(s)${notRet.length ? ` · ${notRet.length} produit(s) non retourné(s) avec raison` : ''}`);
+      onDone && onDone();
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return React.createElement(KbSheet, {
+    title: '↩️ Retour PDP — ' + (f.consumer_name || f.clientName || 'client'),
+    onClose: onClose
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginBottom: 8
+    }
+  }, f.site, " · commande du ", React.createElement("b", null, formatDateShort(f.distribDate || f.day)), ". Coche ce qui ", React.createElement("b", null, "repart à PDP"), ". Pour le reste : une raison."), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginBottom: 8,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minHeight: 48,
+      fontWeight: 700
+    },
+    onClick: () => setPick(p => {
+      const o = {
+        ...p
+      };
+      rows.forEach(r => {
+        o[r.k] = {
+          ...o[r.k],
+          q: r.q
+        };
+      });
+      return o;
+    })
+  }, "☑️ Tout retourner"), React.createElement("button", {
+    type: "button",
+    className: "btn-ghost",
+    style: {
+      minHeight: 48
+    },
+    onClick: () => setPick(p => {
+      const o = {
+        ...p
+      };
+      rows.forEach(r => {
+        o[r.k] = {
+          ...o[r.k],
+          q: 0
+        };
+      });
+      return o;
+    })
+  }, "Tout décocher")), React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8
+    }
+  }, rows.map(r => {
+    const on = r.c.q > 0,
+      need = r.rest > 0;
+    return React.createElement("div", {
+      key: r.k,
+      style: {
+        borderRadius: 12,
+        padding: '8px 10px',
+        border: '2px solid ' + (on ? '#1565c0' : need && !r.c.why && !r.c.txt ? '#ef6c00' : 'var(--border)'),
+        background: on ? '#e3f2fd' : '#fff'
+      }
+    }, React.createElement("div", {
+      onClick: () => upd(r.k, {
+        q: on ? 0 : r.q
+      }),
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        cursor: 'pointer',
+        minHeight: 44
+      }
+    }, React.createElement("span", {
+      style: {
+        fontSize: 26
+      }
+    }, on ? '☑️' : '⬜'), React.createElement("span", {
+      style: {
+        flex: 1,
+        fontSize: 17,
+        fontWeight: 700
+      }
+    }, r.it.produit, r.q > 1 ? React.createElement("span", {
+      style: {
+        color: 'var(--danger)'
+      }
+    }, " ×", r.q) : '', React.createElement("div", {
+      style: {
+        fontSize: 12,
+        fontWeight: 400,
+        color: 'var(--ink-mute)'
+      }
+    }, r.it.producteur || '', r.it.dlc ? ' · DLC ' + formatDateShort(r.it.dlc) : '')), on && r.q > 1 && React.createElement("span", {
+      onClick: e => e.stopPropagation(),
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6
+      }
+    }, React.createElement("button", {
+      type: "button",
+      className: "btn-secondary",
+      style: {
+        minWidth: 40,
+        minHeight: 40
+      },
+      onClick: () => upd(r.k, {
+        q: Math.max(1, r.c.q - 1)
+      })
+    }, "−"), React.createElement("b", {
+      style: {
+        fontSize: 18
+      }
+    }, r.c.q), React.createElement("button", {
+      type: "button",
+      className: "btn-secondary",
+      style: {
+        minWidth: 40,
+        minHeight: 40
+      },
+      onClick: () => upd(r.k, {
+        q: Math.min(r.q, r.c.q + 1)
+      })
+    }, "+"))), need && React.createElement("div", {
+      style: {
+        marginTop: 6
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700,
+        color: '#e65100',
+        marginBottom: 4
+      }
+    }, on ? `${r.rest} non retourné(s)` : 'Non retourné', " — pourquoi ? *"), React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap'
+      }
+    }, KB_NR_REASONS.map(x => React.createElement("span", {
+      key: x,
+      onClick: () => upd(r.k, {
+        why: r.c.why === x ? '' : x
+      }),
+      className: 'chip' + (r.c.why === x ? ' selected' : ''),
+      style: {
+        cursor: 'pointer'
+      }
+    }, x))), React.createElement("input", {
+      type: "text",
+      value: r.c.txt,
+      onChange: e => upd(r.k, {
+        txt: e.target.value
+      }),
+      placeholder: "ou écrire la raison…",
+      style: {
+        width: '100%',
+        marginTop: 6,
+        minHeight: 40
+      }
+    })));
+  })), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy,
+    onClick: save,
+    style: {
+      width: '100%',
+      minHeight: 60,
+      fontSize: 18,
+      fontWeight: 800,
+      marginTop: 12,
+      background: '#1565c0'
+    }
+  }, busy ? '⏳…' : `↩️ Valider le retour PDP (${nRet} article${nRet > 1 ? 's' : ''})`), missing.length > 0 && nRet > 0 && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#e65100',
+      marginTop: 6,
+      fontWeight: 700
+    }
+  }, "⚠️ Raison manquante : ", missing.map(r => r.it.produit).join(', ')));
+}
 function NonRecupSubPage({
   session,
   currentSite,
@@ -9559,19 +10238,8 @@ function NonRecupSubPage({
     if (filter === 'resolved') return TERMINAL.includes(f.status);
     return true;
   });
-  const sendToPdpNow = async f => {
-    if (!confirm(`Envoyer la commande de ${f.consumer_name || 'ce client'} en retour PDP maintenant ?\n(le chauffeur la ramènera à l'entrepôt)`)) return;
-    await storage.setDoc('followups', f.id || f.orderId, {
-      ...f,
-      forceReturnPdp: true,
-      forceReturnPdpBy: session.name,
-      forceReturnPdpAt: new Date().toISOString(),
-      updatedBy: session.name,
-      updatedAt: new Date().toISOString()
-    });
-    await kbPickupWrite(f);
-    showToast('✓ Envoyé en retour PDP');
-  };
+  const [pdpPick, setPdpPick] = React.useState(null);
+  const sendToPdpNow = f => setPdpPick(f);
   const setStatus = async (f, newStatus) => {
     const docId = f.id || f.orderId;
     if (!docId) {
@@ -9734,7 +10402,12 @@ function NonRecupSubPage({
   const alertCount = enriched.filter(f => !TERMINAL_STATUSES.includes(f.status) && daysSince(f.distribDate || f.day) >= ALERT_DAYS_NON_RECUP).length;
   return React.createElement("div", {
     className: "stack"
-  }, React.createElement("h1", null, "Non-récupérés · ", currentSite), React.createElement("p", {
+  }, pdpPick && React.createElement(KbPdpReturnPicker, {
+    f: pdpPick,
+    by: session.name,
+    onClose: () => setPdpPick(null),
+    onDone: () => setPdpPick(null)
+  }), React.createElement("h1", null, "Non-récupérés · ", currentSite), React.createElement("p", {
     style: {
       color: 'var(--ink-soft)',
       fontSize: 13,
@@ -10063,7 +10736,14 @@ function NonRecupSubPage({
         fontWeight: 600,
         padding: '6px 0'
       }
-    }, "↩️ En retour PDP"), session.isMaster && React.createElement("button", {
+    }, "↩️ En retour PDP", Array.isArray(f.items) ? ` · ${f.items.reduce((t, x) => t + (Number(x.qty) || 1), 0)} article(s)` : ''), f.forceReturnPdp && !f.pdpRecoveredAt && React.createElement("button", {
+      className: "btn-ghost",
+      style: {
+        padding: '6px 10px',
+        fontSize: 12
+      },
+      onClick: () => setPdpPick(f)
+    }, "✏️ Produits retournés"), session.isMaster && React.createElement("button", {
       className: "btn-ghost",
       style: {
         padding: '6px 10px',
@@ -10088,7 +10768,13 @@ function NonRecupSubPage({
         color: 'var(--warn)',
         marginTop: 4
       }
-    }, "🙋 Transmis à Henry")))));
+    }, "🙋 Transmis à Henry"), Array.isArray(f.pdpNotReturned) && f.pdpNotReturned.length > 0 && React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: '#e65100',
+        marginTop: 4
+      }
+    }, "Non retourné : ", f.pdpNotReturned.map(x => `${x.produit}${x.qty > 1 ? ' ×' + x.qty : ''} (${x.reason})`).join(' · '))))));
   }), session.isMaster && (() => {
     const emailOnly = enriched.filter(f => !f.hasPhone && f.email && f.status !== 'resolved');
     if (emailOnly.length === 0) return null;
@@ -15205,6 +15891,7 @@ function MasterRecapPage({
     showToast(`Statut : ${newStatus}`);
   };
   const [nrMsg, setNrMsg] = React.useState(null);
+  const [nrPick, setNrPick] = React.useState(null);
   const [nrFocus, setNrFocus] = React.useState(() => window.__kbNrFocus || '');
   React.useEffect(() => {
     if (!nrFocus) return;
@@ -15223,17 +15910,7 @@ function MasterRecapPage({
   const decideNr = async (f, d) => {
     const now = new Date().toISOString();
     if (d === 'retour') {
-      if (!confirm(`Valider le retour PDP de la commande de ${f.consumer_name || 'ce client'} (${f.site}) ?\nLe chauffeur la ramènera à l'entrepôt.`)) return;
-      await storage.setDoc('followups', f.id || f.orderId, {
-        pdpDecision: 'retour',
-        forceReturnPdp: true,
-        forceReturnPdpBy: session.name,
-        forceReturnPdpAt: now,
-        decidedBy: session.name,
-        decidedAt: now
-      });
-      await kbPickupWrite(f);
-      showToast('↩️ Retour PDP validé — visible par le chauffeur');
+      setNrPick(f);
     } else {
       await storage.setDoc('followups', f.id || f.orderId, {
         pdpDecision: 'sav',
@@ -15518,7 +16195,17 @@ function MasterRecapPage({
   };
   return React.createElement("div", {
     className: "stack"
-  }, React.createElement("h1", null, "📋 Récap master — tous locaux"), React.createElement("p", {
+  }, nrPick && React.createElement(KbPdpReturnPicker, {
+    f: nrPick,
+    by: session.name,
+    onClose: () => setNrPick(null),
+    onDone: () => setNrPick(null),
+    extra: () => storage.setDoc('followups', nrPick.id || nrPick.orderId, {
+      pdpDecision: 'retour',
+      decidedBy: session.name,
+      decidedAt: new Date().toISOString()
+    })
+  }), React.createElement("h1", null, "📋 Récap master — tous locaux"), React.createElement("p", {
     style: {
       color: 'var(--ink-soft)',
       fontSize: 13,
@@ -27702,7 +28389,6 @@ async function kbPainPribonNear(day, have) {
   }
   return res;
 }
-// V10.97 — Master › Commande pain : commande Brut de pain + commande / facturation pain des magasins Pribon
 function MasterPainPage({
   session,
   catalogue
@@ -27994,7 +28680,6 @@ function PainPribonPage({
     key: s.code,
     value: s.code
   }, s.label)));
-  // V10.97 — liste des livraisons à refacturer (toutes périodes, non facturées)
   const aRefact = orders.filter(o => !o.invoiced).slice().sort((a, b) => a.date.localeCompare(b.date));
   const aRefactEur = aRefact.reduce((t, o) => t + (o.total || 0), 0);
   const aRefactNb = aRefact.reduce((t, o) => t + (o.nb || 0), 0);
@@ -28969,13 +29654,6 @@ function KbMiseEnPlace() {
     }
   }, "Casiers / cagettes / cartons estimés d'après les ", calib && calib.nDays ? calib.nDays + ' derniers jours chargés' : 'habitudes', " (nb moyen par commande, lieu par lieu). Les vrais numéros arrivent avec le chargement des commandes."))));
 }
-// V11.00 — PALETTES EPAL RUNGIS : ce que Rungis nous doit (palettes EPAL uniquement)
-//   • Récupérées en boutique par le chauffeur Rungis (epal/mvts type « retour » : déduites des boutiques) → il doit les DÉPOSER À PDP.
-//     La prépa confirme par jour : « Normalement vous avez reçu le JJ/MM : N palettes (x de BIC, y de TOL) » → ✅ / partiel / ❌.
-//   • Envoyées à Rungis par l'Ajout express (La Centrale, destination RUNGIS, palette EPAL — ex. cagettes en bois à détruire)
-//     = enlevements/<id>/items (code RUNGIS, epalN) → comptées dès que le chauffeur l'a prise (picked ok) ou validée et passée.
-//   • Retour de Rungis reçu à PDP (saisie) → compteur −.
-//   Registre : RTDB kelbongoo-prep  epal/rungis  { type: recu | ko | retour | ajust, mat:'epal', n, ref, code, day, at, by, cancelled }
 const KB_RDU_URL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/epal/rungis';
 const KB_RDU_ENL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/enlevements';
 const KB_RDU_START = '2026-11-05';
@@ -29018,7 +29696,6 @@ const kbRduIso = t => {
   }
 };
 const kbRduKey = k => String(k || '').replace(/[\/#\[\]\.$]/g, '_').slice(0, 140);
-/** Fonction pure : palettes EPAL envoyées à Rungis par l'Ajout express (La Centrale). */
 function kbRduEnvois(enl, start, today) {
   const out = [];
   Object.keys(enl || {}).forEach(id => {
@@ -29052,7 +29729,6 @@ function kbRduEnvois(enl, start, today) {
   });
   return out.sort((a, b) => b.day.localeCompare(a.day));
 }
-/** Fonction pure : compteur + récupérations en boutique groupées par jour. */
 function kbRduCompute(rdu, epal, enl, start, today) {
   start = start || KB_RDU_START;
   today = today || todayKey();
@@ -29081,7 +29757,6 @@ function kbRduCompute(rdu, epal, enl, start, today) {
       recu: a && a.type === 'recu' ? Math.min(n, Math.round(Number(a.n) || 0)) : 0
     };
   });
-  // regroupement par jour de récupération
   const byDay = {};
   pickups.forEach(p => {
     const g = byDay[p.day] || (byDay[p.day] = {
@@ -29299,7 +29974,6 @@ function KbRduRetourForm({
     }
   }, busy ? 'Enregistrement…' : '📥 Enregistrer le retour'));
 }
-// V11.00 — Master › Camion Rungis › Palettes EPAL : compteur « Rungis nous doit » (lecture seule)
 function KbRduMasterCard() {
   const R = useKbRungisDu();
   return React.createElement("div", {
@@ -29330,7 +30004,6 @@ function RungisDuPage({
   const R = useKbRungisDu();
   const [busy, setBusy] = React.useState('');
   const who = String(session && session.name || '').slice(0, 80);
-  // confirme un jour : n reçues au total → réparti sur les récupérations du jour (boutique par boutique)
   const confirmDay = async (g, mode) => {
     const open = g.list.filter(p => !p.ans);
     const tot = open.reduce((t, p) => t + p.n, 0);
@@ -30107,7 +30780,7 @@ function KbLieuxPage({
           name: String(L.name || c).trim() || c,
           type: L.type || 'camion',
           adresse: String(L.adresse || '').trim(),
-          email: String(L.email || '').replace(/[;\s]+/g, ',').split(',').filter(Boolean).join(', '), // V10.98
+          email: String(L.email || '').replace(/[;\s]+/g, ',').split(',').filter(Boolean).join(', '),
           hours: h,
           days,
           exc: kbExcClean(L.exc),
@@ -30654,8 +31327,6 @@ function kbClientMailsClients(day, data) {
     return out;
   }).sort((a, b) => a.site.localeCompare(b.site) || casCmp(a.casiers[0], b.casiers[0]) || a.name.localeCompare(b.name));
 }
-// V11.04 — clients présents dans la prépa (statuts) mais disparus des commandes chargées
-// (ex. JSON rechargé le jour J : l'ancien site a retiré les commandes 100 % en rupture).
 function kbClientMailsGhosts(data) {
   const present = new Set((data.orders || []).map(o => String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')));
   const seen = {};
@@ -30663,12 +31334,13 @@ function kbClientMailsGhosts(data) {
     const a = k.split('||');
     if (a.length < 3) return;
     const ck = a[0] + '||' + a[1];
-    if (!present.has(ck)) seen[ck] = { site: a[0], name: a[1] };
+    if (!present.has(ck)) seen[ck] = {
+      site: a[0],
+      name: a[1]
+    };
   });
   return Object.values(seen);
 }
-// Mail « neutralisé » : heure d'envoi la veille à 0h UTC → le serveur le passe en « expired » sans l'envoyer
-// (règle des 6 h de retard). Un mail déjà envoyé n'est jamais modifié côté serveur.
 function kbCmNeutral(day, type, site, name) {
   return {
     date: day,
@@ -31342,6 +32014,8 @@ function PrepaDuJourPage({
   const [replBox, setReplBox] = React.useState(null);
   const [remCliOpen, setRemCliOpen] = React.useState({});
   const [artOpen, setArtOpen] = React.useState({});
+  const [doneSiteOpen, setDoneSiteOpen] = React.useState({});
+  const [remBox, setRemBox] = React.useState(null);
   const [openClient, setOpenClient] = React.useState(null);
   const [ancienOpen, setAncienOpen] = React.useState(false);
   const [prodFilter, setProdFilter] = React.useState('');
@@ -31680,7 +32354,36 @@ function PrepaDuJourPage({
   }, [rows, reserved]);
   const getCasiers = (s, c) => prep.casiers[CK(s, c)] || ((reserved[CK(s, c)] || []).length ? reserved[CK(s, c)] : [(rows.find(r => r.site === s && r.client === c) || {}).casier || '?']);
   const clientCasier = (s, c) => getCasiers(s, c).join('·');
+  const cliHasCas = (s, c) => s !== 'DOM' && rows.some(r => r.site === s && r.client === c && r.cat !== 'pain' && r.cat !== 'nd' && !kbIsSolidaire(r.product));
   const casFirst = (s, c) => getCasiers(s, c)[0];
+  const casAutoSig = React.useRef('');
+  React.useEffect(() => {
+    if (!day || prep.closed || prep.presence === undefined || !rows.length) return;
+    const miss = {};
+    rows.forEach(r => {
+      if (r.site === 'DOM' || r.cat === 'pain' || r.cat === 'nd' || kbIsSolidaire(r.product)) return;
+      const cs = getCasiers(r.site, r.client).map(String).filter(v => v && v !== '?');
+      if (!cs.length) (miss[r.site] = miss[r.site] || new Set()).add(r.client);
+    });
+    const sig = Object.entries(miss).map(([s, set]) => s + ':' + [...set].sort().join(',')).sort().join('|');
+    if (!sig || sig === casAutoSig.current) return;
+    casAutoSig.current = sig;
+    let cnt = 0;
+    Object.entries(miss).forEach(([s, set]) => {
+      const own = casOwners(s);
+      let n = 0;
+      Object.keys(own).forEach(v => {
+        const x = parseInt(v, 10);
+        if (!isNaN(x) && String(x) === v && x > n) n = x;
+      });
+      [...set].sort((a, b) => a.localeCompare(b)).forEach(c => {
+        n++;
+        cnt++;
+        wCas(CK(s, c), [String(n)]);
+      });
+    });
+    if (cnt) showToast(`🧊 ${cnt} client${cnt > 1 ? 's' : ''} sans casier → n° attribué`);
+  }, [day, rows, prep]);
   const basket = (s, c) => rows.filter(r => r.site === s && r.client === c).reduce((a, r) => a + r.qty, 0);
   const weighable = t => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
   const st = r => prep.status[K(r)] || 'todo';
@@ -31753,6 +32456,29 @@ function PrepaDuJourPage({
     pct: refProg.t ? Math.round(refProg.d / refProg.t * 100) : 0,
     allDone: refProg.t > 0 && refProg.d === refProg.t
   };
+  const siteDone = x => {
+    const p = siteProgress(x);
+    return p.total > 0 && p.done === p.total;
+  };
+  const sitesOrd = [...sites.filter(x => !siteDone(x)), ...sites.filter(siteDone)];
+  const curDoneRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!curSite) return;
+    const d = siteDone(curSite),
+      was = curDoneRef.current;
+    curDoneRef.current = curSite + '|' + d;
+    if (!d || was !== curSite + '|false') return;
+    const next = sites.find(x => x !== curSite && !siteDone(x));
+    if (next && mode !== 'produits') {
+      setCurSite(next);
+      showToast(`✅ ${curSite} terminé → ${next}`);
+      try {
+        window.scrollTo({
+          top: 0
+        });
+      } catch (_) {}
+    }
+  }, [curSite, refProg]);
   React.useEffect(() => {
     if (!day || !rows.length) return;
     const lines = openProd ? rows.filter(r => r.product === openProd) : [];
@@ -31828,7 +32554,6 @@ function PrepaDuJourPage({
       });
     }, 1100);
   };
-  // V11.03 — tout ce qui est TRAITÉ sort de l'écran (casier ✓, rupture 🚫, partiel) → « ✅ Traités » pour corriger
   const isHidden = r => {
     const x = st(r);
     return (x === 'done' || x === 'rupture' || x === 'partiel') && !recent[K(r)];
@@ -32569,7 +33294,6 @@ function PrepaDuJourPage({
       onClick: applyRepl
     }, "🔄 Valider le remplacement")));
   })();
-  // V11.03 — poids / remise ARTICLE PAR ARTICLE (q > 1) : chaque article garde sa propre remise
   const rcArts = (k, q) => {
     const rc = prep.remiseCli[k];
     if (!rc) return Array.from({
@@ -32712,7 +33436,6 @@ function PrepaDuJourPage({
   };
   const setPoidsProd = (site, product) => setPoidsRows(rows.filter(r => r.site === site && r.product === product), '', false);
   const ndSavedAt = React.useRef({});
-  // V11.03 — annuler une mise en cagette ND (erreur de bouton) : statuts remis à « à faire »
   const resetND = (site, product) => {
     const pk = PK(site, product);
     rows.filter(r => r.site === site && r.product === product).forEach(r => {
@@ -32786,7 +33509,7 @@ function PrepaDuJourPage({
     if (placed > total) placed = total;
     const list = po.map(r => ({
       client: r.client,
-      casier: clientCasier(site, r.client),
+      casier: cliHasCas(site, r.client) ? clientCasier(site, r.client) : 'ND',
       need: r.qty,
       key: K(r)
     })).sort((a, b) => basket(site, b.client) - basket(site, a.client) || b.need - a.need || a.client.localeCompare(b.client));
@@ -32950,7 +33673,6 @@ function PrepaDuJourPage({
     const rc = prep.remiseCli[k];
     return !!(rc && Array.isArray(rc.arts) && rc.arts.some(a => a && a.reason === 'Poids réel'));
   };
-  // valider la remise d'un client : si des articles sont déjà pesés, ils gardent leur remise poids
   const saveRemCli = (k, o) => {
     if (!hasPoidsArts(k)) return wRemCli(k, o);
     const q = Math.max(1, o.q || 1),
@@ -33081,6 +33803,603 @@ function PrepaDuJourPage({
       [k]: undefined
     }))
   }, "Fermer")));
+  const remArtsOf = k => {
+    const rc = prep.remiseCli[k];
+    return rc && Array.isArray(rc.arts) ? rc.arts.filter(Boolean) : rc && Number(rc.pct) > 0 ? [{
+      pct: Number(rc.pct),
+      reason: rc.reason || ''
+    }] : [];
+  };
+  const hasPoidsRem = k => remArtsOf(k).some(a => a.reason === 'Poids réel') || !!prep.poids[k];
+  const hasPctRem = (k, pk) => remArtsOf(k).some(a => a.reason !== 'Poids réel') || !!(pk && prep.remiseAll[pk] && !prep.remiseCli[k]);
+  const remTag2 = (k, pk) => {
+    const arts = remArtsOf(k);
+    const g = {};
+    arts.forEach(a => {
+      const t = a.reason === 'Poids réel' ? '⚖️' : '🏷️';
+      const kk = t + a.pct;
+      g[kk] = g[kk] || {
+        t,
+        pct: a.pct,
+        n: 0
+      };
+      g[kk].n++;
+    });
+    let out = Object.values(g).sort((a, b) => a.t.localeCompare(b.t) || b.pct - a.pct).map(x => `${x.t}−${x.pct}%${x.n > 1 ? '×' + x.n : ''}`).join(' ');
+    if (!arts.length && pk && prep.remiseAll[pk]) out = `🏷️−${prep.remiseAll[pk].pct}% (tout le produit)`;
+    return out;
+  };
+  const remPrevuOf = product => {
+    const r0 = rows.find(r => r.product === product);
+    const ng = kbNameGrams(product);
+    if (ng) return ng;
+    const rg = kbPoidsRange(weightOf(r0) || r0 && r0.type || '');
+    return rg ? Math.round(rg.min) : 0;
+  };
+  const openRemBox = (kind, r, type, site, product) => {
+    if (kind === 'cli') {
+      const q = Math.max(1, r.qty || 1);
+      setRemBox({
+        kind,
+        k: K(r),
+        pk: PK(r.site, r.product),
+        site: r.site,
+        product: r.product,
+        client: r.client,
+        q,
+        step: q > 1 ? 'scope' : 'art',
+        art: 0,
+        type: type || 'pct',
+        pct: 10,
+        reason: 'Abîmé / écrasé',
+        reel: '',
+        prevu: String(remPrevuOf(r.product) || '')
+      });
+    } else {
+      const pk = PK(site, product);
+      setRemBox({
+        kind: 'prod',
+        pk,
+        site,
+        product,
+        step: 'scope',
+        type: type || 'pct',
+        pct: prep.remiseAll[pk] && prep.remiseAll[pk].pct || 10,
+        reason: prep.remiseAll[pk] && prep.remiseAll[pk].reason || 'DLC courte',
+        reel: '',
+        prevu: String(remPrevuOf(product) || '')
+      });
+    }
+    setRemCliOpen({});
+    setArtOpen({});
+    setRemAllOpen({});
+  };
+  const remUpd = patch => setRemBox(b => b ? {
+    ...b,
+    ...patch
+  } : b);
+  const remPoidsPct = b => kbPoidsPct(kbParseGrams(b.reel), kbParseGrams(b.prevu));
+  const remVal = b => {
+    if (b.type === 'poids') {
+      const reel = kbParseGrams(b.reel),
+        pct = remPoidsPct(b);
+      return pct ? {
+        pct,
+        reason: 'Poids réel',
+        poids: reel + ' g'
+      } : null;
+    }
+    return Number(b.pct) > 0 ? {
+      pct: Math.min(100, Number(b.pct)),
+      reason: b.reason || 'Autre'
+    } : null;
+  };
+  const remCheck = b => {
+    if (b.type !== 'poids') return true;
+    if (!kbParseGrams(b.reel)) {
+      showToast('⚖️ Indique le poids réel (ex : 320)');
+      return false;
+    }
+    if (!kbParseGrams(b.prevu)) {
+      showToast('⚖️ Indique le poids prévu');
+      return false;
+    }
+    if (!remPoidsPct(b)) {
+      showToast('⚖️ Poids ≥ prévu : pas de remise');
+      return false;
+    }
+    return true;
+  };
+  const remSaveCli = (b, which) => {
+    const arts = which === 'all' || which === 'clear' ? Array.from({
+      length: b.q
+    }, () => null) : rcArts(b.k, b.q);
+    if (which !== 'clear') {
+      if (!remCheck(b)) return false;
+      const v = remVal(b);
+      if (which === 'all') for (let i = 0; i < b.q; i++) arts[i] = v ? {
+        ...v
+      } : null;else arts[which] = v;
+    }
+    wArts(b.k, b.q, arts);
+    return true;
+  };
+  const remSaveProd = b => {
+    if (!remCheck(b)) return false;
+    const v = remVal(b);
+    if (b.type === 'poids') {
+      rows.filter(r => r.site === b.site && r.product === b.product).forEach(r => {
+        const q = Math.max(1, r.qty || 1);
+        wArts(K(r), q, Array.from({
+          length: q
+        }, () => ({
+          ...v
+        })));
+      });
+      showToast(`⚖️ Remise poids −${v.pct} % sur tout le produit`);
+    } else {
+      wRemAll(b.pk, v);
+      showToast(`🏷️ Remise −${v.pct} % sur tout le produit`);
+    }
+    return true;
+  };
+  const remBig = {
+    minHeight: 64,
+    fontSize: 19,
+    fontWeight: 800,
+    borderRadius: 14,
+    padding: '10px 14px',
+    cursor: 'pointer',
+    width: '100%',
+    textAlign: 'left'
+  };
+  const remEditor = (b, onOk, okLabel, onNormal) => {
+    const pp = remPoidsPct(b);
+    return React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 8
+      }
+    }, [['pct', '🏷️ Remise %'], ['poids', '⚖️ Poids réel']].map(([t, l]) => React.createElement("button", {
+      key: t,
+      onClick: () => remUpd({
+        type: t
+      }),
+      style: {
+        flex: 1,
+        minHeight: 56,
+        fontSize: 18,
+        fontWeight: 800,
+        borderRadius: 12,
+        cursor: 'pointer',
+        border: '3px solid ' + (t === 'poids' ? '#1565c0' : '#a3125b'),
+        background: b.type === t ? t === 'poids' ? '#1565c0' : '#a3125b' : '#fff',
+        color: b.type === t ? '#fff' : t === 'poids' ? '#1565c0' : '#a3125b'
+      }
+    }, l))), b.type === 'pct' ? React.createElement(React.Fragment, null, React.createElement("div", {
+      className: "pdj-row wrap"
+    }, PDJ_REM_MOTIFS.map(x => React.createElement("span", {
+      key: x,
+      className: "pdj-pick" + (b.reason === x ? " on" : ""),
+      onClick: () => remUpd({
+        reason: x
+      })
+    }, x))), React.createElement("div", {
+      className: "pdj-row wrap"
+    }, PDJ_REM_PRESETS.map(p => React.createElement("span", {
+      key: p,
+      className: "pdj-pick" + (Number(b.pct) === p ? " on" : ""),
+      style: {
+        minWidth: 76,
+        justifyContent: 'center',
+        fontSize: 22
+      },
+      onClick: () => remUpd({
+        pct: p
+      })
+    }, "−", p, "%")), React.createElement("span", {
+      className: "pdj-pick" + (PDJ_REM_PRESETS.includes(Number(b.pct)) ? "" : " on"),
+      onClick: () => askAutre(n => remUpd({
+        pct: n
+      }))
+    }, PDJ_REM_PRESETS.includes(Number(b.pct)) ? 'Autre…' : `−${b.pct}% ✎`))) : React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8
+      }
+    }, React.createElement("label", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700
+      }
+    }, "Poids réel (g)", React.createElement("input", {
+      type: "number",
+      inputMode: "numeric",
+      autoFocus: true,
+      value: b.reel,
+      onChange: e => remUpd({
+        reel: e.target.value
+      }),
+      placeholder: "ex : 320",
+      style: {
+        display: 'block',
+        width: '100%',
+        marginTop: 4,
+        minHeight: 60,
+        fontSize: 28,
+        fontWeight: 800,
+        padding: '6px 12px',
+        borderRadius: 12,
+        border: '3px solid #1565c0'
+      }
+    })), React.createElement("label", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700,
+        color: '#555'
+      }
+    }, "Poids prévu (g)", React.createElement("input", {
+      type: "number",
+      inputMode: "numeric",
+      value: b.prevu,
+      onChange: e => remUpd({
+        prevu: e.target.value
+      }),
+      style: {
+        display: 'block',
+        width: '100%',
+        marginTop: 4,
+        minHeight: 48,
+        fontSize: 20,
+        padding: '4px 12px',
+        borderRadius: 10,
+        border: '2px solid #bbb'
+      }
+    })), React.createElement("div", {
+      style: {
+        fontSize: 20,
+        fontWeight: 800,
+        color: pp ? '#1565c0' : '#777'
+      }
+    }, kbParseGrams(b.reel) && kbParseGrams(b.prevu) ? pp ? `→ remise −${pp} %` : '→ poids ≥ prévu : pas de remise' : '…')), React.createElement("button", {
+      className: "pdj-remgo",
+      onClick: onOk,
+      style: {
+        minHeight: 64,
+        fontSize: 21
+      }
+    }, okLabel), onNormal && React.createElement("button", {
+      className: "pdj-btn",
+      onClick: onNormal,
+      style: {
+        minHeight: 52,
+        fontSize: 17,
+        fontWeight: 700
+      }
+    }, "✓ Normal (pas de remise)"));
+  };
+  const remPopup = remBox && (() => {
+    const b = remBox;
+    const close = () => setRemBox(null);
+    const name = String(b.product).replace(/^\[TEST\]\s*/, '');
+    const head = React.createElement("div", {
+      style: {
+        background: '#f3f1ec',
+        borderRadius: 12,
+        padding: '8px 12px',
+        marginBottom: 10
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 19,
+        fontWeight: 800
+      }
+    }, name), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: '#555'
+      }
+    }, React.createElement("span", {
+      style: {
+        background: kbSiteColor(b.site),
+        color: '#fff',
+        borderRadius: 6,
+        padding: '0 8px',
+        fontWeight: 800
+      }
+    }, b.site), b.kind === 'cli' ? React.createElement(React.Fragment, null, " · ", React.createElement("b", null, b.client), " · ", b.q, " article", b.q > 1 ? 's' : '') : ' · tous les clients'));
+    if (b.kind === 'prod') {
+      const po = rows.filter(r => r.site === b.site && r.product === b.product);
+      const nArt = po.reduce((t, r) => t + Math.max(1, r.qty || 1), 0);
+      let body;
+      if (b.step === 'scope') body = React.createElement("div", {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 17,
+          fontWeight: 800
+        }
+      }, "Sur quoi ?"), React.createElement("button", {
+        onClick: () => remUpd({
+          step: 'all'
+        }),
+        style: {
+          ...remBig,
+          border: '3px solid #a3125b',
+          background: '#fff'
+        }
+      }, "🟰 Tout le produit", React.createElement("div", {
+        style: {
+          fontSize: 14,
+          fontWeight: 600,
+          color: '#555'
+        }
+      }, po.length, " client", po.length > 1 ? 's' : '', " · ", nArt, " article", nArt > 1 ? 's' : '', " — même remise partout")), React.createElement("button", {
+        onClick: () => remUpd({
+          step: 'clients'
+        }),
+        style: {
+          ...remBig,
+          border: '3px solid #1565c0',
+          background: '#fff'
+        }
+      }, "👤 Client par client", React.createElement("div", {
+        style: {
+          fontSize: 14,
+          fontWeight: 600,
+          color: '#555'
+        }
+      }, "puis article par article si besoin")), prep.remiseAll[b.pk] && React.createElement("button", {
+        className: "pdj-btn",
+        onClick: () => {
+          wRemAll(b.pk, null);
+          showToast('Remise produit retirée');
+          close();
+        },
+        style: {
+          minHeight: 52,
+          fontSize: 16,
+          fontWeight: 700
+        }
+      }, "✕ Retirer la remise « tout le produit » (−", prep.remiseAll[b.pk].pct, " %)"));else if (b.step === 'all') body = React.createElement(React.Fragment, null, React.createElement("button", {
+        className: "pdj-btn",
+        onClick: () => remUpd({
+          step: 'scope'
+        }),
+        style: {
+          marginBottom: 8
+        }
+      }, "← Sur quoi ?"), remEditor(b, () => {
+        if (remSaveProd(b)) close();
+      }, '✓ Appliquer à tout le produit'));else body = React.createElement("div", {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8
+        }
+      }, React.createElement("button", {
+        className: "pdj-btn",
+        onClick: () => remUpd({
+          step: 'scope'
+        }),
+        style: {
+          alignSelf: 'flex-start'
+        }
+      }, "← Sur quoi ?"), po.map(r => {
+        const k = K(r),
+          tg = remTag2(k, b.pk);
+        return React.createElement("button", {
+          key: k,
+          onClick: () => openRemBox('cli', r, b.type),
+          style: {
+            ...remBig,
+            minHeight: 60,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            border: '3px solid ' + (tg ? '#2e7d32' : '#ddd'),
+            background: tg ? '#e8f5e9' : '#fff'
+          }
+        }, React.createElement("span", {
+          style: {
+            fontWeight: 900
+          }
+        }, getCasiers(r.site, r.client).map(kbCasShort).join('·')), React.createElement("span", {
+          style: {
+            flex: 1
+          }
+        }, r.client, (r.qty || 1) > 1 ? React.createElement("span", {
+          style: {
+            color: '#c62828'
+          }
+        }, " ×", r.qty) : ''), React.createElement("span", {
+          style: {
+            fontSize: 15
+          }
+        }, tg || '›'));
+      }), React.createElement("button", {
+        className: "pdj-remgo",
+        onClick: close,
+        style: {
+          minHeight: 60,
+          marginTop: 6
+        }
+      }, "✓ Terminé"));
+      return React.createElement(KbSheet, {
+        title: b.type === 'poids' ? '⚖️ Poids / remise' : '🏷️ Remise',
+        onClose: close
+      }, head, body);
+    }
+    const arts = rcArts(b.k, b.q);
+    const back = b.q > 1 ? React.createElement("button", {
+      className: "pdj-btn",
+      onClick: () => remUpd({
+        step: b.step === 'art' ? 'grid' : 'scope'
+      }),
+      style: {
+        marginBottom: 8
+      }
+    }, b.step === 'art' ? '← Articles' : '← Sur quoi ?') : null;
+    let body;
+    if (b.step === 'scope') body = React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 17,
+        fontWeight: 800
+      }
+    }, "Sur quoi ?"), React.createElement("button", {
+      onClick: () => remUpd({
+        step: 'all'
+      }),
+      style: {
+        ...remBig,
+        border: '3px solid #a3125b',
+        background: '#fff'
+      }
+    }, "🟰 Les ", b.q, " articles", React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 600,
+        color: '#555'
+      }
+    }, "même remise pour tous")), React.createElement("button", {
+      onClick: () => remUpd({
+        step: 'grid'
+      }),
+      style: {
+        ...remBig,
+        border: '3px solid #1565c0',
+        background: '#fff'
+      }
+    }, "🔢 Article par article", React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 600,
+        color: '#555'
+      }
+    }, "un carré par article (ex. 1 sachet abîmé sur 2, un poids chacun)")), arts.some(Boolean) && React.createElement("button", {
+      className: "pdj-btn",
+      onClick: () => {
+        remSaveCli(b, 'clear');
+        showToast('Remises retirées');
+        close();
+      },
+      style: {
+        minHeight: 52,
+        fontSize: 16,
+        fontWeight: 700
+      }
+    }, "✕ Retirer toutes les remises de ce client"));else if (b.step === 'all') body = React.createElement(React.Fragment, null, back, remEditor(b, () => {
+      if (remSaveCli(b, 'all')) {
+        showToast(`✓ Remise sur les ${b.q} articles`);
+        close();
+      }
+    }, b.q > 1 ? `✓ Appliquer aux ${b.q} articles` : '✓ Valider', b.q > 1 ? null : () => {
+      remSaveCli(b, 'clear');
+      close();
+    }));else if (b.step === 'grid') body = React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      }
+    }, back, React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700
+      }
+    }, "Touche l'article à remiser :"), React.createElement("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))',
+        gap: 10
+      }
+    }, arts.slice(0, 24).map((a, i) => React.createElement("button", {
+      key: i,
+      onClick: () => remUpd({
+        step: 'art',
+        art: i,
+        reel: a && a.poids ? String(kbParseGrams(a.poids)) : '',
+        type: a ? a.reason === 'Poids réel' ? 'poids' : 'pct' : b.type,
+        pct: a && a.reason !== 'Poids réel' ? a.pct : b.pct,
+        reason: a && a.reason !== 'Poids réel' ? a.reason : b.reason
+      }),
+      style: {
+        minHeight: 96,
+        borderRadius: 14,
+        cursor: 'pointer',
+        border: '3px solid ' + (a ? a.reason === 'Poids réel' ? '#1565c0' : '#a3125b' : '#ccc'),
+        background: a ? a.reason === 'Poids réel' ? '#e3f2fd' : '#fce4ec' : '#fff',
+        padding: 6
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 700
+      }
+    }, "Article ", i + 1), React.createElement("div", {
+      style: {
+        fontSize: 20,
+        fontWeight: 900
+      }
+    }, a ? `${a.reason === 'Poids réel' ? '⚖️' : '🏷️'} −${a.pct}%` : '✓ normal'), a && a.poids && React.createElement("div", {
+      style: {
+        fontSize: 13
+      }
+    }, a.poids)))), React.createElement("button", {
+      className: "pdj-remgo",
+      onClick: close,
+      style: {
+        minHeight: 60
+      }
+    }, "✓ Terminé"));else body = React.createElement(React.Fragment, null, back, b.q > 1 && React.createElement("div", {
+      style: {
+        fontSize: 20,
+        fontWeight: 900,
+        marginBottom: 6
+      }
+    }, "Article ", b.art + 1, " / ", b.q), remEditor(b, () => {
+      if (remSaveCli(b, b.q > 1 ? b.art : 'all')) {
+        if (b.q > 1) remUpd({
+          step: 'grid'
+        });else close();
+      }
+    }, b.q > 1 ? `✓ Fini (article ${b.art + 1})` : '✓ Valider', () => {
+      if (b.q > 1) {
+        remSaveCli({
+          ...b,
+          type: 'pct',
+          pct: 0
+        }, b.art);
+        remUpd({
+          step: 'grid'
+        });
+      } else {
+        remSaveCli(b, 'clear');
+        close();
+      }
+    }));
+    return React.createElement(KbSheet, {
+      title: b.type === 'poids' ? '⚖️ Poids / remise' : '🏷️ Remise',
+      onClose: close
+    }, head, body);
+  })();
   const rollSites = React.useMemo(() => {
     const out = {};
     sites.filter(s => s !== 'DOM').forEach(s => {
@@ -33413,12 +34732,12 @@ function PrepaDuJourPage({
     }, nd.alloc.map((a, i) => React.createElement("div", {
       key: "a" + i,
       className: "pdj-line"
-    }, React.createElement("span", null, "Casier ", a.casier, " — ", a.client), React.createElement("span", {
+    }, React.createElement("span", null, a.casier === 'ND' ? "🍞 à la main" : "Casier " + a.casier, " — ", a.client), React.createElement("span", {
       className: "ok"
     }, "+", a.give, "× ✓"))), (nd.shortage || []).map((s, i) => React.createElement("div", {
       key: "s" + i,
       className: "pdj-line"
-    }, React.createElement("span", null, "Casier ", s.casier, " — ", s.client), React.createElement("span", {
+    }, React.createElement("span", null, s.casier === 'ND' ? "🍞 à la main" : "Casier " + s.casier, " — ", s.client), React.createElement("span", {
       className: "ko"
     }, "manque ", s.need, " → rupture")))), !prep.closed && React.createElement("div", {
       className: "pdj-row wrap",
@@ -33515,7 +34834,7 @@ function PrepaDuJourPage({
         }
       }, "garde ", product), rc && React.createElement("span", {
         className: "pdj-tag rem"
-      }, remTag(rc)), pv && React.createElement("span", {
+      }, remTag2(k, pk) || remTag(rc)), pv && !hasPoidsRem(k) && React.createElement("span", {
         className: "pdj-tag w"
       }, "⚖️", pv), React.createElement("span", {
         className: "pdj-cqty" + ((r.qty || 1) > 1 && x === 'todo' ? " multi" : "")
@@ -33526,19 +34845,13 @@ function PrepaDuJourPage({
         title: "Rupture ce client",
         onClick: () => toggleRuptCli(r)
       }, "🚫"), React.createElement("button", {
-        className: "pdj-xr",
+        className: "pdj-xr w" + (hasPoidsRem(k) ? " on" : ""),
         title: "Poids",
-        onClick: () => setPoids1(r)
+        onClick: () => openRemBox('cli', r, 'poids')
       }, "⚖️"), React.createElement("button", {
-        className: "pdj-xr rem" + (prep.remiseCli[k] ? " on" : ""),
+        className: "pdj-xr rem" + (hasPctRem(k, pk) ? " on" : ""),
         title: "Remise ce client",
-        onClick: () => {
-          setRemAllOpen(o => ({
-            ...o,
-            [pk]: undefined
-          }));
-          openRemCli(k, r.qty);
-        }
+        onClick: () => openRemBox('cli', r, 'pct')
       }, "🏷️"), React.createElement("button", {
         className: "pdj-xr",
         title: "Nouveau casier pour ce client",
@@ -33654,7 +34967,7 @@ function PrepaDuJourPage({
     }, React.createElement("div", {
       className: "pdj-mact",
       onClick: () => {
-        setPoidsProd(site, product);
+        openRemBox('prod', null, 'poids', site, product);
         setMoreOpen(m => ({
           ...m,
           [pk]: false
@@ -33662,7 +34975,13 @@ function PrepaDuJourPage({
       }
     }, "⚖️ Poids (produit)"), React.createElement("div", {
       className: "pdj-mact rem" + (ra ? " on" : ""),
-      onClick: () => openRemAll(pk)
+      onClick: () => {
+        openRemBox('prod', null, 'pct', site, product);
+        setMoreOpen(m => ({
+          ...m,
+          [pk]: false
+        }));
+      }
     }, "🏷️ Remise (produit)"), site !== 'DOM' && nd && !painPk.has(pk) && React.createElement("div", {
       className: "pdj-mact",
       style: {
@@ -33802,7 +35121,7 @@ function PrepaDuJourPage({
         marginTop: 12
       },
       onClick: () => setAncienOpen(true)
-    }, "🚫 Ruptures ancien site")), rgPopup, replPopup, React.createElement("div", {
+    }, "🚫 Ruptures ancien site")), rgPopup, replPopup, remPopup, React.createElement("div", {
       style: {
         maxWidth: 520,
         margin: '12px auto'
@@ -33893,13 +35212,75 @@ function PrepaDuJourPage({
         className: "pdj-dcount" + (ps.fin ? " ok" : "")
       }, ps.dn, React.createElement("span", null, "/", ps.tot))), ps.po.some(r => (r.qty || 1) > 1) && React.createElement("div", {
         className: "pdj-multihint"
-      }, "👆 Quantité ×2 ou plus : toucher le casier ", React.createElement("b", null, "une fois par article posé"), " (1/2 → 2/2 ✓)."), ps.ss.map(site => React.createElement("div", {
-        key: site,
-        className: "pdj-dblock"
-      }, React.createElement("div", {
-        className: "pdj-dsite",
-        style: kbSiteVars(site)
-      }, React.createElement("span", null, "📍 ", site, siteLabel(site) !== site ? ' · ' + siteLabel(site) : '')), renderProduct(site, openProd, ps.po.filter(r => r.site === site)))), React.createElement("div", {
+      }, "👆 Quantité ×2 ou plus : toucher le casier ", React.createElement("b", null, "une fois par article posé"), " (1/2 → 2/2 ✓)."), (() => {
+        const siteFin = site => ps.po.filter(r => r.site === site).every(handled);
+        const ord = [...ps.ss.filter(x => !siteFin(x)), ...ps.ss.filter(siteFin)];
+        return ord.map(site => {
+          const fin = siteFin(site),
+            dk = openProd + '||' + site;
+          if (fin && !doneSiteOpen[dk]) return React.createElement("button", {
+            key: site,
+            onClick: () => setDoneSiteOpen(o => ({
+              ...o,
+              [dk]: true
+            })),
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              width: '100%',
+              marginTop: 8,
+              padding: '10px 14px',
+              minHeight: 52,
+              borderRadius: 14,
+              border: '3px solid ' + kbSiteColor(site),
+              background: '#e8f5e9',
+              color: '#1b5e20',
+              fontSize: 17,
+              fontWeight: 800,
+              textAlign: 'left',
+              cursor: 'pointer'
+            }
+          }, React.createElement("span", {
+            style: {
+              background: kbSiteColor(site),
+              color: '#fff',
+              borderRadius: 8,
+              padding: '2px 10px'
+            }
+          }, site), React.createElement("span", {
+            style: {
+              flex: 1
+            }
+          }, "✅ Fait"), React.createElement("span", {
+            style: {
+              fontSize: 13,
+              fontWeight: 700,
+              color: '#555'
+            }
+          }, "revoir / corriger ▾"));
+          return React.createElement("div", {
+            key: site,
+            className: "pdj-dblock"
+          }, React.createElement("div", {
+            className: "pdj-dsite",
+            style: kbSiteVars(site)
+          }, React.createElement("span", null, "📍 ", site, siteLabel(site) !== site ? ' · ' + siteLabel(site) : '')), renderProduct(site, openProd, ps.po.filter(r => r.site === site)), fin && React.createElement("button", {
+            onClick: () => setDoneSiteOpen(o => ({
+              ...o,
+              [dk]: false
+            })),
+            className: "pdj-btn",
+            style: {
+              width: '100%',
+              marginTop: 6,
+              minHeight: 48,
+              fontSize: 16,
+              fontWeight: 800
+            }
+          }, "✅ ", site, " fait · replier ▴"));
+        });
+      })(), React.createElement("div", {
         className: "pdj-dnav"
       }, React.createElement("button", {
         className: "pdj-navbtn",
@@ -34086,7 +35467,7 @@ function PrepaDuJourPage({
         }
       }, React.createElement("option", {
         value: ""
-      }, "Toutes les boutiques (", sites.length, ")"), sites.map(x => {
+      }, "Toutes les boutiques (", sites.length, ")"), sitesOrd.map(x => {
         const pg = siteProgress(x);
         return React.createElement("option", {
           key: x,
@@ -34359,7 +35740,7 @@ function PrepaDuJourPage({
           className: "pdj-tag nd"
         }, "🔴 cagette ND"), rc && React.createElement("span", {
           className: "pdj-tag rem"
-        }, remTag(rc)), pv && React.createElement("span", {
+        }, remTag2(k, pk) || remTag(rc)), pv && !hasPoidsRem(k) && React.createElement("span", {
           className: "pdj-tag w"
         }, "⚖️", pv), React.createElement("span", {
           className: "pdj-cqty" + ((r.qty || 1) > 1 && x === 'todo' ? " multi" : "")
@@ -34368,13 +35749,13 @@ function PrepaDuJourPage({
           title: "Rupture",
           onClick: () => toggleRuptCli(r)
         }, "🚫"), React.createElement("button", {
-          className: "pdj-xr",
+          className: "pdj-xr w" + (hasPoidsRem(k) ? " on" : ""),
           title: "Poids",
-          onClick: () => setPoids1(r)
+          onClick: () => openRemBox('cli', r, 'poids')
         }, "⚖️"), React.createElement("button", {
-          className: "pdj-xr rem" + (prep.remiseCli[k] ? " on" : ""),
+          className: "pdj-xr rem" + (hasPctRem(k, pk) ? " on" : ""),
           title: "Remise",
-          onClick: () => openRemCli(k, r.qty)
+          onClick: () => openRemBox('cli', r, 'pct')
         }, "🏷️"), React.createElement("button", {
           className: "pdj-xr",
           title: "Nouveau casier pour ce client",
@@ -34515,7 +35896,7 @@ function PrepaDuJourPage({
         marginTop: 8
       }
     }, "Un numéro = un seul client par lieu. Casier pas utilisé ? ✕ pour le supprimer : son n° redevient libre.")));
-  })(), rgPopup, replPopup, React.createElement("div", {
+  })(), rgPopup, replPopup, remPopup, React.createElement("div", {
     className: "pdj-topbar"
   }, React.createElement("div", {
     className: "pdj-modebar"
@@ -34557,7 +35938,7 @@ function PrepaDuJourPage({
     onChange: e => setSearchQ(e.target.value)
   })), !searchOpen && mode !== 'produits' && mode !== 'nd' && React.createElement("div", {
     className: "pdj-subbar"
-  }, sites.map(s => {
+  }, sitesOrd.map(s => {
     const p = siteProgress(s);
     const ok = p.done === p.total && p.total > 0;
     return React.createElement("button", {
@@ -34894,7 +36275,7 @@ function PdjStyle() {
 .pdj-chip.prt{background:#fff1e0;border-color:#c62828;border-style:dashed}.pdj-chip.prt .pdj-cqty{background:#c62828;color:#fff;border-radius:10px;padding:2px 10px;white-space:nowrap}
 .pdj-chip.rupt{background:var(--warn-s);border-color:var(--warn)}.pdj-chip.rupt .pdj-cbody{text-decoration:line-through;opacity:.8}
 .pdj-xr{flex:0 0 auto;width:56px;height:56px;border-radius:12px;border:2px solid #e0dbd2;background:#fff;font-size:24px;cursor:pointer}
-.pdj-xr.rem.on{background:var(--rem);color:#fff;border-color:var(--rem)}
+.pdj-xr.rem.on{background:var(--rem);color:#fff;border-color:var(--rem)}.pdj-xr.w.on{background:#1565c0;color:#fff;border-color:#1565c0}
 .pdj-arow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .pdj-act{flex:1 1 140px;min-height:56px;display:flex;align-items:center;justify-content:center;text-align:center;padding:8px 12px;border-radius:12px;border:2px solid #cfc8bb;background:#fcfaf6;font-size:18px;font-weight:700;color:#4a463f;cursor:pointer}
 .pdj-act.nd{border-color:var(--nd);color:var(--nd);background:var(--nd-s)}.pdj-act.nd.on{background:var(--nd);color:#fff}
@@ -46646,7 +48027,6 @@ function kbFactuEcarts(o, data) {
         legMiss--;
       }
       manque += arr.filter(x => x >= 100).length;
-      // V11.01 — une ligne d'écart PAR taux de remise (plus de % moyen arrondi : 30 % + 15 % ≠ 2 × 23 %)
       const grp = {};
       for (const x of arr) if (x > 0 && x < 100) grp[x] = (grp[x] || 0) + 1;
       manque = Math.min(manque, q);
@@ -46658,10 +48038,20 @@ function kbFactuEcarts(o, data) {
       };
       const taux = Object.keys(grp).map(Number).sort((x, y) => y - x);
       if (!taux.length) {
-        if (manque > 0) out.push({ ...base, manque, remise_pct: 0, remise_qte: 0 });
+        if (manque > 0) out.push({
+          ...base,
+          manque,
+          remise_pct: 0,
+          remise_qte: 0
+        });
         continue;
       }
-      taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: grp[t] }));
+      taux.forEach((t, i) => out.push({
+        ...base,
+        manque: i === 0 ? manque : 0,
+        remise_pct: t,
+        remise_qte: grp[t]
+      }));
       continue;
     }
     for (const r of refunds) {
@@ -48439,6 +49829,7 @@ function useKbPdpBoard() {
       tm,
       lineId,
       orders,
+      manualAll: manual || [],
       recoverManual,
       recoverOrders,
       recoveredTodayManual,
@@ -48498,6 +49889,7 @@ function PdpReturnsPage({
   const B = useKbPdpBoard();
   const [busy, setBusy] = React.useState(false);
   const [recoverOpen, setRecoverOpen] = React.useState(false);
+  const [mDest, setMDest] = React.useState(null);
   const isDriver = session.role === 'pdp' && kbIsPdpDriver();
   React.useEffect(() => {
     if (!isDriver || !B || !B.ready) return;
@@ -49060,6 +50452,260 @@ function PdpReturnsPage({
       onClick: () => onPick(k)
     }, KB_DEST_UI[k].icon, " ", KB_DEST_UI[k].label))));
   };
+  const masterUndo = async r => {
+    if (!confirm(`Annuler le traitement de « ${r.produit || r.productLabel} » ?\nIl repasse « à traiter ».`)) return;
+    setBusy(true);
+    try {
+      await storage.setDoc('pdp_returns', r.id, {
+        status: 'recovered',
+        destination: '',
+        navetteDate: '',
+        treatedBy: '',
+        treatedAt: ''
+      });
+      try {
+        await storage.deleteDoc('losses', `lossret_${r.id}`);
+      } catch (_) {}
+      showToast('↩️ Repassé à traiter');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const masterUndoLine = async id => {
+    if (!confirm('Annuler ce traitement ? La ligne repasse « à traiter ».')) return;
+    setBusy(true);
+    try {
+      await storage.deleteDoc('pdp_treatments', id);
+      try {
+        await storage.deleteDoc('losses', `lossret_${id}`);
+      } catch (_) {}
+      showToast('↩️ Repassé à traiter');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const masterRecovered = async r => {
+    setBusy(true);
+    try {
+      await storage.setDoc('pdp_returns', r.id, {
+        status: 'recovered',
+        recoveredBy: session.name + ' (master)',
+        recoveredAt: now()
+      });
+      showToast('✓ Marqué récupéré');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const masterDropOrder = async f => {
+    if (!confirm(`Retirer la commande de ${f.consumer_name || 'ce client'} (${f.site}) des retours PDP ?\nElle ne sera plus à récupérer ni à traiter.`)) return;
+    setBusy(true);
+    try {
+      await storage.setDoc('followups', f.id || f.orderId, {
+        forceReturnPdp: false,
+        pdpRecoveredAt: '',
+        pdpRecoveredBy: '',
+        updatedAt: now()
+      });
+      try {
+        await storage.deleteDoc('pdp_pickups', String(f.orderId || f.id));
+      } catch (_) {}
+      showToast('Retiré des retours PDP');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const masterPanel = () => {
+    if (!isMaster || !B.ready) return null;
+    const manAll = (B.manualAll || []).filter(r => r.status !== 'treated' || kbIsToday(r.treatedAt));
+    const lines = [];
+    (B.orders || []).forEach(f => (f.items || []).forEach((it, idx) => {
+      const id = B.lineId(f, it, idx);
+      const t = B.tm[id];
+      if (!t || kbIsToday(t.treatedAt)) lines.push({
+        f,
+        it,
+        idx,
+        id,
+        t
+      });
+    }));
+    const stLbl = r => r.status === 'treated' ? ['✅ traité', '#2e7d32'] : r.status === 'recovered' ? ['📦 récupéré', '#1565c0'] : r.status === 'missing' ? ['❓ introuvable', '#c62828'] : ['🚚 à récupérer', '#e65100'];
+    const destRow = (key, dlc, onPick) => mDest === key ? React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap',
+        marginTop: 8
+      }
+    }, Object.keys(KB_DEST_UI).map(k => React.createElement("button", {
+      key: k,
+      disabled: busy,
+      onClick: async () => {
+        await onPick(k);
+        setMDest(null);
+      },
+      style: {
+        flex: '1 1 45%',
+        minHeight: 48,
+        fontSize: 15,
+        fontWeight: 700,
+        borderRadius: 10,
+        border: 'none',
+        background: KB_DEST_UI[k].color,
+        color: '#fff',
+        cursor: 'pointer'
+      }
+    }, KB_DEST_UI[k].icon, " ", KB_DEST_UI[k].label, routeReturn(dlc).dest === k ? ' ★' : '')), React.createElement("button", {
+      className: "btn-ghost",
+      onClick: () => setMDest(null),
+      style: {
+        fontSize: 13
+      }
+    }, "Fermer")) : null;
+    const btn = (txt, on, col) => React.createElement("button", {
+      disabled: busy,
+      onClick: on,
+      style: {
+        minHeight: 40,
+        fontSize: 14,
+        fontWeight: 700,
+        padding: '6px 10px',
+        borderRadius: 10,
+        border: '2px solid ' + (col || 'var(--line)'),
+        background: '#fff',
+        color: col || 'var(--ink)',
+        cursor: 'pointer'
+      }
+    }, txt);
+    return React.createElement("details", {
+      className: "card",
+      open: true,
+      style: {
+        padding: '12px 14px',
+        border: '3px solid var(--master)',
+        background: 'var(--master-soft)'
+      }
+    }, React.createElement("summary", {
+      style: {
+        fontSize: 18,
+        fontWeight: 700,
+        cursor: 'pointer',
+        color: 'var(--master)'
+      }
+    }, "🛠️ Master — tous les retours (", manAll.length + lines.length, ") : destination, supprimer, annuler"), React.createElement("div", {
+      className: "stack",
+      style: {
+        gap: 8,
+        marginTop: 10
+      }
+    }, !manAll.length && !lines.length && React.createElement("div", {
+      style: {
+        fontSize: 15,
+        color: 'var(--ink-soft)'
+      }
+    }, "Aucun retour en cours."), manAll.map(r => {
+      const [sl, sc] = stLbl(r);
+      return React.createElement("div", {
+        key: r.id,
+        style: {
+          background: '#fff',
+          borderRadius: 12,
+          padding: '10px 12px',
+          border: '2px solid ' + sc
+        }
+      }, React.createElement("div", {
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          flexWrap: 'wrap'
+        }
+      }, React.createElement("span", {
+        style: {
+          background: kbSiteColor(r.site),
+          color: '#fff',
+          borderRadius: 8,
+          padding: '2px 8px',
+          fontWeight: 700
+        }
+      }, r.site), React.createElement("b", {
+        style: {
+          fontSize: 17
+        }
+      }, r.produit || r.productLabel, (r.qty || 1) > 1 ? ' ×' + r.qty : ''), React.createElement("span", {
+        style: {
+          fontSize: 13,
+          fontWeight: 700,
+          color: sc
+        }
+      }, sl, r.status === 'treated' && KB_DEST_UI[r.destination] ? ' → ' + KB_DEST_UI[r.destination].label : '')), React.createElement("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--ink-soft)'
+        }
+      }, r.clientName ? r.clientName + ' · ' : '', r.dlc ? 'DLC ' + formatDateShort(r.dlc) : 'DLC ?', r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : '', r.treatedBy ? ' · traité par ' + r.treatedBy : '', r.remark ? ' · « ' + r.remark + ' »' : ''), React.createElement("div", {
+        style: {
+          display: 'flex',
+          gap: 6,
+          flexWrap: 'wrap',
+          marginTop: 6
+        }
+      }, r.status !== 'treated' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)'), (r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0'), r.status === 'treated' && btn('↩️ Annuler le traitement', () => masterUndo(r), '#ef6c00'), btn('🗑️ Supprimer', () => deleteManual(r), 'var(--danger)')), destRow(r.id, r.dlc, d => treatManual(r, d)));
+    }), lines.map(L => React.createElement("div", {
+      key: L.id,
+      style: {
+        background: '#fff',
+        borderRadius: 12,
+        padding: '10px 12px',
+        border: '2px solid ' + (L.t ? '#2e7d32' : L.f.pdpRecoveredAt ? '#1565c0' : '#e65100')
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 8,
+        alignItems: 'center',
+        flexWrap: 'wrap'
+      }
+    }, React.createElement("span", {
+      style: {
+        background: kbSiteColor(L.f.site),
+        color: '#fff',
+        borderRadius: 8,
+        padding: '2px 8px',
+        fontWeight: 700
+      }
+    }, L.f.site), React.createElement("b", {
+      style: {
+        fontSize: 17
+      }
+    }, L.it.produit, (L.it.qty || 1) > 1 ? ' ×' + L.it.qty : ''), React.createElement("span", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700
+      }
+    }, L.t ? '✅ traité → ' + (KB_DEST_UI[L.t.destination] ? KB_DEST_UI[L.t.destination].label : L.t.destination) : L.f.pdpRecoveredAt ? '📦 récupéré' : '🚚 à récupérer')), React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: 'var(--ink-soft)'
+      }
+    }, "📦 Commande non récupérée de ", L.f.consumer_name || '(client)', L.it.dlc ? ' · DLC ' + formatDateShort(L.it.dlc) : ''), React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap',
+        marginTop: 6
+      }
+    }, !L.t && btn('🎯 Choisir la destination', () => setMDest(L.id), 'var(--master)'), L.t && btn('↩️ Annuler le traitement', () => masterUndoLine(L.id), '#ef6c00'), L.idx === 0 && !L.t && btn('🗑️ Retirer la commande des retours', () => masterDropOrder(L.f), 'var(--danger)')), destRow(L.id, L.it.dlc, d => treatLine(L, d))))));
+  };
   return React.createElement("div", {
     className: "stack",
     style: {
@@ -49070,7 +50716,7 @@ function PdpReturnsPage({
       margin: 0,
       fontSize: 28
     }
-  }, "↩️ Retours PDP · à traiter"), !B.ready && React.createElement("p", null, "Chargement…"), B.ready && B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length === 0 && React.createElement("div", {
+  }, "↩️ Retours PDP · à traiter"), !B.ready && React.createElement("p", null, "Chargement…"), masterPanel(), B.ready && B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length === 0 && React.createElement("div", {
     className: "card",
     style: {
       textAlign: 'center',
@@ -53325,6 +54971,8 @@ function FlAutoCard({
     ventes: true
   });
   const [codeIn, setCodeIn] = React.useState({});
+  const [pick, setPick] = React.useState({});
+  const [bulk, setBulk] = React.useState(null);
   const by = session && session.name;
   const load = React.useCallback(async () => {
     setErr('');
@@ -53437,6 +55085,140 @@ function FlAutoCard({
     why: i.type,
     _type: i.type
   }, actif ? `✓ ${i.des} passé Actif` : `✓ ${i.des} passé Non actif`);
+  const pkey = i => i.type + '|' + i.row + '|' + i.des;
+  const runBulk = async (items, actif, ignoreLabel) => {
+    if (!items.length) return;
+    if (!confirm(`${ignoreLabel ? ignoreLabel : actif ? '🟢 Passer Actif' : '⛔ Passer Non actif'} : ${items.length} produit(s) ?\n\n${items.slice(0, 12).map(i => '• ' + i.des).join('\n')}${items.length > 12 ? '\n…' : ''}`)) return;
+    setBusy('bulk');
+    setBulk({
+      done: 0,
+      total: items.length
+    });
+    const ok = [],
+      ko = [];
+    for (const i of items) {
+      try {
+        const payload = ignoreLabel ? {
+          action: 'fl_auto_ignore',
+          kind: i.type,
+          des: i.des,
+          row: i.row || ''
+        } : {
+          action: 'fl_auto_actif',
+          row: i.row,
+          des: i.des,
+          actif,
+          why: i.type
+        };
+        const d = await flPost({
+          secret: FRESHDESK_SECRET,
+          ...payload,
+          by
+        });
+        if (!d || d.ok === false) throw new Error(d && d.error || 'refus');
+        ok.push(i);
+      } catch (e) {
+        ko.push(i.des + ' : ' + (e.message || e));
+      }
+      setBulk(b => b ? {
+        ...b,
+        done: b.done + 1
+      } : b);
+    }
+    const okK = new Set(ok.map(pkey));
+    setRep(r => r ? {
+      ...r,
+      issues: r.issues.filter(x => !okK.has(pkey(x)))
+    } : r);
+    setPick({});
+    setBulk(null);
+    setBusy('');
+    showToast(ko.length ? `⚠️ ${ok.length} fait(s), ${ko.length} erreur(s) : ${ko[0]}` : `✓ ${ok.length} produit(s) ${ignoreLabel ? 'traités' : actif ? 'passé(s) Actif' : 'passé(s) Non actif'}`);
+  };
+  const bulkBar = (k, actions) => {
+    const L = byType[k] || [];
+    if (L.length < 2 && !L.some(i => pick[pkey(i)])) return null;
+    const sel = L.filter(i => pick[pkey(i)]);
+    const all = sel.length === L.length;
+    return React.createElement("div", {
+      style: {
+        position: 'sticky',
+        top: 0,
+        zIndex: 2,
+        display: 'flex',
+        gap: 8,
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        marginTop: 8,
+        padding: '8px 10px',
+        borderRadius: 10,
+        background: '#fff',
+        border: '2px solid var(--line)'
+      }
+    }, React.createElement("button", {
+      className: "btn-secondary",
+      disabled: !!busy,
+      onClick: () => setPick(p => {
+        const n = {
+          ...p
+        };
+        L.forEach(i => {
+          n[pkey(i)] = !all;
+        });
+        return n;
+      }),
+      style: {
+        fontSize: 14,
+        padding: '8px 12px',
+        fontWeight: 700
+      }
+    }, all ? '☐ Tout décocher' : '☑ Tout cocher', " (", L.length, ")"), React.createElement("strong", {
+      style: {
+        fontSize: 14
+      }
+    }, sel.length, " coché(s)"), actions.map(([lbl, fn, col]) => React.createElement("button", {
+      key: lbl,
+      className: "btn-primary",
+      disabled: !!busy || !sel.length,
+      onClick: () => fn(sel),
+      style: {
+        fontSize: 14,
+        padding: '8px 12px',
+        fontWeight: 700,
+        background: col,
+        borderColor: col
+      }
+    }, lbl, " (", sel.length, ")")), bulk && React.createElement("span", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700,
+        color: '#ef6c00'
+      }
+    }, "⏳ ", bulk.done, "/", bulk.total, "…"));
+  };
+  const checkRow = i => React.createElement("label", {
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      marginRight: 8,
+      cursor: 'pointer',
+      fontSize: 15,
+      fontWeight: 700
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: !!pick[pkey(i)],
+    disabled: !!busy,
+    onChange: e => setPick(p => ({
+      ...p,
+      [pkey(i)]: e.target.checked
+    })),
+    style: {
+      width: 26,
+      height: 26
+    }
+  }), " cocher");
   const setId = (i, s) => act('id-' + i.row, {
     action: 'fl_auto_setid',
     row: i.row,
@@ -53759,14 +55541,77 @@ function FlAutoCard({
       style: {
         color: 'var(--ink-mute)'
       }
-    }, " Vérifié ", MI.hourly ? 'toutes les heures (7h→22h)' : 'à 4h30', " · dernier relevé ", kbFlaWhen(MI.at))), MI.list.map(x => React.createElement("div", {
+    }, " Vérifié ", MI.hourly ? 'toutes les heures (7h→22h)' : 'à 4h30', " · dernier relevé ", kbFlaWhen(MI.at))), (() => {
+      const inact = MI.list.filter(x => x.why === 'inactif' && x.row).map(x => ({
+        type: 'ventes',
+        row: x.row,
+        des: x.des
+      }));
+      if (!inact.length) return null;
+      const sel = inact.filter(i => pick[pkey(i)]);
+      const all = sel.length === inact.length;
+      return React.createElement("div", {
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          margin: '6px 0',
+          padding: '8px 10px',
+          borderRadius: 10,
+          background: '#fff',
+          border: '2px solid var(--line)'
+        }
+      }, React.createElement("button", {
+        className: "btn-secondary",
+        disabled: !!busy,
+        onClick: () => setPick(p => {
+          const n = {
+            ...p
+          };
+          inact.forEach(i => {
+            n[pkey(i)] = !all;
+          });
+          return n;
+        }),
+        style: {
+          fontSize: 14,
+          padding: '8px 12px',
+          fontWeight: 700
+        }
+      }, all ? '☐ Tout décocher' : '☑ Tout cocher', " (", inact.length, " « Non actif »)"), React.createElement("button", {
+        className: "btn-primary",
+        disabled: !!busy || !sel.length,
+        onClick: async () => {
+          await runBulk(sel, true);
+          load();
+        },
+        style: {
+          fontSize: 14,
+          padding: '8px 12px',
+          fontWeight: 700,
+          background: '#2e7d32',
+          borderColor: '#2e7d32'
+        }
+      }, "🟢 Passer Actif (", sel.length, ")"), bulk && React.createElement("span", {
+        style: {
+          fontSize: 14,
+          fontWeight: 700,
+          color: '#ef6c00'
+        }
+      }, "⏳ ", bulk.done, "/", bulk.total, "…"));
+    })(), MI.list.map(x => React.createElement("div", {
       key: x.id,
       style: {
         fontSize: 15,
         fontWeight: 700,
         padding: '4px 0'
       }
-    }, "• ", x.des, " — ", x.n, " vendu(s)", x.code ? React.createElement("span", {
+    }, x.why === 'inactif' && x.row ? checkRow({
+      type: 'ventes',
+      row: x.row,
+      des: x.des
+    }) : null, "• ", x.des, " — ", x.n, " vendu(s)", x.code ? React.createElement("span", {
       style: {
         fontWeight: 600
       }
@@ -53798,7 +55643,7 @@ function FlAutoCard({
       color: 'var(--ink-soft)',
       marginTop: 4
     }
-  }, "Choisis le code Rungis pour ajouter la ligne (elle se complète seule), ou ajoute-la sans code."), list('newSale', i => React.createElement(React.Fragment, null, rungisChips(i, code => add(i, code), '➕'), chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc'), chip('Ignorer', () => ignore(i), 'ign'))))), section('saleInactif', (byType.saleInactif || []).length, React.createElement(React.Fragment, null, list('saleInactif', i => React.createElement("div", null, chip('🟢 Passer Actif', () => setActif(i, true), 'a'), chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign'))))), section('red', (byType.red || []).length, React.createElement(React.Fragment, null, list('red', i => React.createElement("div", null, chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('absentRungis', (byType.absentRungis || []).length, React.createElement(React.Fragment, null, list('absentRungis', i => React.createElement("div", null, chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('incoh', (byType.incoh || []).length, React.createElement(React.Fragment, null, list('incoh', i => React.createElement("div", null, chip('Vu', () => ignore(i, 'Vu'), 'ign'))))), section('pa', (byType.pa || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
+  }, "Choisis le code Rungis pour ajouter la ligne (elle se complète seule), ou ajoute-la sans code."), list('newSale', i => React.createElement(React.Fragment, null, rungisChips(i, code => add(i, code), '➕'), chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc'), chip('Ignorer', () => ignore(i), 'ign'))))), section('saleInactif', (byType.saleInactif || []).length, React.createElement(React.Fragment, null, bulkBar('saleInactif', [['🟢 Passer Actif', sel => runBulk(sel, true), '#2e7d32'], ['Laisser Non actif', sel => runBulk(sel, false, 'Laisser Non actif'), '#757575']]), list('saleInactif', i => React.createElement("div", null, checkRow(i), chip('🟢 Passer Actif', () => setActif(i, true), 'a'), chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign'))))), section('red', (byType.red || []).length, React.createElement(React.Fragment, null, bulkBar('red', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('red', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('absentRungis', (byType.absentRungis || []).length, React.createElement(React.Fragment, null, bulkBar('absentRungis', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('absentRungis', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('incoh', (byType.incoh || []).length, React.createElement(React.Fragment, null, list('incoh', i => React.createElement("div", null, chip('Vu', () => ignore(i, 'Vu'), 'ign'))))), section('pa', (byType.pa || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-soft)',
@@ -72446,6 +74291,6 @@ if (window.__firebase) boot();else window.addEventListener('firebase-ready', boo
     once: true
   });else arm();
 })();
-</script>
+  </script>
 </body>
 </html>
