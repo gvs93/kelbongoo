@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.06';
+    const APP_VERSION = 'V11.07';
+    // V11.07 — (09/11/2026) Master › SAV : section « ↩️ Retours » (commandes non récupérées / retour PDP : clic → contenu + décision PAR ARTICLE : retour PDP · partage équipe · garder · récupéré · jeter → pertes + consigne push au lieu ; Retours PDP entrepôt intégrés). Menu master réorganisé (Commande pain sous Aujourd'hui ; « Clients · prépa · distrib » : Chargement en haut, SAV, Push, Historique, Facturation web, Synchro ancien site en bas ; F&L : contrôle seul / Inventaire & ajout F&L ; Camion Rungis sous Stats équipes ; Horaires boutiques + commande en bas de Réglages ; Mails clients et Qui fait quoi retirés du menu). Push mail clients : distribution du jour OU du lendemain. Chargement des commandes : plus de rechargement, on reste sur la page ; « Commandes TXT Progmag » retiré. Commande pain : « ✅ Commande passée » + suivi. Report ancien site à la clôture prépa : lancé tout de suite + relance auto (postes master/prépa) + alerte Aujourd'hui. Sélecteur master : « 🚛 Vue chauffeur ».
     // V11.06 — (09/11/2026) Qualité : client choisi → « 📅 Date de distribution » (ses commandes des 3 dernières semaines sur le lieu) → on COCHE les produits de SA commande (quantité, DLC par produit) ; une anomalie par produit (oubli : un seul mail client avec tous les produits) ; « en trop » / client sans commande : liste produits comme avant. Non-récupérés (distrib + Master) : « Retour PDP » ouvre le choix des produits retournés (quantité ajustable) ; chaque produit non retourné exige une raison (choix rapide ou texte) → followups.pdpNotReturned ; le chauffeur et l'entrepôt ne voient que les produits retournés.
     // V11.05 — (08/11/2026) Prépa : 🏷️/⚖️ = UNE popup « Sur quoi ? » (tout le produit / client par client ; tous les articles / article par article, un carré par article + « ✓ Fini ») ; remise poids → ⚖️ allumé (plus 🏷️) ; boutique finie → passe EN BAS repliée (onglets + fiche produit), passage auto à la boutique suivante ; client avec frais/sec SANS n° de casier → n° attribué tout de suite (prochain libre) ; Distrib : pain / ND seuls = « pas de casier » (plus de faux casier 3 en double), « casier ? » rouge si n° manquant, pain dernière minute affiché une seule fois ; Master › F&L : multi-coche (Tout cocher → Passer Actif / Non actif en une fois) ; Retours PDP : panneau master (destination, récupéré, annuler, supprimer, retirer une commande).
     // V10.96 — (04/11/2026) Distrib : un article déjà remisé en prépa peut être retiré ou remisé plus (la nouvelle remise REMPLACE celle de la prépa, remboursement = la différence) ; ancien site : remise prépa annulée (unreduce) puis nouvelle remise (KBG_AncienDistrib v1.6).
@@ -7230,6 +7231,100 @@
         </KbSheet>);
     }
 
+    // V11.07 — MASTER : ouvrir une commande non récupérée / en retour PDP, voir son contenu et décider PAR ARTICLE.
+    //   ↩️ Retour PDP · 🤝 Partage équipe (distrib) · 🏪 Garder (le client repasse) · ✅ Récupéré par le client · 🗑️ Jeter.
+    //   Retour PDP → kbApplyPdpReturn (chauffeur) ; partage / jeté → pertes (losses) ; consignes envoyées en push au lieu.
+    const KB_NR_DECISIONS = [
+      { k: 'pdp', ic: '↩️', l: 'Retour PDP', c: '#1565c0' },
+      { k: 'partage', ic: '🤝', l: 'Partage équipe', c: '#2e7d32' },
+      { k: 'garde', ic: '🏪', l: 'Garder (client repasse)', c: '#6a1b9a' },
+      { k: 'recup', ic: '✅', l: 'Récupéré par le client', c: '#00838f' },
+      { k: 'jete', ic: '🗑️', l: 'Jeter', c: '#c62828' },
+    ];
+    function KbNrOrderSheet({ f, session, catalogue, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const all = Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : (f.items || []);
+      const lk = (it, i) => String(it.id || '') + '__' + i;
+      const recovered = !!f.pdpRecoveredAt;
+      const prev = React.useMemo(() => { const m = {}; (f.lineDecisions || []).forEach(d => { if (d && d.k) m[d.k] = d.d; }); return m; }, [f]);
+      const [dec, setDec] = React.useState(() => { const o = {}; all.forEach((it, i) => { const k = lk(it, i); o[k] = prev[k] || ''; }); return o; });
+      const [note, setNote] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const dlcDays = (d) => { if (!d) return null; const a = new Date(String(d).slice(0, 10) + 'T12:00:00'), b = new Date(todayKey() + 'T12:00:00'); return Math.round((a - b) / 86400000); };
+      const priceOf = (produit, producteur) => { const c = catalogue || []; const p = c.find(x => x.produit === produit && (!producteur || x.producteur === producteur)) || c.find(x => x.produit === produit); return p ? (p.prixAchat || p.prixHT || 0) : 0; };
+      const setAll = (d) => setDec(o => { const n = { ...o }; all.forEach((it, i) => { n[lk(it, i)] = d; }); return n; });
+      const missing = all.filter((it, i) => !dec[lk(it, i)]);
+      const save = async () => {
+        if (!all.length) { showToast('Commande vide'); return; }
+        if (missing.length) { showToast('Choisis une action pour : ' + missing.map(x => x.produit).slice(0, 3).join(', ')); return; }
+        setBusy(true);
+        try {
+          const by = session.name, now = new Date().toISOString(), id = f.id || f.orderId;
+          const rows = all.map((it, i) => ({ it, i, k: lk(it, i), d: dec[lk(it, i)] }));
+          const lbl = (d) => (KB_NR_DECISIONS.find(x => x.k === d) || {}).l || d;
+          const pdpRows = rows.filter(r => r.d === 'pdp'), other = rows.filter(r => r.d !== 'pdp');
+          const notRet = other.map(r => ({ id: r.it.id || '', produit: r.it.produit, producteur: r.it.producteur || '', qty: Number(r.it.qty) || 1, reason: 'Décision master : ' + lbl(r.d) + (note.trim() ? ' · ' + note.trim() : '') }));
+          const lineDecisions = rows.map(r => ({ k: r.k, produit: r.it.produit, qty: Number(r.it.qty) || 1, d: r.d }));
+          if (pdpRows.length) {
+            await kbApplyPdpReturn(f, pdpRows.map(r => r.it), notRet, by);
+          } else {
+            await storage.setDoc('followups', id, { itemsInit: all, pdpNotReturned: notRet, forceReturnPdp: false, updatedBy: by, updatedAt: now });
+            if (f.forceReturnPdp && !recovered) { try { await storage.deleteDoc('pdp_pickups', String(f.orderId || id)); } catch (_) {} }
+          }
+          const garde = other.some(r => r.d === 'garde');
+          await storage.setDoc('followups', id, { lineDecisions, pdpDecision: pdpRows.length ? 'retour' : 'master', masterDecisionBy: by, masterDecisionAt: now, masterNote: note.trim(), decidedBy: by, decidedAt: now,
+            ...(!pdpRows.length && !garde ? { status: 'resolved', resolvedBy: by, resolvedAt: now } : {}) });
+          // pertes : partage équipe / jeté
+          for (const r of other.filter(r => r.d === 'partage' || r.d === 'jete')) {
+            const q = Number(r.it.qty) || 1, up = priceOf(r.it.produit, r.it.producteur);
+            await storage.setDoc('losses', `lossnr_${f.orderId || id}_${r.i}`, { id: `lossnr_${f.orderId || id}_${r.i}`, productKey: `${r.it.producteur || ''}|${r.it.produit || ''}`, producteur: r.it.producteur || '', produit: r.it.produit || '',
+              destination: r.d, reason: 'non_recupere', usingWeight: false, quantity: q, weight: 0, unitPrice: up, totalValue: up * q, dlc: r.it.dlc || '', site: f.site || '',
+              remark: `Commande non récupérée ${f.consumer_name || ''} (${formatDateShort(f.distribDate || f.day || '')})`, day: todayKey(), fromNonRecup: true, createdBy: by, createdAt: now, updatedAt: now });
+          }
+          // consigne au lieu (push lu avec initiales)
+          const grp = (d) => other.filter(r => r.d === d).map(r => `${r.it.produit}${(Number(r.it.qty) || 1) > 1 ? ' ×' + r.it.qty : ''}`);
+          const lines = [['partage', '🤝 Mettre en PARTAGE ÉQUIPE'], ['jete', '🗑️ JETER'], ['garde', '🏪 GARDER au casier (le client repasse)'], ['pdp', '↩️ Préparer pour le RETOUR PDP (chauffeur)']]
+            .map(([d, t]) => { const l = d === 'pdp' ? pdpRows.map(r => `${r.it.produit}${(Number(r.it.qty) || 1) > 1 ? ' ×' + r.it.qty : ''}`) : grp(d); return l.length ? `${t} :\n• ${l.join('\n• ')}` : ''; }).filter(Boolean);
+          if (lines.length && f.site) {
+            const pid = 'push_nrdec_' + Date.now();
+            await storage.setDoc('push_messages', pid, { id: pid, kind: 'info', followupId: id, icon: '📦', title: `Commande non récupérée : ${f.consumer_name || 'client'}`,
+              body: `${lines.join('\n\n')}${note.trim() ? '\n\n📝 ' + note.trim() : ''}\n\n(Commande du ${formatDateShort(f.distribDate || f.day || '')}${f.storedCasier ? ', casier ' + f.storedCasier : ''} — décision ${by})`,
+              target: 'some', sites: [f.site], to: [], acks: {}, cancelled: false, createdBy: by, createdAt: now });
+          }
+          showToast(`✓ Décision enregistrée${lines.length && f.site ? ' · consigne envoyée à ' + f.site : ''}`);
+          onClose && onClose();
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      return (
+        <KbSheet title={'📦 ' + (f.consumer_name || f.clientName || 'client')} onClose={onClose}>
+          <div style={{ fontSize: 15, marginBottom: 8 }}>{f.site} · commande du <b>{formatDateShort(f.distribDate || f.day || '')}</b>{f.storedCasier ? ' · casier ' + f.storedCasier : ''} · {all.length} produit{all.length > 1 ? 's' : ''}</div>
+          {recovered && <div style={{ padding: 10, borderRadius: 10, background: '#e3f2fd', border: '2px solid #1565c0', fontWeight: 700, marginBottom: 8 }}>🚚 Déjà récupéré par le chauffeur ({f.pdpRecoveredBy || ''}) : le traitement se fait à PDP (bloc « Retours PDP » plus bas).</div>}
+          {(f.lineDecisions || []).length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', marginBottom: 6 }}>Dernière décision : {f.masterDecisionBy || f.decidedBy || ''} {f.masterDecisionAt ? new Date(f.masterDecisionAt).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''}</div>}
+          {!recovered && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, alignSelf: 'center' }}>Tout :</span>
+            {KB_NR_DECISIONS.map(x => <button key={x.k} type="button" className="btn-secondary" style={{ fontSize: 13, padding: '6px 10px' }} onClick={() => setAll(x.k)}>{x.ic} {x.l}</button>)}
+          </div>}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {all.map((it, i) => { const k = lk(it, i), d = dec[k], dd = dlcDays(it.dlc), short = dd != null && dd <= 2; const cur = KB_NR_DECISIONS.find(x => x.k === d);
+              return (
+                <div key={k} style={{ borderRadius: 12, padding: '8px 10px', border: '2px solid ' + (cur ? cur.c : recovered ? 'var(--border)' : '#ef6c00'), background: cur ? cur.c + '12' : '#fff' }}>
+                  <div style={{ fontSize: 17, fontWeight: 700 }}>{it.produit}{(Number(it.qty) || 1) > 1 ? <span style={{ color: 'var(--danger)' }}> ×{it.qty}</span> : ''}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{it.producteur || ''}{it.dlc ? ' · DLC ' + formatDateShort(String(it.dlc).slice(0, 10)) : ''}</div>
+                  {short && <div style={{ fontSize: 13, fontWeight: 700, color: '#c62828' }}>⏰ DLC très courte ({dd <= 0 ? 'aujourd\'hui ou dépassée' : 'dans ' + dd + ' j'}) → partage équipe conseillé</div>}
+                  {!recovered && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                    {KB_NR_DECISIONS.map(x => <button key={x.k} type="button" onClick={() => setDec(o => ({ ...o, [k]: o[k] === x.k ? '' : x.k }))}
+                      style={{ minHeight: 44, padding: '6px 10px', borderRadius: 10, fontSize: 14, fontWeight: 700, border: '2px solid ' + x.c, background: d === x.k ? x.c : '#fff', color: d === x.k ? '#fff' : x.c }}>{x.ic} {x.l}</button>)}
+                  </div>}
+                </div>); })}
+          </div>
+          {!recovered && <>
+            <input type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="Note pour la distrib (optionnel)…" style={{ width: '100%', marginTop: 10, minHeight: 44 }} />
+            <button type="button" className="btn-primary" disabled={busy} onClick={save} style={{ width: '100%', minHeight: 60, fontSize: 18, fontWeight: 800, marginTop: 10 }}>
+              {busy ? '⏳…' : missing.length ? `Reste ${missing.length} produit${missing.length > 1 ? 's' : ''} à décider` : '✅ Valider et envoyer la consigne au lieu'}</button>
+          </>}
+        </KbSheet>);
+    }
+
     // ----- Sous-page Non-récup (ancien contenu de FollowUpPage) -----
     function NonRecupSubPage({ session, currentSite, consumersByEmail }) {
       const showToast = React.useContext(ToastContext);
@@ -10202,7 +10297,7 @@
       );
     }
 
-    function MasterRecapPage({ session, consumersByEmail }) {
+    function MasterRecapPage({ session, consumersByEmail, catalogue }) {
       const showToast = React.useContext(ToastContext);
       const [consignes, setConsignes] = React.useState([]);
       const [followups, setFollowups] = React.useState([]);
@@ -10307,6 +10402,7 @@
       // V9.91 — décision Henry / Raimbaud + échanges avec la distrib (popup sur le lieu, lue une fois avec initiales)
       const [nrMsg, setNrMsg] = React.useState(null);
       const [nrPick, setNrPick] = React.useState(null); // V11.06 — retour PDP : choix des produits
+      const [nrOpen, setNrOpen] = React.useState(null); // V11.07 — commande ouverte : contenu + décision par article
       const [nrFocus, setNrFocus] = React.useState(() => window.__kbNrFocus || '');
       React.useEffect(() => {
         if (!nrFocus) return;
@@ -10456,6 +10552,7 @@
         <div className="stack">
           {nrPick && <KbPdpReturnPicker f={nrPick} by={session.name} onClose={() => setNrPick(null)} onDone={() => setNrPick(null)}
             extra={() => storage.setDoc('followups', nrPick.id || nrPick.orderId, { pdpDecision: 'retour', decidedBy: session.name, decidedAt: new Date().toISOString() })} />}
+          {nrOpen && <KbNrOrderSheet key={nrOpen.id || nrOpen.orderId} f={followups.find(x => (x.id || x.orderId) === (nrOpen.id || nrOpen.orderId)) || nrOpen} session={session} catalogue={catalogue} onClose={() => setNrOpen(null)} />}
           <h1>📋 Récap master — tous locaux</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Vue globale pour traiter sans changer de local : clients à rappeler, consignes en attente, oublis casier.          </p>
@@ -10496,7 +10593,34 @@
             <div className={`chip ${section==='oublis'?'selected':''}`} onClick={()=>setSection('oublis')}>
               📦 Oublis <span className="badge badge-info" style={{marginLeft:6,padding:'1px 6px',fontSize:10}}>{fOublis.length}</span>
             </div>
+            <div className={`chip ${section==='retours'?'selected':''}`} onClick={()=>setSection('retours')}>
+              ↩️ Retours <span className="badge badge-info" style={{marginLeft:6,padding:'1px 6px',fontSize:10}}>{fFollow.length + pdpReturns.filter(r => r.status !== 'treated' && (siteFilter === 'TOUS' || r.site === siteFilter)).length}</span>
+            </div>
           </div>
+
+          {/* ----- V11.07 SECTION : retours & non récupérés — ouvrir la commande, décider par article ----- */}
+          {section === 'retours' && (<>
+            <div className="card">
+              <h3 style={{marginBottom:4}}>📦 Commandes non récupérées / retour PDP en cours · {fFollow.length}</h3>
+              <div style={{fontSize:13,color:'var(--ink-mute)',marginBottom:8}}>Clique une commande : tu vois son contenu et tu choisis quoi faire de CHAQUE article (retour PDP, partage équipe, garder, jeter…). La consigne part au lieu.</div>
+              {fFollow.length === 0 ? <div style={{fontSize:14}}>✓ Rien en cours.</div> :
+                <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                  {[...fFollow].sort((a,b)=>String(a.distribDate||a.day||'').localeCompare(String(b.distribDate||b.day||''))).map(f => { const its = (Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : (f.items || [])); return (
+                    <button key={f.orderId || f.id} type="button" onClick={() => setNrOpen(f)} style={{display:'flex',alignItems:'center',gap:10,textAlign:'left',padding:'10px 12px',borderRadius:12,border:'2px solid '+(f.forceReturnPdp?'#1565c0':'var(--line)'),background:'#fff',minHeight:56,width:'100%'}}>
+                      <span style={{fontSize:24}}>{f.pdpRecoveredAt ? '🚚' : f.forceReturnPdp ? '↩️' : '📦'}</span>
+                      <span style={{flex:1,minWidth:0}}>
+                        <b style={{fontSize:16}}>{f.consumer_name || '(client)'}</b> <span className="badge badge-site">{f.site}</span>
+                        <div style={{fontSize:12,color:'var(--ink-mute)'}}>distrib du {formatDateShort(f.distribDate || f.day || '')} · {daysSince(f.distribDate || f.day)} j · {its.length} produit{its.length>1?'s':''}{f.forceReturnPdp ? (f.pdpRecoveredAt ? ' · récupéré par le chauffeur' : ' · retour PDP demandé') : ''}{f.lineDecisions ? ' · décidé' : ''}</div>
+                      </span>
+                      <span style={{fontSize:14,fontWeight:700,color:'var(--accent-dark)'}}>Voir ›</span>
+                    </button>); })}
+                </div>}
+            </div>
+            <div className="card" style={{padding:'8px 10px'}}>
+              <h3 style={{margin:'4px 4px 6px'}}>↩️ Retours PDP (entrepôt)</h3>
+              <PdpReturnsPage session={session} catalogue={catalogue || []} />
+            </div>
+          </>)}
 
           {/* ----- SECTION : clients à contacter ----- */}
           {section === 'followups' && (
@@ -10509,7 +10633,7 @@
                     <div key={f.orderId} id={'nr-' + (f.orderId || f.id)} className="list-item" style={{flexDirection:'column',alignItems:'stretch',...(f.escalated?{borderLeft:'3px solid var(--warn)'}:{}),...(nrFocus === (f.orderId || f.id) ? {boxShadow:'0 0 0 3px #1565c0',borderRadius:10} : {})}}>
                       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
                         <div className="list-item-main">
-                          <div className="list-item-name">{f.escalated && '🙋 '}{f.consumer_name || '(client)'}</div>
+                          <div className="list-item-name" onClick={() => setNrOpen(f)} style={{cursor:'pointer',textDecoration:'underline dotted'}} title="Voir la commande et décider par article">{f.escalated && '🙋 '}{f.consumer_name || '(client)'} 👁️</div>
                           <div className="list-item-sub"><PhoneOrEmail phone={f.phone} email={f.email} /></div>
                           {f.escalated && <div style={{fontSize:11,color:'var(--warn)'}}>Demande de {f.escalatedBy} — distrib n'a pas pu joindre</div>}
                         </div>
@@ -10528,6 +10652,7 @@
                         </div>
                       )}
                       <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap'}}>
+                        <button className="btn-primary" style={{padding:'6px 10px',fontSize:12}} onClick={()=>setNrOpen(f)}>📦 Voir & décider par article</button>
                         <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={()=>setFollowStatus(f,'called')}>Contacté</button>
                         <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12}} onClick={()=>setFollowStatus(f,'no_answer')}>No answer</button>
                         <FreshdeskRecupButton client={f} />
@@ -11332,6 +11457,95 @@
       const j = await kbAncienJob(day);
       if (!j.products.length) return { ok: false, error: 'aucune commande de l\'ancien site ce jour' };
       return await flPost({ action: 'rungis_ancien_run', day, by: by || '', products: j.products, dry: !!(opts && opts.dry) });
+    }
+
+    // V11.07 — REPORT ANCIEN SITE FIABLE À LA CLÔTURE DE LA PRÉPA.
+    //   Avant : lancé en DERNIER, après Rungis / rajout F&L / Dromy / mails / célébration, dans le navigateur de la personne
+    //   qui clôture → tablette fermée ou appli rechargée avant la fin = jamais lancé (plus de mail « Ancien site », locaux non clôturés).
+    //   Désormais : lancé dès la clôture (sans attendre), résultat noté dans day_<j>_prep/meta (ancienRun / ancienTry),
+    //   et chaque poste master / prépa ouvert vérifie toutes les 5 min : prépa clôturée sans report → relance (4 essais max).
+    //   Le serveur (KBG_Ancien) est sans risque à relancer : ce qui est déjà fait n'est pas refait.
+    const KB_ANC_RETRY_MS = 15 * 60000;
+    async function kbAncienLaunch(day, by, force) {
+      const P = `day_${day}_prep`;
+      const meta = (await storage.getDoc(P, 'meta').catch(() => null)) || {};
+      if (!meta.closed) return { ok: false, error: 'prépa non clôturée' };
+      if (!force && meta.ancienRun && (meta.ancienRun.ok || meta.ancienRun.none)) return { ok: true, already: true };
+      const tr = meta.ancienTry || {};
+      if (!force && tr.at && Date.now() - Date.parse(tr.at) < KB_ANC_RETRY_MS) return { ok: false, pending: true };
+      if (!force && (tr.n || 0) >= 4) return { ok: false, gaveUp: true };
+      // déjà lancé côté serveur pour ce jour (après la clôture) ? → on le note, rien à relancer
+      try {
+        const st = await flPost({ action: 'rungis_ancien_status', day });
+        const r = st && st.ok && st.result;
+        if (!force && r && r.startedAt && (!meta.closedAt || String(r.startedAt) >= String(meta.closedAt).slice(0, 19)) && r.state !== 'erreur') {
+          await storage.setDoc(P, 'meta', { ancienRun: { ok: true, at: r.startedAt, by: r.by || '', n: r.n || 0, state: r.state || '', seen: true } });
+          return { ok: true, already: true, result: r };
+        }
+      } catch (_) {}
+      const now = new Date().toISOString();
+      await storage.setDoc(P, 'meta', { ancienTry: { at: now, by: by || '', n: (tr.n || 0) + 1 } }).catch(() => {});
+      let ar;
+      try { ar = await kbAncienRun(day, by); } catch (e) { ar = { ok: false, error: e.message || String(e) }; }
+      const none = !!(ar && !ar.ok && /aucune commande/i.test(String(ar.error || '')));
+      await storage.setDoc(P, 'meta', { ancienRun: { ok: !!(ar && ar.ok), none, at: now, by: by || '', n: (ar && ar.result && ar.result.n) || 0, err: ar && !ar.ok ? String(ar.error || '?').slice(0, 300) : '' } }).catch(() => {});
+      return ar || { ok: false, error: '?' };
+    }
+    // Monté sur les postes master et prépa : relance automatique si la prépa est clôturée sans report.
+    function KbAncienAutoRun({ by }) {
+      React.useEffect(() => {
+        if (!KB_COHABITATION) return;
+        let stop = false, busy = false;
+        const tick = async () => {
+          if (stop || busy) return; busy = true;
+          try {
+            for (const d of [todayKey(), addDays(todayKey(), 1)]) {
+              const m = await storage.getDoc(`day_${d}_prep`, 'meta').catch(() => null);
+              if (!m || !m.closed || (m.ancienRun && (m.ancienRun.ok || m.ancienRun.none))) continue;
+              if (m.closedAt && Date.now() - Date.parse(m.closedAt) < 3 * 60000) continue; // laisse la clôture lancer elle-même
+              await kbAncienLaunch(d, (by || 'auto') + ' (auto)');
+            }
+          } catch (_) {} finally { busy = false; }
+        };
+        const t0 = setTimeout(tick, 60000), iv = setInterval(tick, 5 * 60000);
+        return () => { stop = true; clearTimeout(t0); clearInterval(iv); };
+      }, [by]);
+      return null;
+    }
+    // Alerte « Aujourd'hui » (master) : prépa clôturée depuis 20 min sans report ancien site → bouton Relancer.
+    function KbAncienRunAlert({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [bad, setBad] = React.useState([]);
+      const [busy, setBusy] = React.useState(false);
+      const load = React.useCallback(async () => {
+        if (!KB_COHABITATION) return;
+        const out = [];
+        for (const d of [todayKey(), addDays(todayKey(), 1)]) {
+          const m = await storage.getDoc(`day_${d}_prep`, 'meta').catch(() => null);
+          if (!m || !m.closed || (m.ancienRun && (m.ancienRun.ok || m.ancienRun.none))) continue;
+          if (m.closedAt && Date.now() - Date.parse(m.closedAt) < 20 * 60000) continue;
+          out.push({ day: d, m });
+        }
+        setBad(out);
+      }, []);
+      React.useEffect(() => { load(); const iv = setInterval(load, 2 * 60000); return () => clearInterval(iv); }, [load]);
+      if (!bad.length) return null;
+      const relance = async (d) => {
+        setBusy(true);
+        try { const r = await kbAncienLaunch(d, session && session.name, true); showToast(r && r.ok ? `🤖 Report ancien site lancé (${formatDateShort(d)})` : '⚠️ ' + ((r && r.error) || '?')); }
+        finally { setBusy(false); load(); }
+      };
+      return (
+        <div className="card" style={{ border: '3px solid #c62828', background: '#ffebee' }}>
+          {bad.map(({ day, m }) => (
+            <div key={day} style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <div style={{ flex: 1, minWidth: 220 }}>
+                <div style={{ fontWeight: 800, fontSize: 17, color: '#c62828' }}>⚠️ Report ancien site du {formatDateShort(day)} pas fait</div>
+                <div style={{ fontSize: 13 }}>Prépa clôturée{m.closedBy ? ' par ' + m.closedBy : ''}{m.closedAt ? ' à ' + new Date(m.closedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''}{m.ancienTry ? ` · ${m.ancienTry.n || 1} essai(s)` : ' · jamais lancé'}{m.ancienRun && m.ancienRun.err ? ' · ' + m.ancienRun.err : ''}</div>
+              </div>
+              <button className="btn-primary" disabled={busy} onClick={() => relance(day)} style={{ fontSize: 16, padding: '12px 16px', background: '#c62828', borderColor: '#c62828' }}>{busy ? '⏳…' : '🔁 Relancer maintenant'}</button>
+            </div>))}
+        </div>);
     }
 
     // Carte « 📡 Poste synchro ancien site » (Master › Pilotage › Ancien site).
@@ -14130,6 +14344,39 @@
     }
 
     // ---------- Page : impression dispatch pain ----------
+    // V11.07 — « ✅ Commande passée » (bon Brut de Pains) : suivi de la commande pain par distribution.
+    //   app_config/painbdp_<jour> = { passedAt, passedBy, total, detail } — alerte si la commande a changé depuis.
+    function KbPainPassed({ day, total, recap, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [doc, setDoc] = React.useState(undefined);
+      const id = 'painbdp_' + day;
+      const load = React.useCallback(() => { let stop = false; storage.getDoc('app_config', id).then(d => { if (!stop) setDoc(d || null); }).catch(() => { if (!stop) setDoc(null); }); return () => { stop = true; }; }, [id]);
+      React.useEffect(load, [load]);
+      const detail = (recap || []).map(x => x.produit + ' ×' + x.qty).join(' · ');
+      const pass = async () => {
+        const rec = { id, day, passedAt: new Date().toISOString(), passedBy: (session && session.name) || '', total, detail, hist: [...((doc && doc.hist) || []), ...(doc && doc.passedAt ? [{ at: doc.passedAt, by: doc.passedBy, total: doc.total }] : [])].slice(-10) };
+        try { await storage.setDoc('app_config', id, rec); setDoc(rec); showToast('✅ Commande pain du ' + formatDateShort(day) + ' notée « passée »'); } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const undo = async () => { if (!window.confirm('Annuler « commande passée » ?')) return; const rec = { ...doc, passedAt: null, passedBy: '', undoneAt: new Date().toISOString() }; try { await storage.setDoc('app_config', id, rec); setDoc(rec); } catch (e) { showToast('Erreur : ' + e.message); } };
+      if (doc === undefined) return null;
+      const passed = doc && doc.passedAt;
+      const changed = passed && Number(doc.total) !== Number(total);
+      return (
+        <div style={{ marginTop: 10 }}>
+          {passed
+            ? <div style={{ padding: 12, borderRadius: 10, background: changed ? '#fff3e0' : '#e8f5e9', border: '2px solid ' + (changed ? '#ef6c00' : '#2e7d32') }}>
+                <div style={{ fontWeight: 800, fontSize: 16, color: changed ? '#ef6c00' : '#2e7d32' }}>✅ Commande passée le {new Date(doc.passedAt).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}{doc.passedBy ? ' par ' + doc.passedBy : ''} · {doc.total} pain{doc.total > 1 ? 's' : ''}</div>
+                {changed && <div style={{ fontSize: 14, fontWeight: 700, marginTop: 4 }}>⚠️ La commande a changé depuis : {total} pain{total > 1 ? 's' : ''} maintenant ({total - doc.total > 0 ? '+' : ''}{total - doc.total}). Prévenir Brut de Pains puis re-cliquer.</div>}
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                  {changed && <button className="btn-primary" onClick={pass} style={{ fontSize: 15 }}>✅ Commande mise à jour passée</button>}
+                  <button className="btn-secondary" onClick={undo} style={{ fontSize: 13 }}>↩️ Annuler</button>
+                </div>
+              </div>
+            : <button className="btn-primary btn-block" disabled={!total} onClick={pass} style={{ fontSize: 17, padding: 14, background: '#2e7d32', borderColor: '#2e7d32' }}>✅ Commande passée ({total} pain{total > 1 ? 's' : ''})</button>}
+          {doc && (doc.hist || []).length > 0 && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Historique : {doc.hist.map(h => new Date(h.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) + (h.by ? ' ' + h.by : '') + ' (' + h.total + ')').join(' · ')}</div>}
+        </div>
+      );
+    }
     function PrintPainPage({ session, setTab, master }) {
       const [day, setDay] = React.useState(() => activeDay());
       const [confirmed, setConfirmed] = React.useState(false);
@@ -14223,6 +14470,7 @@
                 <div key={x.produit} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 2px', borderBottom: '1px solid var(--line)', fontSize: 15, color: '#b45309', fontWeight: 700 }}><span>⚠️ {x.produit} <small>(hors bon habituel)</small></span><span style={{ fontSize: 18, fontWeight: 700 }}>{x.qty}</span></div>
               ))}
               <button className="btn-primary btn-block" disabled={!canPrint} onClick={printOrder} style={{ marginTop: 10, fontSize: 16, padding: 14, background: '#5d4037', borderColor: '#5d4037' }}>📄 Ouvrir le bon de commande (PDF)</button>
+              <KbPainPassed day={day} total={total} recap={recap} session={session} />
             </div>
           )}
           {producers.length > 1 && (
@@ -19420,9 +19668,13 @@
       closed: true,
       closedBy: user,
       closedAt: new Date().toISOString(),
-      rungis: rungisList || []
+      rungis: rungisList || [],
+      ancienRun: null,
+      ancienTry: null
     });
     showToast(`✅ Prépa clôturée · ${Object.keys(agg).length} produit(s) → Manquants & ND`);
+    // V11.07 — report ancien site lancé TOUT DE SUITE (sans attendre la suite) ; relance auto par les postes ouverts si besoin
+    if (KB_COHABITATION) kbAncienLaunch(day, user).then(ar => showToast(ar && ar.ok ? `🤖 Ancien site : report lancé${ar.result && ar.result.n ? ` (${ar.result.n} produits)` : ''}` : (ar && ar.pending) ? '🤖 Ancien site : report déjà en cours' : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — nouvel essai automatique')).catch(e => showToast('⚠️ Report ancien site : ' + e.message));
     if (rungisList && rungisList.length) {
       try {
         const lg = await kbSendRungis(day, user, rungisList);
@@ -19463,12 +19715,7 @@
       sub: `${rows.length} lignes préparées · merci l'équipe 💚`
     });
     if (KB_COHABITATION) {
-      try {
-        const ar = await kbAncienRun(day, user);
-        showToast(ar && ar.ok ? `🤖 Ancien site : report lancé (${ar.result && ar.result.n || 0} produits)${ar.result && ar.result.dry ? ' — simulation' : ''}` : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — Master › Synchro ancien site');
-      } catch (e) {
-        showToast('⚠️ Report ancien site : ' + e.message);
-      }
+      // V11.07 — report ancien site : lancé plus haut, dès la clôture (kbAncienLaunch)
       try {
         const lg = await kbSendRuptures(day, user, {
           auto: true
@@ -25648,6 +25895,7 @@
         <div className="stack">
           <style>{`@keyframes kbPulse{0%{box-shadow:0 0 0 0 rgba(76,175,80,.7)}70%{box-shadow:0 0 0 10px rgba(76,175,80,0)}100%{box-shadow:0 0 0 0 rgba(76,175,80,0)}}`}</style>
           <KbTodoBoard todo={todo} />
+          <KbAncienRunAlert session={session} />
 
           <div className="card" style={{ background: 'linear-gradient(135deg,#1f3a24,#3f6e31)', color: '#fff', padding: '16px 18px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
@@ -26823,7 +27071,7 @@
           {sub === 'factweb' && <KbFacturationWebPage />}
           {sub === 'horaires' && <KbHorairesCommandePage />}
           {sub === 'rungis' && <><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
-          {sub === 'invfl' && <FlInventorySuiviCard session={session} />}
+          {sub === 'invfl' && <div className="stack"><h1 style={{ margin: '0 0 4px' }}>📦 Inventaire &amp; ajout F&amp;L</h1><FlInventorySuiviCard session={session} /><FlRuptureCard session={session} /></div>}
           {sub === 'live' && <KbLivePage />}
           {sub === 'histo' && <HistoryPage session={session} />}
         </div>
@@ -30042,9 +30290,8 @@
     function FLPage({ session }) {
       return (
         <div className="stack">
-          <h1 style={{ margin: '0 0 4px' }}>🥬 Fruits &amp; Légumes</h1>
+          <h1 style={{ margin: '0 0 4px' }}>🥬 F&amp;L : contrôle</h1>
           <FlAutoCard session={session} />
-          <FlRuptureCard session={session} />
           {/* V10.18 : « 🔎 Contrôle info du Sheet » (V10.02) et « MAJ FL — Sxx » (PVTTC) retirés de l'écran :
               le Contrôle auto (KBG_FL_Auto) remplit seul UV / TYPE / MU (site) et COL / prix (PVTTC). Composants gardés en code. */}
         </div>
@@ -31879,9 +32126,7 @@
             try { alert(`⚠️ Chargement OK mais données manquantes :\n${(res.missingConsumers.size || res.missingConsumers.length || 0)} client(s) inconnu(s) → recharger « Consommateurs »\n${(res.missingProducts.size || res.missingProducts.length || 0)} produit(s) inconnu(s) → recharger « Produits »\n\n(Le message reste affiché sur la page Chargement.)`); } catch (_) {}
           }
           showToast(`✓ ${res.orders.length} commandes chargées`);
-          if (dayKey !== todayKey()) {
-            setTimeout(() => window.location.reload(), 1200);
-          }
+          // V11.07 — plus de rechargement de l'appli : le changement de jour ré-abonne les pages (dayRev), on reste sur Chargement
         } catch (e) { showToast('Erreur : ' + e.message); }
         finally { setBusy(false); }
       };
@@ -32150,19 +32395,7 @@
               </button>
             )}
 
-            <label className="upload-zone" style={{display:'block',marginBottom:6}}>
-              <input type="file" accept=".txt,text/plain,*/*" style={{display:'none'}}
-                onChange={e => { const f=e.target.files[0]; if(!f) return; setProgmagName(f.name); const rd=new FileReader(); rd.onload=()=>{ const txt=rd.result; setProgmagText(txt); try{ const {dateDoc}=parseProgmagTSV(txt); if(dateDoc && dateDoc.length===8) setProgmagDate(`${dateDoc.slice(0,4)}-${dateDoc.slice(4,6)}-${dateDoc.slice(6,8)}`); }catch(_){} showToast('✓ '+f.name); }; rd.readAsText(f); }} />
-              <span>🚚 Commandes TXT Progmag (nouveau site) {progmagText ? '✓ '+progmagName : '(optionnel)'}</span>
-            </label>
-            {progmagText && (
-              <div style={{margin:'0 0 10px',padding:8,background:'var(--accent-soft)',border:'1px solid var(--accent)',borderRadius:8}}>
-                <div style={{fontSize:12,fontWeight:600,marginBottom:6}}>📅 Date de distribution du fichier Progmag (obligatoire) :</div>
-                <input type="date" value={progmagDate} onChange={e=>setProgmagDate(e.target.value||todayKey())} style={{padding:'5px 8px',borderRadius:6,border:'1px solid var(--line)'}} />
-                <button className="btn-primary btn-block" disabled={busy} onClick={handleProgmagLoad} style={{marginTop:8}}>{busy?'Fusion…':'Charger / fusionner Progmag'}</button>
-                <div style={{fontSize:11,color:'var(--ink-soft)',marginTop:6}}>Fusionné avec les commandes existantes de cette date, sous le site « TEST PROGMAG ». Date pré-remplie depuis le fichier (à vérifier).</div>
-              </div>
-            )}
+            {/* V11.07 — « Commandes TXT Progmag » retiré (nouveau système de chargement) */}
 
             {/* V9.52 — Nouveau site PrestaShop (module kbprepa) */}
             <div style={{margin:'4px 0 10px',padding:10,border:'2px dashed '+(psTest?'#d97706':'var(--accent)'),borderRadius:10,background:psTest?'#fff7ed':'var(--accent-soft)'}}>
@@ -35379,8 +35612,18 @@
     // Mail groupé aux clients : copie cachée systématique à HG.
     const MAIL_BCC_SELF = 'hg@probon.fr';
     function kbMailDayLbl() { try { return new Date(activeDay() + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return activeDay(); } }
-    function ClientMailComposer({ session, orders, statusMap }) {
+    // V11.07 — choix de la distribution : du jour OU la suivante (lendemain, ou 1re date avec commandes dans les 3 jours)
+    function ClientMailComposer({ session, orders: ordersActive, statusMap: statusActive }) {
       const showToast = React.useContext(ToastContext);
+      const [mday, setMday] = React.useState(todayKey());
+      const [nextDay, setNextDay] = React.useState(addDays(todayKey(), 1));
+      React.useEffect(() => { let stop = false; (async () => { for (let k = 1; k <= 3; k++) { const d = addDays(todayKey(), k); const l = await kbDayOrders(d); if (stop) return; if (l.length) { setNextDay(d); return; } } })(); return () => { stop = true; }; }, []);
+      const [dayOrders, setDayOrders] = React.useState(null);
+      React.useEffect(() => { if (mday === activeDay()) { setDayOrders(null); return; } let stop = false; setDayOrders([]); kbDayOrders(mday).then(l => { if (!stop) setDayOrders(l); }); return () => { stop = true; }; }, [mday]);
+      const orders = dayOrders === null ? ordersActive : dayOrders;
+      const statusMap = dayOrders === null ? statusActive : null;
+      const dayLbl = (d) => { try { return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) { return d; } };
+      const kbMailDayLbl = () => dayLbl(mday);
       const [scope, setScope] = React.useState('all'); // 'all' | 'site'
       const [site, setSite] = React.useState('');
       const [subject, setSubject] = React.useState('');
@@ -35417,7 +35660,7 @@
       };
 
       // Toute modif du périmètre / du message annule une reprise en attente
-      React.useEffect(() => { setResume(null); }, [scope, site, ignorePassed, subject, body]);
+      React.useEffect(() => { setResume(null); }, [scope, site, ignorePassed, subject, body, mday]);
 
       const MAIL_BATCH_SIZE = 40;
       const sendBatch = async (list, withBccSelf) => {
@@ -35443,7 +35686,7 @@
         const lots = Math.ceil(list.length / MAIL_BATCH_SIZE);
         const msg = resume
           ? `Reprendre l'envoi : ${list.length} client(s) restant(s), ${lots} lot(s) de ${MAIL_BATCH_SIZE} max ?`
-          : `Envoyer ce mail à ${list.length} client(s) de la distribution du ${kbMailDayLbl()} en copie cachée (BCC) ?${activeDay() !== todayKey() ? '\n\n⚠️ ATTENTION : ce n\'est PAS aujourd\'hui.' : ''}\n${lots} lot(s) de ${MAIL_BATCH_SIZE} max.`; // V10.80
+          : `Envoyer ce mail à ${list.length} client(s) de la distribution du ${kbMailDayLbl()} en copie cachée (BCC) ?${mday !== todayKey() ? '\n\n📅 Distribution du LENDEMAIN (pas aujourd\'hui).' : ''}\n${lots} lot(s) de ${MAIL_BATCH_SIZE} max.`; // V10.80
         if (!confirm(msg)) return;
         setBusy(true);
         let sent = 0;
@@ -35470,9 +35713,14 @@
 
       return (
         <div style={{display:'flex',flexDirection:'column',gap:10}}>
-          <div style={{fontSize:16,fontWeight:800,padding:'8px 12px',borderRadius:10,border:'3px solid '+(activeDay()===todayKey()?'#2e7d32':'#c62828'),background:activeDay()===todayKey()?'#e8f5e9':'#fdecea',color:activeDay()===todayKey()?'#1b5e20':'#8e0000'}}>
-            📅 Clients de la distribution du <span style={{textTransform:'capitalize'}}>{kbMailDayLbl()}</span>{activeDay()===todayKey() ? ' (aujourd\'hui)' : ' — ⚠️ PAS aujourd\'hui'}
-            {activeDay()!==todayKey() && <button className="btn-primary" style={{marginLeft:8,fontSize:13,padding:'4px 10px'}} onClick={()=>{ setActiveDay(null); window.location.reload(); }}>↩️ Aujourd'hui</button>}
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            {[[todayKey(),'Distribution du jour'],[nextDay,'Distribution du lendemain']].map(([d,l]) => (
+              <button key={l} type="button" className={mday===d?'btn-primary':'btn-secondary'} onClick={()=>setMday(d)} style={{flex:'1 1 200px',fontSize:16,padding:12,fontWeight:800}}>
+                📅 {l}<br/><small style={{textTransform:'capitalize',fontWeight:600}}>{dayLbl(d)}</small>
+              </button>))}
+          </div>
+          <div style={{fontSize:16,fontWeight:800,padding:'8px 12px',borderRadius:10,border:'3px solid '+(mday===todayKey()?'#2e7d32':'#1565c0'),background:mday===todayKey()?'#e8f5e9':'#e3f2fd',color:mday===todayKey()?'#1b5e20':'#0d47a1'}}>
+            📅 Clients de la distribution du <span style={{textTransform:'capitalize'}}>{kbMailDayLbl()}</span>{mday===todayKey() ? ' (aujourd\'hui)' : ' (lendemain)'}{dayOrders !== null && !dayOrders.length ? ' — aucune commande chargée' : ''}
           </div>
           <p style={{color:'var(--ink-soft)',fontSize:12,margin:0}}>Clients ayant une commande ce jour-là. Envoi depuis <strong>contact@kelbongoo.com</strong> (Freshdesk), clients en <strong>copie cachée (BCC)</strong> — ils ne voient jamais les adresses des autres (RGPD). Copie cachée aussi à <strong>hg@probon.fr</strong>.</p>
           <div className="filter-row" style={{marginBottom:0}}>
@@ -35519,7 +35767,7 @@
       );
     }
 
-    function PushComposerPage({ session, availableSites, pushMessages, orders }) {
+    function PushComposerPage({ session, availableSites, pushMessages, orders, setTab }) {
       const showToast = React.useContext(ToastContext);
       const [title, setTitle] = React.useState('');
       const [body, setBody] = React.useState('');
@@ -35615,15 +35863,16 @@
 
       return (
         <div className="stack">
-          <h1>📣 Push & mails</h1>
+          <h1>📣 Push (équipes & clients)</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
-            Push = message plein écran sur l'appli des boutiques : validé par UNE personne du lieu (initiales), qui transmet à ses collègues · « Annuler » l'arrête partout · plus affiché après 7 jours. Mail = email aux clients du jour (BCC, envoi serveur).
+            Push = message plein écran sur l'appli des boutiques : validé par UNE personne du lieu (initiales), qui transmet à ses collègues · « Annuler » l'arrête partout · plus affiché après 7 jours. Mail = email aux clients de la distribution du jour ou du lendemain (BCC, envoi serveur).
           </p>
 
           <div className="card" style={{display:'flex',flexDirection:'column',gap:12}}>
             <div className="filter-row" style={{marginBottom:0}}>
               <div className={`chip ${channel==='push'?'selected':''}`} onClick={()=>setChannel('push')}>📣 Push boutiques</div>
               <div className={`chip ${channel==='mail'?'selected':''}`} onClick={()=>setChannel('mail')}>✉️ Mail clients</div>
+              <div className="chip" onClick={()=>{ try { localStorage.setItem('kbg_suivi_sub','cmails'); window.dispatchEvent(new CustomEvent('kb:suivi-cur',{detail:'cmails'})); } catch(e){} setTab && setTab('suivi'); }} title="Réglage des mails automatiques clients (off / test / live)">⚙️ Mails automatiques</div>
             </div>
 
             {channel === 'mail' && <ClientMailComposer session={session} orders={orders} statusMap={statusMap} />}
@@ -36225,8 +36474,10 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       React.useEffect(() => {
         if (!session) return;
         if (!(session.role === 'master' || session.isMaster)) return;
-        if (viewAs === 'distrib' || viewAs === 'prep') return; // en vue distrib/prépa : on laisse Clients/Clôture
-        if (tab === 'clients' || tab === 'closure') setTab('today'); // V10.02 (+) — accueil master = « Aujourd'hui »
+        if (viewAs === 'distrib' || viewAs === 'prep' || viewAs === 'pdp') return; // en vue distrib/prépa/chauffeur : on laisse Clients/Clôture
+        // V11.07 — après un rechargement (chargement des commandes, ↩ Aujourd'hui…) on reste sur la même page master
+        if (tab === 'clients' || tab === 'closure') { let t0 = ''; try { t0 = sessionStorage.getItem('kb_master_tab') || ''; } catch (e) {} setTab(t0 && t0 !== 'clients' && t0 !== 'closure' ? t0 : 'today'); return; } // V10.02 (+) — accueil master = « Aujourd'hui »
+        if (!viewAs) { try { sessionStorage.setItem('kb_master_tab', tab); } catch (e) {} }
       }, [session, tab, viewAs]);
 
       // V9.53 — Synchro PrestaShop automatique sur les postes Master et Prépa (auto-limitée à 1 appel / 15 min).
@@ -36638,7 +36889,9 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           ? { ...session, role:'distrib', isMaster:false, _masterView:true }
           : (session.isMaster && viewAs === 'rungis')
             ? { ...session, role:'rungis', isMaster:false, _masterView:true }
-            : session;
+            : (session.isMaster && viewAs === 'pdp') // V11.07 — 🚚 Vue chauffeur
+              ? { ...session, role:'pdp', isMaster:false, _masterView:true }
+              : session;
       // V10.80 — en quittant la vue prépa (calée sur DEMAIN), le master revient sur AUJOURD'HUI (avant : restait sur demain → push / mails aux clients du lendemain)
       const switchView = (v) => { if (v !== 'prep' && viewAs === 'prep' && activeDay() !== todayKey()) setActiveDay(null); setViewAs(v); setTab(v === 'prep' ? 'prepajour' : 'clients'); };
       // Sélecteur de vue, affiché uniquement pour un vrai master.
@@ -36652,6 +36905,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             <option value="distrib">🚚 Vue distrib</option>
             <option value="prep">📦 Vue prépa</option>
             <option value="rungis">🚚 Espace Rungis</option>
+            <option value="pdp">🚛 Vue chauffeur</option>
           </select>
         ) : null
       );
@@ -36671,8 +36925,9 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
                 <strong>🚚 Rungis <span className="ver-badge">{APP_VERSION}</span></strong>
                 <small>{effSession.name} · {formatDateFR()}</small>
               </div>
-              <div className="topbar-actions"><button className="btn-ghost" onClick={handleLogout} style={{fontSize:13}}>Sortir</button></div>
+              <div className="topbar-actions" style={{display:'flex',gap:6,alignItems:'center'}}><MasterViewSwitcher /><button className="btn-ghost" onClick={handleLogout} style={{fontSize:13}}>Sortir</button></div>
             </div>
+            {effSession._masterView && <div style={{margin:'8px 12px 0',padding:'8px 12px',borderRadius:10,background:'#fff3e0',border:'2px solid #ef6c00',fontSize:14,fontWeight:700,color:'#8a4b00'}}>👁️ Vue master : tu vois exactement l'écran du chauffeur. Attention, ce que tu valides ici est enregistré à ton nom.</div>}
             <RungisDriverHome session={effSession} />
           </div>
         );
@@ -36685,6 +36940,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             {overlay}
             <UpdateChecker />
             <DlcMorningPopup session={effSession} setTab={setTab} />
+            <KbAncienAutoRun by={session.name} />
             <KbSupport session={effSession} tab={tab} site="ENTREPOT" />
             <div className="topbar">
               <div className="topbar-title">
@@ -36747,6 +37003,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {overlay}
             <UpdateChecker />
           <KbSupport session={effSession} tab={tab} site={currentSite} />
+          {session.isMaster && <KbAncienAutoRun by={session.name} />}
           {effSession.isMaster && <KbMasterSidebar tab={tab} setTab={setTab} session={effSession} onLogout={handleLogout} />}
           <div className="topbar">
             <div className="topbar-title">
@@ -36814,8 +37071,8 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {tab === 'closure' && <ClosurePage session={effSession} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           </React.Fragment>
           {effSession.isMaster && tab !== 'today' && <KbMasterChips tab={tab} setTab={setTab} />}
-          {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} />}
-          {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} />}
+          {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} catalogue={catalogue} />}
+          {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} setTab={setTab} />}
           {tab === 'suivi' && effSession.isMaster && <SuiviGeneralPage session={effSession} />}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
           {/* V10.61 — poste synchro Tampermonkey retiré : le report est fait par le serveur (KBG_Ancien) */}
@@ -36907,39 +37164,39 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
     //   « Étiquettes livraison DOM » retiré (même écran que Dromy › Envoi & étiquettes, route mdom gardée).
     const KB_MNAV = [
       { s: 'today', l: "Aujourd'hui", sh: "Aujourd'hui", ic: '🏠', items: [{ t: 'today', l: "Aujourd'hui", ic: '🏠' }] },
-      { s: 'cli', l: 'Clients & distrib', sh: 'Clients', ic: '🛍️', items: [
-        { t: 'masterrecap', l: 'SAV · consignes · oublis', ic: '🧾' },
-        { t: 'push', l: 'Push équipes', ic: '📣' },
-        { sub: 'cmails', l: 'Mails clients', ic: '📧' },
-        { sub: 'live', l: 'Qui fait quoi', ic: '🟢' },
-        { sub: 'ancien', l: 'Synchro ancien site', ic: '🔁' },
+      // V11.07 — Commande pain remontée juste sous « Aujourd'hui »
+      { s: 'pain', l: 'Commande pain', sh: 'Pain', ic: '🍞', items: [{ t: 'mpain', l: 'Commande pain', ic: '🍞' }] },
+      { s: 'cli', l: 'Clients · prépa · distrib', sh: 'Clients', ic: '🛍️', items: [
+        { t: 'admin', l: 'Chargement des commandes', ic: '📥' },
+        { t: 'masterrecap', l: 'SAV · consignes · oublis · retours', ic: '🧾' },
+        { t: 'push', l: 'Push (équipes & clients)', ic: '📣' },
+        { sub: 'histo', l: 'Historique', ic: '📜' },
         { sub: 'factweb', l: 'Facturation web', ic: '🧾' },
-        { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
+        { sub: 'ancien', l: 'Synchro ancien site', ic: '🔁' },
       ] },
       { s: 'appro', l: 'Achats & prépa', sh: 'Achats', ic: '🥬', items: [
-        { t: 'fl', l: 'F&L : contrôle & rajout', ic: '🥬' },
-        { sub: 'invfl', l: 'Inventaire F&L', ic: '📦' },
-        { sub: 'rungis', l: 'Camion Rungis', ic: '🚚' },
-        { t: 'mpain', l: 'Commande pain', ic: '🍞' },
+        { t: 'fl', l: 'F&L : contrôle', ic: '🥬' },
+        { sub: 'invfl', l: 'Inventaire & ajout F&L', ic: '📦' },
         { t: 'minv', l: 'Inventaire magasin', ic: '📋' },
-        { t: 'admin', l: 'Chargement commandes', ic: '📥' },
       ] },
       { s: 'chif', l: 'Chiffres', sh: 'Chiffres', ic: '💶', items: [
         { sub: 'ca', l: 'Suivi CA', ic: '💶' },
-        { sub: 'stats', l: 'Statistiques', ic: '📊' },
         { sub: 'manq', l: 'Manquants & remises', ic: '💸' },
         { sub: 'pertes', l: 'Pertes ROB', ic: '♻️' },
-        { sub: 'histo', l: 'Historique', ic: '📜' },
+        { sub: 'stats', l: 'Statistiques équipes', ic: '📊' },
+        { sub: 'rungis', l: 'Camion Rungis', ic: '🚚' },
       ] },
       { s: 'plus', l: 'Livraison & réglages', sh: 'Plus', ic: '⚙️', items: [
         { sub: 'dromy', l: 'Dromy : envoi & étiquettes', ic: '🛵' },
         { sub: 'dromyfact', l: 'Factures Dromy', ic: '🧾' },
-        { sub: 'lieux', l: 'Lieux & horaires', ic: '📍' },
         { sub: 'temp', l: 'Températures', ic: '🌡️' },
         { sub: 'codes', l: 'Codes-barres', ic: '🏷️' },
+        { sub: 'lieux', l: 'Lieux & horaires boutiques', ic: '📍' },
+        { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
       ] },
     ];
-    const KB_MSUBS = KB_MNAV.flatMap(g => g.items.filter(i => i.sub).map(i => i.sub));
+    // V11.07 — écrans retirés du menu mais toujours accessibles (lien depuis Push / Aujourd'hui)
+    const KB_MSUBS = [...KB_MNAV.flatMap(g => g.items.filter(i => i.sub).map(i => i.sub)), 'cmails', 'live'];
     const KB_OLD_TAB_SUB = { casuivi: 'ca', stats: 'stats', manqhist: 'manq', histo: 'histo', tempmaster: 'temp' };
     function useKbMasterNav(tab, setTab) {
       const [cur, setCur] = React.useState(() => { try { return localStorage.getItem('kbg_suivi_sub') || 'ca'; } catch (e) { return 'ca'; } });
@@ -36953,8 +37210,8 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           if (tab === 'suivi') { try { window.dispatchEvent(new CustomEvent('kb:suivi', { detail: it.sub })); } catch (e) {} } else setTab('suivi'); }
         window.scrollTo({ top: 0 });
       };
-      const sec = KB_MNAV.find(g => g.items.some(isOn)) || null;
-      const dot = (it) => it.sub === 'cmails' && !!mailErr;
+      const sec = KB_MNAV.find(g => g.items.some(isOn)) || (tab === 'suivi' && (cur === 'cmails') ? KB_MNAV.find(g => g.s === 'cli') : null) || null;
+      const dot = (it) => (it.t === 'push' || it.sub === 'cmails') && !!mailErr;
       const secDot = (g) => g.items.some(dot) || (g.s === 'appro' && kbFlAutoDot());
       return { isOn, go, sec, dot, secDot };
     }
