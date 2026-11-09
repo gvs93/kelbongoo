@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.07) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.08) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.07';
+const APP_VERSION = 'V11.08';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -5624,6 +5624,9 @@ function AnomalyForm({
           producteur: retProducer,
           qty,
           clientName: effName,
+          clientEmail: clientEmail || '',
+          srcOrderId: L.orderId || (selectedOrder ? selectedOrder.orderId : ''),
+          distribDate: L.day || '',
           dlc: retourDlc,
           pickupDate: nextDelivForSite || '',
           anomalyLabel,
@@ -5712,6 +5715,7 @@ function AnomalyForm({
         dlc: coPick[l.key].dlc || '',
         day: coDay,
         lineId: String(l.it.id || l.key),
+        orderId: String(l.order.orderId || ''),
         noMail: i > 0,
         mailLabel: labels.join(', ')
       }));
@@ -9413,7 +9417,10 @@ function QualityPage({
     }
   }, "+ Nouvelle")), isClosed && React.createElement("div", {
     className: "alert-info"
-  }, "🔒 Journée clôturée"), hideAfterClose ? React.createElement("div", {
+  }, "🔒 Journée clôturée"), React.createElement(KbRollsReturnCard, {
+    session: session,
+    site: currentSite
+  }), hideAfterClose ? React.createElement("div", {
     className: "empty-state"
   }, React.createElement("div", {
     className: "icon"
@@ -20610,7 +20617,10 @@ function ClosurePage({
       fontSize: 13,
       marginTop: -8
     }
-  }, "Validation de fin de journée. Les non-passés iront dans le suivi."), session.isMaster && pastUnclosed.length > 0 && React.createElement("div", {
+  }, "Validation de fin de journée. Les non-passés iront dans le suivi."), React.createElement(KbRollsReturnCard, {
+    session: session,
+    site: currentSite
+  }), session.isMaster && pastUnclosed.length > 0 && React.createElement("div", {
     className: "alert-red"
   }, React.createElement("strong", null, "⚠️ Distribution", pastUnclosed.length > 1 ? 's' : '', " précédente", pastUnclosed.length > 1 ? 's' : '', " non clôturée", pastUnclosed.length > 1 ? 's' : '', " sur ", currentSite, " :"), React.createElement("div", {
     style: {
@@ -50663,6 +50673,447 @@ function kbPdpRecapHtml(day, rows, by) {
   };
   return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#1565c0;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">↩️ Retours PDP traités</div><div style="font-size:15px;text-transform:capitalize">${kbEsc(kbCmDate(day))} · validé par ${kbEsc(by || '—')}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${groups.map(([k, a]) => box(k, a.reduce((t, r) => t + (r.qty || 0), 0))).join('')}</tr></table>` + groups.map(sec).join('') + `<p style="color:#999;font-size:12px;margin-top:18px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
 }
+const KB_RET_RM_REASONS = ['Introuvable', 'Erreur de saisie', 'Doublon', 'Déjà traité autrement', 'Client a récupéré'];
+function KbPdpRetOrigin({
+  r
+}) {
+  const bits = [];
+  if (r.clientName) bits.push('👤 ' + r.clientName);
+  if (r.distribDate) bits.push('commande du ' + formatDateShort(r.distribDate));
+  if (r.srcOrderId) bits.push('n° ' + r.srcOrderId);
+  bits.push('signalé par ' + (r.createdBy || '?') + (r.createdAt ? ' le ' + new Date(r.createdAt).toLocaleString('fr-FR', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  }) : ''));
+  if (r.anomalyLabel) bits.push(r.anomalyLabel);
+  if (r.editedBy) bits.push('✏️ corrigé par ' + r.editedBy + (r.editedFrom ? ' (avant : ' + r.editedFrom + ')' : ''));
+  return React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#4a148c',
+      marginTop: 2
+    }
+  }, bits.join(' · '));
+}
+function KbPdpRetFixSheet({
+  r,
+  mode,
+  session,
+  onClose
+}) {
+  const showToast = React.useContext(ToastContext);
+  const co = useKbClientOrders(mode === 'edit' ? r.site : '', r.clientEmail || '', r.clientName && r.clientName !== 'Produit non attribué' ? r.clientName : '', 28);
+  const [srcOrder, setSrcOrder] = React.useState(null);
+  React.useEffect(() => {
+    if (mode !== 'edit' || !r.srcOrderId || !r.distribDate) return;
+    let stop = false;
+    kbDayOrders(r.distribDate).then(l => {
+      if (!stop) setSrcOrder(l.find(o => String(o.orderId) === String(r.srcOrderId)) || null);
+    });
+    return () => {
+      stop = true;
+    };
+  }, [r.id]);
+  const groups = React.useMemo(() => {
+    if (srcOrder) return [{
+      day: r.distribDate,
+      order: srcOrder
+    }];
+    const l = co.list.filter(x => !r.distribDate || x.day === r.distribDate);
+    return l.length ? l : co.list;
+  }, [srcOrder, co.list]);
+  const [pick, setPick] = React.useState(null);
+  const [free, setFree] = React.useState('');
+  const [qty, setQty] = React.useState(Number(r.qty) || 1);
+  const [why, setWhy] = React.useState('');
+  const [txt, setTxt] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const by = session.name,
+    now = new Date().toISOString();
+  const saveEdit = async () => {
+    const produit = pick ? pick.produit : free.trim(),
+      producteur = pick ? pick.producteur || '' : '';
+    if (!produit) {
+      showToast('Choisis le bon produit');
+      return;
+    }
+    setBusy(true);
+    try {
+      const before = `${r.produit || r.productLabel}${(r.qty || 1) > 1 ? ' ×' + r.qty : ''}`;
+      const patch = {
+        produit,
+        producteur,
+        productKey: `${producteur}|${produit}`,
+        productLabel: producteur ? `${produit} (${producteur})` : produit,
+        qty: Math.max(1, Number(qty) || 1),
+        editedBy: by,
+        editedAt: now,
+        editedFrom: before,
+        editHist: [...(r.editHist || []), {
+          at: now,
+          by,
+          from: before
+        }].slice(-10),
+        updatedAt: now
+      };
+      await storage.setDoc('pdp_returns', r.id, patch);
+      if (r.anomalyId && r.day) {
+        try {
+          await storage.setDoc(`day_${r.day}_anomalies`, r.anomalyId, {
+            productKey: patch.productKey,
+            productLabel: patch.productLabel,
+            retourQty: patch.qty,
+            editedByMaster: by,
+            editedAt: now
+          });
+        } catch (_) {}
+      }
+      if (r.dlc) {
+        try {
+          await storage.setDoc('dlc_watch', r.id, {
+            produit,
+            producteur
+          });
+        } catch (_) {}
+      }
+      if (r.status === 'treated') {
+        try {
+          await storage.setDoc('losses', `lossret_${r.id}`, {
+            produit,
+            producteur,
+            productKey: patch.productKey,
+            quantity: patch.qty
+          });
+        } catch (_) {}
+      }
+      showToast('✏️ Produit corrigé : ' + produit);
+      onClose();
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveRemove = async () => {
+    const reason = [why, txt.trim()].filter(Boolean).join(' · ');
+    if (!reason) {
+      showToast('Raison obligatoire');
+      return;
+    }
+    setBusy(true);
+    try {
+      await storage.setDoc('app_config', 'pdpret_removed_' + todayKey().slice(0, 7), {
+        items: {
+          [r.id]: {
+            ...r,
+            removedBy: by,
+            removedAt: now,
+            removedReason: reason
+          }
+        }
+      });
+      await storage.deleteDoc('pdp_returns', r.id);
+      try {
+        await storage.deleteDoc('losses', `lossret_${r.id}`);
+      } catch (_) {}
+      try {
+        await storage.deleteDoc('dlc_watch', r.id);
+      } catch (_) {}
+      showToast('🚫 Retiré du suivi (' + reason + ')');
+      onClose();
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return React.createElement(KbSheet, {
+    title: (mode === 'edit' ? '✏️ Corriger le produit — ' : '🚫 Retirer du suivi — ') + (r.produit || r.productLabel),
+    onClose: onClose
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginBottom: 6
+    }
+  }, React.createElement("b", null, r.site), " · actuellement : ", React.createElement("b", null, r.produit || r.productLabel, (r.qty || 1) > 1 ? ' ×' + r.qty : '')), React.createElement(KbPdpRetOrigin, {
+    r: r
+  }), mode === 'edit' ? React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      margin: '10px 0 6px'
+    }
+  }, "Le bon produit (commande du client) :"), co.loading && !srcOrder && React.createElement("div", null, "Chargement des commandes…"), !co.loading && !groups.length && React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-mute)'
+    }
+  }, "Commande introuvable (client non rattaché) → écris le produit ci-dessous."), groups.map(({
+    day,
+    order
+  }) => React.createElement("div", {
+    key: order.orderId + day,
+    style: {
+      marginBottom: 8
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      color: 'var(--ink-mute)'
+    }
+  }, "📅 ", formatDateShort(day), " · ", displayName(order), " · n° ", order.orderId), React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+      marginTop: 4
+    }
+  }, (order.items || []).map((it, i) => {
+    const on = pick && pick.produit === it.produit && pick.producteur === (it.producteur || '');
+    return React.createElement("button", {
+      key: i,
+      type: "button",
+      onClick: () => {
+        setPick({
+          produit: it.produit,
+          producteur: it.producteur || '',
+          max: Number(it.qty) || 1
+        });
+        setFree('');
+        setQty(q => Math.min(Math.max(1, q), Number(it.qty) || 1));
+      },
+      style: {
+        textAlign: 'left',
+        minHeight: 46,
+        padding: '6px 10px',
+        borderRadius: 10,
+        border: '2px solid ' + (on ? '#1565c0' : 'var(--line)'),
+        background: on ? '#e3f2fd' : '#fff',
+        fontSize: 15,
+        fontWeight: on ? 800 : 600
+      }
+    }, on ? '☑️ ' : '⬜ ', it.produit, (Number(it.qty) || 1) > 1 ? ' ×' + it.qty : '', " ", React.createElement("small", {
+      style: {
+        color: 'var(--ink-mute)',
+        fontWeight: 400
+      }
+    }, it.producteur || ''));
+  })))), React.createElement("input", {
+    type: "text",
+    value: free,
+    onChange: e => {
+      setFree(e.target.value);
+      if (e.target.value) setPick(null);
+    },
+    placeholder: "ou écrire le produit (hors commande)…",
+    style: {
+      width: '100%',
+      minHeight: 44,
+      marginTop: 4
+    }
+  }), React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      marginTop: 10
+    }
+  }, React.createElement("b", null, "Quantité"), React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 44,
+      minHeight: 44
+    },
+    onClick: () => setQty(q => Math.max(1, q - 1))
+  }, "−"), React.createElement("b", {
+    style: {
+      fontSize: 20
+    }
+  }, qty), React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 44,
+      minHeight: 44
+    },
+    onClick: () => setQty(q => q + 1)
+  }, "+")), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy,
+    onClick: saveEdit,
+    style: {
+      width: '100%',
+      minHeight: 56,
+      fontSize: 18,
+      fontWeight: 800,
+      marginTop: 12
+    }
+  }, busy ? '⏳…' : '✏️ Enregistrer la correction')) : React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      margin: '10px 0 6px',
+      color: '#b71c1c',
+      fontWeight: 700
+    }
+  }, "Le retour disparaît du suivi (chauffeur, entrepôt, alertes). Il est gardé en archive avec la raison."), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap'
+    }
+  }, KB_RET_RM_REASONS.map(x => React.createElement("span", {
+    key: x,
+    className: 'chip' + (why === x ? ' selected' : ''),
+    style: {
+      cursor: 'pointer'
+    },
+    onClick: () => setWhy(w => w === x ? '' : x)
+  }, x))), React.createElement("input", {
+    type: "text",
+    value: txt,
+    onChange: e => setTxt(e.target.value),
+    placeholder: "ou écrire la raison…",
+    style: {
+      width: '100%',
+      minHeight: 44,
+      marginTop: 8
+    }
+  }), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy,
+    onClick: saveRemove,
+    style: {
+      width: '100%',
+      minHeight: 56,
+      fontSize: 18,
+      fontWeight: 800,
+      marginTop: 12,
+      background: '#c62828',
+      borderColor: '#c62828'
+    }
+  }, busy ? '⏳…' : '🚫 Retirer du suivi')));
+}
+function KbRollsReturnCard({
+  session,
+  site
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [all, setAll] = React.useState([]);
+  const [n, setN] = React.useState(1);
+  const [busy, setBusy] = React.useState(false);
+  React.useEffect(() => storage.subscribe('pdp_returns', a => setAll((a || []).filter(r => r.kind === 'rolls' && r.site === site && r.status !== 'treated'))), [site]);
+  if (!site) return null;
+  const send = async () => {
+    if (!window.confirm(`Demander au chauffeur de récupérer ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à ${site} ?`)) return;
+    setBusy(true);
+    try {
+      const id = `pdpret_rolls_${site}_${Date.now()}`,
+        now = new Date().toISOString();
+      await storage.setDoc('pdp_returns', id, {
+        id,
+        kind: 'rolls',
+        site,
+        produit: '🛒 Rolls vides',
+        producteur: '',
+        productKey: 'ROLLS',
+        productLabel: '🛒 Rolls vides',
+        qty: n,
+        clientName: '',
+        dlc: '',
+        pickupDate: nextDistribDateForSite(site, activeDay()) || '',
+        remark: 'Rolls vides à ramener à PDP',
+        day: activeDay(),
+        status: 'pending',
+        createdBy: session.name,
+        createdAt: now,
+        updatedAt: now
+      });
+      showToast(`🛒 Demande envoyée : ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à récupérer`);
+      setN(1);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      border: '3px solid #6d4c41',
+      background: '#efebe9'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 19,
+      fontWeight: 800,
+      color: '#4e342e'
+    }
+  }, "🛒 Rolls vides à faire récupérer"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 2
+    }
+  }, "Les rolls de la distrib sont vides ? Le chauffeur devra les ramener à PDP."), all.map(r => React.createElement("div", {
+    key: r.id,
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      marginTop: 6,
+      color: r.status === 'recovered' ? '#2e7d32' : '#e65100'
+    }
+  }, r.status === 'recovered' ? '✅' : '⏳', " ", r.qty, " roll", r.qty > 1 ? 's' : '', " · demandé par ", r.createdBy, " le ", formatDateShort(String(r.createdAt || '').slice(0, 10)), r.status === 'recovered' ? ' · récupéré par ' + (r.recoveredBy || 'le chauffeur') : ' · en attente du chauffeur')), React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      marginTop: 10,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 52,
+      minHeight: 52,
+      fontSize: 22
+    },
+    onClick: () => setN(x => Math.max(1, x - 1))
+  }, "−"), React.createElement("b", {
+    style: {
+      fontSize: 26,
+      minWidth: 30,
+      textAlign: 'center'
+    }
+  }, n), React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 52,
+      minHeight: 52,
+      fontSize: 22
+    },
+    onClick: () => setN(x => x + 1)
+  }, "+"), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy,
+    onClick: send,
+    style: {
+      flex: 1,
+      minHeight: 56,
+      fontSize: 17,
+      fontWeight: 800,
+      background: '#6d4c41',
+      borderColor: '#6d4c41'
+    }
+  }, busy ? '⏳…' : `🛒 Demander la récupération (${n})`)));
+}
 function PdpReturnsPage({
   session,
   catalogue
@@ -50672,6 +51123,7 @@ function PdpReturnsPage({
   const [busy, setBusy] = React.useState(false);
   const [recoverOpen, setRecoverOpen] = React.useState(false);
   const [mDest, setMDest] = React.useState(null);
+  const [fix, setFix] = React.useState(null);
   const isDriver = session.role === 'pdp' && kbIsPdpDriver();
   React.useEffect(() => {
     if (!isDriver || !B || !B.ready) return;
@@ -50765,6 +51217,22 @@ function PdpReturnsPage({
       createdAt: now(),
       updatedAt: now()
     });
+  };
+  const treatRolls = async r => {
+    setBusy(true);
+    try {
+      await storage.setDoc('pdp_returns', r.id, {
+        status: 'treated',
+        destination: 'rolls',
+        treatedBy: session.name,
+        treatedAt: now()
+      });
+      showToast(`🛒 ${r.qty || 1} roll(s) reçu(s) à PDP`);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
   };
   const treatManual = async (r, dest) => {
     setBusy(true);
@@ -51434,14 +51902,22 @@ function PdpReturnsPage({
           fontSize: 13,
           color: 'var(--ink-soft)'
         }
-      }, r.clientName ? r.clientName + ' · ' : '', r.dlc ? 'DLC ' + formatDateShort(r.dlc) : 'DLC ?', r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : '', r.treatedBy ? ' · traité par ' + r.treatedBy : '', r.remark ? ' · « ' + r.remark + ' »' : ''), React.createElement("div", {
+      }, r.kind === 'rolls' ? '' : r.dlc ? 'DLC ' + formatDateShort(r.dlc) : 'DLC ?', r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : '', r.treatedBy ? ' · traité par ' + r.treatedBy : '', r.remark ? ' · « ' + r.remark + ' »' : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
+        r: r
+      }), React.createElement("div", {
         style: {
           display: 'flex',
           gap: 6,
           flexWrap: 'wrap',
           marginTop: 6
         }
-      }, r.status !== 'treated' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)'), (r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0'), r.status === 'treated' && btn('↩️ Annuler le traitement', () => masterUndo(r), '#ef6c00'), btn('🗑️ Supprimer', () => deleteManual(r), 'var(--danger)')), destRow(r.id, r.dlc, d => treatManual(r, d)));
+      }, r.status !== 'treated' && r.kind !== 'rolls' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)'), r.status === 'recovered' && r.kind === 'rolls' && btn('✓ Rolls reçus à PDP', () => treatRolls(r), '#6d4c41'), (r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0'), r.status === 'treated' && btn('↩️ Annuler le traitement', () => masterUndo(r), '#ef6c00'), r.kind !== 'rolls' && btn('✏️ Corriger le produit', () => setFix({
+        r,
+        mode: 'edit'
+      }), '#4a148c'), btn('🚫 Retirer du suivi', () => setFix({
+        r,
+        mode: 'rm'
+      }), 'var(--danger)')), destRow(r.id, r.dlc, d => treatManual(r, d)));
     }), lines.map(L => React.createElement("div", {
       key: L.id,
       style: {
@@ -51493,7 +51969,13 @@ function PdpReturnsPage({
     style: {
       marginTop: 10
     }
-  }, React.createElement("h1", {
+  }, fix && React.createElement(KbPdpRetFixSheet, {
+    key: fix.r.id + fix.mode,
+    r: fix.r,
+    mode: fix.mode,
+    session: session,
+    onClose: () => setFix(null)
+  }), React.createElement("h1", {
     style: {
       margin: 0,
       fontSize: 28
@@ -51579,10 +52061,55 @@ function PdpReturnsPage({
       fontSize: 15,
       color: 'var(--ink-soft)'
     }
-  }, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée', r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), !B.nyToday(r.id) && React.createElement(DestButtons, {
+  }, r.kind === 'rolls' ? 'Rolls vides de la distrib' : React.createElement(React.Fragment, null, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée'), r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
+    r: r
+  }), isMaster && React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap',
+      marginTop: 6
+    }
+  }, r.kind !== 'rolls' && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 14,
+      color: '#4a148c',
+      borderColor: '#4a148c'
+    },
+    onClick: () => setFix({
+      r,
+      mode: 'edit'
+    })
+  }, "✏️ Corriger le produit"), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 14,
+      color: 'var(--danger)',
+      borderColor: 'var(--danger)'
+    },
+    onClick: () => setFix({
+      r,
+      mode: 'rm'
+    })
+  }, "🚫 Retirer du suivi")), !B.nyToday(r.id) && (r.kind === 'rolls' ? React.createElement("button", {
+    disabled: busy,
+    onClick: () => treatRolls(r),
+    style: {
+      width: '100%',
+      minHeight: 64,
+      marginTop: 10,
+      fontSize: 20,
+      fontWeight: 800,
+      borderRadius: 14,
+      border: 'none',
+      background: '#6d4c41',
+      color: '#fff'
+    }
+  }, "✓ Rolls reçus à PDP") : React.createElement(DestButtons, {
     dlc: r.dlc,
     onPick: d => treatManual(r, d)
-  }), React.createElement(NotYetBar, {
+  })), React.createElement(NotYetBar, {
     id: r.id,
     info: {
       produit: r.produit || r.productLabel,
