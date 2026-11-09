@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.07';
+    const APP_VERSION = 'V11.08';
+    // V11.08 — (09/11/2026) Retours PDP : origine visible (client, commande du, n°, signalé par) ; Master « ✏️ Corriger le produit » (choisi dans la commande d'origine, ou texte) + « 🚫 Retirer du suivi » avec raison (archive app_config/pdpret_removed_<mois>) ; pdp_returns garde srcOrderId / distribDate / clientEmail. Boutiques : « 🛒 Rolls vides à faire récupérer » (Qualité + Clôture) → retour PDP kind 'rolls' : le chauffeur coche récupéré, l'entrepôt « ✓ Rolls reçus à PDP » (sans perte).
     // V11.07 — (09/11/2026) Master › SAV : section « ↩️ Retours » (commandes non récupérées / retour PDP : clic → contenu + décision PAR ARTICLE : retour PDP · partage équipe · garder · récupéré · jeter → pertes + consigne push au lieu ; Retours PDP entrepôt intégrés). Menu master réorganisé (Commande pain sous Aujourd'hui ; « Clients · prépa · distrib » : Chargement en haut, SAV, Push, Historique, Facturation web, Synchro ancien site en bas ; F&L : contrôle seul / Inventaire & ajout F&L ; Camion Rungis sous Stats équipes ; Horaires boutiques + commande en bas de Réglages ; Mails clients et Qui fait quoi retirés du menu). Push mail clients : distribution du jour OU du lendemain. Chargement des commandes : plus de rechargement, on reste sur la page ; « Commandes TXT Progmag » retiré. Commande pain : « ✅ Commande passée » + suivi. Report ancien site à la clôture prépa : lancé tout de suite + relance auto (postes master/prépa) + alerte Aujourd'hui. Sélecteur master : « 🚛 Vue chauffeur ».
     // V11.06 — (09/11/2026) Qualité : client choisi → « 📅 Date de distribution » (ses commandes des 3 dernières semaines sur le lieu) → on COCHE les produits de SA commande (quantité, DLC par produit) ; une anomalie par produit (oubli : un seul mail client avec tous les produits) ; « en trop » / client sans commande : liste produits comme avant. Non-récupérés (distrib + Master) : « Retour PDP » ouvre le choix des produits retournés (quantité ajustable) ; chaque produit non retourné exige une raison (choix rapide ou texte) → followups.pdpNotReturned ; le chauffeur et l'entrepôt ne voient que les produits retournés.
     // V11.05 — (08/11/2026) Prépa : 🏷️/⚖️ = UNE popup « Sur quoi ? » (tout le produit / client par client ; tous les articles / article par article, un carré par article + « ✓ Fini ») ; remise poids → ⚖️ allumé (plus 🏷️) ; boutique finie → passe EN BAS repliée (onglets + fiche produit), passage auto à la boutique suivante ; client avec frais/sec SANS n° de casier → n° attribué tout de suite (prochain libre) ; Distrib : pain / ND seuls = « pas de casier » (plus de faux casier 3 en double), « casier ? » rouge si n° manquant, pain dernière minute affiché une seule fois ; Master › F&L : multi-coche (Tout cocher → Passer Actif / Non actif en une fois) ; Retours PDP : panneau master (destination, récupéré, annuler, supprimer, retirer une commande).
@@ -4654,6 +4655,9 @@
                 produit: retName, producteur: retProducer,
                 qty,
                 clientName: effName,
+                clientEmail: clientEmail || '',
+                srcOrderId: L.orderId || (selectedOrder ? selectedOrder.orderId : ''), // V11.08 — commande d'origine (correction master)
+                distribDate: L.day || '',
                 dlc: retourDlc,
                 pickupDate: nextDelivForSite || '',
                 anomalyLabel,
@@ -4699,7 +4703,7 @@
           if (!sel.length) { showToast('Coche au moins un produit de la commande'); return; }
           if (needsDlc) { const noD = sel.find(l => !coPick[l.key].dlc); if (noD) { showToast('Indique la DLC de « ' + noD.it.produit + ' »'); return; } }
           const labels = sel.map(l => l.it.produit + ((coPick[l.key].qty || 1) > 1 ? ' ×' + coPick[l.key].qty : ''));
-          list = sel.map((l, i) => ({ productKey: (l.it.producteur || '') + '|' + l.it.produit, qty: coPick[l.key].qty || 1, dlc: coPick[l.key].dlc || '', day: coDay, lineId: String(l.it.id || l.key), noMail: i > 0, mailLabel: labels.join(', ') }));
+          list = sel.map((l, i) => ({ productKey: (l.it.producteur || '') + '|' + l.it.produit, qty: coPick[l.key].qty || 1, dlc: coPick[l.key].dlc || '', day: coDay, lineId: String(l.it.id || l.key), orderId: String(l.order.orderId || ''), noMail: i > 0, mailLabel: labels.join(', ') }));
         } else {
           if (!productKey0) { showToast('Choisis un produit'); return; }
           if (needsDlc && !retourDlc) { showToast('Indique la DLC du produit'); return; }
@@ -6878,6 +6882,8 @@
           {isClosed && (
             <div className="alert-info">🔒 Journée clôturée</div>
           )}
+          {/* V11.08 — rolls vides à faire récupérer par le chauffeur (retour PDP) */}
+          <KbRollsReturnCard session={session} site={currentSite} />
 
           {hideAfterClose ? (
             <div className="empty-state">
@@ -12209,6 +12215,7 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Validation de fin de journée. Les non-passés iront dans le suivi.
           </p>
+          <KbRollsReturnCard session={session} site={currentSite} />
 
           {session.isMaster && pastUnclosed.length > 0 && (
             <div className="alert-red">
@@ -27485,12 +27492,141 @@
         + `<p style="color:#999;font-size:12px;margin-top:18px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
     }
 
+    // V11.08 — MASTER : corriger le produit d'un retour PDP (erreur de la distrib) à partir de la commande d'origine,
+    //   ou le RETIRER DU SUIVI (introuvable, erreur, doublon…) avec raison — archivé dans app_config/pdpret_removed_<AAAA-MM>.
+    const KB_RET_RM_REASONS = ['Introuvable', 'Erreur de saisie', 'Doublon', 'Déjà traité autrement', 'Client a récupéré'];
+    function KbPdpRetOrigin({ r }) {
+      const bits = [];
+      if (r.clientName) bits.push('👤 ' + r.clientName);
+      if (r.distribDate) bits.push('commande du ' + formatDateShort(r.distribDate));
+      if (r.srcOrderId) bits.push('n° ' + r.srcOrderId);
+      bits.push('signalé par ' + (r.createdBy || '?') + (r.createdAt ? ' le ' + new Date(r.createdAt).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''));
+      if (r.anomalyLabel) bits.push(r.anomalyLabel);
+      if (r.editedBy) bits.push('✏️ corrigé par ' + r.editedBy + (r.editedFrom ? ' (avant : ' + r.editedFrom + ')' : ''));
+      return <div style={{ fontSize: 13, color: '#4a148c', marginTop: 2 }}>{bits.join(' · ')}</div>;
+    }
+    function KbPdpRetFixSheet({ r, mode, session, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const co = useKbClientOrders(mode === 'edit' ? r.site : '', r.clientEmail || '', r.clientName && r.clientName !== 'Produit non attribué' ? r.clientName : '', 28);
+      const [srcOrder, setSrcOrder] = React.useState(null);
+      React.useEffect(() => { if (mode !== 'edit' || !r.srcOrderId || !r.distribDate) return; let stop = false; kbDayOrders(r.distribDate).then(l => { if (!stop) setSrcOrder(l.find(o => String(o.orderId) === String(r.srcOrderId)) || null); }); return () => { stop = true; }; }, [r.id]);
+      const groups = React.useMemo(() => {
+        if (srcOrder) return [{ day: r.distribDate, order: srcOrder }];
+        const l = co.list.filter(x => !r.distribDate || x.day === r.distribDate);
+        return l.length ? l : co.list;
+      }, [srcOrder, co.list]);
+      const [pick, setPick] = React.useState(null); // { produit, producteur, max }
+      const [free, setFree] = React.useState('');
+      const [qty, setQty] = React.useState(Number(r.qty) || 1);
+      const [why, setWhy] = React.useState(''); const [txt, setTxt] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const by = session.name, now = new Date().toISOString();
+      const saveEdit = async () => {
+        const produit = pick ? pick.produit : free.trim(), producteur = pick ? (pick.producteur || '') : '';
+        if (!produit) { showToast('Choisis le bon produit'); return; }
+        setBusy(true);
+        try {
+          const before = `${r.produit || r.productLabel}${(r.qty || 1) > 1 ? ' ×' + r.qty : ''}`;
+          const patch = { produit, producteur, productKey: `${producteur}|${produit}`, productLabel: producteur ? `${produit} (${producteur})` : produit, qty: Math.max(1, Number(qty) || 1),
+            editedBy: by, editedAt: now, editedFrom: before, editHist: [...(r.editHist || []), { at: now, by, from: before }].slice(-10), updatedAt: now };
+          await storage.setDoc('pdp_returns', r.id, patch);
+          if (r.anomalyId && r.day) { try { await storage.setDoc(`day_${r.day}_anomalies`, r.anomalyId, { productKey: patch.productKey, productLabel: patch.productLabel, retourQty: patch.qty, editedByMaster: by, editedAt: now }); } catch (_) {} }
+          if (r.dlc) { try { await storage.setDoc('dlc_watch', r.id, { produit, producteur }); } catch (_) {} }
+          if (r.status === 'treated') { try { await storage.setDoc('losses', `lossret_${r.id}`, { produit, producteur, productKey: patch.productKey, quantity: patch.qty }); } catch (_) {} }
+          showToast('✏️ Produit corrigé : ' + produit);
+          onClose();
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const saveRemove = async () => {
+        const reason = [why, txt.trim()].filter(Boolean).join(' · ');
+        if (!reason) { showToast('Raison obligatoire'); return; }
+        setBusy(true);
+        try {
+          await storage.setDoc('app_config', 'pdpret_removed_' + todayKey().slice(0, 7), { items: { [r.id]: { ...r, removedBy: by, removedAt: now, removedReason: reason } } });
+          await storage.deleteDoc('pdp_returns', r.id);
+          try { await storage.deleteDoc('losses', `lossret_${r.id}`); } catch (_) {}
+          try { await storage.deleteDoc('dlc_watch', r.id); } catch (_) {}
+          showToast('🚫 Retiré du suivi (' + reason + ')');
+          onClose();
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      return (
+        <KbSheet title={(mode === 'edit' ? '✏️ Corriger le produit — ' : '🚫 Retirer du suivi — ') + (r.produit || r.productLabel)} onClose={onClose}>
+          <div style={{ fontSize: 15, marginBottom: 6 }}><b>{r.site}</b> · actuellement : <b>{r.produit || r.productLabel}{(r.qty || 1) > 1 ? ' ×' + r.qty : ''}</b></div>
+          <KbPdpRetOrigin r={r} />
+          {mode === 'edit' ? <>
+            <div style={{ fontSize: 15, fontWeight: 700, margin: '10px 0 6px' }}>Le bon produit (commande du client) :</div>
+            {co.loading && !srcOrder && <div>Chargement des commandes…</div>}
+            {!co.loading && !groups.length && <div style={{ fontSize: 14, color: 'var(--ink-mute)' }}>Commande introuvable (client non rattaché) → écris le produit ci-dessous.</div>}
+            {groups.map(({ day, order }) => (
+              <div key={order.orderId + day} style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-mute)' }}>📅 {formatDateShort(day)} · {displayName(order)} · n° {order.orderId}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
+                  {(order.items || []).map((it, i) => { const on = pick && pick.produit === it.produit && pick.producteur === (it.producteur || ''); return (
+                    <button key={i} type="button" onClick={() => { setPick({ produit: it.produit, producteur: it.producteur || '', max: Number(it.qty) || 1 }); setFree(''); setQty(q => Math.min(Math.max(1, q), Number(it.qty) || 1)); }}
+                      style={{ textAlign: 'left', minHeight: 46, padding: '6px 10px', borderRadius: 10, border: '2px solid ' + (on ? '#1565c0' : 'var(--line)'), background: on ? '#e3f2fd' : '#fff', fontSize: 15, fontWeight: on ? 800 : 600 }}>
+                      {on ? '☑️ ' : '⬜ '}{it.produit}{(Number(it.qty) || 1) > 1 ? ' ×' + it.qty : ''} <small style={{ color: 'var(--ink-mute)', fontWeight: 400 }}>{it.producteur || ''}</small></button>); })}
+                </div>
+              </div>))}
+            <input type="text" value={free} onChange={e => { setFree(e.target.value); if (e.target.value) setPick(null); }} placeholder="ou écrire le produit (hors commande)…" style={{ width: '100%', minHeight: 44, marginTop: 4 }} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+              <b>Quantité</b>
+              <button type="button" className="btn-secondary" style={{ minWidth: 44, minHeight: 44 }} onClick={() => setQty(q => Math.max(1, q - 1))}>−</button>
+              <b style={{ fontSize: 20 }}>{qty}</b>
+              <button type="button" className="btn-secondary" style={{ minWidth: 44, minHeight: 44 }} onClick={() => setQty(q => q + 1)}>+</button>
+            </div>
+            <button type="button" className="btn-primary" disabled={busy} onClick={saveEdit} style={{ width: '100%', minHeight: 56, fontSize: 18, fontWeight: 800, marginTop: 12 }}>{busy ? '⏳…' : '✏️ Enregistrer la correction'}</button>
+          </> : <>
+            <div style={{ fontSize: 14, margin: '10px 0 6px', color: '#b71c1c', fontWeight: 700 }}>Le retour disparaît du suivi (chauffeur, entrepôt, alertes). Il est gardé en archive avec la raison.</div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {KB_RET_RM_REASONS.map(x => <span key={x} className={'chip' + (why === x ? ' selected' : '')} style={{ cursor: 'pointer' }} onClick={() => setWhy(w => w === x ? '' : x)}>{x}</span>)}
+            </div>
+            <input type="text" value={txt} onChange={e => setTxt(e.target.value)} placeholder="ou écrire la raison…" style={{ width: '100%', minHeight: 44, marginTop: 8 }} />
+            <button type="button" className="btn-primary" disabled={busy} onClick={saveRemove} style={{ width: '100%', minHeight: 56, fontSize: 18, fontWeight: 800, marginTop: 12, background: '#c62828', borderColor: '#c62828' }}>{busy ? '⏳…' : '🚫 Retirer du suivi'}</button>
+          </>}
+        </KbSheet>);
+    }
+    // V11.08 — BOUTIQUE : demander la récupération des ROLLS VIDES (rolls de la distrib remplis en prépa) en retour PDP.
+    //   Crée un retour PDP « 🛒 Rolls vides ×N » : le chauffeur DOIT le cocher récupéré, l'entrepôt confirme « reçus ».
+    function KbRollsReturnCard({ session, site }) {
+      const showToast = React.useContext(ToastContext);
+      const [all, setAll] = React.useState([]);
+      const [n, setN] = React.useState(1);
+      const [busy, setBusy] = React.useState(false);
+      React.useEffect(() => storage.subscribe('pdp_returns', a => setAll((a || []).filter(r => r.kind === 'rolls' && r.site === site && r.status !== 'treated'))), [site]);
+      if (!site) return null;
+      const send = async () => {
+        if (!window.confirm(`Demander au chauffeur de récupérer ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à ${site} ?`)) return;
+        setBusy(true);
+        try {
+          const id = `pdpret_rolls_${site}_${Date.now()}`, now = new Date().toISOString();
+          await storage.setDoc('pdp_returns', id, { id, kind: 'rolls', site, produit: '🛒 Rolls vides', producteur: '', productKey: 'ROLLS', productLabel: '🛒 Rolls vides', qty: n, clientName: '', dlc: '',
+            pickupDate: nextDistribDateForSite(site, activeDay()) || '', remark: 'Rolls vides à ramener à PDP', day: activeDay(), status: 'pending', createdBy: session.name, createdAt: now, updatedAt: now });
+          showToast(`🛒 Demande envoyée : ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à récupérer`);
+          setN(1);
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      return (
+        <div className="card" style={{ border: '3px solid #6d4c41', background: '#efebe9' }}>
+          <div style={{ fontSize: 19, fontWeight: 800, color: '#4e342e' }}>🛒 Rolls vides à faire récupérer</div>
+          <div style={{ fontSize: 14, marginTop: 2 }}>Les rolls de la distrib sont vides ? Le chauffeur devra les ramener à PDP.</div>
+          {all.map(r => <div key={r.id} style={{ fontSize: 14, fontWeight: 700, marginTop: 6, color: r.status === 'recovered' ? '#2e7d32' : '#e65100' }}>{r.status === 'recovered' ? '✅' : '⏳'} {r.qty} roll{r.qty > 1 ? 's' : ''} · demandé par {r.createdBy} le {formatDateShort(String(r.createdAt || '').slice(0, 10))}{r.status === 'recovered' ? ' · récupéré par ' + (r.recoveredBy || 'le chauffeur') : ' · en attente du chauffeur'}</div>)}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+            <button type="button" className="btn-secondary" style={{ minWidth: 52, minHeight: 52, fontSize: 22 }} onClick={() => setN(x => Math.max(1, x - 1))}>−</button>
+            <b style={{ fontSize: 26, minWidth: 30, textAlign: 'center' }}>{n}</b>
+            <button type="button" className="btn-secondary" style={{ minWidth: 52, minHeight: 52, fontSize: 22 }} onClick={() => setN(x => x + 1)}>+</button>
+            <button type="button" className="btn-primary" disabled={busy} onClick={send} style={{ flex: 1, minHeight: 56, fontSize: 17, fontWeight: 800, background: '#6d4c41', borderColor: '#6d4c41' }}>{busy ? '⏳…' : `🛒 Demander la récupération (${n})`}</button>
+          </div>
+        </div>);
+    }
+
     function PdpReturnsPage({ session, catalogue }) {
       const showToast = React.useContext(ToastContext);
       const B = useKbPdpBoard();
       const [busy, setBusy] = React.useState(false);
       const [recoverOpen, setRecoverOpen] = React.useState(false); // V10.02 (+) — « À récupérer aux boutiques » en plein écran
       const [mDest, setMDest] = React.useState(null); // V11.05 — master : ligne dont on choisit la destination
+      const [fix, setFix] = React.useState(null); // V11.08 — { r, mode:'edit'|'rm' }
       const isDriver = session.role === 'pdp' && kbIsPdpDriver();
       // V9.95 — présence chauffeur : retours récupérés aujourd'hui / total
       React.useEffect(() => {
@@ -27534,6 +27670,11 @@
           dlc: dlc || '', robSentDate: nav ? nav.date : '', remark, day: activeDay(), fromReturn: true,
           createdBy: session.name, createdAt: now(), updatedAt: now(),
         });
+      };
+      const treatRolls = async (r) => {
+        setBusy(true);
+        try { await storage.setDoc('pdp_returns', r.id, { status: 'treated', destination: 'rolls', treatedBy: session.name, treatedAt: now() }); showToast(`🛒 ${r.qty || 1} roll(s) reçu(s) à PDP`); }
+        catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
       const treatManual = async (r, dest) => {
         setBusy(true);
@@ -27731,12 +27872,15 @@
                     <b style={{ fontSize: 17 }}>{r.produit || r.productLabel}{(r.qty || 1) > 1 ? ' ×' + r.qty : ''}</b>
                     <span style={{ fontSize: 13, fontWeight: 700, color: sc }}>{sl}{r.status === 'treated' && KB_DEST_UI[r.destination] ? ' → ' + KB_DEST_UI[r.destination].label : ''}</span>
                   </div>
-                  <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{r.clientName ? r.clientName + ' · ' : ''}{r.dlc ? 'DLC ' + formatDateShort(r.dlc) : 'DLC ?'}{r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}{r.treatedBy ? ' · traité par ' + r.treatedBy : ''}{r.remark ? ' · « ' + r.remark + ' »' : ''}</div>
+                  <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{r.kind === 'rolls' ? '' : (r.dlc ? 'DLC ' + formatDateShort(r.dlc) : 'DLC ?')}{r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}{r.treatedBy ? ' · traité par ' + r.treatedBy : ''}{r.remark ? ' · « ' + r.remark + ' »' : ''}</div>
+                  {r.kind !== 'rolls' && <KbPdpRetOrigin r={r} />}
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                    {r.status !== 'treated' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)')}
+                    {r.status !== 'treated' && r.kind !== 'rolls' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)')}
+                    {r.status === 'recovered' && r.kind === 'rolls' && btn('✓ Rolls reçus à PDP', () => treatRolls(r), '#6d4c41')}
                     {(r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0')}
                     {r.status === 'treated' && btn('↩️ Annuler le traitement', () => masterUndo(r), '#ef6c00')}
-                    {btn('🗑️ Supprimer', () => deleteManual(r), 'var(--danger)')}
+                    {r.kind !== 'rolls' && btn('✏️ Corriger le produit', () => setFix({ r, mode: 'edit' }), '#4a148c')}
+                    {btn('🚫 Retirer du suivi', () => setFix({ r, mode: 'rm' }), 'var(--danger)')}
                   </div>
                   {destRow(r.id, r.dlc, (d) => treatManual(r, d))}
                 </div>); })}
@@ -27761,6 +27905,7 @@
       };
       return (
         <div className="stack" style={{ marginTop: 10 }}>
+          {fix && <KbPdpRetFixSheet key={fix.r.id + fix.mode} r={fix.r} mode={fix.mode} session={session} onClose={() => setFix(null)} />}
           <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP · à traiter</h1>
           {!B.ready && <p>Chargement…</p>}
           {masterPanel()}
@@ -27780,8 +27925,15 @@
                 <div style={{ fontSize: 23, fontWeight: 700 }}>{r.produit || r.productLabel}{(r.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{r.qty}</span> : ''}</div>
                 <span style={{ background: kbSiteColor(r.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700, height: 'fit-content' }}>{r.site}</span>
               </div>
-              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>{r.producteur ? r.producteur + ' · ' : ''}{r.dlc ? <>DLC <b>{formatDateShort(r.dlc)}</b></> : 'DLC non renseignée'}{r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}</div>
-              {!B.nyToday(r.id) && <DestButtons dlc={r.dlc} onPick={(d) => treatManual(r, d)} />}
+              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>{r.kind === 'rolls' ? 'Rolls vides de la distrib' : <>{r.producteur ? r.producteur + ' · ' : ''}{r.dlc ? <>DLC <b>{formatDateShort(r.dlc)}</b></> : 'DLC non renseignée'}</>}{r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}</div>
+              {r.kind !== 'rolls' && <KbPdpRetOrigin r={r} />}
+              {isMaster && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                {r.kind !== 'rolls' && <button className="btn-secondary" style={{ fontSize: 14, color: '#4a148c', borderColor: '#4a148c' }} onClick={() => setFix({ r, mode: 'edit' })}>✏️ Corriger le produit</button>}
+                <button className="btn-secondary" style={{ fontSize: 14, color: 'var(--danger)', borderColor: 'var(--danger)' }} onClick={() => setFix({ r, mode: 'rm' })}>🚫 Retirer du suivi</button>
+              </div>}
+              {!B.nyToday(r.id) && (r.kind === 'rolls'
+                ? <button disabled={busy} onClick={() => treatRolls(r)} style={{ width: '100%', minHeight: 64, marginTop: 10, fontSize: 20, fontWeight: 800, borderRadius: 14, border: 'none', background: '#6d4c41', color: '#fff' }}>✓ Rolls reçus à PDP</button>
+                : <DestButtons dlc={r.dlc} onPick={(d) => treatManual(r, d)} />)}
               <NotYetBar id={r.id} info={{ produit: r.produit || r.productLabel, site: r.site, qty: r.qty || 1, recoveredBy: r.recoveredBy, recoveredAt: r.recoveredAt }} />
             </div>
           ))}
