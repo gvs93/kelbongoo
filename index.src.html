@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.08';
+    const APP_VERSION = 'V11.09';
+    // V11.09 — (10/11/2026) Inventaire : plus de références en double (fiches catalogue en double fusionnées : ligne déjà comptée > active > plus récente) ; rapprochement feuille de stock → catalogue par ID d'abord ; liste et menu fournisseurs = articles ACTIFS uniquement (avant : tout le catalogue, inactifs compris, quand la feuille de stock n'était pas lue).
     // V11.08 — (09/11/2026) Retours PDP : origine visible (client, commande du, n°, signalé par) ; Master « ✏️ Corriger le produit » (choisi dans la commande d'origine, ou texte) + « 🚫 Retirer du suivi » avec raison (archive app_config/pdpret_removed_<mois>) ; pdp_returns garde srcOrderId / distribDate / clientEmail. Boutiques : « 🛒 Rolls vides à faire récupérer » (Qualité + Clôture) → retour PDP kind 'rolls' : le chauffeur coche récupéré, l'entrepôt « ✓ Rolls reçus à PDP » (sans perte).
     // V11.07 — (09/11/2026) Master › SAV : section « ↩️ Retours » (commandes non récupérées / retour PDP : clic → contenu + décision PAR ARTICLE : retour PDP · partage équipe · garder · récupéré · jeter → pertes + consigne push au lieu ; Retours PDP entrepôt intégrés). Menu master réorganisé (Commande pain sous Aujourd'hui ; « Clients · prépa · distrib » : Chargement en haut, SAV, Push, Historique, Facturation web, Synchro ancien site en bas ; F&L : contrôle seul / Inventaire & ajout F&L ; Camion Rungis sous Stats équipes ; Horaires boutiques + commande en bas de Réglages ; Mails clients et Qui fait quoi retirés du menu). Push mail clients : distribution du jour OU du lendemain. Chargement des commandes : plus de rechargement, on reste sur la page ; « Commandes TXT Progmag » retiré. Commande pain : « ✅ Commande passée » + suivi. Report ancien site à la clôture prépa : lancé tout de suite + relance auto (postes master/prépa) + alerte Aujourd'hui. Sélecteur master : « 🚛 Vue chauffeur ».
     // V11.06 — (09/11/2026) Qualité : client choisi → « 📅 Date de distribution » (ses commandes des 3 dernières semaines sur le lieu) → on COCHE les produits de SA commande (quantité, DLC par produit) ; une anomalie par produit (oubli : un seul mail client avec tous les produits) ; « en trop » / client sans commande : liste produits comme avant. Non-récupérés (distrib + Master) : « Retour PDP » ouvre le choix des produits retournés (quantité ajustable) ; chaque produit non retourné exige une raison (choix rapide ou texte) → followups.pdpNotReturned ; le chauffeur et l'entrepôt ne voient que les produits retournés.
@@ -9289,39 +9290,69 @@
         } catch(e){}
       };
 
-      // Univers d'inventaire : si la feuille de stock a été lue → uniquement ses produits
-      // (col E), enrichis depuis le cache par correspondance de nom (NFD/minuscule). Un produit
-      // de la feuille absent du cache reste saisissable (sans code-barres). Sinon → cache complet.
-      const universe = React.useMemo(() => {
-        if (!stockProducts) return products;
-        const byName = {};
-        for (const p of products) { const k = normalizeText(p.name || ''); if (k) byName[k] = p; }
-        const seen = new Set(); const out = [];
+      // V11.09 — Univers d'inventaire RÉÉCRIT (doublons + fournisseurs inactifs) :
+      //   • feuille de stock lue → ses produits, rapprochés au cache par ID d'abord (règle « l'ID est le pivot »),
+      //     puis par nom (+ fournisseur s'il est fourni) ;
+      //   • sinon (repli cache) → UNIQUEMENT les produits ACTIFS du catalogue (avant : tout le catalogue, inactifs compris) ;
+      //   • dans les deux cas, une seule ligne par fournisseur + produit : les fiches en double du catalogue
+      //     (ré-import juin 2026 = 2 ObjectId pour le même article) sont fusionnées. Ligne gardée : celle déjà
+      //     comptée > l'active > la plus récente (date de l'ObjectId). Les fiches écartées sont comptées (invDup).
+      const invActiveKnown = React.useMemo(() => products.some(p => p.active === true), [products]);
+      const invIsActive = React.useCallback((p) => !invActiveKnown || (p && p.active !== false), [invActiveKnown]);
+      const invCountedKey = Object.keys(counts).sort().join(',');
+      const { universe, invDup } = React.useMemo(() => {
+        const counted = new Set(invCountedKey ? invCountedKey.split(',') : []);
+        const oidTs = (id) => /^[0-9a-f]{24}$/i.test(String(id || '')) ? parseInt(String(id).slice(0, 8), 16) : 0;
+        const better = (a, b) => {
+          const ca = counted.has(String(a.id)), cb = counted.has(String(b.id));
+          if (ca !== cb) return ca ? a : b;
+          const aa = invIsActive(a), ab = invIsActive(b);
+          if (aa !== ab) return aa ? a : b;
+          return oidTs(b.id) > oidTs(a.id) ? b : a;
+        };
+        const nk = (x) => normalizeText(String(x || '')).replace(/\s+/g, ' ').trim();
+        const keyOf = (p) => nk(p.producer) + '|' + nk(p.name);
+        const dedup = (list) => {
+          const m = new Map(); let dup = 0;
+          for (const p of list) {
+            if (!p || !nk(p.name)) continue;
+            const k = keyOf(p);
+            if (m.has(k)) { dup++; m.set(k, better(m.get(k), p)); } else m.set(k, p);
+          }
+          return { list: [...m.values()], dup };
+        };
+        if (!stockProducts) {
+          const r = dedup(products.filter(invIsActive));
+          return { universe: r.list, invDup: r.dup };
+        }
+        const byId = {}; const byName = {};
+        for (const p of products) {
+          byId[String(p.id)] = p;
+          const k = nk(p.name); if (!k) continue;
+          (byName[k] = byName[k] || []).push(p);
+        }
+        const raw = [];
         for (const sp of stockProducts) {
           const name = sp && sp.name ? sp.name : '';
-          const k = normalizeText(name);
-          if (!k || seen.has(k)) continue;
-          seen.add(k);
-          const match = byName[k];
+          const k = nk(name);
+          if (!k) continue;
+          let match = sp.id ? byId[String(sp.id)] : null;
+          if (!match && byName[k]) {
+            let cands = byName[k];
+            const spProd = nk(sp.producteur);
+            if (spProd) { const same = cands.filter(c => nk(c.producer) === spProd); if (same.length) cands = same; }
+            match = cands.reduce((a, b) => better(a, b));
+          }
           if (match) {
-            // Produit du cache : on garde ses champs, en complétant catégorie/famille
-            // depuis la feuille si le cache ne les a pas.
-            out.push({
-              ...match,
-              category: match.category || (sp.category || ''),
-              family: match.family || (sp.family || ''),
-            });
+            raw.push({ ...match, category: match.category || (sp.category || ''), family: match.family || (sp.family || '') });
           } else {
-            // Produit présent dans la feuille mais absent du cache : saisissable quand même
-            // (sans code-barres), avec la catégorie/famille fournies par la feuille.
-            out.push({
-              id: 'stk_' + k.replace(/\s+/g, '_'), name,
-              producer: '', category: sp.category || '', family: sp.family || '', _stockOnly: true,
-            });
+            // Produit de la feuille absent du cache : saisissable quand même (sans code-barres).
+            raw.push({ id: 'stk_' + k.replace(/\s+/g, '_'), name, producer: sp.producteur || '', category: sp.category || '', family: sp.family || '', _stockOnly: true });
           }
         }
-        return out;
-      }, [stockProducts, products]);
+        const r = dedup(raw);
+        return { universe: r.list, invDup: r.dup };
+      }, [stockProducts, products, invIsActive, invCountedKey]);
 
       const producers = React.useMemo(() => {
         const s = new Set(); for (const p of universe) if (p.producer) s.add(p.producer);
@@ -9420,8 +9451,9 @@
           const ids = new Set(base.map(p => p.id));
           for (const p of products) {
             if (!p || !p.name || ids.has(p.id) || have.has(normalizeText(p.name))) continue;
+            if (!invIsActive(p)) continue; // V11.09 — jamais d'article inactif
             if (invType === 'tournant' && scopeValue && !inScope(p)) continue;
-            if (kbSearchMatch(p.name + ' ' + (p.producer||'') + ' ' + (p.family||'') + ' ' + (p.category||''), q)) filtered.push({ ...p, _horsFeuille: true });
+            if (kbSearchMatch(p.name + ' ' + (p.producer||'') + ' ' + (p.family||'') + ' ' + (p.category||''), q)) { have.add(normalizeText(p.name)); filtered.push({ ...p, _horsFeuille: true }); }
           }
         }
         const fam = p => (p.family || p.famille || '');
@@ -9438,7 +9470,7 @@
         // Produits de la feuille d'abord, puis ceux du catalogue hors feuille.
         filtered.sort((a, b) => (a._horsFeuille ? 1 : 0) - (b._horsFeuille ? 1 : 0));
         return filtered.slice(0, 800);
-      }, [search, products, universe, invType, scopeProducts, invSort, stockProducts, inScope, scopeValue]);
+      }, [search, products, universe, invType, scopeProducts, invSort, stockProducts, inScope, scopeValue, invIsActive]);
 
       // Pour associer un code inconnu : on cherche dans TOUT le catalogue (pas seulement le périmètre)
       const assocMatches = React.useMemo(() => {
@@ -9799,7 +9831,7 @@
             )}
             {(invType === 'complet' || invType === 'tournant') && stockNote && (
               <div style={{fontSize:11,color: stockNote.startsWith('⚠️') ? 'var(--danger)' : 'var(--ink-mute)', marginTop:4}}>
-                {stockProducts ? `📋 ${stockProducts.length} produits actifs · ` : ''}{stockNote}
+                {`📋 ${universe.length} produits actifs · `}{invDup > 0 ? `🔁 ${invDup} fiche(s) en double fusionnée(s) · ` : ''}{stockNote}
               </div>
             )}
             {invType === 'tournant' && (
