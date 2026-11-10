@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.09) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.11) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.09';
+const APP_VERSION = 'V11.11';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -11774,7 +11774,8 @@ function BarcodeScanner({
 function QtyInput({
   value,
   onCommit,
-  style
+  style,
+  inputRef
 }) {
   const [str, setStr] = React.useState(value ? String(value) : '');
   const focused = React.useRef(false);
@@ -11787,6 +11788,7 @@ function QtyInput({
     onCommit(s === '' ? 0 : parseInt(s, 10));
   };
   return React.createElement("input", {
+    ref: inputRef,
     type: "number",
     inputMode: "numeric",
     min: "0",
@@ -14084,6 +14086,20 @@ function InventoryPage({
     for (const p of universe) if (p.producer) s.add(p.producer);
     return [...s].sort((a, b) => a.localeCompare(b, 'fr'));
   }, [universe]);
+  const tournantProducers = React.useMemo(() => {
+    const tot = {},
+      chz = {};
+    for (const p of universe) {
+      if (!p.producer) continue;
+      tot[p.producer] = (tot[p.producer] || 0) + 1;
+      if (kbInvIsCheese(p)) chz[p.producer] = (chz[p.producer] || 0) + 1;
+    }
+    const cheese = new Set(Object.keys(tot).filter(pr => chz[pr] && chz[pr] === tot[pr]));
+    return {
+      list: producers.filter(pr => !cheese.has(pr)),
+      hidden: cheese.size
+    };
+  }, [producers, universe]);
   const categories = React.useMemo(() => {
     const s = new Set();
     for (const p of universe) if (p.category) s.add(p.category);
@@ -14174,6 +14190,63 @@ function InventoryPage({
       });
     } catch (e) {}
   };
+  const [lastChange, setLastChange] = React.useState(null);
+  const qtyRefs = React.useRef({});
+  const changeCount = (productId, qty) => {
+    if (invLocked) {
+      showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier');
+      return;
+    }
+    const q = Math.max(0, parseInt(qty, 10) || 0);
+    const cur = counts[productId];
+    setLastChange(prev => {
+      const now = Date.now();
+      const same = prev && prev.id === productId && now - prev.at < 8000;
+      return {
+        id: productId,
+        name: prodById[productId]?.name || productId,
+        before: same ? prev.before : cur,
+        after: q,
+        at: now
+      };
+    });
+    setCount(productId, q);
+  };
+  const undoLastChange = async () => {
+    const lc = lastChange;
+    if (!lc) return;
+    if (invLocked) {
+      showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier');
+      return;
+    }
+    setLastChange(null);
+    if (lc.before === undefined || lc.before === null) {
+      setCounts(prev => {
+        const n = {
+          ...prev
+        };
+        delete n[lc.id];
+        return n;
+      });
+      try {
+        await storage.deleteDoc(`inventory_${invDate}_${mode}`, lc.id);
+      } catch (e) {
+        showToast('⚠️ Annulation non enregistrée — vérifie la connexion');
+        return;
+      }
+    } else {
+      await setCount(lc.id, lc.before);
+    }
+    showToast(`↩️ ${lc.name} : remis à ${lc.before === undefined || lc.before === null ? 'non compté' : lc.before}`);
+  };
+  React.useEffect(() => {
+    if (!lastChange) return;
+    const t = setTimeout(() => setLastChange(null), 15000);
+    return () => clearTimeout(t);
+  }, [lastChange]);
+  React.useEffect(() => {
+    setLastChange(null);
+  }, [invDate, mode]);
   const matches = React.useMemo(() => {
     const baseAll = invType === 'tournant' ? scopeProducts : universe;
     const base = baseAll.filter(p => {
@@ -14983,10 +15056,18 @@ function InventoryPage({
     }
   }, React.createElement("option", {
     value: ""
-  }, "— Choisir un producteur (", producers.length, ") —"), producers.map(pr => React.createElement("option", {
+  }, "— Choisir un producteur (", tournantProducers.list.length, ") —"), tournantProducers.list.map(pr => React.createElement("option", {
     key: pr,
     value: pr
-  }, pr))), scopeKind === 'type' && React.createElement("div", {
+  }, pr)), scopeValue && !tournantProducers.list.includes(scopeValue) && React.createElement("option", {
+    value: scopeValue
+  }, scopeValue)), scopeKind === 'producer' && tournantProducers.hidden > 0 && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "🧀 ", tournantProducers.hidden, " producteur(s) 100 % fromage pas listé(s) ici → ils se comptent dans le périmètre « 🧀 Fromage »."), scopeKind === 'type' && React.createElement("div", {
     className: "filter-row",
     style: {
       marginBottom: 0
@@ -15420,7 +15501,42 @@ function InventoryPage({
       color: 'var(--ink-mute)',
       marginBottom: 6
     }
-  }, matches.length, " produit(s)", matches.some(p => p._horsFeuille) ? ` dont ${matches.filter(p => p._horsFeuille).length} hors feuille de stock` : '', " · touche ", React.createElement("strong", null, "−"), " / ", React.createElement("strong", null, "+"), " ou tape le nombre. « Stock 0 » si vide."), React.createElement("div", {
+  }, matches.length, " produit(s)", matches.some(p => p._horsFeuille) ? ` dont ${matches.filter(p => p._horsFeuille).length} hors feuille de stock` : '', " · touche ", React.createElement("strong", null, "+"), " / ", React.createElement("strong", null, "−"), ", ou touche le nom pour taper le nombre. « Stock 0 » si vide."), lastChange && React.createElement("div", {
+    style: {
+      position: 'sticky',
+      top: 0,
+      zIndex: 5,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      marginBottom: 6,
+      padding: '10px 12px',
+      borderRadius: 12,
+      background: '#fffde7',
+      border: '2px solid #f9a825'
+    }
+  }, React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0,
+      fontSize: 15,
+      fontWeight: 700,
+      wordBreak: 'break-word'
+    }
+  }, lastChange.name, " : ", lastChange.before === undefined || lastChange.before === null ? '—' : lastChange.before, " → ", lastChange.after), React.createElement("button", {
+    onClick: undoLastChange,
+    style: {
+      flex: '0 0 auto',
+      fontSize: 16,
+      fontWeight: 800,
+      padding: '10px 14px',
+      borderRadius: 10,
+      border: '2px solid #f57f17',
+      background: '#fff',
+      color: '#e65100',
+      cursor: 'pointer'
+    }
+  }, "↩️ Annuler")), React.createElement("div", {
     className: "stack",
     style: {
       gap: 4,
@@ -15450,10 +15566,13 @@ function InventoryPage({
       }
     }, React.createElement("button", {
       onClick: () => {
-        try {
-          navigator.vibrate && navigator.vibrate(15);
-        } catch (_) {}
-        setCount(p.id, (counts[p.id] ?? 0) + 1);
+        const el = qtyRefs.current[p.id];
+        if (el) {
+          try {
+            el.focus();
+            el.select();
+          } catch (_) {}
+        }
       },
       style: {
         minWidth: 0,
@@ -15495,27 +15614,26 @@ function InventoryPage({
       style: {
         fontSize: 13,
         fontWeight: 700,
-        color: '#2e7d32',
+        color: 'var(--ink-mute)',
         marginTop: 3
       }
-    }, "👆 touche = +1 ", kbIsFLProduct(p) ? 'colis' : 'article', invLv && invLv.levels && invLv.levels[p.id] ? React.createElement("span", {
+    }, "en ", kbIsFLProduct(p) ? 'colis' : 'articles', invLv && invLv.levels && invLv.levels[p.id] ? React.createElement("span", {
       style: {
-        color: 'var(--ink-mute)',
         fontWeight: 600
       }
     }, " · théorique ", Math.round(invLv.levels[p.id].stock)) : null)), React.createElement("div", {
       style: {
         display: 'flex',
         alignItems: 'center',
-        gap: 5,
+        gap: 6,
         flex: '0 0 auto'
       }
     }, React.createElement("button", {
-      onClick: () => setCount(p.id, Math.max(0, (counts[p.id] ?? 0) - 1)),
+      onClick: () => changeCount(p.id, Math.max(0, (counts[p.id] ?? 0) - 1)),
       "aria-label": "moins",
       style: {
         width: 52,
-        height: 56,
+        height: 60,
         fontSize: 30,
         fontWeight: 700,
         lineHeight: 1,
@@ -15525,25 +15643,48 @@ function InventoryPage({
         cursor: 'pointer'
       }
     }, "−"), React.createElement(QtyInput, {
+      inputRef: el => {
+        if (el) qtyRefs.current[p.id] = el;else delete qtyRefs.current[p.id];
+      },
       value: counts[p.id] ?? 0,
-      onCommit: q => setCount(p.id, q),
+      onCommit: q => changeCount(p.id, q),
       style: {
         width: 68,
-        height: 56,
+        height: 60,
         textAlign: 'center',
         fontSize: 28,
         fontWeight: 700,
         padding: 0,
         borderRadius: 12
       }
-    }))), React.createElement("div", {
+    }), React.createElement("button", {
+      onClick: () => {
+        try {
+          navigator.vibrate && navigator.vibrate(15);
+        } catch (_) {}
+        changeCount(p.id, (counts[p.id] ?? 0) + 1);
+      },
+      "aria-label": "plus",
+      style: {
+        width: 52,
+        height: 60,
+        fontSize: 30,
+        fontWeight: 700,
+        lineHeight: 1,
+        borderRadius: 12,
+        border: '2px solid #2e7d32',
+        background: '#e8f5e9',
+        color: '#1b5e20',
+        cursor: 'pointer'
+      }
+    }, "+"))), React.createElement("div", {
       style: {
         display: 'flex',
         gap: 8,
         marginTop: 8
       }
     }, React.createElement("button", {
-      onClick: () => setCount(p.id, 0),
+      onClick: () => changeCount(p.id, 0),
       style: {
         fontSize: 13,
         padding: '7px 16px',
