@@ -785,8 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.13';
+    const APP_VERSION = 'V11.14';
     // V11.12 — (10/11/2026) Inventaire › DLC : plus d'enregistrement au moindre changement (iPhone pré-remplit la date du jour → DLC « aujourd'hui » fantômes dans Suivi DLC) ; bouton « ✓ Valider DLC jj/mm », DLC du jour à confirmer, une seule DLC par produit et par inventaire (les précédentes encore à traiter sont supprimées). Ligne produit repensée pour iPhone : nom pleine largeur, − / nombre / + sur toute la largeur.
+    // V11.14 — (10/11/2026) DLC : pertes DLC 10-11/11 du mardi = règle « prochaine distrib + 3 » seule → le vendredi (distrib sam.) ces DLC passaient, puis plus de navette avant mardi. ANTICIPATION : retiré dès le vendredi (navette ROB 18h) tout ce qui ne sera plus vendable au prochain contrôle sans navette avant la DLC ; exception fournisseur La Belle Blonde J+4 ; Master › Plus › 📅 Règles DLC (règles en cours + simulation + modification, app_config/dlc_rules) ; « Écoulé » → « ✅ Vendu · pas de perte » (plus de « conseil » affiché) ; mail DLC à rr@ : lien vers le Sheet « DLC retirées » (1 onglet/jour, ordre de la feuille de stock, colonne à coller dans PURGE — KBG_DlcSheet.gs dans KBG STOCK PROXY) ; mails clients (clôture prépa + rappel du jour) : bandeau orange en gros « ⚠️ ATTENTION · HORAIRE EXCEPTIONNEL » (ou lieu fermé) + objet préfixé, si le lieu a un horaire exceptionnel ce jour-là
     // V11.13 — (10/11/2026) Inventaire : clôture BLOQUÉE si le classeur n'a pas reçu tous les comptages (classeur vide du 10/11 = colonne « _id » de la feuille de stock non reconnue par le proxy → corrigé côté serveur v-proxy 11/11) ; Master › F&L : un produit « vendu mais Non actif » passé Actif disparaît tout de suite de la liste (mémorisé, partagé) au lieu d'attendre le relevé horaire
     // V11.11 — (10/11/2026) Tournant « par producteur » : seuls les producteurs 100 % fromage sont retirés (un seul produit non-fromage → reste listé, ex. Gaborit). Plus de liste d'exceptions.
     // V11.10 — (10/11/2026) Inventaire anti-erreur : toucher le nom ne fait plus +1 (ouvre la saisie du nombre) ; gros boutons − / nombre / + ; « ↩️ Annuler » la dernière modif (15 s, les touches rapprochées sur un même produit = une seule annulation). Tournant « par producteur » : sans les producteurs de fromage (comptés dans 🧀 Fromage), sauf Gaborit.
@@ -1335,11 +1336,64 @@
     // Le mardi (ou mercredi si raté) = palette dispatch. Le jeudi = navette pour la distrib
     // ROB du jeudi. Le vendredi = LA grosse navette pertes (FL invendu inclus) pour samedi ROB.
     // V9.91 — navettes Robespierre : mercredi, jeudi, vendredi soir (bilan global ; personne à l'entrepôt avant mardi)
-    const NAVETTE_ROB = [
-      { dow: 3, hour: 13, label: 'mercredi 13h' },
-      { dow: 4, hour: 13, label: 'jeudi 13h' },
-      { dow: 5, hour: 18, label: 'vendredi 18h' },
-    ];
+    // V11.14 — RÈGLES DLC éditables (Master › Plus › 📅 Règles DLC) → app_config/dlc_rules
+    //   minDays = DLC mini du client le jour de la distrib (J+3) · exceptions fournisseur (La Belle Blonde J+4)
+    //   navettes ROB (jour + heure) · jours du contrôle « À retirer » du matin · anticipe = retirer AVANT un trou sans navette.
+    const KB_DOW_FR = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+    const KB_DLC_RULES_DEFAULT = {
+      minDays: 3,
+      exceptions: [{ nom: 'La Belle Blonde', jours: 4 }],
+      navettes: [{ dow: 3, hour: 13 }, { dow: 4, hour: 13 }, { dow: 5, hour: 18 }],
+      checkDow: [2, 3, 4, 5],
+      anticipe: true,
+    };
+    function kbDlcRulesNorm(r) {
+      const d = KB_DLC_RULES_DEFAULT; r = r || {};
+      const minDays = Math.max(0, Math.min(15, Math.round(Number(r.minDays)))); 
+      const exceptions = (Array.isArray(r.exceptions) ? r.exceptions : d.exceptions)
+        .map(x => ({ nom: String((x && x.nom) || '').trim(), jours: Math.max(0, Math.min(15, Math.round(Number(x && x.jours) || 0))) }))
+        .filter(x => x.nom && x.jours);
+      const navettes = (Array.isArray(r.navettes) && r.navettes.length ? r.navettes : d.navettes)
+        .map(n => ({ dow: Math.round(Number(n.dow)), hour: Math.max(0, Math.min(23, Math.round(Number(n.hour) || 0))) }))
+        .filter(n => n.dow >= 0 && n.dow <= 6)
+        .sort((a, b) => a.dow - b.dow || a.hour - b.hour);
+      const checkDow = (Array.isArray(r.checkDow) && r.checkDow.length ? r.checkDow : d.checkDow).map(Number).filter(x => x >= 0 && x <= 6);
+      return { minDays: isNaN(minDays) ? d.minDays : minDays, exceptions, navettes: navettes.length ? navettes : d.navettes, checkDow, anticipe: r.anticipe === undefined ? d.anticipe : !!r.anticipe, updatedBy: r.updatedBy || '', updatedAt: r.updatedAt || '' };
+    }
+    function kbNavLabel(n) { return `${KB_DOW_FR[n.dow]} ${n.hour}h`; }
+    let _kbDlcRules = kbDlcRulesNorm(KB_DLC_RULES_DEFAULT), _kbDlcRulesAt = 0;
+    let NAVETTE_ROB = _kbDlcRules.navettes.map(n => ({ ...n, label: kbNavLabel(n) }));
+    function kbDlcRules() { return _kbDlcRules; }
+    function kbDlcRulesApply(r) {
+      _kbDlcRules = kbDlcRulesNorm(r);
+      NAVETTE_ROB = _kbDlcRules.navettes.map(n => ({ ...n, label: kbNavLabel(n) }));
+      try { window.dispatchEvent(new CustomEvent('kb:dlc-rules')); } catch (e) {}
+      return _kbDlcRules;
+    }
+    async function kbDlcRulesLoad(force) {
+      if (!force && _kbDlcRulesAt && Date.now() - _kbDlcRulesAt < 60000) return _kbDlcRules;
+      try { const d = await storage.getDoc('app_config', 'dlc_rules'); if (d) kbDlcRulesApply(d); _kbDlcRulesAt = Date.now(); } catch (_) {}
+      return _kbDlcRules;
+    }
+    // Recharge la page quand les règles changent (dlc board, popup, réglages)
+    function useKbDlcRules() {
+      const [, tick] = React.useState(0);
+      React.useEffect(() => {
+        const h = () => tick(x => x + 1);
+        window.addEventListener('kb:dlc-rules', h);
+        kbDlcRulesLoad().then(h);
+        return () => window.removeEventListener('kb:dlc-rules', h);
+      }, []);
+      return _kbDlcRules;
+    }
+    const kbNormLoose = (x) => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    // DLC mini (jours) qu'un client doit avoir le jour de la distrib pour CE produit
+    function kbDlcMinDays(i) {
+      const r = _kbDlcRules; let n = r.minDays;
+      const pr = kbNormLoose(i && i.producteur), pd = kbNormLoose(i && i.produit);
+      for (const x of r.exceptions) { const k = kbNormLoose(x.nom); if (k && (pr.includes(k) || (!pr && pd.includes(k)))) n = Math.max(n, x.jours); }
+      return n;
+    }
     // Renvoie la DERNIÈRE navette ROB qui part un jour STRICTEMENT antérieur à la DLC
     // et encore à venir par rapport à "now". null si aucune → le produit doit être partagé.
     function lastNavetteBeforeDLC(dlcKey, now) {
@@ -3337,6 +3391,9 @@
       _kbSameDayAt = Date.now();
       return _kbSameDay;
     }
+    // V11.14 — règles DLC chargées tôt (navettes ROB utilisées partout : retours PDP, pertes, historique)
+    setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 2500);
+    setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 15000);
     async function kbSameDayOpen(day) {
       await kbSameDayLoad();
       if (!kbIsSameDay(day)) return false;
@@ -17315,6 +17372,22 @@
       return { rel: '', future: day > t };
     }
     // ---- rendu HTML (mail) ----
+    // V11.14 — HORAIRE EXCEPTIONNEL du lieu ce jour-là (Lieux & horaires › horaires exceptionnels) → bandeau en gros dans les mails clients
+    function kbCmExc(lieu, day, site) {
+      if (!lieu || site === 'DOM') return null;
+      const ex = lieu.exc && lieu.exc[day]; if (!ex) return null;
+      const dow = new Date(day + 'T12:00:00').getDay();
+      const usual = kbSlotParse(((lieu.hours || {})[dow]) || '');
+      const fmt = (h) => h ? `${h.start.replace(':', 'h')} – ${h.end.replace(':', 'h')}` : '';
+      const p = ex.hours ? kbSlotParse(ex.hours) : null;
+      return { closed: !!ex.closed, hours: fmt(p), usual: fmt(usual), note: String(ex.note || '') };
+    }
+    function kbCmExcHtml(x, day) {
+      if (!x) return '';
+      const titre = x.closed ? '⚠️ ATTENTION · LIEU FERMÉ CE JOUR' : '⚠️ ATTENTION · HORAIRE EXCEPTIONNEL';
+      const corps = x.closed ? `Le lieu est exceptionnellement <b>fermé</b> le ${kbEsc(kbCmDate(day))}.` : `Le ${kbEsc(kbCmDate(day))}, retrait <b style="font-size:24px">${kbEsc(x.hours)}</b>${x.usual && x.usual !== x.hours ? `<br><span style="font-size:15px">au lieu de ${kbEsc(x.usual)} habituellement</span>` : ''}`;
+      return `<tr><td style="padding:16px 22px 0"><div style="background:#fff3e0;border:4px solid #ef6c00;border-radius:14px;padding:14px 16px;text-align:center;color:#7a3300"><div style="font-size:22px;font-weight:900;color:#e65100;letter-spacing:.5px">${titre}</div><div style="font-size:18px;margin-top:6px;line-height:1.4">${corps}</div>${x.note ? `<div style="font-size:15px;margin-top:6px;color:#555">${kbEsc(x.note)}</div>` : ''}</div></td></tr>`;
+    }
     function kbMailHtml(kind, day, c, lieu, hours) {
       const G = '#2e7d32', jour = kbCmDate(day);
       const first = c.firstname || String(c.name).split(' ')[0];
@@ -17375,6 +17448,7 @@
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f1ec;padding:16px 0"><tr><td align="center">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:14px;overflow:hidden">
 <tr><td style="background:${G};padding:16px 22px;color:#fff;font-size:22px;font-weight:900">🥬 Kelbongoo<div style="font-size:14px;font-weight:600;opacity:.9;margin-top:2px">${kind === 'cloture' ? `Votre commande a été préparée · retrait le ${kbEsc(jour)}` : 'Rappel : votre commande vous attend aujourd\'hui'}</div></td></tr>
+${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 <tr><td style="padding:20px 22px 4px;font-size:15px;line-height:1.5">${intro}</td></tr>
 <tr><td style="padding:14px 22px"><div style="border:3px solid ${G};border-radius:14px;padding:14px 16px;text-align:center;background:#f1f8e9">${casBox}${lieuBox}</div></td></tr>
 <tr><td style="padding:0 22px"><table width="100%" cellpadding="0" cellspacing="0">${sections}</table></td></tr>
@@ -17393,6 +17467,7 @@
       }
       L.push(kind === 'cloture' ? `Notre équipe vient de préparer votre commande${kbCmWhen(day).rel ? ' de ' + kbCmWhen(day).rel : ''}. ${c.site === 'DOM' ? 'Livraison' : 'À retirer'} le ${kbCmDate(day)}${horaire ? ' ' + horaire : ''}${kbCmWhen(day).future && c.site !== 'DOM' ? ' (pas avant)' : ''}.` : `Votre commande vous attend aujourd'hui${horaire ? ' ' + horaire : ''}.`);
       if (c.site !== 'DOM') L.push(`CASIER${c.casiers.length > 1 ? 'S' : ''} : ${c.casiers.join(' · ') || '-'}`, `Lieu : ${(lieu && lieu.name) || c.site} (${c.site})${lieu && lieu.adresse ? ' - ' + lieu.adresse : ''}${horaire ? ' - ' + horaire : ''}`);
+      { const x = kbCmExc(lieu, day, c.site); if (x) L.splice(2, 0, x.closed ? `!!! ATTENTION : LIEU FERMÉ le ${kbCmDate(day)} !!!` : `!!! ATTENTION · HORAIRE EXCEPTIONNEL le ${kbCmDate(day)} : ${x.hours}${x.usual && x.usual !== x.hours ? ' (au lieu de ' + x.usual + ')' : ''} !!!${x.note ? ' ' + x.note : ''}`, ''); }
       const sec = (t, arr, fn) => { if (arr.length) { L.push('', t); arr.forEach(l => L.push('- ' + fn(l))); } };
       const q = (l) => l.repl ? `${l.qty > 1 ? l.qty + ' x ' : ''}${l.repl.to} (REMPLACEMENT de ${l.product}, indisponible)` : `${l.qty > 1 ? l.qty + ' x ' : ''}${l.product}`;
       sec(c.site === 'DOM' ? 'Votre commande :' : 'Dans votre casier :', c.casier, l => q(l) + (l.rem ? ` (remise -${l.rem.pct}%)` : '')); // V10.80 — aussi dans le rappel
@@ -17421,16 +17496,17 @@
         const tag = cfg.mode === 'live' ? '' : `[TEST → ${realTo}] `;
         const base = { date: day, site: c.site, client: c.name };
         const cas = c.site === 'DOM' ? '' : ` · casier${c.casiers.length > 1 ? 's' : ''} ${c.casiers.join('·')}`;
+        const excTag = kbCmExc(lieu, day, c.site) ? '⚠️ HORAIRE EXCEPTIONNEL · ' : ''; // V11.14
         if (!startMs || now < startMs) {
           mails.push({ ...base, key: `${day}|cloture|${c.site}|${c.name}`, type: 'cloture', to, sendAt: new Date(now).toISOString(),
-            subject: c.allRupt ? `${tag}Kelbongoo · commande du ${kbCmDate(day)} en rupture · rien à retirer, rien de débité` : `${tag}Kelbongoo · commande préparée · ${c.site === 'DOM' ? 'livrée' : 'à retirer'} le ${kbCmDate(day)}${cas}`, // V10.80 — plus « est prête » (clients venus trop tôt)
+            subject: c.allRupt ? `${tag}Kelbongoo · commande du ${kbCmDate(day)} en rupture · rien à retirer, rien de débité` : `${tag}${excTag}Kelbongoo · commande préparée · ${c.site === 'DOM' ? 'livrée' : 'à retirer'} le ${kbCmDate(day)}${cas}`, // V10.80 — plus « est prête » (clients venus trop tôt)
             htmlBody: kbMailHtml('cloture', day, c, lieu, hours), body: kbMailText('cloture', day, c, lieu, hours) });
         }
         if (!hours) { noHours.add(c.site); return; }
         if (now > endMs) return;
         if (c.allRupt) { mails.push(kbCmNeutral(day, 'rappel', c.site, c.name)); return; } // V11.04 — pas de « votre commande vous attend »
         mails.push({ ...base, key: `${day}|rappel|${c.site}|${c.name}`, type: 'rappel', to, sendAt: new Date(startMs - 60 * 60000).toISOString(),
-          subject: `${tag}Kelbongoo · rappel : à récupérer aujourd'hui ${hours.start.replace(':', 'h')}-${hours.end.replace(':', 'h')}${c.site === 'DOM' ? '' : ' · ' + ((lieu && lieu.name) || c.site)}${cas}`,
+          subject: `${tag}${excTag}Kelbongoo · rappel : à récupérer aujourd'hui ${hours.start.replace(':', 'h')}-${hours.end.replace(':', 'h')}${c.site === 'DOM' ? '' : ' · ' + ((lieu && lieu.name) || c.site)}${cas}`,
           htmlBody: kbMailHtml('rappel', day, c, lieu, hours), body: kbMailText('rappel', day, c, lieu, hours) });
       });
       const ghosts = cfg.mode === 'test' ? [] : kbClientMailsGhosts(data); // V11.04 — rappels des clients retirés du JSON
@@ -27170,6 +27246,124 @@
       );
     }
 
+    // ============================================================
+    // V11.14 — MASTER › PLUS › 📅 RÈGLES DLC (app_config/dlc_rules)
+    //   Règles en cours (en clair + simulation des prochains contrôles) et modification.
+    // ============================================================
+    function kbDlcThresholdFor(day, ex) {
+      // 1re DLC conservée en rayon au contrôle de « day » (toutes celles avant sont à retirer)
+      for (let k = 0; k <= 20; k++) { const dlc = addDays(day, k); if (!kbDlcToRemove({ dlc, producteur: ex || '' }, day)) return dlc; }
+      return null;
+    }
+    function KbDlcRulesPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const rules = useKbDlcRules();
+      const [f, setF] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      React.useEffect(() => { kbDlcRulesLoad(true).then(r => setF(JSON.parse(JSON.stringify(r)))); }, []);
+      const today = todayKey();
+      const sim = React.useMemo(() => {
+        const out = []; let d = today;
+        for (let k = 0; k < 8 && out.length < 4; k++, d = addDays(d, 1)) {
+          if (!rules.checkDow.includes(kbDow(d))) continue;
+          const keep = kbDlcThresholdFor(d, '');
+          const nd = kbNextDistribDay(d);
+          const base = addDays(nd, rules.minDays);
+          out.push({ d, nd, keep, early: keep && keep > base, ex: rules.exceptions.map(x => ({ nom: x.nom, keep: kbDlcThresholdFor(d, x.nom) })) });
+        }
+        return out;
+      }, [rules, today]);
+      if (!f) return <p style={{ color: 'var(--ink-mute)' }}>Chargement…</p>;
+      const set = (k, v) => setF(o => ({ ...o, [k]: v }));
+      const save = async () => {
+        setBusy(true);
+        try {
+          const clean = kbDlcRulesNorm({ ...f, minDays: Number(f.minDays) });
+          const doc = { minDays: clean.minDays, exceptions: clean.exceptions, navettes: clean.navettes, checkDow: clean.checkDow, anticipe: clean.anticipe, updatedBy: session.name || '', updatedAt: new Date().toISOString() };
+          await storage.setDoc('app_config', 'dlc_rules', doc, { replace: true });
+          kbDlcRulesApply(doc); _kbDlcRulesAt = Date.now(); setF(JSON.parse(JSON.stringify(kbDlcRules())));
+          showToast('✓ Règles DLC enregistrées — appliquées partout');
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const big = { fontSize: 17, fontWeight: 700 };
+      const inp = { fontSize: 17, padding: '8px 10px', borderRadius: 10, border: '2px solid var(--line)', minHeight: 44 };
+      return (
+        <div className="stack">
+          <h1 style={{ margin: 0 }}>📅 Règles DLC</h1>
+
+          <div className="card" style={{ border: '3px solid #2e7d32', background: '#f1f8f1' }}>
+            <div style={{ ...big, fontSize: 20, marginBottom: 8 }}>✅ Règles en cours</div>
+            <div style={{ fontSize: 16, lineHeight: 1.6 }}>
+              <div>👤 Le client doit avoir une DLC ≥ <b>J+{rules.minDays}</b> le jour de sa distribution.</div>
+              {rules.exceptions.map((x, k) => <div key={k}>📏 <b>{x.nom}</b> : DLC ≥ <b>J+{x.jours}</b></div>)}
+              <div>🚚 Navettes ROB : <b>{rules.navettes.map(kbNavLabel).join(' · ')}</b></div>
+              <div>🧹 Contrôle « À retirer » du matin : <b>{rules.checkDow.slice().sort().map(d => KB_DOW_FR[d]).join(', ')}</b></div>
+              <div>⏩ Anticipation avant un trou sans navette : <b>{rules.anticipe ? 'OUI' : 'non'}</b> {rules.anticipe && <span style={{ color: 'var(--ink-mute)' }}>(ex. vendredi : on retire ce qui serait perdu mardi)</span>}</div>
+              {rules.updatedBy && <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Modifié par {rules.updatedBy}{rules.updatedAt ? ' le ' + new Date(rules.updatedAt).toLocaleString('fr-FR') : ''}</div>}
+            </div>
+          </div>
+
+          <div className="card">
+            <div style={{ ...big, marginBottom: 8 }}>🔮 Ce que ça donne aux prochains contrôles</div>
+            {sim.map(x => (
+              <div key={x.d} style={{ padding: '8px 0', borderTop: '1px solid var(--line)', fontSize: 16 }}>
+                <b style={{ textTransform: 'capitalize' }}>{dayLabelShort(x.d)}</b> (distrib du {formatDateShort(x.nd)}) → on retire toute DLC <b>avant le {x.keep ? formatDateShort(x.keep) : '?'}</b>
+                {x.early && <span style={{ color: '#6e4a9c', fontWeight: 700 }}> · ⏩ anticipé (dernière navette avant le trou)</span>}
+                {x.ex.map(e => <div key={e.nom} style={{ fontSize: 14, color: '#6e4a9c' }}>📏 {e.nom} : avant le {e.keep ? formatDateShort(e.keep) : '?'}</div>)}
+              </div>
+            ))}
+          </div>
+
+          <div className="card stack" style={{ gap: 12 }}>
+            <div style={{ ...big, fontSize: 20 }}>✏️ Modifier</div>
+            <label style={big}>DLC mini client (jours) <input type="number" min="0" max="15" value={f.minDays} onChange={e => set('minDays', e.target.value)} style={{ ...inp, width: 90, marginLeft: 8 }} /></label>
+
+            <div>
+              <div style={big}>📏 Exceptions fournisseur</div>
+              {(f.exceptions || []).map((x, k) => (
+                <div key={k} style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+                  <input value={x.nom} placeholder="Fournisseur" onChange={e => set('exceptions', f.exceptions.map((y, j) => j === k ? { ...y, nom: e.target.value } : y))} style={{ ...inp, flex: 1 }} />
+                  <span style={big}>J+</span><input type="number" min="1" max="15" value={x.jours} onChange={e => set('exceptions', f.exceptions.map((y, j) => j === k ? { ...y, jours: e.target.value } : y))} style={{ ...inp, width: 70 }} />
+                  <button className="btn-secondary" onClick={() => set('exceptions', f.exceptions.filter((_, j) => j !== k))}>🗑️</button>
+                </div>
+              ))}
+              <button className="btn-secondary" style={{ marginTop: 6 }} onClick={() => set('exceptions', [...(f.exceptions || []), { nom: '', jours: 4 }])}>➕ Ajouter un fournisseur</button>
+            </div>
+
+            <div>
+              <div style={big}>🚚 Navettes ROB</div>
+              {(f.navettes || []).map((n, k) => (
+                <div key={k} style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+                  <select value={n.dow} onChange={e => set('navettes', f.navettes.map((y, j) => j === k ? { ...y, dow: Number(e.target.value) } : y))} style={inp}>
+                    {KB_DOW_FR.map((l, d) => <option key={d} value={d}>{l}</option>)}
+                  </select>
+                  <input type="number" min="0" max="23" value={n.hour} onChange={e => set('navettes', f.navettes.map((y, j) => j === k ? { ...y, hour: e.target.value } : y))} style={{ ...inp, width: 70 }} /><span style={big}>h</span>
+                  <button className="btn-secondary" onClick={() => set('navettes', f.navettes.filter((_, j) => j !== k))}>🗑️</button>
+                </div>
+              ))}
+              <button className="btn-secondary" style={{ marginTop: 6 }} onClick={() => set('navettes', [...(f.navettes || []), { dow: 5, hour: 18 }])}>➕ Ajouter une navette</button>
+            </div>
+
+            <div>
+              <div style={big}>🧹 Jours du contrôle du matin</div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                {[1, 2, 3, 4, 5, 6, 0].map(d => { const on = (f.checkDow || []).includes(d); return (
+                  <button key={d} className={on ? 'btn-primary' : 'btn-secondary'} style={{ textTransform: 'capitalize' }}
+                    onClick={() => set('checkDow', on ? f.checkDow.filter(x => x !== d) : [...(f.checkDow || []), d])}>{KB_DOW_FR[d]}</button>); })}
+              </div>
+            </div>
+
+            <label style={{ ...big, display: 'flex', gap: 10, alignItems: 'center' }}>
+              <input type="checkbox" checked={!!f.anticipe} onChange={e => set('anticipe', e.target.checked)} style={{ width: 26, height: 26 }} />
+              ⏩ Retirer à l'avance ce qui serait perdu au prochain contrôle (dernière navette avant un trou)
+            </label>
+
+            <button className="btn-primary" disabled={busy} onClick={save} style={{ minHeight: 56, fontSize: 19 }}>{busy ? 'Enregistrement…' : '💾 Enregistrer les règles'}</button>
+          </div>
+        </div>
+      );
+    }
+
     function SuiviGeneralPage({ session }) {
       // V10.48 — le menu est désormais unique (KB_MNAV : barre latérale PC / barre du bas + puces mobile).
       const [sub, setSub] = React.useState(() => { try { const v = localStorage.getItem('kbg_suivi_sub') || 'ca'; return KB_MSUBS.includes(v) ? v : 'ca'; } catch (e) { return 'ca'; } });
@@ -27191,6 +27385,7 @@
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
           {sub === 'factweb' && <KbFacturationWebPage />}
           {sub === 'horaires' && <KbHorairesCommandePage />}
+          {sub === 'dlcrules' && <KbDlcRulesPage session={session} />}
           {sub === 'rungis' && <><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'invfl' && <div className="stack"><h1 style={{ margin: '0 0 4px' }}>📦 Inventaire &amp; ajout F&amp;L</h1><FlInventorySuiviCard session={session} /><FlRuptureCard session={session} /></div>}
           {sub === 'live' && <KbLivePage />}
@@ -33268,14 +33463,37 @@
       const same = String(dlc).slice(0, 4) === String(today || todayKey()).slice(0, 4);
       return same ? formatDateShort(dlc) : `${dlc.slice(8, 10)}/${dlc.slice(5, 7)}/${dlc.slice(0, 4)}`;
     }
-    // À retirer : DLC < prochaine distrib + 3 (ou date illisible → à vérifier au rayon)
+    // À retirer : DLC < prochaine distrib + J (J = 3, ou exception fournisseur) — date illisible → à vérifier au rayon
+    // V11.14 — + ANTICIPATION : si au PROCHAIN contrôle du matin (ex. vendredi → mardi) le produit ne sera plus
+    //   vendable ET qu'aucune navette ROB ne partira plus avant sa DLC, on le retire AUJOURD'HUI (dernière navette utile).
+    //   Ex. ven. 06/11 : DLC 10/11 ou 11/11 → vendable sam. 07/11 mais perdu mardi (plus de navette) → ROB vendredi 18h.
+    function kbNextCheckDay(today) {
+      const dows = _kbDlcRules.checkDow;
+      let d = addDays(today, 1);
+      for (let k = 0; k < 10; k++) { if (dows.includes(kbDow(d))) return d; d = addDays(d, 1); }
+      return null;
+    }
+    function kbDlcAnticipe(i, today, need) {
+      if (!_kbDlcRules.anticipe || !kbDlcValid(i.dlc)) return null;
+      const nc = kbNextCheckDay(today);
+      if (!nc) return null;
+      const nd2 = kbNextDistribDay(nc);
+      if (dlcDaysLeft(i.dlc, nd2) >= need) return null;                 // encore vendable après le prochain contrôle
+      if (kbFirstNavetteBeforeDLC(i.dlc, new Date(nc + 'T05:00:00'))) return null; // une navette rattrapera encore au prochain contrôle
+      const now = today === todayKey() ? new Date() : new Date(today + 'T05:00:00');
+      const nav = kbFirstNavetteBeforeDLC(i.dlc, now);
+      if (!nav) return null;                                            // plus de navette de toute façon : on laisse vendre
+      return { nextCheck: nc, navette: nav };
+    }
     function kbDlcToRemove(i, today) {
       if (!kbDlcValid(i.dlc)) return true;
-      return dlcDaysLeft(i.dlc, kbNextDistribDay(today)) < 3;
+      const need = kbDlcMinDays(i);
+      if (dlcDaysLeft(i.dlc, kbNextDistribDay(today)) < need) return true;
+      return !!kbDlcAnticipe(i, today, need);
     }
     function kbHhmm(iso) { try { return new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }).replace(':', 'h'); } catch (e) { return ''; } }
     const kbMorningId = (d) => '_morning_' + d;
-    const KB_DLC_MORNING_DOW = [2, 3, 4, 5];
+    // V11.14 — jours du contrôle du matin = règles DLC (Master › Plus › Règles DLC)
 
     // Stock par produit (feuille de stock du jour de distrib) — cache par date, silencieux si l'action n'existe pas
     function useStockLevels(date) {
@@ -33330,6 +33548,7 @@
 
     // Tableau commun (page, popup, hub, clôture)
     function useDlcBoard() {
+      const rules = useKbDlcRules();
       const [items, setItems] = React.useState(null);
       React.useEffect(() => storage.subscribe('dlc_watch', (arr) => setItems(arr || [])), []);
       const today = todayKey();
@@ -33339,12 +33558,13 @@
         const morning = items.find(i => i.id === kbMorningId(today)) || null;
         const real = items.filter(i => !String(i.id || '').startsWith('_'));
         const list = real.filter(i => (!i.status || i.status === 'watch') && i.dlc && kbDlcToRemove(i, today))
-          .map(i => ({ ...i, days: kbDlcValid(i.dlc) ? dlcDaysLeft(i.dlc, today) : null }))
+          .map(i => { const need = kbDlcMinDays(i); const early = kbDlcValid(i.dlc) && dlcDaysLeft(i.dlc, nextDistrib) >= need ? kbDlcAnticipe(i, today, need) : null;
+            return { ...i, need, early, days: kbDlcValid(i.dlc) ? dlcDaysLeft(i.dlc, today) : null }; })
           .sort((a, b) => String(a.dlc).localeCompare(String(b.dlc)) || String(a.produit).localeCompare(String(b.produit)));
         const done = real.filter(i => i.retirerDay === today && i.status && i.status !== 'watch')
           .sort((a, b) => String(b.resolvedAt || '').localeCompare(String(a.resolvedAt || '')));
         return { ready: true, list, done, total: list.length, morning, today, nextDistrib };
-      }, [items, today]);
+      }, [items, today, rules]);
     }
 
     // ---- Récap mail « DLC traitées » (style Rungis : gros, lisible) ----
@@ -33359,26 +33579,44 @@
         byNav[k].map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))).join('');
       return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
         + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>`
-        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Rien trouvé', vide.length, '#2e7d32')}</tr></table>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Vendu · pas de perte', vide.length, '#2e7d32')}</tr></table>`
+        + (m && m.sheetUrl ? `<a href="${kbEsc(m.sheetUrl)}" style="display:block;margin-top:14px;background:#ef6c00;color:#fff;text-decoration:none;border-radius:12px;padding:16px 18px;font-size:20px;font-weight:900;text-align:center">📋 Ouvrir la feuille « DLC retirées » du jour<br><span style="font-size:14px;font-weight:400">colonne orange = à copier-coller dans la colonne PURGE de la feuille de stock${m.sheetUnmatched ? ' · ⚠️ ' + m.sheetUnmatched + ' produit(s) à saisir à la main' : ''}</span></a>` : (m && m.sheetErr ? `<div style="margin-top:12px;color:#c62828;font-size:13px">⚠️ Feuille « DLC retirées » non générée : ${kbEsc(m.sheetErr)}</div>` : ''))
         + robHtml
         + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
-        + sec('✅ Rien trouvé en rayon', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
+        + sec('✅ Vendu · pas de perte', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))
         + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
     }
     function kbDlcRecapText(day, done) {
       const L = [`DLC du jour traitées — ${kbCmDate(day)}`, ''];
-      done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'rien trouvé en rayon'}`));
+      done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'vendu, pas de perte'}`));
       return L.join('\n');
     }
     async function kbSendDlcRecap(day, done, m, by) {
       if (!done.length) return { ok: false, error: 'rien de traité aujourd’hui' };
       const rob = done.filter(i => i.status === 'rob').length, part = done.filter(i => i.status === 'perte').length;
+      // V11.14 — Sheet « DLC retirées » (1 onglet / jour, ordre de la feuille de stock) → lien en gros dans le mail
+      const sh = await kbDlcSheetWrite(day, done, by);
+      m = { ...(m || {}), sheetUrl: sh.url || '', sheetErr: sh.ok ? '' : sh.error, sheetUnmatched: (sh.unmatched || []).length };
       let r;
-      try { r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_DLC_RECAP_TO, subject: `📅 DLC traitées ${formatDateShort(day)} · ${rob} ROB · ${part} partage`, body: kbDlcRecapText(day, done), htmlBody: kbDlcRecapHtml(day, done, m) }); }
+      try { r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_DLC_RECAP_TO, subject: `📅 DLC traitées ${formatDateShort(day)} · ${rob} ROB · ${part} partage`, body: kbDlcRecapText(day, done) + (sh.url ? `\n\nFeuille DLC retirées (à coller dans PURGE) : ${sh.url}` : ''), htmlBody: kbDlcRecapHtml(day, done, m) }); }
       catch (e) { r = { ok: false, error: e.message }; }
       const ok = !!(r && r.ok);
-      try { await storage.setDoc('dlc_watch', kbMorningId(day), { id: kbMorningId(day), day, mailSentAt: ok ? new Date().toISOString() : '', mailErr: ok ? '' : String((r && r.error) || 'inconnue'), mailBy: by || '' }); } catch (_) {}
+      try { await storage.setDoc('dlc_watch', kbMorningId(day), { id: kbMorningId(day), day, sheetUrl: sh.url || '', mailSentAt: ok ? new Date().toISOString() : '', mailErr: ok ? '' : String((r && r.error) || 'inconnue'), mailBy: by || '' }); } catch (_) {}
       return { ok, error: ok ? '' : String((r && r.error) || 'inconnue') };
+    }
+
+    // V11.14 — écrit l'onglet du jour du Sheet « DLC retirées » (proxy stock, action dlc_sheet_day / KBG_DlcSheet.gs)
+    async function kbDlcSheetWrite(day, done, by) {
+      const rows = (done || []).map(i => ({
+        produit: i.produit || '', produitCourt: kbProdName(i.produit || ''), producteur: i.producteur || '', productId: i.productId || '',
+        dlc: i.dlc ? kbDlcFmt(i.dlc, day) : '', qty: (i.status === 'rob' || i.status === 'perte') ? (Number(i.qtyRetired) || 0) : 0,
+        dest: i.status, navette: i.navetteDate ? `${i.navetteLabel || ''} ${formatDateShort(i.navetteDate)}`.trim() : '', by: i.resolvedBy || by || '',
+      }));
+      try {
+        const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'dlc_sheet_day', date: day, rows });
+        if (r && r.ok && r.url) return { ok: true, url: r.url, unmatched: r.unmatched || [] };
+        return { ok: false, error: String((r && r.error) || 'action dlc_sheet_day absente du proxy stock (KBG_DlcSheet.gs à installer)') };
+      } catch (e) { return { ok: false, error: e.message }; }
     }
 
     function KbDlcTabDot() {
@@ -33410,7 +33648,7 @@
       if (!board.ready || !board.total) return null;
       if (board.morning && board.morning.takenBy) return null;
       const now = new Date();
-      if (!KB_DLC_MORNING_DOW.includes(now.getDay()) || now.getHours() < 5) return null;
+      if (!_kbDlcRules.checkDow.includes(now.getDay()) || now.getHours() < 5) return null;
       const valider = async () => {
         const c = String(code).trim();
         if (!c) { setErr('Tape ton code perso'); return; }
@@ -33561,7 +33799,7 @@
         setBusy(true);
         try {
           await storage.setDoc('dlc_watch', i.id, { status: 'ecoule', qtyRetired: 0, retirerDay: today, outcome: 'vide', resolvedAt: new Date().toISOString(), resolvedBy: session.name });
-          muCelebrate(0); showToast(`✅ ${kbProdName(i.produit)} : rien trouvé en rayon`);
+          muCelebrate(0); showToast(`✅ ${kbProdName(i.produit)} : vendu, pas de perte`);
           await finishIfDone(board.total - 1);
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
@@ -33616,7 +33854,7 @@
         <div className="stack" style={{ marginTop: 10 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
             <h1 style={{ margin: 0, fontSize: 28 }}>🧹 À retirer</h1>
-            <span style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'right' }}>Distrib du <b>{formatDateShort(board.nextDistrib)}</b><br />DLC mini <b>{formatDateShort(addDays(board.nextDistrib, 3))}</b></span>
+            <span style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'right' }}>Distrib du <b>{formatDateShort(board.nextDistrib)}</b><br />DLC mini <b>{formatDateShort(addDays(board.nextDistrib, kbDlcRules().minDays))}</b></span>
           </div>
           <DlcMorningBanner board={board} />
           {!showForm && <button onClick={() => setShowForm(true)} style={{ minHeight: 60, fontSize: 19, fontWeight: 700, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', cursor: 'pointer' }}>➕ Produit pas vu à l'inventaire</button>}
@@ -33633,6 +33871,7 @@
               <div style={{ fontSize: 54 }}>🎉</div>
               <div style={{ fontSize: 24, fontWeight: 700, color: '#1b5e20' }}>{doneN ? 'Tout a été traité' : 'Rien à retirer aujourd’hui'}</div>
               {doneN > 0 && <div style={{ fontSize: 14, marginTop: 6, color: '#2e7d32' }}>{board.morning && board.morning.mailSentAt ? `Récap envoyé à rr@ et hg@ à ${kbHhmm(board.morning.mailSentAt)}` : 'Récap pas encore envoyé'}</div>}
+              {doneN > 0 && board.morning && board.morning.sheetUrl && <div style={{ marginTop: 10 }}><a href={board.morning.sheetUrl} target="_blank" rel="noopener" style={{ fontSize: 16, fontWeight: 700, color: '#ef6c00' }}>📋 Feuille « DLC retirées » du jour</a></div>}
               {doneN > 0 && <button className="btn-secondary" style={{ marginTop: 10 }} disabled={busy} onClick={renvoyerRecap}>✉️ {board.morning && board.morning.mailSentAt ? 'Renvoyer' : 'Envoyer'} le récap</button>}
             </div>
           )}
@@ -33649,6 +33888,8 @@
                     {i.producteur && <div style={{ fontSize: 14, color: 'var(--ink-mute)' }}>{i.producteur}</div>}
                     <span style={{ display: 'inline-block', marginTop: 6, background: d != null && d <= 0 ? '#c62828' : '#b26a00', color: '#fff', borderRadius: 10, padding: '4px 12px', fontWeight: 700, fontSize: 17 }}>DLC {kbDlcFmt(i.dlc, today)} · {tag}</span>
                     <DlcRotationLine info={e} today={today} />
+                    {i.need > kbDlcRules().minDays && <div style={{ fontSize: 14, fontWeight: 700, color: '#6e4a9c', marginTop: 4 }}>📏 Règle fournisseur : DLC client ≥ J+{i.need}</div>}
+                    {i.early && <div style={{ fontSize: 15, fontWeight: 700, color: '#6e4a9c', marginTop: 4 }}>⏩ À retirer dès aujourd'hui : au prochain contrôle ({formatDateShort(i.early.nextCheck)}) il ne serait plus vendable et plus aucune navette ROB ne partirait avant la DLC → navette {i.early.navette.label}</div>}
                   </div>
                   <div style={{ textAlign: 'center', minWidth: 86, background: '#c62828', color: '#fff', borderRadius: 14, padding: '6px 8px' }}>
                     <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase' }}>À retirer</div>
@@ -33672,7 +33913,7 @@
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <b>{kbProdName(i.produit)}</b> <span style={{ color: 'var(--ink-mute)' }}>· DLC {kbDlcFmt(i.dlc, today)}</span>
                       <div style={{ fontSize: 13, fontWeight: 600, color: i.status === 'rob' ? '#6e4a9c' : i.status === 'perte' ? '#c62828' : '#2e7d32' }}>
-                        {i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ rien trouvé en rayon'} · {i.resolvedBy} {kbHhmm(i.resolvedAt)}
+                        {i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ vendu, pas de perte'} · {i.resolvedBy} {kbHhmm(i.resolvedAt)}
                       </div>
                     </div>
                     <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => annuler(i)}>Annuler</button>
@@ -33695,7 +33936,7 @@
                   <button onClick={() => setSheet(s => ({ ...s, qty: (Number(s.qty) || 0) + 1 }))} style={{ width: 72, height: 72, fontSize: 40, fontWeight: 700, borderRadius: 16, border: 'none', background: '#2e7d32', color: '#fff' }}>+</button>
                 </div>
                 {Number(sheet.qty) === 0 ? (
-                  <div style={{ marginTop: 14, borderRadius: 14, padding: '12px 14px', background: 'var(--bg-muted)', border: '2px solid var(--line)', fontSize: 17, fontWeight: 700 }}>0 = rien trouvé en rayon (déjà vendu ou déjà retiré)</div>
+                  <div style={{ marginTop: 14, borderRadius: 14, padding: '12px 14px', background: 'var(--bg-muted)', border: '2px solid var(--line)', fontSize: 17, fontWeight: 700 }}>0 = plus rien en rayon = vendu, pas de perte</div>
                 ) : (() => { const r = kbRouteRetrait(kbDlcValid(sheet.i.dlc) ? sheet.i.dlc : '', new Date()); const rob = r.dest === 'pribon' && r.navette; return (
                   <div style={{ marginTop: 14, borderRadius: 14, padding: '12px 14px', background: rob ? '#f3edfb' : '#fdecea', border: '2px solid ' + (rob ? '#6e4a9c' : '#c62828'), fontSize: 18, fontWeight: 700, color: rob ? '#4a148c' : '#b71c1c' }}>
                     {rob ? <>🚚 Mets-les dans la <u>zone ROB</u> · navette {r.navette.label}, {kbCmDate(r.navette.date)}</> : <>🤝 Mets-les dans la <u>cagette partage équipe</u> (plus de navette avant la DLC)</>}
@@ -34184,7 +34425,8 @@
 
       const fmtTime = (iso) => { try { return new Date(iso).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}); } catch(e){ return ''; } };
       const DEST = {
-        done: { label: '✅ Écoulé', color: 'var(--accent-dark)', bg: 'var(--accent-soft)' },
+        done: { label: '✅ Vendu · pas de perte', color: 'var(--accent-dark)', bg: 'var(--accent-soft)' },
+        ecoule: { label: '✅ Vendu · pas de perte', color: 'var(--accent-dark)', bg: 'var(--accent-soft)' },
         rob:  { label: '🚚 ROB (Pribon)', color: 'var(--info)', bg: 'var(--info-soft)' },
         perte:{ label: '🗑️ Perte (partage/jeté)', color: 'var(--danger)', bg: 'var(--danger-soft)' },
       };
@@ -34192,7 +34434,7 @@
       const rows = React.useMemo(() => {
         const resolved = (items || []).filter(i => i.status && i.status !== 'watch' && i.resolvedAt);
         return resolved.map(i => {
-          const reco = i.dlc ? routeByDLC(i.dlc, new Date(i.resolvedAt)) : null;
+          const reco = i.dlc && i.status !== 'ecoule' && i.status !== 'done' ? routeByDLC(i.dlc, new Date(i.resolvedAt)) : null;
           let flag = false, flagWhy = '';
           if (reco) {
             if (i.status === 'rob' && reco.dest === 'partage') { flag = true; flagWhy = "envoyé ROB alors qu'aucune navette ne rattrape la DLC"; }
@@ -34230,7 +34472,7 @@
           )}
           <div className="stat-grid" style={{marginBottom:12}}>
             <div className="stat"><div className="stat-value">{rows.length}</div><div className="stat-label">Produits résolus</div></div>
-            <div className="stat"><div className="stat-value" style={{color:'var(--accent)'}}>{rows.filter(r=>r.status==='done').length}</div><div className="stat-label">Écoulés</div></div>
+            <div className="stat"><div className="stat-value" style={{color:'var(--accent)'}}>{rows.filter(r=>r.status==='done'||r.status==='ecoule').length}</div><div className="stat-label">Vendus (pas de perte)</div></div>
             <div className="stat"><div className="stat-value" style={{color: flagCount?'var(--warn)':'var(--ink-mute)'}}>{flagCount}</div><div className="stat-label">🚩 Divergences</div></div>
           </div>
           {days.map(dk => (
@@ -34250,7 +34492,7 @@
                       </div>
                       <div style={{fontSize:11,color:'var(--ink-mute)',marginTop:4}}>
                         {r.resolvedBy ? `par ${r.resolvedBy}` : ''}{r.resolvedAt ? ` · ${fmtTime(r.resolvedAt)}` : ''}
-                        {r.reco && <span> · conseil : {r.reco.dest==='pribon' ? 'ROB' : 'partage'}</span>}
+                        {r.reco && r.status !== 'ecoule' && r.status !== 'done' && <span> · conseil : {r.reco.dest==='pribon' ? 'ROB' : 'partage'}</span>}
                       </div>
                       {r.flag && <div style={{fontSize:11,color:'var(--warn)',marginTop:3}}>🚩 {r.flagWhy}</div>}
                     </div>
@@ -37487,6 +37729,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         { sub: 'codes', l: 'Codes-barres', ic: '🏷️' },
         { sub: 'lieux', l: 'Lieux & horaires boutiques', ic: '📍' },
         { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
+        { sub: 'dlcrules', l: 'Règles DLC', ic: '📅' },
       ] },
     ];
     // V11.07 — écrans retirés du menu mais toujours accessibles (lien depuis Push / Aujourd'hui)

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.13) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.14) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.13';
+const APP_VERSION = 'V11.14';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -839,19 +839,103 @@ function nextDistribDateForSite(site, fromDayKey) {
   }
   return null;
 }
-const NAVETTE_ROB = [{
-  dow: 3,
-  hour: 13,
-  label: 'mercredi 13h'
-}, {
-  dow: 4,
-  hour: 13,
-  label: 'jeudi 13h'
-}, {
-  dow: 5,
-  hour: 18,
-  label: 'vendredi 18h'
-}];
+const KB_DOW_FR = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+const KB_DLC_RULES_DEFAULT = {
+  minDays: 3,
+  exceptions: [{
+    nom: 'La Belle Blonde',
+    jours: 4
+  }],
+  navettes: [{
+    dow: 3,
+    hour: 13
+  }, {
+    dow: 4,
+    hour: 13
+  }, {
+    dow: 5,
+    hour: 18
+  }],
+  checkDow: [2, 3, 4, 5],
+  anticipe: true
+};
+function kbDlcRulesNorm(r) {
+  const d = KB_DLC_RULES_DEFAULT;
+  r = r || {};
+  const minDays = Math.max(0, Math.min(15, Math.round(Number(r.minDays))));
+  const exceptions = (Array.isArray(r.exceptions) ? r.exceptions : d.exceptions).map(x => ({
+    nom: String(x && x.nom || '').trim(),
+    jours: Math.max(0, Math.min(15, Math.round(Number(x && x.jours) || 0)))
+  })).filter(x => x.nom && x.jours);
+  const navettes = (Array.isArray(r.navettes) && r.navettes.length ? r.navettes : d.navettes).map(n => ({
+    dow: Math.round(Number(n.dow)),
+    hour: Math.max(0, Math.min(23, Math.round(Number(n.hour) || 0)))
+  })).filter(n => n.dow >= 0 && n.dow <= 6).sort((a, b) => a.dow - b.dow || a.hour - b.hour);
+  const checkDow = (Array.isArray(r.checkDow) && r.checkDow.length ? r.checkDow : d.checkDow).map(Number).filter(x => x >= 0 && x <= 6);
+  return {
+    minDays: isNaN(minDays) ? d.minDays : minDays,
+    exceptions,
+    navettes: navettes.length ? navettes : d.navettes,
+    checkDow,
+    anticipe: r.anticipe === undefined ? d.anticipe : !!r.anticipe,
+    updatedBy: r.updatedBy || '',
+    updatedAt: r.updatedAt || ''
+  };
+}
+function kbNavLabel(n) {
+  return `${KB_DOW_FR[n.dow]} ${n.hour}h`;
+}
+let _kbDlcRules = kbDlcRulesNorm(KB_DLC_RULES_DEFAULT),
+  _kbDlcRulesAt = 0;
+let NAVETTE_ROB = _kbDlcRules.navettes.map(n => ({
+  ...n,
+  label: kbNavLabel(n)
+}));
+function kbDlcRules() {
+  return _kbDlcRules;
+}
+function kbDlcRulesApply(r) {
+  _kbDlcRules = kbDlcRulesNorm(r);
+  NAVETTE_ROB = _kbDlcRules.navettes.map(n => ({
+    ...n,
+    label: kbNavLabel(n)
+  }));
+  try {
+    window.dispatchEvent(new CustomEvent('kb:dlc-rules'));
+  } catch (e) {}
+  return _kbDlcRules;
+}
+async function kbDlcRulesLoad(force) {
+  if (!force && _kbDlcRulesAt && Date.now() - _kbDlcRulesAt < 60000) return _kbDlcRules;
+  try {
+    const d = await storage.getDoc('app_config', 'dlc_rules');
+    if (d) kbDlcRulesApply(d);
+    _kbDlcRulesAt = Date.now();
+  } catch (_) {}
+  return _kbDlcRules;
+}
+function useKbDlcRules() {
+  const [, tick] = React.useState(0);
+  React.useEffect(() => {
+    const h = () => tick(x => x + 1);
+    window.addEventListener('kb:dlc-rules', h);
+    kbDlcRulesLoad().then(h);
+    return () => window.removeEventListener('kb:dlc-rules', h);
+  }, []);
+  return _kbDlcRules;
+}
+const kbNormLoose = x => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+function kbDlcMinDays(i) {
+  const r = _kbDlcRules;
+  let n = r.minDays;
+  const pr = kbNormLoose(i && i.producteur),
+    pd = kbNormLoose(i && i.produit);
+  for (const x of r.exceptions) {
+    const k = kbNormLoose(x.nom);
+    if (k && (pr.includes(k) || !pr && pd.includes(k))) n = Math.max(n, x.jours);
+  }
+  return n;
+}
 function lastNavetteBeforeDLC(dlcKey, now) {
   if (!dlcKey) return null;
   now = now || new Date();
@@ -3608,6 +3692,16 @@ async function kbSameDayLoad(force) {
   _kbSameDayAt = Date.now();
   return _kbSameDay;
 }
+setTimeout(() => {
+  try {
+    kbDlcRulesLoad();
+  } catch (e) {}
+}, 2500);
+setTimeout(() => {
+  try {
+    kbDlcRulesLoad();
+  } catch (e) {}
+}, 15000);
 async function kbSameDayOpen(day) {
   await kbSameDayLoad();
   if (!kbIsSameDay(day)) return false;
@@ -32422,6 +32516,27 @@ function kbCmWhen(day) {
     future: day > t
   };
 }
+function kbCmExc(lieu, day, site) {
+  if (!lieu || site === 'DOM') return null;
+  const ex = lieu.exc && lieu.exc[day];
+  if (!ex) return null;
+  const dow = new Date(day + 'T12:00:00').getDay();
+  const usual = kbSlotParse((lieu.hours || {})[dow] || '');
+  const fmt = h => h ? `${h.start.replace(':', 'h')} – ${h.end.replace(':', 'h')}` : '';
+  const p = ex.hours ? kbSlotParse(ex.hours) : null;
+  return {
+    closed: !!ex.closed,
+    hours: fmt(p),
+    usual: fmt(usual),
+    note: String(ex.note || '')
+  };
+}
+function kbCmExcHtml(x, day) {
+  if (!x) return '';
+  const titre = x.closed ? '⚠️ ATTENTION · LIEU FERMÉ CE JOUR' : '⚠️ ATTENTION · HORAIRE EXCEPTIONNEL';
+  const corps = x.closed ? `Le lieu est exceptionnellement <b>fermé</b> le ${kbEsc(kbCmDate(day))}.` : `Le ${kbEsc(kbCmDate(day))}, retrait <b style="font-size:24px">${kbEsc(x.hours)}</b>${x.usual && x.usual !== x.hours ? `<br><span style="font-size:15px">au lieu de ${kbEsc(x.usual)} habituellement</span>` : ''}`;
+  return `<tr><td style="padding:16px 22px 0"><div style="background:#fff3e0;border:4px solid #ef6c00;border-radius:14px;padding:14px 16px;text-align:center;color:#7a3300"><div style="font-size:22px;font-weight:900;color:#e65100;letter-spacing:.5px">${titre}</div><div style="font-size:18px;margin-top:6px;line-height:1.4">${corps}</div>${x.note ? `<div style="font-size:15px;margin-top:6px;color:#555">${kbEsc(x.note)}</div>` : ''}</div></td></tr>`;
+}
 function kbMailHtml(kind, day, c, lieu, hours) {
   const G = '#2e7d32',
     jour = kbCmDate(day);
@@ -32476,6 +32591,7 @@ function kbMailHtml(kind, day, c, lieu, hours) {
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f1ec;padding:16px 0"><tr><td align="center">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:14px;overflow:hidden">
 <tr><td style="background:${G};padding:16px 22px;color:#fff;font-size:22px;font-weight:900">🥬 Kelbongoo<div style="font-size:14px;font-weight:600;opacity:.9;margin-top:2px">${kind === 'cloture' ? `Votre commande a été préparée · retrait le ${kbEsc(jour)}` : 'Rappel : votre commande vous attend aujourd\'hui'}</div></td></tr>
+${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 <tr><td style="padding:20px 22px 4px;font-size:15px;line-height:1.5">${intro}</td></tr>
 <tr><td style="padding:14px 22px"><div style="border:3px solid ${G};border-radius:14px;padding:14px 16px;text-align:center;background:#f1f8e9">${casBox}${lieuBox}</div></td></tr>
 <tr><td style="padding:0 22px"><table width="100%" cellpadding="0" cellspacing="0">${sections}</table></td></tr>
@@ -32494,6 +32610,10 @@ function kbMailText(kind, day, c, lieu, hours) {
   }
   L.push(kind === 'cloture' ? `Notre équipe vient de préparer votre commande${kbCmWhen(day).rel ? ' de ' + kbCmWhen(day).rel : ''}. ${c.site === 'DOM' ? 'Livraison' : 'À retirer'} le ${kbCmDate(day)}${horaire ? ' ' + horaire : ''}${kbCmWhen(day).future && c.site !== 'DOM' ? ' (pas avant)' : ''}.` : `Votre commande vous attend aujourd'hui${horaire ? ' ' + horaire : ''}.`);
   if (c.site !== 'DOM') L.push(`CASIER${c.casiers.length > 1 ? 'S' : ''} : ${c.casiers.join(' · ') || '-'}`, `Lieu : ${lieu && lieu.name || c.site} (${c.site})${lieu && lieu.adresse ? ' - ' + lieu.adresse : ''}${horaire ? ' - ' + horaire : ''}`);
+  {
+    const x = kbCmExc(lieu, day, c.site);
+    if (x) L.splice(2, 0, x.closed ? `!!! ATTENTION : LIEU FERMÉ le ${kbCmDate(day)} !!!` : `!!! ATTENTION · HORAIRE EXCEPTIONNEL le ${kbCmDate(day)} : ${x.hours}${x.usual && x.usual !== x.hours ? ' (au lieu de ' + x.usual + ')' : ''} !!!${x.note ? ' ' + x.note : ''}`, '');
+  }
   const sec = (t, arr, fn) => {
     if (arr.length) {
       L.push('', t);
@@ -32534,6 +32654,7 @@ function kbClientMailsBuild(day, data, cfg, nowMs) {
       client: c.name
     };
     const cas = c.site === 'DOM' ? '' : ` · casier${c.casiers.length > 1 ? 's' : ''} ${c.casiers.join('·')}`;
+    const excTag = kbCmExc(lieu, day, c.site) ? '⚠️ HORAIRE EXCEPTIONNEL · ' : '';
     if (!startMs || now < startMs) {
       mails.push({
         ...base,
@@ -32541,7 +32662,7 @@ function kbClientMailsBuild(day, data, cfg, nowMs) {
         type: 'cloture',
         to,
         sendAt: new Date(now).toISOString(),
-        subject: c.allRupt ? `${tag}Kelbongoo · commande du ${kbCmDate(day)} en rupture · rien à retirer, rien de débité` : `${tag}Kelbongoo · commande préparée · ${c.site === 'DOM' ? 'livrée' : 'à retirer'} le ${kbCmDate(day)}${cas}`,
+        subject: c.allRupt ? `${tag}Kelbongoo · commande du ${kbCmDate(day)} en rupture · rien à retirer, rien de débité` : `${tag}${excTag}Kelbongoo · commande préparée · ${c.site === 'DOM' ? 'livrée' : 'à retirer'} le ${kbCmDate(day)}${cas}`,
         htmlBody: kbMailHtml('cloture', day, c, lieu, hours),
         body: kbMailText('cloture', day, c, lieu, hours)
       });
@@ -32561,7 +32682,7 @@ function kbClientMailsBuild(day, data, cfg, nowMs) {
       type: 'rappel',
       to,
       sendAt: new Date(startMs - 60 * 60000).toISOString(),
-      subject: `${tag}Kelbongoo · rappel : à récupérer aujourd'hui ${hours.start.replace(':', 'h')}-${hours.end.replace(':', 'h')}${c.site === 'DOM' ? '' : ' · ' + (lieu && lieu.name || c.site)}${cas}`,
+      subject: `${tag}${excTag}Kelbongoo · rappel : à récupérer aujourd'hui ${hours.start.replace(':', 'h')}-${hours.end.replace(':', 'h')}${c.site === 'DOM' ? '' : ' · ' + (lieu && lieu.name || c.site)}${cas}`,
       htmlBody: kbMailHtml('rappel', day, c, lieu, hours),
       body: kbMailText('rappel', day, c, lieu, hours)
     });
@@ -50007,6 +50128,322 @@ function KbHorairesCommandePage() {
     }
   }, "Module kbhoraires ", etat.module, " · kbtunnel ", etat.kbtunnel || 'absent', etat.kbtunnel_actif ? '' : ' (inactif)', " · seuls les jours proposés par le site (créneaux Prestatill) sont réellement commandables.")));
 }
+function kbDlcThresholdFor(day, ex) {
+  for (let k = 0; k <= 20; k++) {
+    const dlc = addDays(day, k);
+    if (!kbDlcToRemove({
+      dlc,
+      producteur: ex || ''
+    }, day)) return dlc;
+  }
+  return null;
+}
+function KbDlcRulesPage({
+  session
+}) {
+  const showToast = React.useContext(ToastContext);
+  const rules = useKbDlcRules();
+  const [f, setF] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+  React.useEffect(() => {
+    kbDlcRulesLoad(true).then(r => setF(JSON.parse(JSON.stringify(r))));
+  }, []);
+  const today = todayKey();
+  const sim = React.useMemo(() => {
+    const out = [];
+    let d = today;
+    for (let k = 0; k < 8 && out.length < 4; k++, d = addDays(d, 1)) {
+      if (!rules.checkDow.includes(kbDow(d))) continue;
+      const keep = kbDlcThresholdFor(d, '');
+      const nd = kbNextDistribDay(d);
+      const base = addDays(nd, rules.minDays);
+      out.push({
+        d,
+        nd,
+        keep,
+        early: keep && keep > base,
+        ex: rules.exceptions.map(x => ({
+          nom: x.nom,
+          keep: kbDlcThresholdFor(d, x.nom)
+        }))
+      });
+    }
+    return out;
+  }, [rules, today]);
+  if (!f) return React.createElement("p", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "Chargement…");
+  const set = (k, v) => setF(o => ({
+    ...o,
+    [k]: v
+  }));
+  const save = async () => {
+    setBusy(true);
+    try {
+      const clean = kbDlcRulesNorm({
+        ...f,
+        minDays: Number(f.minDays)
+      });
+      const doc = {
+        minDays: clean.minDays,
+        exceptions: clean.exceptions,
+        navettes: clean.navettes,
+        checkDow: clean.checkDow,
+        anticipe: clean.anticipe,
+        updatedBy: session.name || '',
+        updatedAt: new Date().toISOString()
+      };
+      await storage.setDoc('app_config', 'dlc_rules', doc, {
+        replace: true
+      });
+      kbDlcRulesApply(doc);
+      _kbDlcRulesAt = Date.now();
+      setF(JSON.parse(JSON.stringify(kbDlcRules())));
+      showToast('✓ Règles DLC enregistrées — appliquées partout');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const big = {
+    fontSize: 17,
+    fontWeight: 700
+  };
+  const inp = {
+    fontSize: 17,
+    padding: '8px 10px',
+    borderRadius: 10,
+    border: '2px solid var(--line)',
+    minHeight: 44
+  };
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: 0
+    }
+  }, "📅 Règles DLC"), React.createElement("div", {
+    className: "card",
+    style: {
+      border: '3px solid #2e7d32',
+      background: '#f1f8f1'
+    }
+  }, React.createElement("div", {
+    style: {
+      ...big,
+      fontSize: 20,
+      marginBottom: 8
+    }
+  }, "✅ Règles en cours"), React.createElement("div", {
+    style: {
+      fontSize: 16,
+      lineHeight: 1.6
+    }
+  }, React.createElement("div", null, "👤 Le client doit avoir une DLC ≥ ", React.createElement("b", null, "J+", rules.minDays), " le jour de sa distribution."), rules.exceptions.map((x, k) => React.createElement("div", {
+    key: k
+  }, "📏 ", React.createElement("b", null, x.nom), " : DLC ≥ ", React.createElement("b", null, "J+", x.jours))), React.createElement("div", null, "🚚 Navettes ROB : ", React.createElement("b", null, rules.navettes.map(kbNavLabel).join(' · '))), React.createElement("div", null, "🧹 Contrôle « À retirer » du matin : ", React.createElement("b", null, rules.checkDow.slice().sort().map(d => KB_DOW_FR[d]).join(', '))), React.createElement("div", null, "⏩ Anticipation avant un trou sans navette : ", React.createElement("b", null, rules.anticipe ? 'OUI' : 'non'), " ", rules.anticipe && React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "(ex. vendredi : on retire ce qui serait perdu mardi)")), rules.updatedBy && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "Modifié par ", rules.updatedBy, rules.updatedAt ? ' le ' + new Date(rules.updatedAt).toLocaleString('fr-FR') : ''))), React.createElement("div", {
+    className: "card"
+  }, React.createElement("div", {
+    style: {
+      ...big,
+      marginBottom: 8
+    }
+  }, "🔮 Ce que ça donne aux prochains contrôles"), sim.map(x => React.createElement("div", {
+    key: x.d,
+    style: {
+      padding: '8px 0',
+      borderTop: '1px solid var(--line)',
+      fontSize: 16
+    }
+  }, React.createElement("b", {
+    style: {
+      textTransform: 'capitalize'
+    }
+  }, dayLabelShort(x.d)), " (distrib du ", formatDateShort(x.nd), ") → on retire toute DLC ", React.createElement("b", null, "avant le ", x.keep ? formatDateShort(x.keep) : '?'), x.early && React.createElement("span", {
+    style: {
+      color: '#6e4a9c',
+      fontWeight: 700
+    }
+  }, " · ⏩ anticipé (dernière navette avant le trou)"), x.ex.map(e => React.createElement("div", {
+    key: e.nom,
+    style: {
+      fontSize: 14,
+      color: '#6e4a9c'
+    }
+  }, "📏 ", e.nom, " : avant le ", e.keep ? formatDateShort(e.keep) : '?'))))), React.createElement("div", {
+    className: "card stack",
+    style: {
+      gap: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      ...big,
+      fontSize: 20
+    }
+  }, "✏️ Modifier"), React.createElement("label", {
+    style: big
+  }, "DLC mini client (jours) ", React.createElement("input", {
+    type: "number",
+    min: "0",
+    max: "15",
+    value: f.minDays,
+    onChange: e => set('minDays', e.target.value),
+    style: {
+      ...inp,
+      width: 90,
+      marginLeft: 8
+    }
+  })), React.createElement("div", null, React.createElement("div", {
+    style: big
+  }, "📏 Exceptions fournisseur"), (f.exceptions || []).map((x, k) => React.createElement("div", {
+    key: k,
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      marginTop: 6
+    }
+  }, React.createElement("input", {
+    value: x.nom,
+    placeholder: "Fournisseur",
+    onChange: e => set('exceptions', f.exceptions.map((y, j) => j === k ? {
+      ...y,
+      nom: e.target.value
+    } : y)),
+    style: {
+      ...inp,
+      flex: 1
+    }
+  }), React.createElement("span", {
+    style: big
+  }, "J+"), React.createElement("input", {
+    type: "number",
+    min: "1",
+    max: "15",
+    value: x.jours,
+    onChange: e => set('exceptions', f.exceptions.map((y, j) => j === k ? {
+      ...y,
+      jours: e.target.value
+    } : y)),
+    style: {
+      ...inp,
+      width: 70
+    }
+  }), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => set('exceptions', f.exceptions.filter((_, j) => j !== k))
+  }, "🗑️"))), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginTop: 6
+    },
+    onClick: () => set('exceptions', [...(f.exceptions || []), {
+      nom: '',
+      jours: 4
+    }])
+  }, "➕ Ajouter un fournisseur")), React.createElement("div", null, React.createElement("div", {
+    style: big
+  }, "🚚 Navettes ROB"), (f.navettes || []).map((n, k) => React.createElement("div", {
+    key: k,
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      marginTop: 6
+    }
+  }, React.createElement("select", {
+    value: n.dow,
+    onChange: e => set('navettes', f.navettes.map((y, j) => j === k ? {
+      ...y,
+      dow: Number(e.target.value)
+    } : y)),
+    style: inp
+  }, KB_DOW_FR.map((l, d) => React.createElement("option", {
+    key: d,
+    value: d
+  }, l))), React.createElement("input", {
+    type: "number",
+    min: "0",
+    max: "23",
+    value: n.hour,
+    onChange: e => set('navettes', f.navettes.map((y, j) => j === k ? {
+      ...y,
+      hour: e.target.value
+    } : y)),
+    style: {
+      ...inp,
+      width: 70
+    }
+  }), React.createElement("span", {
+    style: big
+  }, "h"), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => set('navettes', f.navettes.filter((_, j) => j !== k))
+  }, "🗑️"))), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginTop: 6
+    },
+    onClick: () => set('navettes', [...(f.navettes || []), {
+      dow: 5,
+      hour: 18
+    }])
+  }, "➕ Ajouter une navette")), React.createElement("div", null, React.createElement("div", {
+    style: big
+  }, "🧹 Jours du contrôle du matin"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      flexWrap: 'wrap',
+      marginTop: 6
+    }
+  }, [1, 2, 3, 4, 5, 6, 0].map(d => {
+    const on = (f.checkDow || []).includes(d);
+    return React.createElement("button", {
+      key: d,
+      className: on ? 'btn-primary' : 'btn-secondary',
+      style: {
+        textTransform: 'capitalize'
+      },
+      onClick: () => set('checkDow', on ? f.checkDow.filter(x => x !== d) : [...(f.checkDow || []), d])
+    }, KB_DOW_FR[d]);
+  }))), React.createElement("label", {
+    style: {
+      ...big,
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center'
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: !!f.anticipe,
+    onChange: e => set('anticipe', e.target.checked),
+    style: {
+      width: 26,
+      height: 26
+    }
+  }), "⏩ Retirer à l'avance ce qui serait perdu au prochain contrôle (dernière navette avant un trou)"), React.createElement("button", {
+    className: "btn-primary",
+    disabled: busy,
+    onClick: save,
+    style: {
+      minHeight: 56,
+      fontSize: 19
+    }
+  }, busy ? 'Enregistrement…' : '💾 Enregistrer les règles')));
+}
 function SuiviGeneralPage({
   session
 }) {
@@ -50060,7 +50497,9 @@ function SuiviGeneralPage({
     session: session
   }), sub === 'ancien' && React.createElement(AncienSitePilotagePage, {
     session: session
-  }), sub === 'factweb' && React.createElement(KbFacturationWebPage, null), sub === 'horaires' && React.createElement(KbHorairesCommandePage, null), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement(KbRungisRoute, null), React.createElement(GeotabTruckCard, null), React.createElement(GeotabTruckCard, {
+  }), sub === 'factweb' && React.createElement(KbFacturationWebPage, null), sub === 'horaires' && React.createElement(KbHorairesCommandePage, null), sub === 'dlcrules' && React.createElement(KbDlcRulesPage, {
+    session: session
+  }), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement(KbRungisRoute, null), React.createElement(GeotabTruckCard, null), React.createElement(GeotabTruckCard, {
     title: "🚚🥬 Camion F&L",
     device: GEOTAB_DEVICE_FL,
     color: "#2e7d32",
@@ -65108,9 +65547,35 @@ function kbDlcFmt(dlc, today) {
   const same = String(dlc).slice(0, 4) === String(today || todayKey()).slice(0, 4);
   return same ? formatDateShort(dlc) : `${dlc.slice(8, 10)}/${dlc.slice(5, 7)}/${dlc.slice(0, 4)}`;
 }
+function kbNextCheckDay(today) {
+  const dows = _kbDlcRules.checkDow;
+  let d = addDays(today, 1);
+  for (let k = 0; k < 10; k++) {
+    if (dows.includes(kbDow(d))) return d;
+    d = addDays(d, 1);
+  }
+  return null;
+}
+function kbDlcAnticipe(i, today, need) {
+  if (!_kbDlcRules.anticipe || !kbDlcValid(i.dlc)) return null;
+  const nc = kbNextCheckDay(today);
+  if (!nc) return null;
+  const nd2 = kbNextDistribDay(nc);
+  if (dlcDaysLeft(i.dlc, nd2) >= need) return null;
+  if (kbFirstNavetteBeforeDLC(i.dlc, new Date(nc + 'T05:00:00'))) return null;
+  const now = today === todayKey() ? new Date() : new Date(today + 'T05:00:00');
+  const nav = kbFirstNavetteBeforeDLC(i.dlc, now);
+  if (!nav) return null;
+  return {
+    nextCheck: nc,
+    navette: nav
+  };
+}
 function kbDlcToRemove(i, today) {
   if (!kbDlcValid(i.dlc)) return true;
-  return dlcDaysLeft(i.dlc, kbNextDistribDay(today)) < 3;
+  const need = kbDlcMinDays(i);
+  if (dlcDaysLeft(i.dlc, kbNextDistribDay(today)) < need) return true;
+  return !!kbDlcAnticipe(i, today, need);
 }
 function kbHhmm(iso) {
   try {
@@ -65123,7 +65588,6 @@ function kbHhmm(iso) {
   }
 }
 const kbMorningId = d => '_morning_' + d;
-const KB_DLC_MORNING_DOW = [2, 3, 4, 5];
 function useStockLevels(date) {
   const [lv, setLv] = React.useState(() => window.__kbStockLv && window.__kbStockLv[date] || null);
   React.useEffect(() => {
@@ -65227,6 +65691,7 @@ function DlcRotationLine({
   }, "🔄 Même avec une bonne rotation, il en reste ≈×", info.resteTh));
 }
 function useDlcBoard() {
+  const rules = useKbDlcRules();
   const [items, setItems] = React.useState(null);
   React.useEffect(() => storage.subscribe('dlc_watch', arr => setItems(arr || [])), []);
   const today = todayKey();
@@ -65243,10 +65708,16 @@ function useDlcBoard() {
     };
     const morning = items.find(i => i.id === kbMorningId(today)) || null;
     const real = items.filter(i => !String(i.id || '').startsWith('_'));
-    const list = real.filter(i => (!i.status || i.status === 'watch') && i.dlc && kbDlcToRemove(i, today)).map(i => ({
-      ...i,
-      days: kbDlcValid(i.dlc) ? dlcDaysLeft(i.dlc, today) : null
-    })).sort((a, b) => String(a.dlc).localeCompare(String(b.dlc)) || String(a.produit).localeCompare(String(b.produit)));
+    const list = real.filter(i => (!i.status || i.status === 'watch') && i.dlc && kbDlcToRemove(i, today)).map(i => {
+      const need = kbDlcMinDays(i);
+      const early = kbDlcValid(i.dlc) && dlcDaysLeft(i.dlc, nextDistrib) >= need ? kbDlcAnticipe(i, today, need) : null;
+      return {
+        ...i,
+        need,
+        early,
+        days: kbDlcValid(i.dlc) ? dlcDaysLeft(i.dlc, today) : null
+      };
+    }).sort((a, b) => String(a.dlc).localeCompare(String(b.dlc)) || String(a.produit).localeCompare(String(b.produit)));
     const done = real.filter(i => i.retirerDay === today && i.status && i.status !== 'watch').sort((a, b) => String(b.resolvedAt || '').localeCompare(String(a.resolvedAt || '')));
     return {
       ready: true,
@@ -65257,7 +65728,7 @@ function useDlcBoard() {
       today,
       nextDistrib
     };
-  }, [items, today]);
+  }, [items, today, rules]);
 }
 function kbDlcRecapHtml(day, done, m) {
   const rob = done.filter(i => i.status === 'rob'),
@@ -65272,11 +65743,11 @@ function kbDlcRecapHtml(day, done, m) {
     (byNav[k] = byNav[k] || []).push(i);
   });
   const robHtml = Object.keys(byNav).sort().map(k => sec(`🚚 Navette Robespierre · ${k === '?' ? 'date ?' : kbCmDate(k)}${byNav[k][0].navetteLabel ? ' (' + kbEsc(byNav[k][0].navetteLabel) + ')' : ''}`, '#6e4a9c', byNav[k].map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))).join('');
-  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Rien trouvé', vide.length, '#2e7d32')}</tr></table>` + robHtml + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + sec('✅ Rien trouvé en rayon', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Vendu · pas de perte', vide.length, '#2e7d32')}</tr></table>` + (m && m.sheetUrl ? `<a href="${kbEsc(m.sheetUrl)}" style="display:block;margin-top:14px;background:#ef6c00;color:#fff;text-decoration:none;border-radius:12px;padding:16px 18px;font-size:20px;font-weight:900;text-align:center">📋 Ouvrir la feuille « DLC retirées » du jour<br><span style="font-size:14px;font-weight:400">colonne orange = à copier-coller dans la colonne PURGE de la feuille de stock${m.sheetUnmatched ? ' · ⚠️ ' + m.sheetUnmatched + ' produit(s) à saisir à la main' : ''}</span></a>` : m && m.sheetErr ? `<div style="margin-top:12px;color:#c62828;font-size:13px">⚠️ Feuille « DLC retirées » non générée : ${kbEsc(m.sheetErr)}</div>` : '') + robHtml + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + sec('✅ Vendu · pas de perte', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
 }
 function kbDlcRecapText(day, done) {
   const L = [`DLC du jour traitées — ${kbCmDate(day)}`, ''];
-  done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'rien trouvé en rayon'}`));
+  done.forEach(i => L.push(`- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${i.status === 'rob' ? `ROB x${i.qtyRetired} (navette ${i.navetteDate ? formatDateShort(i.navetteDate) : '?'})` : i.status === 'perte' ? `partage équipe x${i.qtyRetired}` : 'vendu, pas de perte'}`));
   return L.join('\n');
 }
 async function kbSendDlcRecap(day, done, m, by) {
@@ -65286,6 +65757,13 @@ async function kbSendDlcRecap(day, done, m, by) {
   };
   const rob = done.filter(i => i.status === 'rob').length,
     part = done.filter(i => i.status === 'perte').length;
+  const sh = await kbDlcSheetWrite(day, done, by);
+  m = {
+    ...(m || {}),
+    sheetUrl: sh.url || '',
+    sheetErr: sh.ok ? '' : sh.error,
+    sheetUnmatched: (sh.unmatched || []).length
+  };
   let r;
   try {
     r = await stockPost({
@@ -65293,7 +65771,7 @@ async function kbSendDlcRecap(day, done, m, by) {
       action: 'send_mail',
       to: KB_DLC_RECAP_TO,
       subject: `📅 DLC traitées ${formatDateShort(day)} · ${rob} ROB · ${part} partage`,
-      body: kbDlcRecapText(day, done),
+      body: kbDlcRecapText(day, done) + (sh.url ? `\n\nFeuille DLC retirées (à coller dans PURGE) : ${sh.url}` : ''),
       htmlBody: kbDlcRecapHtml(day, done, m)
     });
   } catch (e) {
@@ -65307,6 +65785,7 @@ async function kbSendDlcRecap(day, done, m, by) {
     await storage.setDoc('dlc_watch', kbMorningId(day), {
       id: kbMorningId(day),
       day,
+      sheetUrl: sh.url || '',
       mailSentAt: ok ? new Date().toISOString() : '',
       mailErr: ok ? '' : String(r && r.error || 'inconnue'),
       mailBy: by || ''
@@ -65316,6 +65795,41 @@ async function kbSendDlcRecap(day, done, m, by) {
     ok,
     error: ok ? '' : String(r && r.error || 'inconnue')
   };
+}
+async function kbDlcSheetWrite(day, done, by) {
+  const rows = (done || []).map(i => ({
+    produit: i.produit || '',
+    produitCourt: kbProdName(i.produit || ''),
+    producteur: i.producteur || '',
+    productId: i.productId || '',
+    dlc: i.dlc ? kbDlcFmt(i.dlc, day) : '',
+    qty: i.status === 'rob' || i.status === 'perte' ? Number(i.qtyRetired) || 0 : 0,
+    dest: i.status,
+    navette: i.navetteDate ? `${i.navetteLabel || ''} ${formatDateShort(i.navetteDate)}`.trim() : '',
+    by: i.resolvedBy || by || ''
+  }));
+  try {
+    const r = await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'dlc_sheet_day',
+      date: day,
+      rows
+    });
+    if (r && r.ok && r.url) return {
+      ok: true,
+      url: r.url,
+      unmatched: r.unmatched || []
+    };
+    return {
+      ok: false,
+      error: String(r && r.error || 'action dlc_sheet_day absente du proxy stock (KBG_DlcSheet.gs à installer)')
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.message
+    };
+  }
 }
 function KbDlcTabDot() {
   const b = useDlcBoard();
@@ -65395,7 +65909,7 @@ function DlcMorningPopup({
   if (!board.ready || !board.total) return null;
   if (board.morning && board.morning.takenBy) return null;
   const now = new Date();
-  if (!KB_DLC_MORNING_DOW.includes(now.getDay()) || now.getHours() < 5) return null;
+  if (!_kbDlcRules.checkDow.includes(now.getDay()) || now.getHours() < 5) return null;
   const valider = async () => {
     const c = String(code).trim();
     if (!c) {
@@ -65856,7 +66370,7 @@ function DlcWatchPage({
         resolvedBy: session.name
       });
       muCelebrate(0);
-      showToast(`✅ ${kbProdName(i.produit)} : rien trouvé en rayon`);
+      showToast(`✅ ${kbProdName(i.produit)} : vendu, pas de perte`);
       await finishIfDone(board.total - 1);
     } catch (e) {
       showToast('Erreur : ' + e.message);
@@ -65997,7 +66511,7 @@ function DlcWatchPage({
       color: 'var(--ink-soft)',
       textAlign: 'right'
     }
-  }, "Distrib du ", React.createElement("b", null, formatDateShort(board.nextDistrib)), React.createElement("br", null), "DLC mini ", React.createElement("b", null, formatDateShort(addDays(board.nextDistrib, 3))))), React.createElement(DlcMorningBanner, {
+  }, "Distrib du ", React.createElement("b", null, formatDateShort(board.nextDistrib)), React.createElement("br", null), "DLC mini ", React.createElement("b", null, formatDateShort(addDays(board.nextDistrib, kbDlcRules().minDays))))), React.createElement(DlcMorningBanner, {
     board: board
   }), !showForm && React.createElement("button", {
     onClick: () => setShowForm(true),
@@ -66069,7 +66583,20 @@ function DlcWatchPage({
       marginTop: 6,
       color: '#2e7d32'
     }
-  }, board.morning && board.morning.mailSentAt ? `Récap envoyé à rr@ et hg@ à ${kbHhmm(board.morning.mailSentAt)}` : 'Récap pas encore envoyé'), doneN > 0 && React.createElement("button", {
+  }, board.morning && board.morning.mailSentAt ? `Récap envoyé à rr@ et hg@ à ${kbHhmm(board.morning.mailSentAt)}` : 'Récap pas encore envoyé'), doneN > 0 && board.morning && board.morning.sheetUrl && React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, React.createElement("a", {
+    href: board.morning.sheetUrl,
+    target: "_blank",
+    rel: "noopener",
+    style: {
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#ef6c00'
+    }
+  }, "📋 Feuille « DLC retirées » du jour")), doneN > 0 && React.createElement("button", {
     className: "btn-secondary",
     style: {
       marginTop: 10
@@ -66124,7 +66651,21 @@ function DlcWatchPage({
     }, "DLC ", kbDlcFmt(i.dlc, today), " · ", tag), React.createElement(DlcRotationLine, {
       info: e,
       today: today
-    })), React.createElement("div", {
+    }), i.need > kbDlcRules().minDays && React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700,
+        color: '#6e4a9c',
+        marginTop: 4
+      }
+    }, "📏 Règle fournisseur : DLC client ≥ J+", i.need), i.early && React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 700,
+        color: '#6e4a9c',
+        marginTop: 4
+      }
+    }, "⏩ À retirer dès aujourd'hui : au prochain contrôle (", formatDateShort(i.early.nextCheck), ") il ne serait plus vendable et plus aucune navette ROB ne partirait avant la DLC → navette ", i.early.navette.label)), React.createElement("div", {
       style: {
         textAlign: 'center',
         minWidth: 86,
@@ -66216,7 +66757,7 @@ function DlcWatchPage({
       fontWeight: 600,
       color: i.status === 'rob' ? '#6e4a9c' : i.status === 'perte' ? '#c62828' : '#2e7d32'
     }
-  }, i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ rien trouvé en rayon', " · ", i.resolvedBy, " ", kbHhmm(i.resolvedAt))), React.createElement("button", {
+  }, i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ vendu, pas de perte', " · ", i.resolvedBy, " ", kbHhmm(i.resolvedAt))), React.createElement("button", {
     className: "btn-ghost",
     style: {
       fontSize: 12
@@ -66319,7 +66860,7 @@ function DlcWatchPage({
       fontSize: 17,
       fontWeight: 700
     }
-  }, "0 = rien trouvé en rayon (déjà vendu ou déjà retiré)") : (() => {
+  }, "0 = plus rien en rayon = vendu, pas de perte") : (() => {
     const r = kbRouteRetrait(kbDlcValid(sheet.i.dlc) ? sheet.i.dlc : '', new Date());
     const rob = r.dest === 'pribon' && r.navette;
     return React.createElement("div", {
@@ -67342,7 +67883,12 @@ function HistoryDlcView() {
   };
   const DEST = {
     done: {
-      label: '✅ Écoulé',
+      label: '✅ Vendu · pas de perte',
+      color: 'var(--accent-dark)',
+      bg: 'var(--accent-soft)'
+    },
+    ecoule: {
+      label: '✅ Vendu · pas de perte',
       color: 'var(--accent-dark)',
       bg: 'var(--accent-soft)'
     },
@@ -67360,7 +67906,7 @@ function HistoryDlcView() {
   const rows = React.useMemo(() => {
     const resolved = (items || []).filter(i => i.status && i.status !== 'watch' && i.resolvedAt);
     return resolved.map(i => {
-      const reco = i.dlc ? routeByDLC(i.dlc, new Date(i.resolvedAt)) : null;
+      const reco = i.dlc && i.status !== 'ecoule' && i.status !== 'done' ? routeByDLC(i.dlc, new Date(i.resolvedAt)) : null;
       let flag = false,
         flagWhy = '';
       if (reco) {
@@ -67448,9 +67994,9 @@ function HistoryDlcView() {
     style: {
       color: 'var(--accent)'
     }
-  }, rows.filter(r => r.status === 'done').length), React.createElement("div", {
+  }, rows.filter(r => r.status === 'done' || r.status === 'ecoule').length), React.createElement("div", {
     className: "stat-label"
-  }, "Écoulés")), React.createElement("div", {
+  }, "Vendus (pas de perte)")), React.createElement("div", {
     className: "stat"
   }, React.createElement("div", {
     className: "stat-value",
@@ -67523,7 +68069,7 @@ function HistoryDlcView() {
         color: 'var(--ink-mute)',
         marginTop: 4
       }
-    }, r.resolvedBy ? `par ${r.resolvedBy}` : '', r.resolvedAt ? ` · ${fmtTime(r.resolvedAt)}` : '', r.reco && React.createElement("span", null, " · conseil : ", r.reco.dest === 'pribon' ? 'ROB' : 'partage')), r.flag && React.createElement("div", {
+    }, r.resolvedBy ? `par ${r.resolvedBy}` : '', r.resolvedAt ? ` · ${fmtTime(r.resolvedAt)}` : '', r.reco && r.status !== 'ecoule' && r.status !== 'done' && React.createElement("span", null, " · conseil : ", r.reco.dest === 'pribon' ? 'ROB' : 'partage')), r.flag && React.createElement("div", {
       style: {
         fontSize: 11,
         color: 'var(--warn)',
@@ -75496,6 +76042,10 @@ const KB_MNAV = [{
     sub: 'horaires',
     l: 'Horaires de commande',
     ic: '🕙'
+  }, {
+    sub: 'dlcrules',
+    l: 'Règles DLC',
+    ic: '📅'
   }]
 }];
 const KB_MSUBS = [...KB_MNAV.flatMap(g => g.items.filter(i => i.sub).map(i => i.sub)), 'cmails', 'live'];
