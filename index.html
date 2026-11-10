@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.11) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.12) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.11';
+const APP_VERSION = 'V11.12';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -11771,6 +11771,93 @@ function BarcodeScanner({
     }
   }, status === 'init' && 'Démarrage de la caméra…', status === 'running' && 'Vise un code-barre — détection automatique.', status === 'denied' && '⚠️ Accès caméra refusé. Autorise la caméra dans le navigateur. (La caméra exige la version en ligne HTTPS, pas un fichier local.)', status === 'error' && '⚠️ ' + errMsg));
 }
+function KbDlcField({
+  saved,
+  onValidate,
+  onClose,
+  big
+}) {
+  const [draft, setDraft] = React.useState(saved || '');
+  const [busy, setBusy] = React.useState(false);
+  const d = draft ? Math.round((new Date(draft) - new Date(todayKey())) / 86400000) : null;
+  const fmtD = v => v ? `${v.slice(8, 10)}/${v.slice(5, 7)}/${v.slice(0, 4)}` : '';
+  const changed = !!draft && draft !== saved;
+  return React.createElement("div", {
+    style: {
+      marginTop: 8,
+      paddingTop: 8,
+      borderTop: '1px dashed var(--border)'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: big ? 14 : 12,
+      fontWeight: 700,
+      color: 'var(--ink-mute)'
+    }
+  }, "DLC :"), React.createElement("input", {
+    type: "date",
+    value: draft,
+    onChange: e => setDraft(e.target.value),
+    style: {
+      fontSize: big ? 17 : 14,
+      padding: big ? '10px' : '6px',
+      flex: '1 1 150px',
+      minWidth: 0,
+      borderRadius: 10
+    }
+  }), d !== null && React.createElement("span", {
+    style: {
+      fontSize: big ? 14 : 12,
+      fontWeight: 800,
+      color: d <= 0 ? 'var(--danger)' : d <= 3 ? 'var(--warn)' : 'var(--accent)'
+    }
+  }, d < 0 ? 'Dépassée' : d === 0 ? "Aujourd'hui" : d + ' j')), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 8
+    }
+  }, React.createElement("button", {
+    disabled: !changed || busy,
+    onClick: async () => {
+      setBusy(true);
+      try {
+        await onValidate(draft);
+      } finally {
+        setBusy(false);
+      }
+    },
+    style: {
+      flex: 1,
+      fontSize: big ? 17 : 14,
+      fontWeight: 800,
+      padding: big ? '12px' : '8px',
+      borderRadius: 10,
+      border: '2px solid #2e7d32',
+      background: changed ? '#2e7d32' : '#e8f5e9',
+      color: changed ? '#fff' : '#6b8f6e',
+      cursor: changed ? 'pointer' : 'default'
+    }
+  }, busy ? '…' : changed ? `✓ Valider DLC ${fmtD(draft)}` : saved ? `✓ DLC ${fmtD(saved)} enregistrée` : 'Choisis la date'), React.createElement("button", {
+    onClick: onClose,
+    style: {
+      flex: '0 0 auto',
+      fontSize: big ? 15 : 13,
+      padding: big ? '12px 14px' : '8px 10px',
+      borderRadius: 10,
+      border: '1px solid var(--border)',
+      background: 'transparent',
+      cursor: 'pointer'
+    }
+  }, "Fermer")));
+}
 function QtyInput({
   value,
   onCommit,
@@ -14374,21 +14461,28 @@ function InventoryPage({
     setLastUnknownCode(null);
   };
   const saveDlcFromInventory = async (productId, dlcDate) => {
-    setDlcInputs(prev => ({
-      ...prev,
-      [productId]: dlcDate
-    }));
     if (!dlcDate) return;
     const p = prodById[productId];
     const qty = counts[productId] || 1;
     const days = Math.round((new Date(dlcDate) - new Date(todayKey())) / 86400000);
-    if (days > 60 && !confirm(`DLC le ${dlcDate.slice(8, 10)}/${dlcDate.slice(5, 7)}/${dlcDate.slice(0, 4)} (dans ${days} jours) : c'est bien la bonne année ?`)) {
-      setDlcInputs(prev => ({
-        ...prev,
-        [productId]: ''
-      }));
-      return;
-    }
+    if (days > 60 && !confirm(`DLC le ${dlcDate.slice(8, 10)}/${dlcDate.slice(5, 7)}/${dlcDate.slice(0, 4)} (dans ${days} jours) : c'est bien la bonne année ?`)) return;
+    if (days === 0 && !confirm(`DLC AUJOURD'HUI (${dlcDate.slice(8, 10)}/${dlcDate.slice(5, 7)}) pour « ${p?.name || ''} » ?\n\nLe produit passera tout de suite dans « À retirer ».`)) return;
+    setDlcInputs(prev => ({
+      ...prev,
+      [productId]: dlcDate
+    }));
+    setDlcExpandedId(null);
+    try {
+      const all = await storage.getAll('dlc_watch');
+      for (const w of all || []) {
+        if (!w || !w.fromInventory || String(w.productId || '') !== String(productId) || w.invDay !== invDate) continue;
+        if (w.dlc === dlcDate || w.status && w.status !== 'watch') continue;
+        const wid = w.id || `dlcw_inv_${productId}_${w.dlc}`;
+        try {
+          await storage.deleteDoc('dlc_watch', wid);
+        } catch (e) {}
+      }
+    } catch (e) {}
     if (days > 14) {
       showToast(`📅 DLC notée (${days}j) — longue, pas de suivi`);
       return;
@@ -15558,12 +15652,6 @@ function InventoryPage({
         background: isCounted ? '#e8f5e9' : 'var(--bg-card,#fff)',
         borderRadius: 14
       }
-    }, React.createElement("div", {
-      style: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 10
-      }
     }, React.createElement("button", {
       onClick: () => {
         const el = qtyRefs.current[p.id];
@@ -15575,28 +15663,29 @@ function InventoryPage({
         }
       },
       style: {
-        minWidth: 0,
-        flex: 1,
+        display: 'block',
+        width: '100%',
         textAlign: 'left',
         border: 'none',
         background: 'transparent',
-        padding: '4px 2px',
+        padding: '2px',
         cursor: 'pointer'
       }
     }, React.createElement("div", {
       style: {
-        fontWeight: 700,
-        fontSize: 20,
-        lineHeight: 1.15,
-        wordBreak: 'break-word',
+        fontWeight: 800,
+        fontSize: 19,
+        lineHeight: 1.2,
+        overflowWrap: 'anywhere',
         color: 'var(--ink)'
       }
     }, isCounted ? '✓ ' : '', p.name), React.createElement("div", {
       style: {
         color: 'var(--ink-mute)',
         fontSize: 13,
-        lineHeight: 1.2,
-        wordBreak: 'break-word'
+        lineHeight: 1.25,
+        overflowWrap: 'anywhere',
+        marginTop: 2
       }
     }, sub), p._horsFeuille && React.createElement("div", {
       style: {
@@ -15621,25 +15710,31 @@ function InventoryPage({
       style: {
         fontWeight: 600
       }
-    }, " · théorique ", Math.round(invLv.levels[p.id].stock)) : null)), React.createElement("div", {
+    }, " · théorique ", Math.round(invLv.levels[p.id].stock)) : null, hasDlc ? React.createElement("span", {
+      style: {
+        color: '#b45309'
+      }
+    }, " · DLC ", dlcInputs[p.id].slice(8, 10), "/", dlcInputs[p.id].slice(5, 7)) : null)), React.createElement("div", {
       style: {
         display: 'flex',
-        alignItems: 'center',
-        gap: 6,
-        flex: '0 0 auto'
+        alignItems: 'stretch',
+        gap: 8,
+        marginTop: 8
       }
     }, React.createElement("button", {
       onClick: () => changeCount(p.id, Math.max(0, (counts[p.id] ?? 0) - 1)),
       "aria-label": "moins",
       style: {
-        width: 52,
+        flex: '1 1 0',
+        minWidth: 0,
         height: 60,
-        fontSize: 30,
+        fontSize: 32,
         fontWeight: 700,
         lineHeight: 1,
         borderRadius: 12,
         border: '2px solid var(--border)',
         background: 'var(--bg-card,#fff)',
+        color: 'var(--ink)',
         cursor: 'pointer'
       }
     }, "−"), React.createElement(QtyInput, {
@@ -15649,13 +15744,16 @@ function InventoryPage({
       value: counts[p.id] ?? 0,
       onCommit: q => changeCount(p.id, q),
       style: {
-        width: 68,
+        flex: '1.2 1 0',
+        minWidth: 0,
+        width: 'auto',
         height: 60,
         textAlign: 'center',
         fontSize: 28,
-        fontWeight: 700,
+        fontWeight: 800,
         padding: 0,
-        borderRadius: 12
+        borderRadius: 12,
+        border: '2px solid var(--border)'
       }
     }), React.createElement("button", {
       onClick: () => {
@@ -15666,9 +15764,10 @@ function InventoryPage({
       },
       "aria-label": "plus",
       style: {
-        width: 52,
+        flex: '1 1 0',
+        minWidth: 0,
         height: 60,
-        fontSize: 30,
+        fontSize: 32,
         fontWeight: 700,
         lineHeight: 1,
         borderRadius: 12,
@@ -15677,7 +15776,7 @@ function InventoryPage({
         color: '#1b5e20',
         cursor: 'pointer'
       }
-    }, "+"))), React.createElement("div", {
+    }, "+")), React.createElement("div", {
       style: {
         display: 'flex',
         gap: 8,
@@ -15686,59 +15785,35 @@ function InventoryPage({
     }, React.createElement("button", {
       onClick: () => changeCount(p.id, 0),
       style: {
-        fontSize: 13,
-        padding: '7px 16px',
-        borderRadius: 8,
+        flex: '0 0 auto',
+        fontSize: 14,
+        padding: '9px 16px',
+        borderRadius: 10,
         border: '1px solid var(--border)',
         background: 'transparent',
+        color: 'var(--ink)',
         cursor: 'pointer',
-        fontWeight: 600
+        fontWeight: 700
       }
     }, "Stock 0"), React.createElement("button", {
       onClick: () => setDlcExpandedId(prev => prev === p.id ? null : p.id),
       style: {
-        fontSize: 13,
-        padding: '7px 14px',
-        borderRadius: 8,
-        border: `1px solid ${hasDlc ? 'var(--accent)' : 'var(--border)'}`,
+        flex: 1,
+        fontSize: 14,
+        padding: '9px 14px',
+        borderRadius: 10,
+        border: `1px solid ${hasDlc ? '#b45309' : 'var(--border)'}`,
         background: 'transparent',
-        color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)',
+        color: hasDlc ? '#b45309' : 'var(--ink-mute)',
         cursor: 'pointer',
-        fontWeight: 600
+        fontWeight: 700
       }
-    }, hasDlc ? '✓ DLC courte' : '📅 DLC courte')), dlcOpen && React.createElement("div", {
-      style: {
-        display: 'flex',
-        gap: 6,
-        alignItems: 'center',
-        marginTop: 8,
-        paddingTop: 8,
-        borderTop: '1px dashed var(--border)'
-      }
-    }, React.createElement("span", {
-      style: {
-        fontSize: 12,
-        color: 'var(--ink-mute)'
-      }
-    }, "DLC :"), React.createElement("input", {
-      type: "date",
-      value: dlcInputs[p.id] || '',
-      onChange: e => saveDlcFromInventory(p.id, e.target.value),
-      style: {
-        fontSize: 15,
-        padding: '8px',
-        flex: 1
-      }
-    }), dlcInputs[p.id] && (() => {
-      const d = Math.round((new Date(dlcInputs[p.id]) - new Date(todayKey())) / 86400000);
-      return React.createElement("span", {
-        style: {
-          fontSize: 12,
-          fontWeight: 600,
-          color: d <= 0 ? 'var(--danger)' : d <= 3 ? 'var(--warn)' : 'var(--accent)'
-        }
-      }, d <= 0 ? 'Dépassée' : d + 'j');
-    })()));
+    }, hasDlc ? `✓ DLC ${dlcInputs[p.id].slice(8, 10)}/${dlcInputs[p.id].slice(5, 7)}` : '📅 DLC courte')), dlcOpen && React.createElement(KbDlcField, {
+      big: true,
+      saved: dlcInputs[p.id] || '',
+      onValidate: v => saveDlcFromInventory(p.id, v),
+      onClose: () => setDlcExpandedId(null)
+    }));
   }), invType === 'tournant' && !scopeOk && React.createElement("p", {
     style: {
       fontSize: 13,
@@ -15829,38 +15904,11 @@ function InventoryPage({
         padding: '2px 6px'
       },
       onClick: () => clearCount(id)
-    }, "✕"))), dlcExpandedId === id && React.createElement("div", {
-      style: {
-        display: 'flex',
-        gap: 6,
-        alignItems: 'center',
-        marginTop: 4,
-        paddingLeft: 8
-      }
-    }, React.createElement("span", {
-      style: {
-        fontSize: 11,
-        color: 'var(--ink-mute)'
-      }
-    }, "DLC :"), React.createElement("input", {
-      type: "date",
-      value: dlcInputs[id] || '',
-      onChange: e => saveDlcFromInventory(id, e.target.value),
-      style: {
-        fontSize: 13,
-        padding: '4px 6px',
-        flex: 1
-      }
-    }), dlcInputs[id] && (() => {
-      const d = Math.round((new Date(dlcInputs[id]) - new Date(todayKey())) / 86400000);
-      return React.createElement("span", {
-        style: {
-          fontSize: 11,
-          fontWeight: 600,
-          color: d <= 0 ? 'var(--danger)' : d <= 3 ? 'var(--warn)' : 'var(--accent)'
-        }
-      }, d <= 0 ? 'Dépassée' : d + 'j');
-    })()));
+    }, "✕"))), dlcExpandedId === id && React.createElement(KbDlcField, {
+      saved: dlcInputs[id] || '',
+      onValidate: v => saveDlcFromInventory(id, v),
+      onClose: () => setDlcExpandedId(null)
+    }));
   }))), React.createElement("div", {
     className: "card",
     style: {

@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.11';
+    const APP_VERSION = 'V11.12';
+    // V11.12 — (10/11/2026) Inventaire › DLC : plus d'enregistrement au moindre changement (iPhone pré-remplit la date du jour → DLC « aujourd'hui » fantômes dans Suivi DLC) ; bouton « ✓ Valider DLC jj/mm », DLC du jour à confirmer, une seule DLC par produit et par inventaire (les précédentes encore à traiter sont supprimées). Ligne produit repensée pour iPhone : nom pleine largeur, − / nombre / + sur toute la largeur.
     // V11.11 — (10/11/2026) Tournant « par producteur » : seuls les producteurs 100 % fromage sont retirés (un seul produit non-fromage → reste listé, ex. Gaborit). Plus de liste d'exceptions.
     // V11.10 — (10/11/2026) Inventaire anti-erreur : toucher le nom ne fait plus +1 (ouvre la saisie du nombre) ; gros boutons − / nombre / + ; « ↩️ Annuler » la dernière modif (15 s, les touches rapprochées sur un même produit = une seule annulation). Tournant « par producteur » : sans les producteurs de fromage (comptés dans 🧀 Fromage), sauf Gaborit.
     // V11.09 — (10/11/2026) Inventaire : plus de références en double (fiches catalogue en double fusionnées : ligne déjà comptée > active > plus récente) ; rapprochement feuille de stock → catalogue par ID d'abord ; liste et menu fournisseurs = articles ACTIFS uniquement (avant : tout le catalogue, inactifs compris, quand la feuille de stock n'était pas lue).
@@ -8095,6 +8096,34 @@
 
     // Saisie de quantité : garde un état chaîne (autorise le champ vide pendant la frappe),
     // ne se fait pas écraser par une MAJ externe tant que le champ a le focus.
+    // V11.12 — saisie DLC SANS enregistrement automatique. Sur iPhone, toucher un <input type="date"> le pré-remplit
+    //   avec la date du jour et déclenche onChange immédiatement → l'ancien code créait une DLC « aujourd'hui »
+    //   (ex. Yaourt framboise DLC 28/11 enregistré au 10/11 ×46). Ici rien n'est écrit tant qu'on n'a pas touché « ✓ Valider ».
+    function KbDlcField({ saved, onValidate, onClose, big }) {
+      const [draft, setDraft] = React.useState(saved || '');
+      const [busy, setBusy] = React.useState(false);
+      const d = draft ? Math.round((new Date(draft) - new Date(todayKey())) / 86400000) : null;
+      const fmtD = (v) => v ? `${v.slice(8,10)}/${v.slice(5,7)}/${v.slice(0,4)}` : '';
+      const changed = !!draft && draft !== saved;
+      return (
+        <div style={{marginTop:8,paddingTop:8,borderTop:'1px dashed var(--border)'}}>
+          <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+            <span style={{fontSize:big?14:12,fontWeight:700,color:'var(--ink-mute)'}}>DLC :</span>
+            <input type="date" value={draft} onChange={e => setDraft(e.target.value)}
+              style={{fontSize:big?17:14,padding:big?'10px':'6px',flex:'1 1 150px',minWidth:0,borderRadius:10}} />
+            {d !== null && <span style={{fontSize:big?14:12,fontWeight:800,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<0?'Dépassée':d===0?"Aujourd'hui":d+' j'}</span>}
+          </div>
+          <div style={{display:'flex',gap:8,marginTop:8}}>
+            <button disabled={!changed || busy} onClick={async () => { setBusy(true); try { await onValidate(draft); } finally { setBusy(false); } }}
+              style={{flex:1,fontSize:big?17:14,fontWeight:800,padding:big?'12px':'8px',borderRadius:10,border:'2px solid #2e7d32',background: changed ? '#2e7d32' : '#e8f5e9',color: changed ? '#fff' : '#6b8f6e',cursor: changed ? 'pointer' : 'default'}}>
+              {busy ? '…' : changed ? `✓ Valider DLC ${fmtD(draft)}` : (saved ? `✓ DLC ${fmtD(saved)} enregistrée` : 'Choisis la date')}
+            </button>
+            <button onClick={onClose} style={{flex:'0 0 auto',fontSize:big?15:13,padding:big?'12px 14px':'8px 10px',borderRadius:10,border:'1px solid var(--border)',background:'transparent',cursor:'pointer'}}>Fermer</button>
+          </div>
+        </div>
+      );
+    }
+
     function QtyInput({ value, onCommit, style, inputRef }) {
       const [str, setStr] = React.useState(value ? String(value) : '');
       const focused = React.useRef(false);
@@ -9589,13 +9618,27 @@
 
       // Signaler une DLC pendant l'inventaire → crée une entrée dans dlc_watch
       const saveDlcFromInventory = async (productId, dlcDate) => {
-        setDlcInputs(prev => ({ ...prev, [productId]: dlcDate }));
         if (!dlcDate) return;
         const p = prodById[productId];
         const qty = counts[productId] || 1;
         const days = Math.round((new Date(dlcDate) - new Date(todayKey())) / 86400000);
         // V9.91 — une DLC à plus de 60 j est souvent une erreur d'année : on demande confirmation
-        if (days > 60 && !confirm(`DLC le ${dlcDate.slice(8,10)}/${dlcDate.slice(5,7)}/${dlcDate.slice(0,4)} (dans ${days} jours) : c'est bien la bonne année ?`)) { setDlcInputs(prev => ({ ...prev, [productId]: '' })); return; }
+        if (days > 60 && !confirm(`DLC le ${dlcDate.slice(8,10)}/${dlcDate.slice(5,7)}/${dlcDate.slice(0,4)} (dans ${days} jours) : c'est bien la bonne année ?`)) return;
+        // V11.12 — DLC du jour même : on fait confirmer (c'était le symptôme du bug iPhone)
+        if (days === 0 && !confirm(`DLC AUJOURD'HUI (${dlcDate.slice(8,10)}/${dlcDate.slice(5,7)}) pour « ${p?.name || ''} » ?\n\nLe produit passera tout de suite dans « À retirer ».`)) return;
+        setDlcInputs(prev => ({ ...prev, [productId]: dlcDate }));
+        setDlcExpandedId(null);
+        // V11.12 — une seule DLC par produit et par inventaire : on retire les DLC saisies avant pour ce produit
+        //   dans CET inventaire (ex. le « 10/11 » posé par erreur avant de choisir le 28/11), si encore à traiter.
+        try {
+          const all = await storage.getAll('dlc_watch');
+          for (const w of (all || [])) {
+            if (!w || !w.fromInventory || String(w.productId || '') !== String(productId) || w.invDay !== invDate) continue;
+            if (w.dlc === dlcDate || (w.status && w.status !== 'watch')) continue;
+            const wid = w.id || `dlcw_inv_${productId}_${w.dlc}`;
+            try { await storage.deleteDoc('dlc_watch', wid); } catch (e) {}
+          }
+        } catch (e) {}
         // V9.91 — suivie si elle peut passer « À retirer » avant le prochain inventaire (≤ 14 j)
         if (days > 14) {
           showToast(`📅 DLC notée (${days}j) — longue, pas de suivi`);
@@ -10070,42 +10113,31 @@
                   const dlcOpen = dlcExpandedId === p.id;
                   return (
                   <div key={p.id} style={{padding:'12px',border:`3px solid ${isCounted?'#2e7d32':'var(--border)'}`,background:isCounted?'#e8f5e9':'var(--bg-card,#fff)',borderRadius:14}}>
-                    <div style={{display:'flex',alignItems:'center',gap:10}}>
-                      {/* V11.10 — toucher le nom ne compte plus (+1 involontaires) : il ouvre la saisie du nombre */}
-                      <button onClick={()=>{ const el = qtyRefs.current[p.id]; if (el) { try { el.focus(); el.select(); } catch(_){} } }}
-                        style={{minWidth:0,flex:1,textAlign:'left',border:'none',background:'transparent',padding:'4px 2px',cursor:'pointer'}}>
-                        <div style={{fontWeight:700,fontSize:20,lineHeight:1.15,wordBreak:'break-word',color:'var(--ink)'}}>{isCounted?'✓ ':''}{p.name}</div>
-                        <div style={{color:'var(--ink-mute)',fontSize:13,lineHeight:1.2,wordBreak:'break-word'}}>{sub}</div>
-                        {p._horsFeuille && <div style={{display:'inline-block',marginTop:4,fontSize:12,fontWeight:700,color:'#b45309',background:'#fff7ed',border:'1px solid #fdba74',borderRadius:6,padding:'2px 7px'}}>📚 Catalogue — absent de la feuille de stock (compté ici, à ajouter dans la feuille)</div>}
-                        <div style={{fontSize:13,fontWeight:700,color:'var(--ink-mute)',marginTop:3}}>en {kbIsFLProduct(p) ? 'colis' : 'articles'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}</div>
-                      </button>
-                      <div style={{display:'flex',alignItems:'center',gap:6,flex:'0 0 auto'}}>
-                        <button onClick={()=>changeCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
-                          style={{width:52,height:60,fontSize:30,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid var(--border)',background:'var(--bg-card,#fff)',cursor:'pointer'}}>−</button>
-                        <QtyInput inputRef={el => { if (el) qtyRefs.current[p.id] = el; else delete qtyRefs.current[p.id]; }}
-                          value={counts[p.id] ?? 0} onCommit={(q)=>changeCount(p.id, q)}
-                          style={{width:68,height:60,textAlign:'center',fontSize:28,fontWeight:700,padding:0,borderRadius:12}} />
-                        <button onClick={()=>{ try { navigator.vibrate && navigator.vibrate(15); } catch(_){} changeCount(p.id, (counts[p.id] ?? 0) + 1); }} aria-label="plus"
-                          style={{width:52,height:60,fontSize:30,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid #2e7d32',background:'#e8f5e9',color:'#1b5e20',cursor:'pointer'}}>+</button>
-                      </div>
+                    {/* V11.12 — mise en page téléphone : nom sur toute la largeur, puis la ligne de comptage (avant : nom écrasé en 1 lettre/ligne sur iPhone) */}
+                    {/* V11.10 — toucher le nom ne compte plus (+1 involontaires) : il ouvre la saisie du nombre */}
+                    <button onClick={()=>{ const el = qtyRefs.current[p.id]; if (el) { try { el.focus(); el.select(); } catch(_){} } }}
+                      style={{display:'block',width:'100%',textAlign:'left',border:'none',background:'transparent',padding:'2px',cursor:'pointer'}}>
+                      <div style={{fontWeight:800,fontSize:19,lineHeight:1.2,overflowWrap:'anywhere',color:'var(--ink)'}}>{isCounted?'✓ ':''}{p.name}</div>
+                      <div style={{color:'var(--ink-mute)',fontSize:13,lineHeight:1.25,overflowWrap:'anywhere',marginTop:2}}>{sub}</div>
+                      {p._horsFeuille && <div style={{display:'inline-block',marginTop:4,fontSize:12,fontWeight:700,color:'#b45309',background:'#fff7ed',border:'1px solid #fdba74',borderRadius:6,padding:'2px 7px'}}>📚 Catalogue — absent de la feuille de stock (compté ici, à ajouter dans la feuille)</div>}
+                      <div style={{fontSize:13,fontWeight:700,color:'var(--ink-mute)',marginTop:3}}>en {kbIsFLProduct(p) ? 'colis' : 'articles'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}{hasDlc ? <span style={{color:'#b45309'}}> · DLC {dlcInputs[p.id].slice(8,10)}/{dlcInputs[p.id].slice(5,7)}</span> : null}</div>
+                    </button>
+                    <div style={{display:'flex',alignItems:'stretch',gap:8,marginTop:8}}>
+                      <button onClick={()=>changeCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
+                        style={{flex:'1 1 0',minWidth:0,height:60,fontSize:32,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid var(--border)',background:'var(--bg-card,#fff)',color:'var(--ink)',cursor:'pointer'}}>−</button>
+                      <QtyInput inputRef={el => { if (el) qtyRefs.current[p.id] = el; else delete qtyRefs.current[p.id]; }}
+                        value={counts[p.id] ?? 0} onCommit={(q)=>changeCount(p.id, q)}
+                        style={{flex:'1.2 1 0',minWidth:0,width:'auto',height:60,textAlign:'center',fontSize:28,fontWeight:800,padding:0,borderRadius:12,border:'2px solid var(--border)'}} />
+                      <button onClick={()=>{ try { navigator.vibrate && navigator.vibrate(15); } catch(_){} changeCount(p.id, (counts[p.id] ?? 0) + 1); }} aria-label="plus"
+                        style={{flex:'1 1 0',minWidth:0,height:60,fontSize:32,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid #2e7d32',background:'#e8f5e9',color:'#1b5e20',cursor:'pointer'}}>+</button>
                     </div>
                     <div style={{display:'flex',gap:8,marginTop:8}}>
                       <button onClick={()=>changeCount(p.id, 0)}
-                        style={{fontSize:13,padding:'7px 16px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',cursor:'pointer',fontWeight:600}}>Stock 0</button>
+                        style={{flex:'0 0 auto',fontSize:14,padding:'9px 16px',borderRadius:10,border:'1px solid var(--border)',background:'transparent',color:'var(--ink)',cursor:'pointer',fontWeight:700}}>Stock 0</button>
                       <button onClick={()=>setDlcExpandedId(prev => prev===p.id ? null : p.id)}
-                        style={{fontSize:13,padding:'7px 14px',borderRadius:8,border:`1px solid ${hasDlc?'var(--accent)':'var(--border)'}`,background:'transparent',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)',cursor:'pointer',fontWeight:600}}>{hasDlc ? '✓ DLC courte' : '📅 DLC courte'}</button>
+                        style={{flex:1,fontSize:14,padding:'9px 14px',borderRadius:10,border:`1px solid ${hasDlc?'#b45309':'var(--border)'}`,background:'transparent',color: hasDlc ? '#b45309' : 'var(--ink-mute)',cursor:'pointer',fontWeight:700}}>{hasDlc ? `✓ DLC ${dlcInputs[p.id].slice(8,10)}/${dlcInputs[p.id].slice(5,7)}` : '📅 DLC courte'}</button>
                     </div>
-                    {dlcOpen && (
-                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:8,paddingTop:8,borderTop:'1px dashed var(--border)'}}>
-                        <span style={{fontSize:12,color:'var(--ink-mute)'}}>DLC :</span>
-                        <input type="date" value={dlcInputs[p.id] || ''} onChange={e => saveDlcFromInventory(p.id, e.target.value)}
-                          style={{fontSize:15,padding:'8px',flex:1}} />
-                        {dlcInputs[p.id] && (() => {
-                          const d = Math.round((new Date(dlcInputs[p.id]) - new Date(todayKey())) / 86400000);
-                          return <span style={{fontSize:12,fontWeight:600,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
-                        })()}
-                      </div>
-                    )}
+                    {dlcOpen && <KbDlcField big saved={dlcInputs[p.id] || ''} onValidate={(v)=>saveDlcFromInventory(p.id, v)} onClose={()=>setDlcExpandedId(null)} />}
                   </div>
                   );
                 })}
@@ -10144,17 +10176,7 @@
                         <button className="btn-ghost" style={{fontSize:11,padding:'2px 6px'}} onClick={()=>clearCount(id)}>✕</button>
                       </div>
                     </div>
-                    {dlcExpandedId === id && (
-                      <div style={{display:'flex',gap:6,alignItems:'center',marginTop:4,paddingLeft:8}}>
-                        <span style={{fontSize:11,color:'var(--ink-mute)'}}>DLC :</span>
-                        <input type="date" value={dlcInputs[id] || ''} onChange={e => saveDlcFromInventory(id, e.target.value)}
-                          style={{fontSize:13,padding:'4px 6px',flex:1}} />
-                        {dlcInputs[id] && (() => {
-                          const d = Math.round((new Date(dlcInputs[id]) - new Date(todayKey())) / 86400000);
-                          return <span style={{fontSize:11,fontWeight:600,color: d<=0?'var(--danger)':d<=3?'var(--warn)':'var(--accent)'}}>{d<=0?'Dépassée':d+'j'}</span>;
-                        })()}
-                      </div>
-                    )}
+                    {dlcExpandedId === id && <KbDlcField saved={dlcInputs[id] || ''} onValidate={(v)=>saveDlcFromInventory(id, v)} onClose={()=>setDlcExpandedId(null)} />}
                   </div>
                   );
                 })}
