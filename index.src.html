@@ -785,7 +785,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.09';
+    const APP_VERSION = 'V11.11';
+    // V11.11 — (10/11/2026) Tournant « par producteur » : seuls les producteurs 100 % fromage sont retirés (un seul produit non-fromage → reste listé, ex. Gaborit). Plus de liste d'exceptions.
+    // V11.10 — (10/11/2026) Inventaire anti-erreur : toucher le nom ne fait plus +1 (ouvre la saisie du nombre) ; gros boutons − / nombre / + ; « ↩️ Annuler » la dernière modif (15 s, les touches rapprochées sur un même produit = une seule annulation). Tournant « par producteur » : sans les producteurs de fromage (comptés dans 🧀 Fromage), sauf Gaborit.
     // V11.09 — (10/11/2026) Inventaire : plus de références en double (fiches catalogue en double fusionnées : ligne déjà comptée > active > plus récente) ; rapprochement feuille de stock → catalogue par ID d'abord ; liste et menu fournisseurs = articles ACTIFS uniquement (avant : tout le catalogue, inactifs compris, quand la feuille de stock n'était pas lue).
     // V11.08 — (09/11/2026) Retours PDP : origine visible (client, commande du, n°, signalé par) ; Master « ✏️ Corriger le produit » (choisi dans la commande d'origine, ou texte) + « 🚫 Retirer du suivi » avec raison (archive app_config/pdpret_removed_<mois>) ; pdp_returns garde srcOrderId / distribDate / clientEmail. Boutiques : « 🛒 Rolls vides à faire récupérer » (Qualité + Clôture) → retour PDP kind 'rolls' : le chauffeur coche récupéré, l'entrepôt « ✓ Rolls reçus à PDP » (sans perte).
     // V11.07 — (09/11/2026) Master › SAV : section « ↩️ Retours » (commandes non récupérées / retour PDP : clic → contenu + décision PAR ARTICLE : retour PDP · partage équipe · garder · récupéré · jeter → pertes + consigne push au lieu ; Retours PDP entrepôt intégrés). Menu master réorganisé (Commande pain sous Aujourd'hui ; « Clients · prépa · distrib » : Chargement en haut, SAV, Push, Historique, Facturation web, Synchro ancien site en bas ; F&L : contrôle seul / Inventaire & ajout F&L ; Camion Rungis sous Stats équipes ; Horaires boutiques + commande en bas de Réglages ; Mails clients et Qui fait quoi retirés du menu). Push mail clients : distribution du jour OU du lendemain. Chargement des commandes : plus de rechargement, on reste sur la page ; « Commandes TXT Progmag » retiré. Commande pain : « ✅ Commande passée » + suivi. Report ancien site à la clôture prépa : lancé tout de suite + relance auto (postes master/prépa) + alerte Aujourd'hui. Sélecteur master : « 🚛 Vue chauffeur ».
@@ -8093,7 +8095,7 @@
 
     // Saisie de quantité : garde un état chaîne (autorise le champ vide pendant la frappe),
     // ne se fait pas écraser par une MAJ externe tant que le champ a le focus.
-    function QtyInput({ value, onCommit, style }) {
+    function QtyInput({ value, onCommit, style, inputRef }) {
       const [str, setStr] = React.useState(value ? String(value) : '');
       const focused = React.useRef(false);
       React.useEffect(() => { if (!focused.current) setStr(value ? String(value) : ''); }, [value]);
@@ -8103,7 +8105,7 @@
         onCommit(s === '' ? 0 : parseInt(s, 10));
       };
       return (
-        <input type="number" inputMode="numeric" min="0" value={str} placeholder="0"
+        <input ref={inputRef} type="number" inputMode="numeric" min="0" value={str} placeholder="0"
           onFocus={e=>{ focused.current = true; e.target.select(); }}
           onBlur={()=>{ focused.current = false; }}
           onChange={e=>handle(e.target.value)}
@@ -9358,6 +9360,15 @@
         const s = new Set(); for (const p of universe) if (p.producer) s.add(p.producer);
         return [...s].sort((a,b)=>a.localeCompare(b,'fr'));
       }, [universe]);
+      // V11.11 — inventaire tournant « par producteur » : PAS les producteurs de fromage (comptés dans 🧀 Fromage).
+      //   Producteur de fromage = 100 % de ses produits actifs sont du fromage. Un seul produit non-fromage
+      //   (ex. Gaborit) → il reste dans la liste.
+      const tournantProducers = React.useMemo(() => {
+        const tot = {}, chz = {};
+        for (const p of universe) { if (!p.producer) continue; tot[p.producer] = (tot[p.producer] || 0) + 1; if (kbInvIsCheese(p)) chz[p.producer] = (chz[p.producer] || 0) + 1; }
+        const cheese = new Set(Object.keys(tot).filter(pr => chz[pr] && chz[pr] === tot[pr]));
+        return { list: producers.filter(pr => !cheese.has(pr)), hidden: cheese.size };
+      }, [producers, universe]);
 
       // Catégories (niveau haut : « Produits laitiers », « Viandes »…)
       const categories = React.useMemo(() => {
@@ -9434,6 +9445,36 @@
           });
         } catch(e){}
       };
+
+      // V11.10 — toute modif de comptage passe par changeCount : on garde la valeur d'avant pour « ↩️ Annuler ».
+      //   Plusieurs touches de suite sur le même produit (< 8 s) = une seule modif à annuler (on garde la valeur de départ).
+      const [lastChange, setLastChange] = React.useState(null); // { id, name, before (undefined = pas compté), after, at }
+      const qtyRefs = React.useRef({});
+      const changeCount = (productId, qty) => {
+        if (invLocked) { showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier'); return; }
+        const q = Math.max(0, parseInt(qty, 10) || 0);
+        const cur = counts[productId];
+        setLastChange(prev => {
+          const now = Date.now();
+          const same = prev && prev.id === productId && (now - prev.at) < 8000;
+          return { id: productId, name: prodById[productId]?.name || productId, before: same ? prev.before : cur, after: q, at: now };
+        });
+        setCount(productId, q);
+      };
+      const undoLastChange = async () => {
+        const lc = lastChange; if (!lc) return;
+        if (invLocked) { showToast('🔒 Inventaire clôturé — clique « Rouvrir » pour modifier'); return; }
+        setLastChange(null);
+        if (lc.before === undefined || lc.before === null) {
+          setCounts(prev => { const n = { ...prev }; delete n[lc.id]; return n; });
+          try { await storage.deleteDoc(`inventory_${invDate}_${mode}`, lc.id); } catch (e) { showToast('⚠️ Annulation non enregistrée — vérifie la connexion'); return; }
+        } else {
+          await setCount(lc.id, lc.before);
+        }
+        showToast(`↩️ ${lc.name} : remis à ${lc.before === undefined || lc.before === null ? 'non compté' : lc.before}`);
+      };
+      React.useEffect(() => { if (!lastChange) return; const t = setTimeout(() => setLastChange(null), 15000); return () => clearTimeout(t); }, [lastChange]);
+      React.useEffect(() => { setLastChange(null); }, [invDate, mode]);
 
       const matches = React.useMemo(() => {
         const baseAll = (invType === 'tournant') ? scopeProducts : universe;
@@ -9855,9 +9896,13 @@
                 {scopeKind === 'producer' && (
                   <select value={scopeValue} onChange={e=>{ setScopeValue(e.target.value); saveMeta({scopeValue:e.target.value}); }}
                     style={{width:'100%',fontSize:15,padding:'8px'}}>
-                    <option value="">— Choisir un producteur ({producers.length}) —</option>
-                    {producers.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+                    <option value="">— Choisir un producteur ({tournantProducers.list.length}) —</option>
+                    {tournantProducers.list.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+                    {scopeValue && !tournantProducers.list.includes(scopeValue) && <option value={scopeValue}>{scopeValue}</option>}
                   </select>
+                )}
+                {scopeKind === 'producer' && tournantProducers.hidden > 0 && (
+                  <div style={{fontSize:12,color:'var(--ink-mute)',marginTop:4}}>🧀 {tournantProducers.hidden} producteur(s) 100 % fromage pas listé(s) ici → ils se comptent dans le périmètre « 🧀 Fromage ».</div>
                 )}
                 {scopeKind === 'type' && (
                   <div className="filter-row" style={{marginBottom:0}}>
@@ -10008,7 +10053,13 @@
                 <div className={`chip ${invSort==='fournisseur'?'selected':''}`} onClick={()=>setInvSort('fournisseur')}>🧺 Fournisseur</div>
                 {hasFamilies && <div className={`chip ${invSort==='famille'?'selected':''}`} onClick={()=>setInvSort('famille')}>🗂️ Famille</div>}
               </div>
-              <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>{matches.length} produit(s){matches.some(p=>p._horsFeuille) ? ` dont ${matches.filter(p=>p._horsFeuille).length} hors feuille de stock` : ''} · touche <strong>−</strong> / <strong>+</strong> ou tape le nombre. « Stock 0 » si vide.</div>
+              <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>{matches.length} produit(s){matches.some(p=>p._horsFeuille) ? ` dont ${matches.filter(p=>p._horsFeuille).length} hors feuille de stock` : ''} · touche <strong>+</strong> / <strong>−</strong>, ou touche le nom pour taper le nombre. « Stock 0 » si vide.</div>
+              {lastChange && (
+                <div style={{position:'sticky',top:0,zIndex:5,display:'flex',alignItems:'center',gap:8,marginBottom:6,padding:'10px 12px',borderRadius:12,background:'#fffde7',border:'2px solid #f9a825'}}>
+                  <div style={{flex:1,minWidth:0,fontSize:15,fontWeight:700,wordBreak:'break-word'}}>{lastChange.name} : {lastChange.before === undefined || lastChange.before === null ? '—' : lastChange.before} → {lastChange.after}</div>
+                  <button onClick={undoLastChange} style={{flex:'0 0 auto',fontSize:16,fontWeight:800,padding:'10px 14px',borderRadius:10,border:'2px solid #f57f17',background:'#fff',color:'#e65100',cursor:'pointer'}}>↩️ Annuler</button>
+                </div>
+              )}
               <div className="stack" style={{gap:4,maxHeight:'55vh',overflowY:'auto'}}>
                 {matches.map(p => {
                   const isCounted = counts[p.id] !== undefined && counts[p.id] !== null;
@@ -10020,23 +10071,26 @@
                   return (
                   <div key={p.id} style={{padding:'12px',border:`3px solid ${isCounted?'#2e7d32':'var(--border)'}`,background:isCounted?'#e8f5e9':'var(--bg-card,#fff)',borderRadius:14}}>
                     <div style={{display:'flex',alignItems:'center',gap:10}}>
-                      {/* V9.91 — toucher la ligne = +1 colis (F&L) ou +1 article */}
-                      <button onClick={()=>{ try { navigator.vibrate && navigator.vibrate(15); } catch(_){} setCount(p.id, (counts[p.id] ?? 0) + 1); }}
+                      {/* V11.10 — toucher le nom ne compte plus (+1 involontaires) : il ouvre la saisie du nombre */}
+                      <button onClick={()=>{ const el = qtyRefs.current[p.id]; if (el) { try { el.focus(); el.select(); } catch(_){} } }}
                         style={{minWidth:0,flex:1,textAlign:'left',border:'none',background:'transparent',padding:'4px 2px',cursor:'pointer'}}>
                         <div style={{fontWeight:700,fontSize:20,lineHeight:1.15,wordBreak:'break-word',color:'var(--ink)'}}>{isCounted?'✓ ':''}{p.name}</div>
                         <div style={{color:'var(--ink-mute)',fontSize:13,lineHeight:1.2,wordBreak:'break-word'}}>{sub}</div>
                         {p._horsFeuille && <div style={{display:'inline-block',marginTop:4,fontSize:12,fontWeight:700,color:'#b45309',background:'#fff7ed',border:'1px solid #fdba74',borderRadius:6,padding:'2px 7px'}}>📚 Catalogue — absent de la feuille de stock (compté ici, à ajouter dans la feuille)</div>}
-                        <div style={{fontSize:13,fontWeight:700,color:'#2e7d32',marginTop:3}}>👆 touche = +1 {kbIsFLProduct(p) ? 'colis' : 'article'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{color:'var(--ink-mute)',fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}</div>
+                        <div style={{fontSize:13,fontWeight:700,color:'var(--ink-mute)',marginTop:3}}>en {kbIsFLProduct(p) ? 'colis' : 'articles'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}</div>
                       </button>
-                      <div style={{display:'flex',alignItems:'center',gap:5,flex:'0 0 auto'}}>
-                        <button onClick={()=>setCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
-                          style={{width:52,height:56,fontSize:30,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid var(--border)',background:'var(--bg-card,#fff)',cursor:'pointer'}}>−</button>
-                        <QtyInput value={counts[p.id] ?? 0} onCommit={(q)=>setCount(p.id, q)}
-                          style={{width:68,height:56,textAlign:'center',fontSize:28,fontWeight:700,padding:0,borderRadius:12}} />
+                      <div style={{display:'flex',alignItems:'center',gap:6,flex:'0 0 auto'}}>
+                        <button onClick={()=>changeCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
+                          style={{width:52,height:60,fontSize:30,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid var(--border)',background:'var(--bg-card,#fff)',cursor:'pointer'}}>−</button>
+                        <QtyInput inputRef={el => { if (el) qtyRefs.current[p.id] = el; else delete qtyRefs.current[p.id]; }}
+                          value={counts[p.id] ?? 0} onCommit={(q)=>changeCount(p.id, q)}
+                          style={{width:68,height:60,textAlign:'center',fontSize:28,fontWeight:700,padding:0,borderRadius:12}} />
+                        <button onClick={()=>{ try { navigator.vibrate && navigator.vibrate(15); } catch(_){} changeCount(p.id, (counts[p.id] ?? 0) + 1); }} aria-label="plus"
+                          style={{width:52,height:60,fontSize:30,fontWeight:700,lineHeight:1,borderRadius:12,border:'2px solid #2e7d32',background:'#e8f5e9',color:'#1b5e20',cursor:'pointer'}}>+</button>
                       </div>
                     </div>
                     <div style={{display:'flex',gap:8,marginTop:8}}>
-                      <button onClick={()=>setCount(p.id, 0)}
+                      <button onClick={()=>changeCount(p.id, 0)}
                         style={{fontSize:13,padding:'7px 16px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',cursor:'pointer',fontWeight:600}}>Stock 0</button>
                       <button onClick={()=>setDlcExpandedId(prev => prev===p.id ? null : p.id)}
                         style={{fontSize:13,padding:'7px 14px',borderRadius:8,border:`1px solid ${hasDlc?'var(--accent)':'var(--border)'}`,background:'transparent',color: hasDlc ? 'var(--accent-dark)' : 'var(--ink-mute)',cursor:'pointer',fontWeight:600}}>{hasDlc ? '✓ DLC courte' : '📅 DLC courte'}</button>
