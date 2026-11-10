@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.12) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.13) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.12';
+const APP_VERSION = 'V11.13';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -14606,6 +14606,13 @@ function InventoryPage({
           items,
           clearFirst: true
         });
+        writtenN = kbInvWrittenN(wr);
+        if (!kbInvWriteOk(wr, items.length)) {
+          kbInvWriteFail(showToast, wr, items.length, reuse.url);
+          setWriting(false);
+          setClosingInv(false);
+          return;
+        }
         const cl = await stockPost({
           secret: FRESHDESK_SECRET,
           action: 'inv_close',
@@ -14614,7 +14621,6 @@ function InventoryPage({
           stockDate
         });
         url = cl && cl.url || reuse.url;
-        writtenN = wr && wr.written || 0;
         setWriteResult({
           written: writtenN,
           sheet: name,
@@ -14639,12 +14645,25 @@ function InventoryPage({
         sheetId = nw.sheetId;
         name = nw.name;
         stockDate = nw.stockDate;
+        if (!nw.count) {
+          showToast('❌ Classeur sans aucun produit (feuille de stock illisible) — inventaire PAS clôturé, rien n\'est perdu. Préviens Henry.');
+          setWriting(false);
+          setClosingInv(false);
+          return;
+        }
         const wr = await stockPost({
           secret: FRESHDESK_SECRET,
           action: 'inv_write',
           sheetId,
           items
         });
+        writtenN = kbInvWrittenN(wr);
+        if (!kbInvWriteOk(wr, items.length)) {
+          kbInvWriteFail(showToast, wr, items.length, nw.url);
+          setWriting(false);
+          setClosingInv(false);
+          return;
+        }
         const cl = await stockPost({
           secret: FRESHDESK_SECRET,
           action: 'inv_close',
@@ -14653,7 +14672,6 @@ function InventoryPage({
           stockDate
         });
         url = cl && cl.url || nw.url;
-        writtenN = wr && wr.written || 0;
         setWriteResult({
           written: writtenN,
           sheet: name,
@@ -56424,6 +56442,24 @@ function FlInfoControlCard({
     }
   }, busy ? 'Écriture…' : '✓ Écrire dans le Sheet'))));
 }
+function kbInvWrittenN(wr) {
+  return wr ? (Number(wr.written) || 0) + (Number(wr.appended) || 0) : 0;
+}
+function kbInvWriteOk(wr, n) {
+  return !!wr && wr.ok !== false && kbInvWrittenN(wr) >= n;
+}
+function kbInvWriteFail(showToast, wr, n, url) {
+  const got = kbInvWrittenN(wr);
+  const why = wr && wr.ok === false ? wr.error || 'erreur serveur' : `${got}/${n} écrit(s)`;
+  showToast(`❌ Inventaire PAS clôturé : ${why}. Les comptages restent dans l'appli (rien n'est perdu). Préviens Henry.`);
+  try {
+    console.warn('[inventaire] écriture classeur incomplète', {
+      wr,
+      n,
+      url
+    });
+  } catch (_) {}
+}
 const KB_FLA_SECTIONS = [{
   k: 'ventes',
   ic: '📊',
@@ -56498,14 +56534,19 @@ function kbFlaCount(rep) {
   const m = rep.meta || {};
   return n + (m.ventesErr ? 1 : 0) + (kbFlaMissing(m).list.length ? 1 : 0);
 }
-function kbFlaMissing(m) {
+function kbFlaDoneKey(x) {
+  return 'r' + String(x.row || '') + '_' + normalizeText(String(x.des || '')).replace(/[^a-z0-9]+/g, '_').slice(0, 60);
+}
+function kbFlaMissing(m, done) {
   const v = m && m.ventes || null,
     w = m && m.veille || null;
   const pick = w && !w.none && (!v || String(w.at || '') > String(v.at || '')) ? w : v && !v.none ? v : null;
+  const at = pick ? String(pick.at || '') : '';
+  const list = (pick && pick.soldMissing || []).filter(x => !(done && x.why === 'inactif' && x.row && done[kbFlaDoneKey(x)] && done[kbFlaDoneKey(x)] > at));
   return {
-    list: pick && pick.soldMissing || [],
+    list,
     day: pick ? pick.day : '',
-    at: pick ? pick.at : '',
+    at,
     hourly: pick === w
   };
 }
@@ -56530,6 +56571,33 @@ function FlAutoCard({
   const [codeIn, setCodeIn] = React.useState({});
   const [pick, setPick] = React.useState({});
   const [bulk, setBulk] = React.useState(null);
+  const [flDone, setFlDone] = React.useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('kb_fl_ventes_actif') || '{}') || {};
+    } catch (_) {
+      return {};
+    }
+  });
+  React.useEffect(() => storage.subscribe('fl_ventes_actif', arr => {
+    const o = {};
+    (arr || []).forEach(d => {
+      if (d && d.k) o[d.k] = d.at || '';
+    });
+    setFlDone(prev => {
+      const n = {
+        ...prev
+      };
+      Object.keys(o).forEach(k => {
+        if (!n[k] || o[k] > n[k]) n[k] = o[k];
+      });
+      return n;
+    });
+  }), []);
+  React.useEffect(() => {
+    try {
+      localStorage.setItem('kb_fl_ventes_actif', JSON.stringify(flDone));
+    } catch (_) {}
+  }, [flDone]);
   const by = session && session.name;
   const load = React.useCallback(async () => {
     setErr('');
@@ -56683,6 +56751,34 @@ function FlAutoCard({
       } : b);
     }
     const okK = new Set(ok.map(pkey));
+    if (actif && !ignoreLabel) {
+      const at = new Date().toISOString();
+      for (const i of ok) {
+        if (i.type !== 'ventes') continue;
+        const k = kbFlaDoneKey(i);
+        try {
+          await storage.setDoc('fl_ventes_actif', k, {
+            id: k,
+            k,
+            row: i.row,
+            des: i.des,
+            at,
+            by: by || ''
+          }, {
+            replace: true
+          });
+        } catch (_) {}
+      }
+      setFlDone(d => {
+        const n = {
+          ...d
+        };
+        ok.forEach(i => {
+          if (i.type === 'ventes') n[kbFlaDoneKey(i)] = at;
+        });
+        return n;
+      });
+    }
     setRep(r => r ? {
       ...r,
       issues: r.issues.filter(x => !okK.has(pkey(x)))
@@ -57088,7 +57184,7 @@ function FlAutoCard({
       width: '100%'
     }
   }, "🔎 Relancer le contrôle"))), (() => {
-    const MI = kbFlaMissing(m);
+    const MI = kbFlaMissing(m, flDone);
     return section('ventes', MI.list.length, React.createElement(React.Fragment, null, React.createElement("div", {
       style: {
         fontSize: 13,
