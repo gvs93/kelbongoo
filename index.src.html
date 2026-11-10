@@ -785,7 +785,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.22';
+    const APP_VERSION = 'V11.24';
+    // V11.24 — (10/11/2026) 🔌 Master › Températures : état de branchement secteur des hubs Koovea (branché / débranché / injoignable),
+    //   lieu de chaque hub réglable, alerte mail « coupure électricité probable » à hg@ / rr@ / ga@ envoyée par le serveur (proxy KBG FRESHDESK, toutes les 5 min).
+    //   Identifiants Koovea uniquement dans les propriétés du script — jamais dans l'appli.
+    // V11.23 — (10/11/2026) 🎄 Espace Rungis › Sapins : prochaine récupération en gros, calendrier (jours en rouge, Lun→Dim), commandes par magasin du jour touché, ajouter / retirer / déplacer un jour (marqué « modifié par Rungis » dans la console).
     // V11.22 — (10/11/2026) 🎄 Sapins : le chauffeur ne peut valider la récupération qu'à partir du jour J (sauf journée de test).
     // V11.21 — (10/11/2026) 🎄 Sapins : URL du serveur Sapins corrigée (sans /a/probon.fr), message clair si serveur injoignable.
     // V11.20 — (10/11/2026) 🎄 Sapins : cœur commun à jour (la prévision part par défaut si le magasin ne valide rien ; Bichat = commande console).
@@ -23882,6 +23886,94 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     }
 
     // ============================================================
+    // V11.24 — HUBS KOOVEA : BRANCHEMENT SECTEUR (master)
+    // Source : proxy KBG FRESHDESK, action 'koovea_hubs' (API api.koovea.fr getHubs, champ plugged.value).
+    // Les identifiants Koovea restent côté serveur (propriétés du script). Le proxy ne renvoie ni IMEI ni GPS.
+    // L'alerte mail est envoyée par le serveur (déclencheur 5 min), PAS par cette page.
+    // ============================================================
+    const KOOVEA_HUB_LIEUX = [...SITES, 'RUNGIS', 'CAMION', 'AUTRE'];
+    function KooveaHubsCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [st, setSt] = React.useState({ loading: true, err: '', hubs: [], at: null });
+      const [busy, setBusy] = React.useState(null);
+      const load = React.useCallback(async () => {
+        setSt(prev => ({ ...prev, loading: true, err: '' }));
+        try {
+          const r = await freshdeskPost({ action: 'koovea_hubs' });
+          if (r && r.ok) setSt({ loading: false, err: '', hubs: Array.isArray(r.hubs) ? r.hubs : [], at: r.checkedAt || new Date().toISOString() });
+          else setSt(prev => ({ ...prev, loading: false, err: (r && r.error) || 'Erreur Koovea (hubs)' }));
+        } catch (e) { setSt(prev => ({ ...prev, loading: false, err: kbErrMsg ? kbErrMsg(e) : e.message })); }
+      }, []);
+      React.useEffect(() => { load(); const id = setInterval(load, 120000); return () => clearInterval(id); }, [load]);
+      const setLieu = async (h, lieu) => {
+        setBusy(h.id);
+        try {
+          const r = await freshdeskPost({ action: 'koovea_hubs_setlieu', hubId: h.id, lieu, by: session && session.name });
+          if (r && r.ok) { showToast(`✓ ${h.name} → ${lieu ? siteLabel(lieu) : 'sans lieu'}`); load(); }
+          else showToast('Erreur : ' + ((r && r.error) || 'inconnue'));
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        setBusy(null);
+      };
+      const ago = (iso) => {
+        if (!iso) return '—';
+        const m = (Date.now() - new Date(iso).getTime()) / 60000;
+        if (!isFinite(m)) return '—';
+        return m < 1 ? "à l'instant" : m < 60 ? `il y a ${Math.round(m)} min` : m < 2880 ? `il y a ${Math.floor(m / 60)}h${String(Math.round(m % 60)).padStart(2, '0')}` : `il y a ${Math.floor(m / 1440)} j`;
+      };
+      const fmt = (iso) => { try { return iso ? `${formatDateShort(iso)} ${formatTimeFR(iso)}` : '—'; } catch (e) { return String(iso || '—'); } };
+      const hubs = [...st.hubs].sort((a, b) => {
+        const rank = (h) => h.plugged === false ? 0 : h.offline ? 1 : h.plugged == null ? 2 : 3;
+        return rank(a) - rank(b) || String(a.name).localeCompare(String(b.name));
+      });
+      const nbOff = hubs.filter(h => h.plugged === false || h.offline).length;
+      return (
+        <div className="card" style={{ borderLeft: `6px solid ${nbOff ? 'var(--danger)' : 'var(--accent-dark)'}` }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <h2 style={{ margin: 0 }}>🔌 Branchement des hubs</h2>
+            <button className="btn-ghost" style={{ fontSize: 13 }} disabled={st.loading} onClick={load}>{st.loading ? '…' : '↻ Actualiser'}</button>
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--ink-mute)', margin: '4px 0 10px' }}>
+            Hub débranché du secteur = <strong>coupure électricité probable</strong>. Alerte mail automatique à hg@probon.fr, rr@pribon.org, ga@pribon.org (contrôle serveur toutes les 5 min).
+            {st.at && <> · Vérifié {ago(st.at)}</>}
+          </div>
+          {nbOff > 0 && (
+            <div style={{ background: 'var(--danger-soft)', color: 'var(--danger)', borderRadius: 10, padding: '12px 14px', fontWeight: 800, fontSize: 18, marginBottom: 10 }}>
+              ⚡ {nbOff} hub{nbOff > 1 ? 's' : ''} sans secteur ou injoignable{nbOff > 1 ? 's' : ''}
+            </div>
+          )}
+          {st.err && <div className="alert-warning" style={{ fontSize: 13 }}>⚠️ {st.err}</div>}
+          {!st.loading && !st.err && hubs.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Aucun hub renvoyé par Koovea.</p>}
+          {hubs.map(h => {
+            const off = h.plugged === false;
+            const unk = !off && h.plugged == null;
+            const color = off || h.offline ? 'var(--danger)' : unk ? 'var(--warn)' : 'var(--accent-dark)';
+            const bg = off || h.offline ? 'var(--danger-soft)' : 'transparent';
+            const label = off ? '⚡ DÉBRANCHÉ — sur batterie' : h.offline ? '⛔ INJOIGNABLE' : unk ? '❔ État inconnu' : '✅ Branché secteur';
+            return (
+              <div key={h.id} style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', padding: '10px 8px', borderTop: '1px solid var(--line)', background: bg, borderRadius: 8 }}>
+                <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+                  <div style={{ fontWeight: 800, fontSize: 17 }}>{h.lieu ? `${siteLabel(h.lieu)} (${h.lieu})` : <span style={{ color: 'var(--warn)' }}>Lieu à choisir</span>}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{h.name}</div>
+                  <div style={{ fontWeight: 800, fontSize: 16, color, marginTop: 2 }}>{label}</div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 2 }}>
+                    {h.pluggedAt && <>{off ? 'Débranché' : 'Branché'} depuis le {fmt(h.pluggedAt)} · </>}
+                    Dernière connexion {ago(h.lastConnection)}
+                    {h.battery != null && <> · 🔋 {Math.round(h.battery)} %</>}
+                  </div>
+                  {h.offline && !off && <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 2 }}>Plus de nouvelles du hub depuis {ago(h.lastConnection).replace('il y a ', '')} : l'état « branché » affiché par Koovea n'est peut-être plus à jour.</div>}
+                </div>
+                <select value={h.lieu || ''} disabled={busy === h.id} onChange={e => setLieu(h, e.target.value)} style={{ padding: 8, borderRadius: 8, border: '1.5px solid var(--border)', fontSize: 14 }}>
+                  <option value="">— Lieu —</option>
+                  {KOOVEA_HUB_LIEUX.map(c => <option key={c} value={c}>{SITE_NAMES[c] ? `${c} · ${SITE_NAMES[c]}` : c}</option>)}
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ============================================================
     // TEMPÉRATURES — PAGE MASTER (réglages seuils par capteur + vue globale)
     // Seul le master peut écrire dans `temp_config` (clé = MAC du capteur). La page
     // TemperaturePage des distributeurs/prépa est 100% lecture seule.
@@ -23957,6 +24049,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             Vue de tous les capteurs des chambres froides. <strong>Seul le master peut modifier un seuil d'alerte</strong> —
             les distributeurs et préparateurs n'ont qu'un affichage en lecture seule.
           </p>
+
+          <KooveaHubsCard session={session} />
 
           {sites.map(site => {
             const st0 = bySite[site] || { loading: true, sensors: [] };
@@ -31950,6 +32044,52 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     }
     /* URL /exec « publique » : enlève le préfixe de domaine Workspace (/a/probon.fr/) qui force une connexion Google. */
     function sapExecUrl(u){ return String(u||"").trim().replace(/script\.google\.com\/a\/(?:macros\/)?[^\/]+\/(?:macros\/)?s\//, "script.google.com/macros/s/"); }
+    /* ---------- Calendrier des récupérations (Console + appli Rungis) ---------- */
+    // Mois à afficher : du mois de la 1re récup au mois de la fin de saison. cells = null (case vide) ou "AAAA-MM-JJ" ; semaine qui commence le lundi.
+    function sapCalMonths(n1, config){
+      var all = sapActiveDates(n1, config, "").concat(((n1&&n1.calendar)||[]).map(function(c){ return c.date; })).sort();
+      var a = all[0] || sapToday(), b = (n1 && n1.finSaison) || all[all.length-1] || a, out = [];
+      var y = +a.slice(0,4), m = +a.slice(5,7) - 1, yb = +b.slice(0,4), mb = +b.slice(5,7) - 1;
+      while (y < yb || (y === yb && m <= mb)){
+        var first = new Date(y, m, 1), n = new Date(y, m+1, 0).getDate(), off = (first.getDay()+6)%7, cells = [];
+        for (var i=0;i<off;i++) cells.push(null);
+        for (var d=1; d<=n; d++) cells.push(y+"-"+(m<9?"0":"")+(m+1)+"-"+(d<10?"0":"")+d);
+        out.push({ y:y, m:m, label:["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"][m]+" "+y, cells:cells });
+        m++; if (m > 11){ m = 0; y++; }
+      }
+      return out;
+    }
+    function sapToday(){ var t = new Date(); return t.getFullYear()+"-"+String(t.getMonth()+1).padStart(2,"0")+"-"+String(t.getDate()).padStart(2,"0"); }
+    /* Ajouter / retirer / déplacer un jour de récup. Renvoie { ok, error, patch } : patch = chemins sous « sapins/ » pour un update multi-chemins.
+       Règles : on ajoute seulement un jour futur (commande encore ouverte) ; on retire seulement un jour non figé ;
+       on peut DÉPLACER un jour figé (Rungis ne peut pas y aller) tant que le chauffeur n'a rien récupéré : les commandes figées suivent. */
+    function sapDayOps(n1, config, cmds, recups, op, from, to, who, src, now){
+      now = now || Date.now(); var act = sapActiveDates(n1, config, ""), P = {}, at = now;
+      var fut = function(d){ return /^\d{4}-\d{2}-\d{2}$/.test(d||"") && sapDeadline(d) > now; };
+      if (op === "add"){
+        if (!fut(to)) return { ok:false, error:"Choisis un jour à venir (au plus tôt après-demain)." };
+        if (act.indexOf(to) >= 0) return { ok:false, error:"C'est déjà un jour de récupération." };
+        P["config/recups/"+to] = { on:true, by:who, at:at, src:src, added:true };
+        return { ok:true, patch:P };
+      }
+      if (act.indexOf(from) < 0) return { ok:false, error:"Ce n'est pas un jour de récupération." };
+      if (((recups||{})[from]||{}).done) return { ok:false, error:"Le chauffeur a déjà noté la récupération de ce jour." };
+      if (op === "remove"){
+        if (sapLocked(config, cmds, from, now)) return { ok:false, error:"Commande déjà figée : déplace le jour au lieu de le retirer." };
+        P["config/recups/"+from] = { on:false, by:who, at:at, src:src, removed:true };
+        return { ok:true, patch:P };
+      }
+      if (op === "move"){
+        if (!fut(to) && !(sapLocked(config, cmds, from, now) && to > sapToday())) return { ok:false, error:"Choisis un jour à venir." };
+        if (act.indexOf(to) >= 0) return { ok:false, error:"Ce jour est déjà un jour de récupération." };
+        P["config/recups/"+from] = { on:false, by:who, at:at, src:src, movedTo:to };
+        P["config/recups/"+to]   = { on:true, by:who, at:at, src:src, movedFrom:from };
+        var c = (cmds||{})[from]; if (c){ P["cmd/"+to] = c; P["cmd/"+from] = null; }
+        P["recap/"+from] = null;
+        return { ok:true, patch:P };
+      }
+      return { ok:false, error:"opération inconnue" };
+    }
     /* Quantités qui partent pour un magasin : commande validée (ou saisie console) sinon la prévision. { L:n } */
     function sapEffLines(n1, config, d, sk, cmds, receps){
       var c = ((cmds||{})[d]||{})[sk], out = {};
@@ -32587,7 +32727,84 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       { k: 'enl', ic: '📦', l: 'Enlèvements' },
       { k: 'trucks', ic: '🚚', l: 'Suivi camions' },
       { k: 'epal', ic: '🟫', l: 'Palettes EPAL' },    // V10.74
+      { k: 'sapins', ic: '🎄', l: 'Sapins' },          // V11.23 — jours de récupération + commandes par magasin
     ];
+    // 🎄 Espace Rungis › Sapins : prochaine récup en gros, calendrier (jours en rouge), commandes par magasin du jour touché,
+    //   ajouter / retirer / déplacer un jour (règles du cœur commun sapDayOps). Pas de prix.
+    function RungisSapinsMasterPage({ session }) {
+      const { S, err, reload } = useKbSapins();
+      const [sel, setSel] = React.useState('');
+      const [moveTo, setMoveTo] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const showToast = React.useContext(ToastContext);
+      if (S === undefined) return <div className="container"><div className="card">Chargement…</div></div>;
+      if (!S || !S.n1) return <div className="container"><div className="card">⚠️ Sapins indisponibles {err}</div></div>;
+      const cfg = S.config || {}, cmds = S.cmd || {}, receps = S.recep || {}, act = sapActiveDates(S.n1, cfg, ''), today = todayKey(), now = Date.now();
+      const next = act.find(x => x >= today) || '';
+      const d = sel || next;
+      const isOn = act.indexOf(d) >= 0;
+      const stores = SAP_STORES.filter(x => !x.test);
+      const eff = (dd, sk) => sapEffLines(S.n1, cfg, dd, sk, cmds, receps);
+      const totDay = (dd) => stores.reduce((a, st) => a + sapSum(eff(dd, st.k)), 0);
+      const who = session.name || session.adminEmail || 'Rungis';
+      const op = async (o, from, to) => {
+        const r = sapDayOps(S.n1, cfg, cmds, S.recup || {}, o, from, to, who, 'rungis', Date.now());
+        if (!r.ok) { alert(r.error); return; }
+        const msg = o === 'add' ? 'Ajouter une récupération le ' + sapDayFr(to, true) + ' ?' : o === 'remove' ? 'Retirer la récupération du ' + sapDayFr(from, true) + ' ?' : 'Déplacer la récupération du ' + sapDayFr(from, true) + ' au ' + sapDayFr(to, true) + ' ?\nLes commandes suivent. Les magasins et la console sont prévenus.';
+        if (!window.confirm(msg)) return;
+        setBusy(true);
+        try { const res = await fetch(KB_SAP_FB + '.json', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r.patch) }); if (!res.ok) throw new Error('HTTP ' + res.status);
+          kbSapPost(((S.meta || {}).url) || '', { action: 'sapin-kick' }).catch(() => {});
+          setSel(o === 'remove' ? from : to); setMoveTo(''); await reload(); showToast && showToast('📅 Calendrier mis à jour');
+        } catch (e) { alert('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const lines = SAP_LINES.filter(L => !L.resa && L.o === 'MORVAN');
+      const months = sapCalMonths(S.n1, cfg);
+      const o = (cfg.recups || {})[d] || {};
+      const Cell = ({ k }) => { if (!k) return <div />; const on = act.indexOf(k) >= 0, past = k < today, oo = (cfg.recups || {})[k] || {}, lock = on && sapLocked(cfg, cmds, k, now);
+        return <button onClick={() => { setSel(k); setMoveTo(''); }} style={{ position: 'relative', height: 46, borderRadius: 10, border: '1px solid ' + (on ? '#C62828' : '#dfe5e1'), background: on ? '#C62828' : '#fff', color: on ? '#fff' : '#1c2b24', fontWeight: 800, fontSize: 18, cursor: 'pointer', opacity: past && k !== d ? .35 : 1, outline: k === d ? '4px solid #F6C744' : 'none', outlineOffset: 1, boxShadow: k === today ? 'inset 0 0 0 2px #1c2b24' : 'none', padding: 0 }}>
+          {+k.slice(8)}{oo.src === 'rungis' && <i style={{ position: 'absolute', top: 2, right: 3, fontStyle: 'normal', fontSize: 10, background: '#F6C744', color: '#3a2a00', borderRadius: 4, padding: '0 3px' }}>R</i>}{lock && <span style={{ position: 'absolute', bottom: 0, right: 2, fontSize: 10 }}>🔒</span>}</button>; };
+      return (
+        <div className="container" style={{ maxWidth: 820 }}>
+          {next ? <div style={{ background: '#123B2C', color: '#fff', borderRadius: 18, padding: 16, marginBottom: 14 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: '#CFE0D7' }}>{next === today ? 'À récupérer AUJOURD’HUI chez Cruard' : 'Prochaine récupération chez Cruard'}</div>
+            <div style={{ fontSize: 30, fontWeight: 900, lineHeight: 1.1 }}>{sapDayFr(next, true).toUpperCase()}</div>
+            <div style={{ fontSize: 44, fontWeight: 900, color: '#F6C744', lineHeight: 1.1 }}>{totDay(next)} sapins</div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>{stores.map(st => <span key={st.k} style={{ background: st.color, borderRadius: 10, padding: '4px 10px', fontWeight: 800, fontSize: 14 }}>{st.short} {sapSum(eff(next, st.k))}</span>)}</div>
+            <div style={{ fontSize: 13, color: '#CFE0D7', marginTop: 8 }}>{sapLocked(cfg, cmds, next, now) ? '🔒 Commandes figées' + (((S.mails || {})['rungis_' + next]) ? ' · mail 2 h envoyé' : ' · mail à 2 h le jour même') : '⏰ Les magasins peuvent encore modifier jusqu’au ' + sapDayFr(sapAddDays(next, -1)) + ' minuit'}</div>
+          </div> : <div className="card">Plus de récupération prévue.</div>}
+          <div className="card" style={{ padding: 14 }}>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>📅 Jours de récupération</div>
+            <div style={{ fontSize: 14, color: 'var(--ink-soft)', margin: '2px 0 10px' }}>Touche un jour pour voir les commandes, et l’ajouter, le retirer ou le déplacer.</div>
+            {months.map(m => <div key={m.label} style={{ marginBottom: 12 }}><div style={{ fontWeight: 800, fontSize: 17, marginBottom: 6 }}>{m.label}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 5 }}>{['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(w => <div key={w} style={{ fontSize: 13, fontWeight: 800, color: 'var(--ink-soft)', textAlign: 'center' }}>{w}</div>)}{m.cells.map((k, i) => <Cell key={i} k={k} />)}</div></div>)}
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-soft)', fontWeight: 700 }}><span>🟥 récupération</span><span>🟨 contour = jour affiché</span><span><b style={{ background: '#F6C744', color: '#3a2a00', borderRadius: 4, padding: '0 3px' }}>R</b> modifié par Rungis</span><span>🔒 figé</span></div>
+          </div>
+          {d && <div className="card" style={{ padding: 14, border: '3px solid #F6C744' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <div><div style={{ fontSize: 13, color: 'var(--ink-soft)', fontWeight: 700 }}>Jour affiché</div><div style={{ fontSize: 22, fontWeight: 900 }}>{sapDayFr(d, true)}{isOn ? ' · ' + totDay(d) + ' sapins' : ''}</div></div>
+              {isOn ? <span style={{ background: '#C62828', color: '#fff', borderRadius: 8, padding: '3px 9px', fontWeight: 800, fontSize: 13 }}>Récupération</span> : <span style={{ color: 'var(--ink-soft)', fontWeight: 700 }}>pas de récupération</span>}
+            </div>
+            {o.at && <div style={{ background: '#FFF8E1', border: '1px solid #F6C744', borderRadius: 10, padding: '6px 10px', fontSize: 13, marginTop: 8 }}>✏️ {o.movedFrom ? 'Déplacé du ' + sapDayFr(o.movedFrom) : o.movedTo ? 'Déplacé au ' + sapDayFr(o.movedTo) : o.added ? 'Ajouté' : o.on === false ? 'Retiré' : 'Modifié'} par <b>{o.by || '?'}</b>{o.src === 'rungis' ? ' (Rungis)' : o.src === 'console' ? ' (console)' : ''} · {new Date(o.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</div>}
+            {isOn && <div style={{ overflowX: 'auto', marginTop: 10 }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+              <thead><tr><th style={{ textAlign: 'left', padding: 6 }}></th>{lines.map(L => <th key={L.k} style={{ padding: 3 }}><span style={{ display: 'inline-block', background: L.hex, color: L.ink, border: '2px solid ' + (L.c === 'blanc' ? '#9e9e9e' : L.hex), borderRadius: 7, padding: '1px 5px', fontWeight: 800, fontSize: 11, lineHeight: 1.15 }}>{L.t.replace('-', '-​')}</span></th>)}<th style={{ padding: 6 }}>Total</th></tr></thead>
+              <tbody>{stores.map(st => { const e = eff(d, st.k); const c = (cmds[d] || {})[st.k]; return <tr key={st.k} style={{ borderTop: '1px solid var(--line)' }}>
+                <td style={{ padding: 6, fontWeight: 800 }}>{st.short}<div style={{ fontSize: 10, color: 'var(--ink-soft)', fontWeight: 600 }}>{c && c.at && !c.auto ? 'validée' : 'prévision'}</div></td>
+                {lines.map(L => { const j = sapOther(L.k); return <td key={L.k} style={{ padding: '6px 2px', textAlign: 'center', whiteSpace: 'nowrap' }}><b>{e[L.k] || 0}</b> / {e[j] || 0}</td>; })}
+                <td style={{ padding: 6, textAlign: 'center', fontWeight: 900, fontSize: 18 }}>{sapSum(e)}</td></tr>; })}</tbody></table></div>}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14, alignItems: 'center' }}>
+              {isOn ? <>
+                <button disabled={busy} onClick={() => op('remove', d)} style={{ flex: '1 1 140px', minHeight: 52, borderRadius: 14, border: '2px solid #C62828', background: '#fff', color: '#C62828', fontWeight: 800, fontSize: 16 }}>✕ Retirer ce jour</button>
+                <input type="date" value={moveTo} onChange={e => setMoveTo(e.target.value)} style={{ flex: '1 1 140px', minHeight: 52, borderRadius: 14, border: '2px solid var(--line)', fontSize: 16, padding: '0 10px' }} />
+                <button disabled={busy || !moveTo} onClick={() => op('move', d, moveTo)} style={{ flex: '1 1 180px', minHeight: 52, borderRadius: 14, border: 'none', background: '#123B2C', color: '#fff', fontWeight: 800, fontSize: 16, opacity: moveTo ? 1 : .5 }}>⇄ Déplacer à cette date</button>
+              </> : (d > today ? <button disabled={busy} onClick={() => op('add', null, d)} style={{ flex: 1, minHeight: 52, borderRadius: 14, border: 'none', background: '#C62828', color: '#fff', fontWeight: 800, fontSize: 16 }}>＋ Ajouter une récupération ce jour</button> : null)}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 6 }}>Chiffres : Morvan / Jutland.</div>
+            <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Ajouter / retirer : possible jusqu’à la veille minuit. Après, on peut seulement déplacer (les commandes figées suivent).</div>
+          </div>}
+        </div>
+      );
+    }
     function RungisSpace({ session, onLogout, switcher, overlay }) {
       const [page, setPage] = React.useState('cmd');
       return (
@@ -32615,6 +32832,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {page === 'enl' && <RungisEnlClearPage session={session} />}
           {page === 'trucks' && <RungisTrucksPage />}
           {page === 'epal' && <><KbRduMasterCard /><RungisEpalBureauPage /></>}
+          {page === 'sapins' && <RungisSapinsMasterPage session={session} />}
         </div>
       );
     }
