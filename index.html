@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.14) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.15) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.14';
+const APP_VERSION = 'V11.15';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -11986,6 +11986,485 @@ function QtyInput({
     style: style
   });
 }
+function InventorySearch({
+  metas,
+  logs,
+  prodById,
+  onOpen
+}) {
+  const today = new Date();
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const back = n => {
+    const d = new Date(today);
+    d.setDate(d.getDate() - n);
+    return iso(d);
+  };
+  const [from, setFrom] = React.useState(back(90));
+  const [to, setTo] = React.useState(iso(today));
+  const [qProd, setQProd] = React.useState('');
+  const [qPrd, setQPrd] = React.useState('');
+  const [rows, setRows] = React.useState(null);
+  const [loading, setLoading] = React.useState(null);
+  const cacheRef = React.useRef({});
+  const [openKey, setOpenKey] = React.useState(null);
+  const allDates = React.useMemo(() => {
+    const s = new Set();
+    for (const m of metas || []) if (/^\d{4}-\d{2}-\d{2}$/.test(m.id || '')) s.add(m.id);
+    for (const l of logs || []) if (/^\d{4}-\d{2}-\d{2}$/.test(l.date || '')) s.add(l.date);
+    return [...s].sort((a, b) => b.localeCompare(a));
+  }, [metas, logs]);
+  const prodByName = React.useMemo(() => {
+    const m = {};
+    for (const p of Object.values(prodById || {})) {
+      if (!p || !p.name) continue;
+      const k = normalizeText(p.name).replace(/\s+/g, ' ').trim();
+      if (!m[k]) m[k] = new Set();
+      if (p.producer) m[k].add(p.producer);
+    }
+    return m;
+  }, [prodById]);
+  const producerOf = React.useCallback(it => {
+    if (it.producteur) return it.producteur;
+    const p = prodById && prodById[it.id];
+    if (p && p.producer) return p.producer;
+    const set = prodByName[normalizeText(it.produit || '').replace(/\s+/g, ' ').trim()];
+    return set && set.size ? [...set].join(' / ') : '';
+  }, [prodById, prodByName]);
+  React.useEffect(() => {
+    if (metas === null || logs === null) return;
+    let stop = false;
+    (async () => {
+      const dates = allDates.filter(d => (!from || d >= from) && (!to || d <= to));
+      const todo = dates.filter(d => !cacheRef.current[d]);
+      setLoading({
+        done: 0,
+        total: todo.length
+      });
+      let done = 0,
+        k = 0;
+      const worker = async () => {
+        while (k < todo.length && !stop) {
+          const d = todo[k++];
+          const out = [];
+          for (const md of ['matin', 'soir', '']) {
+            try {
+              const a = await storage.getAll(md ? `inventory_${d}_${md}` : `inventory_${d}`);
+              for (const it of a || []) out.push({
+                ...it,
+                _mode: md || 'ancien',
+                _date: d
+              });
+            } catch (e) {}
+          }
+          cacheRef.current[d] = out;
+          done++;
+          if (!stop) setLoading({
+            done,
+            total: todo.length
+          });
+        }
+      };
+      await Promise.all([1, 2, 3, 4, 5, 6].map(worker));
+      if (stop) return;
+      const flat = [];
+      for (const d of dates) for (const it of cacheRef.current[d] || []) {
+        const pr = prodById && prodById[it.id];
+        flat.push({
+          date: d,
+          mode: it._mode,
+          id: it.id,
+          name: it.produit || pr && pr.name || it.id,
+          producer: producerOf(it),
+          qty: Number(it.qty) || 0,
+          by: it.countedBy || '—',
+          at: it.countedAt || '',
+          perimetre: it.perimetre || ''
+        });
+      }
+      setRows(flat);
+      setLoading(null);
+    })();
+    return () => {
+      stop = true;
+    };
+  }, [allDates, from, to, metas, logs, producerOf]);
+  const producers = React.useMemo(() => {
+    const s = new Set();
+    for (const r of rows || []) if (r.producer) s.add(r.producer);
+    return [...s].sort((a, b) => a.localeCompare(b, 'fr'));
+  }, [rows]);
+  const filtered = React.useMemo(() => {
+    if (!rows) return [];
+    return rows.filter(r => (!qPrd.trim() || kbSearchMatch(r.producer || '', qPrd)) && (!qProd.trim() || kbSearchMatch(r.name || '', qProd)));
+  }, [rows, qPrd, qProd]);
+  const groups = React.useMemo(() => {
+    const m = new Map();
+    for (const r of filtered) {
+      const key = normalizeText((r.producer || '') + '|' + (r.name || ''));
+      if (!m.has(key)) m.set(key, {
+        key,
+        name: r.name,
+        producer: r.producer,
+        list: []
+      });
+      m.get(key).list.push(r);
+    }
+    const out = [...m.values()];
+    for (const g of out) g.list.sort((a, b) => (b.date + (b.at || '')).localeCompare(a.date + (a.at || '')));
+    out.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.name || '').localeCompare(b.name || '', 'fr'));
+    return out;
+  }, [filtered]);
+  const nbDates = React.useMemo(() => new Set(filtered.map(r => r.date)).size, [filtered]);
+  const fmtD = d => {
+    const [y, mo, da] = String(d).split('-');
+    const dt = new Date(+y, +mo - 1, +da);
+    return isNaN(dt) ? d : dt.toLocaleDateString('fr-FR', {
+      weekday: 'short',
+      day: '2-digit',
+      month: '2-digit',
+      year: '2-digit'
+    });
+  };
+  const fmtH = s => {
+    if (!s) return '';
+    const d = new Date(s);
+    return isNaN(d) ? '' : d.toLocaleTimeString('fr-FR', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+  const exportCsv = () => {
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const lines = [['Date', 'Moment', 'Fournisseur', 'Produit', 'Quantité', 'Compté par', 'Heure'].map(esc).join(';')];
+    for (const r of [...filtered].sort((a, b) => b.date.localeCompare(a.date))) lines.push([r.date, r.mode, r.producer, r.name, r.qty, r.by, fmtH(r.at)].map(esc).join(';'));
+    const blob = new Blob(['﻿' + lines.join('\n')], {
+      type: 'text/csv;charset=utf-8'
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `inventaires_${qPrd ? normalizeText(qPrd).replace(/[^a-z0-9]+/g, '-') + '_' : ''}${from}_${to}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 500);
+  };
+  const preset = n => {
+    setFrom(n == null ? allDates[allDates.length - 1] || '' : back(n));
+    setTo(iso(today));
+  };
+  const big = {
+    fontSize: 16,
+    padding: '10px 12px',
+    borderRadius: 8,
+    border: '1px solid var(--border)',
+    width: '100%',
+    boxSizing: 'border-box'
+  };
+  const hasFilter = !!(qPrd.trim() || qProd.trim());
+  return React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))',
+      gap: 8
+    }
+  }, React.createElement("div", null, React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 13,
+      marginBottom: 3
+    }
+  }, "🏷️ Fournisseur"), React.createElement("input", {
+    list: "kb-inv-search-prd",
+    value: qPrd,
+    onChange: e => setQPrd(e.target.value),
+    placeholder: "ex. kedelai",
+    style: big
+  }), React.createElement("datalist", {
+    id: "kb-inv-search-prd"
+  }, producers.map(p => React.createElement("option", {
+    key: p,
+    value: p
+  })))), React.createElement("div", null, React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 13,
+      marginBottom: 3
+    }
+  }, "🥫 Produit"), React.createElement("input", {
+    value: qProd,
+    onChange: e => setQProd(e.target.value),
+    placeholder: "ex. tofu nature",
+    style: big
+  }))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      alignItems: 'flex-end'
+    }
+  }, React.createElement("label", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, "Du", React.createElement("br", null), React.createElement("input", {
+    type: "date",
+    value: from,
+    onChange: e => setFrom(e.target.value),
+    style: {
+      ...big,
+      width: 'auto'
+    }
+  })), React.createElement("label", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, "Au", React.createElement("br", null), React.createElement("input", {
+    type: "date",
+    value: to,
+    onChange: e => setTo(e.target.value),
+    style: {
+      ...big,
+      width: 'auto'
+    }
+  })), React.createElement("div", {
+    className: "filter-row",
+    style: {
+      flexWrap: 'wrap',
+      overflowX: 'visible',
+      margin: 0
+    }
+  }, React.createElement("div", {
+    className: "chip",
+    onClick: () => preset(7)
+  }, "7 j"), React.createElement("div", {
+    className: "chip",
+    onClick: () => preset(30)
+  }, "30 j"), React.createElement("div", {
+    className: "chip",
+    onClick: () => preset(90)
+  }, "90 j"), React.createElement("div", {
+    className: "chip",
+    onClick: () => preset(null)
+  }, "Tout")), (qPrd || qProd) && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 13
+    },
+    onClick: () => {
+      setQPrd('');
+      setQProd('');
+    }
+  }, "✕ Effacer")), loading && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "⏳ Lecture des inventaires… ", loading.done, "/", loading.total, " date(s)"), rows && !loading && React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 8,
+      flexWrap: 'wrap',
+      background: 'var(--bg2,#f4f6f4)',
+      borderRadius: 8,
+      padding: '8px 10px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 18
+    }
+  }, groups.length), " produit(s) · ", React.createElement("b", null, filtered.length), " comptage(s) · ", React.createElement("b", null, nbDates), " date(s)"), filtered.length > 0 && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 13
+    },
+    onClick: exportCsv
+  }, "⬇️ Excel (CSV)")), rows && !loading && filtered.length === 0 && React.createElement("div", {
+    style: {
+      border: '2px dashed var(--border)',
+      borderRadius: 10,
+      padding: 14,
+      fontSize: 14
+    }
+  }, React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 4
+    }
+  }, "Aucun comptage trouvé", qPrd ? ` pour « ${qPrd} »` : '', qProd ? ` · « ${qProd} »` : '', " du ", fmtD(from), " au ", fmtD(to), "."), React.createElement("div", {
+    style: {
+      color: 'var(--ink-mute)',
+      fontSize: 13
+    }
+  }, "Élargis la période (« Tout »). Si toujours rien : ce fournisseur n'a jamais été compté dans l'appli sur ces dates."), qPrd && producers.length > 0 && (() => {
+    const near = producers.filter(p => normalizeText(p).slice(0, 3) === normalizeText(qPrd).slice(0, 3));
+    return near.length ? React.createElement("div", {
+      style: {
+        marginTop: 6,
+        fontSize: 13
+      }
+    }, "Fournisseurs proches : ", near.map(p => React.createElement("span", {
+      key: p,
+      className: "chip",
+      style: {
+        display: 'inline-block',
+        margin: 2
+      },
+      onClick: () => setQPrd(p)
+    }, p))) : null;
+  })()), rows && !loading && !hasFilter && filtered.length > 0 && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "Tape un fournisseur ou un produit pour filtrer. Liste complète ci-dessous (", groups.length, " produits)."), rows && !loading && groups.length > 0 && React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 6
+    }
+  }, groups.slice(0, hasFilter ? 400 : 150).map(g => {
+    const last = g.list[0];
+    const isOpen = openKey === g.key || hasFilter && groups.length <= 3;
+    return React.createElement("div", {
+      key: g.key,
+      style: {
+        border: '1px solid var(--border)',
+        borderRadius: 10,
+        overflow: 'hidden'
+      }
+    }, React.createElement("div", {
+      onClick: () => setOpenKey(openKey === g.key ? null : g.key),
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: 8,
+        padding: '10px 12px',
+        cursor: 'pointer'
+      }
+    }, React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        fontSize: 15
+      }
+    }, g.name), React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)'
+      }
+    }, g.producer || 'fournisseur inconnu', " · compté ", g.list.length, " fois")), React.createElement("div", {
+      style: {
+        textAlign: 'right',
+        flexShrink: 0
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 800,
+        lineHeight: 1
+      }
+    }, last.qty), React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--ink-mute)'
+      }
+    }, "le ", fmtD(last.date)))), isOpen && React.createElement("div", {
+      style: {
+        borderTop: '1px solid var(--border)',
+        background: 'var(--bg2,#f7f7f7)'
+      }
+    }, React.createElement("table", {
+      style: {
+        width: '100%',
+        borderCollapse: 'collapse',
+        fontSize: 13
+      }
+    }, React.createElement("thead", null, React.createElement("tr", {
+      style: {
+        textAlign: 'left',
+        color: 'var(--ink-mute)',
+        fontSize: 11
+      }
+    }, React.createElement("th", {
+      style: {
+        padding: '4px 8px'
+      }
+    }, "Date"), React.createElement("th", {
+      style: {
+        padding: '4px 8px',
+        textAlign: 'right'
+      }
+    }, "Qté"), React.createElement("th", {
+      style: {
+        padding: '4px 8px'
+      }
+    }, "Par"), React.createElement("th", {
+      style: {
+        padding: '4px 8px'
+      }
+    }))), React.createElement("tbody", null, g.list.map((r, i) => React.createElement("tr", {
+      key: r.date + r.mode + i,
+      style: {
+        borderTop: '1px solid var(--border)'
+      }
+    }, React.createElement("td", {
+      style: {
+        padding: '6px 8px',
+        whiteSpace: 'nowrap'
+      }
+    }, React.createElement("b", null, fmtD(r.date)), " ", r.mode === 'matin' ? '🌅' : r.mode === 'soir' ? '🌙' : '', " ", React.createElement("span", {
+      style: {
+        color: 'var(--ink-mute)'
+      }
+    }, fmtH(r.at))), React.createElement("td", {
+      style: {
+        padding: '6px 8px',
+        textAlign: 'right',
+        fontWeight: 800,
+        fontSize: 16
+      }
+    }, r.qty), React.createElement("td", {
+      style: {
+        padding: '6px 8px'
+      }
+    }, r.by), React.createElement("td", {
+      style: {
+        padding: '6px 8px',
+        textAlign: 'right'
+      }
+    }, onOpen && r.mode !== 'ancien' && React.createElement("span", {
+      onClick: () => onOpen(r.date, r.mode),
+      style: {
+        cursor: 'pointer',
+        textDecoration: 'underline',
+        fontSize: 12
+      }
+    }, "↩️ ouvrir"))))))));
+  }), groups.length > (hasFilter ? 400 : 150) && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "… ", groups.length - (hasFilter ? 400 : 150), " produit(s) de plus — affine la recherche ou exporte en CSV.")));
+}
 function InventoryHistory({
   onOpen,
   defaultTab
@@ -12041,6 +12520,8 @@ function InventoryHistory({
     });
   };
   const scopeLabel = m => {
+    const all = m.scopes ? Object.values(m.scopes).filter(x => x && x.type === 'tournant') : [];
+    if (all.length > 1) return '🔄 tournant · ' + all.map(x => x.kind === 'fromage' ? '🧀 fromage' : x.value || x.kind).join(' · ');
     if (m.type !== 'tournant') return '📦 complet';
     if (m.scopeKind === 'fromage') return '🔄 tournant · 🧀 fromage';
     const k = m.scopeKind === 'producer' ? 'producteur' : m.scopeKind === 'family' ? 'famille' : m.scopeKind === 'category' ? 'catégorie' : 'type';
@@ -12140,15 +12621,26 @@ function InventoryHistory({
       overflowX: 'visible'
     }
   }, React.createElement("div", {
+    className: `chip ${tab === 'search' ? 'selected' : ''}`,
+    style: {
+      fontWeight: 700
+    },
+    onClick: () => setTab('search')
+  }, "🔎 Rechercher"), React.createElement("div", {
     className: `chip ${tab === 'fl' ? 'selected' : ''}`,
     onClick: () => setTab('fl')
   }, "🥬 Inventaire F&L"), React.createElement("div", {
     className: `chip ${tab === 'inv' ? 'selected' : ''}`,
     onClick: () => setTab('inv')
-  }, "📋 Inventaire complet"), React.createElement("div", {
+  }, "📋 Par date"), React.createElement("div", {
     className: `chip ${tab === 'learn' ? 'selected' : ''}`,
     onClick: () => setTab('learn')
-  }, "🏷️ Apprentissage")), tab === 'inv' && logs && logs.length > 0 && React.createElement("div", {
+  }, "🏷️ Apprentissage")), tab === 'search' && React.createElement(InventorySearch, {
+    metas: metas,
+    logs: logs,
+    prodById: prodById,
+    onOpen: onOpen
+  }), tab === 'inv' && logs && logs.length > 0 && React.createElement("div", {
     style: {
       marginBottom: 10
     }
@@ -14346,6 +14838,9 @@ function InventoryPage({
         id: productId,
         qty: q,
         produit: prodById[productId]?.name || '',
+        producteur: prodById[productId]?.producer || '',
+        perimetre: invType === 'tournant' ? `${scopeKind}:${scopeValue || ''}` : 'complet',
+        mode,
         countedBy: session.name || '',
         countedAt: new Date().toISOString()
       });
@@ -14360,6 +14855,7 @@ function InventoryPage({
       return;
     }
     try {
+      const scKey = invType === 'tournant' ? 's_' + normalizeText(`${scopeKind} ${scopeValue || ''}`).replace(/[^a-z0-9]+/g, '_') : 's_complet';
       await storage.setDoc('inventory_meta', invDate, {
         date: invDate,
         type: invType,
@@ -14367,7 +14863,16 @@ function InventoryPage({
         scopeValue,
         mode,
         lastBy: session.name,
-        lastAt: new Date().toISOString()
+        lastAt: new Date().toISOString(),
+        scopes: {
+          [scKey]: {
+            type: invType,
+            kind: scopeKind,
+            value: scopeValue || '',
+            by: session.name || '',
+            at: new Date().toISOString()
+          }
+        }
       });
     } catch (e) {}
   };
@@ -72464,8 +72969,8 @@ function HistoryPage({
       color: 'var(--ink-soft)',
       marginBottom: 6
     }
-  }, "Clique une date pour voir ", React.createElement("b", null, "ce qui a été compté"), " (produit, quantité, qui, quand, matin/soir), puis « ↩️ Ouvrir » pour le reprendre."), React.createElement(InventoryHistory, {
-    defaultTab: "inv",
+  }, React.createElement("b", null, "🔎 Rechercher"), " : par fournisseur, produit et dates — quand, combien, qui. ", React.createElement("b", null, "📋 Par date"), " : tout ce qui a été compté un jour, puis « ↩️ Ouvrir » pour le reprendre."), React.createElement(InventoryHistory, {
+    defaultTab: "search",
     onOpen: (date, md) => {
       try {
         localStorage.setItem('kbg_inv_open', JSON.stringify({
