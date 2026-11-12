@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.25) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.26) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.25';
+const APP_VERSION = 'V11.26';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -23045,27 +23045,40 @@ function muStockOfSnap(snap, k) {
   const it = snap && snap.items ? snap.items[k] : null;
   return it && it.stock != null ? Number(it.stock) || 0 : 0;
 }
+function muModeGet(t) {
+  try {
+    const v = localStorage.getItem('kb_mu_mode_' + t);
+    if (v === 'jour' || v === 'lendemain') return v;
+  } catch (e) {}
+  return new Date().getHours() < 10 ? 'jour' : 'lendemain';
+}
+function muWorkOf(t, open, mode) {
+  return open && mode === 'jour' ? {
+    key: muShiftDate(t, -1),
+    extra: null,
+    target: t,
+    sameDayOpen: true,
+    mode
+  } : {
+    key: t,
+    extra: null,
+    target: open ? muShiftDate(t, 1) : null,
+    sameDayOpen: !!open,
+    mode
+  };
+}
 function useMuWorkDay() {
-  const [st, setSt] = React.useState(() => ({
-    key: todayKey(),
-    extra: null
-  }));
+  const t0 = todayKey();
+  const [mode, setModeSt] = React.useState(() => muModeGet(t0));
+  const [open, setOpen] = React.useState(() => kbIsSameDay(t0));
   React.useEffect(() => {
     let stop = false;
     const chk = async () => {
-      const t = todayKey();
-      let open = false;
+      let o = false;
       try {
-        open = await kbSameDayOpen(t);
+        o = await kbSameDayOpen(todayKey());
       } catch (e) {}
-      const v = open ? {
-        key: muShiftDate(t, -1),
-        extra: t
-      } : {
-        key: t,
-        extra: null
-      };
-      if (!stop) setSt(s => s.key === v.key && s.extra === v.extra ? s : v);
+      if (!stop) setOpen(o);
     };
     chk();
     const iv = setInterval(chk, 60000);
@@ -23074,12 +23087,76 @@ function useMuWorkDay() {
       clearInterval(iv);
     };
   }, []);
-  return st;
+  const setMode = m => {
+    try {
+      localStorage.setItem('kb_mu_mode_' + todayKey(), m);
+    } catch (e) {}
+    setModeSt(m);
+  };
+  const w = React.useMemo(() => muWorkOf(todayKey(), open, mode), [open, mode]);
+  return {
+    ...w,
+    setMode
+  };
+}
+function MuModeSwitch({
+  work
+}) {
+  if (!work || !work.sameDayOpen) return null;
+  const lbl = d => {
+    try {
+      return new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', {
+        weekday: 'long',
+        day: 'numeric'
+      });
+    } catch (e) {
+      return d;
+    }
+  };
+  const t = todayKey(),
+    n = muShiftDate(t, 1);
+  const b = (m, txt, col) => React.createElement("button", {
+    onClick: () => {
+      if (work.mode !== m) work.setMode(m);
+    },
+    style: {
+      flex: 1,
+      minHeight: 64,
+      fontSize: 18,
+      fontWeight: 800,
+      borderRadius: 12,
+      cursor: 'pointer',
+      border: work.mode === m ? '3px solid ' + col : '2px solid #ddd',
+      background: work.mode === m ? col : '#fff',
+      color: work.mode === m ? '#fff' : '#555'
+    }
+  }, txt);
+  return React.createElement("div", {
+    style: {
+      background: '#fffde7',
+      border: '2px solid #fbc02d',
+      borderRadius: 12,
+      padding: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      color: '#8d6e00',
+      marginBottom: 8
+    }
+  }, "\uD83D\uDCC5 Pr\xE9pa le jour m\xEAme (pas encore cl\xF4tur\xE9e) \u2014 tu fais la MU pour :"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, b('jour', '🧺 ' + lbl(t) + ' (à finir)', '#ef6c00'), b('lendemain', '➡️ ' + lbl(n), '#2e7d32')));
 }
 function useMuEntries(dateKey, extraKey, setEntries) {
   React.useEffect(() => {
     let a = {},
       b = {};
+    setEntries({});
     const push = () => {
       const map = {
         ...b
@@ -23119,7 +23196,7 @@ function useMuEntries(dateKey, extraKey, setEntries) {
 }
 function muTargetDay(dateKey) {
   const ad = activeDay();
-  return ad && (ad > dateKey || ad === dateKey && kbIsSameDay(ad)) ? ad : muShiftDate(dateKey, 1);
+  return ad && ad > dateKey ? ad : muShiftDate(dateKey, 1);
 }
 function muSheetStock(flIdx) {
   const stock = {};
@@ -23169,7 +23246,7 @@ async function muComputeStartStock(dateKey, flIdx, snapToday) {
     exact: !!muExactOf(snap)
   };
 }
-function useMuReel(dateKey, items, flRows, entries) {
+function useMuReel(dateKey, items, flRows, entries, targetDay) {
   const flIdx = React.useMemo(() => muFlIndex(flRows), [flRows]);
   const [start, setStart] = React.useState(null);
   const ready = items !== null && flRows !== null;
@@ -23178,13 +23255,18 @@ function useMuReel(dateKey, items, flRows, entries) {
   React.useEffect(() => {
     if (!ready) return;
     let stop = false;
+    setStart(null);
     muComputeStartStock(dateKey, flIdx, snapToday).then(r => {
-      if (!stop) setStart(r);
+      if (!stop) setStart({
+        ...r,
+        forKey: dateKey
+      });
     }).catch(() => {
       if (!stop) setStart({
         stock: {},
         source: 'erreur',
-        fromDate: null
+        fromDate: null,
+        forKey: dateKey
       });
     });
     return () => {
@@ -23192,7 +23274,7 @@ function useMuReel(dateKey, items, flRows, entries) {
     };
   }, [ready, dateKey, flIdx, sheetFlag]);
   const faitToday = React.useMemo(() => muFaitFromEntries(Object.values(entries || {})), [entries]);
-  const nextDay = muTargetDay(dateKey);
+  const nextDay = targetDay || muTargetDay(dateKey);
   const [nextOrders, setNextOrders] = React.useState(null);
   const [after10, setAfter10] = React.useState(() => Date.now() >= new Date(dateKey + 'T10:00:00').getTime());
   React.useEffect(() => {
@@ -23232,7 +23314,7 @@ function useMuReel(dateKey, items, flRows, entries) {
       exactRedirected: res.redirected || {}
     }).catch(() => {});
   }, [ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, snapToday && snapToday.exactAt, dateKey, nextDay]);
-  const exact = muExactOf(snapToday);
+  const exact = snapToday && snapToday.exactFor && snapToday.exactFor !== nextDay ? null : muExactOf(snapToday);
   const rows = React.useMemo(() => {
     const out = [];
     (items || []).forEach(it => {
@@ -23272,7 +23354,7 @@ function useMuReel(dateKey, items, flRows, entries) {
   }, [rows]);
   const lastSaved = React.useRef('');
   React.useEffect(() => {
-    if (!start || !ready || start.source === 'erreur' || !rows.length) return;
+    if (!start || start.forKey !== dateKey || !ready || start.source === 'erreur' || !rows.length) return;
     const itemsMap = {};
     rows.forEach(r => {
       itemsMap[r.key] = {
@@ -23600,10 +23682,9 @@ function MuDuJourPage({
   setTab
 }) {
   const operator = session.name;
-  const {
-    key: dateKey,
-    extra: muExtraKey
-  } = useMuWorkDay();
+  const muWork = useMuWorkDay();
+  const dateKey = muWork.key,
+    muExtraKey = muWork.extra;
   const [itemsSrv, setItems] = React.useState(() => kbMuCacheGet('list'));
   const [busy, setBusy] = React.useState({
     list: false,
@@ -23685,7 +23766,7 @@ function MuDuJourPage({
     loadList();
   }, [loadList]);
   useMuEntries(dateKey, muExtraKey, setEntries);
-  const reel = useMuReel(dateKey, items, flRows, entries);
+  const reel = useMuReel(dateKey, items, flRows, entries, muWork.target);
   const byProduct = React.useMemo(() => {
     const idx = {};
     Object.values(entries).forEach(e => {
@@ -24043,6 +24124,8 @@ function MuDuJourPage({
       loadList();
       loadFl();
     }
+  }), React.createElement(MuModeSwitch, {
+    work: muWork
   }), React.createElement(MuDayStockBar, {
     reel: reel,
     operator: operator,
@@ -24464,10 +24547,9 @@ function MuReelPage({
   setTab
 }) {
   const operator = session && session.name || '—';
-  const {
-    key: dateKey,
-    extra: muExtraKey
-  } = useMuWorkDay();
+  const muWork = useMuWorkDay();
+  const dateKey = muWork.key,
+    muExtraKey = muWork.extra;
   const [itemsSrv, setItems] = React.useState(() => kbMuCacheGet('list'));
   const [flRows, setFlRows] = React.useState(() => kbMuCacheGet('fl'));
   const items = React.useMemo(() => kbMuMergeFl(itemsSrv, flRows), [itemsSrv, flRows]);
@@ -24542,7 +24624,7 @@ function MuReelPage({
     load();
   }, [load]);
   useMuEntries(dateKey, muExtraKey, setEntries);
-  const reel = useMuReel(dateKey, items, flRows, entries);
+  const reel = useMuReel(dateKey, items, flRows, entries, muWork.target);
   const q = search.trim() ? muStrip(search.toLowerCase()) : null;
   const rows = React.useMemo(() => {
     let l = reel.rows.slice();
@@ -24625,6 +24707,8 @@ function MuReelPage({
   }, "\u2190 Retour \xE0 la MU en cours")), React.createElement(MuLoadBar, {
     busy: busy,
     onRetry: load
+  }), React.createElement(MuModeSwitch, {
+    work: muWork
   }), React.createElement(MuDayStockBar, {
     reel: reel,
     operator: operator,

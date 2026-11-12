@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.25';
+    const APP_VERSION = 'V11.26';
+    // V11.26 — (12/11/2026) 🧺 MU jour même : choix « finir la MU du jour » / « MU du lendemain » (prépa du jour pas clôturée), plus de mélange entre journées.
     // V11.25 — (12/11/2026) 🧺 MU + prépa le jour même : la MU faite la veille pour ce jour est reprise (plus de MU à 0 ni de double comptage).
     // V11.24 — (10/11/2026) 🔌 Master › Températures : état de branchement secteur des hubs Koovea (branché / débranché / injoignable),
     //   lieu de chaque hub réglable, alerte mail « coupure électricité probable » à hg@ / rr@ / ga@ envoyée par le serveur (proxy KBG FRESHDESK, toutes les 5 min).
@@ -13402,24 +13403,53 @@
     //   la veille reste compté, le stock PDP n'est pas déduit deux fois, les commandes visées = celles du jour.
     //   Les MU saisies le matin dans mu_<jour> (avant V11.25) sont ajoutées à l'affichage.
     //   Dès la clôture de la prépa du jour → retour normal sur mu_<jour> (cible = lendemain), contrôle chaque minute.
+    // V11.26 — le jour « prépa le jour même » (prépa du jour pas clôturée) on choisit sur l'écran MU :
+    //   « 🧺 Finir la MU du JOUR » (journée MU de la veille, cible = aujourd'hui)
+    //   « ➡️ MU du LENDEMAIN »   (journée MU d'aujourd'hui, cible = lendemain) — comme un jour normal.
+    //   Choix gardé sur l'appareil pour la journée ; par défaut : jour avant 10h, lendemain après.
+    function muModeGet(t){ try { const v=localStorage.getItem('kb_mu_mode_'+t); if(v==='jour'||v==='lendemain') return v; } catch(e){} return (new Date().getHours()<10) ? 'jour' : 'lendemain'; }
+    function muWorkOf(t, open, mode){
+      return (open && mode==='jour')
+        ? { key: muShiftDate(t,-1), extra: null, target: t, sameDayOpen: true, mode } // V11.26 — mu_<jour> = MU du lendemain : plus ajoutée ici
+        : { key: t, extra: null, target: open ? muShiftDate(t,1) : null, sameDayOpen: !!open, mode };
+    }
     function useMuWorkDay(){
-      const [st,setSt] = React.useState(()=>({ key: todayKey(), extra: null }));
+      const t0 = todayKey();
+      const [mode,setModeSt] = React.useState(()=>muModeGet(t0));
+      const [open,setOpen] = React.useState(()=>kbIsSameDay(t0)); // cache (évite le saut d'écran au démarrage)
       React.useEffect(()=>{
         let stop=false;
-        const chk = async ()=>{
-          const t = todayKey(); let open=false;
-          try { open = await kbSameDayOpen(t); } catch(e){}
-          const v = open ? { key: muShiftDate(t,-1), extra: t } : { key: t, extra: null };
-          if(!stop) setSt(s=> (s.key===v.key && s.extra===v.extra) ? s : v);
-        };
+        const chk = async ()=>{ let o=false; try { o = await kbSameDayOpen(todayKey()); } catch(e){} if(!stop) setOpen(o); };
         chk(); const iv=setInterval(chk, 60000);
         return ()=>{ stop=true; clearInterval(iv); };
       },[]);
-      return st;
+      const setMode = (m)=>{ try { localStorage.setItem('kb_mu_mode_'+todayKey(), m); } catch(e){} setModeSt(m); };
+      const w = React.useMemo(()=>muWorkOf(todayKey(), open, mode), [open, mode]);
+      return { ...w, setMode };
+    }
+    // V11.26 — bouton de choix (gros) visible seulement le jour « prépa le jour même »
+    function MuModeSwitch({ work }){
+      if(!work || !work.sameDayOpen) return null;
+      const lbl = (d)=>{ try { return new Date(d+'T12:00:00').toLocaleDateString('fr-FR',{weekday:'long',day:'numeric'}); } catch(e){ return d; } };
+      const t = todayKey(), n = muShiftDate(t,1);
+      const b = (m, txt, col)=>(
+        <button onClick={()=>{ if(work.mode!==m) work.setMode(m); }}
+          style={{flex:1,minHeight:64,fontSize:18,fontWeight:800,borderRadius:12,cursor:'pointer',
+            border: work.mode===m ? '3px solid '+col : '2px solid #ddd', background: work.mode===m ? col : '#fff', color: work.mode===m ? '#fff' : '#555'}}>
+          {txt}
+        </button>);
+      return (
+        <div style={{background:'#fffde7',border:'2px solid #fbc02d',borderRadius:12,padding:10}}>
+          <div style={{fontSize:14,fontWeight:700,color:'#8d6e00',marginBottom:8}}>📅 Prépa le jour même (pas encore clôturée) — tu fais la MU pour :</div>
+          <div style={{display:'flex',gap:8}}>
+            {b('jour', '🧺 '+lbl(t)+' (à finir)', '#ef6c00')}
+            {b('lendemain', '➡️ '+lbl(n), '#2e7d32')}
+          </div>
+        </div>);
     }
     function useMuEntries(dateKey, extraKey, setEntries){
       React.useEffect(()=>{
-        let a={}, b={};
+        let a={}, b={}; setEntries({}); // V11.26 — jamais l'affichage d'une autre journée
         const push=()=>{ const map={ ...b }; Object.values(a).forEach(e=>{ map[e.id]=e; }); setEntries(map); };
         const u1=storage.subscribe('mu_'+dateKey, arr=>{ a={}; (arr||[]).forEach(e=>{ if(e) a[e.id]=e; }); push(); });
         let u2=null;
@@ -13429,7 +13459,7 @@
     }
     function muTargetDay(dateKey){
       const ad = activeDay();
-      return (ad && (ad > dateKey || (ad === dateKey && kbIsSameDay(ad)))) ? ad : muShiftDate(dateKey, 1); // V10.91 — prépa le jour même : MU du jour
+      return (ad && ad > dateKey) ? ad : muShiftDate(dateKey, 1); // V11.26 — le jour même est géré par useMuWorkDay (cible explicite)
     }
     function muSheetStock(flIdx){ const stock={}; Object.entries(flIdx||{}).forEach(([k,v])=>{ if(v.stockMu!=null) stock[k]=Math.max(0,Math.round(v.stockMu)); }); return stock; }
     async function muComputeStartStock(dateKey, flIdx, snapToday){
@@ -13451,7 +13481,7 @@
       return { stock, source:'calc', fromDate:d, exact: !!muExactOf(snap) };
     }
     // Hook : lignes MU réelle pour la journée (items = liste get-mu-list, entries = map mu_<jour>)
-    function useMuReel(dateKey, items, flRows, entries){
+    function useMuReel(dateKey, items, flRows, entries, targetDay){
       const flIdx = React.useMemo(()=>muFlIndex(flRows), [flRows]);
       const [start,setStart] = React.useState(null);
       const ready = items!==null && flRows!==null;
@@ -13460,13 +13490,14 @@
       React.useEffect(()=>{
         if(!ready) return;
         let stop=false;
-        muComputeStartStock(dateKey, flIdx, snapToday).then(r=>{ if(!stop) setStart(r); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null}); });
+        setStart(null); // V11.26
+        muComputeStartStock(dateKey, flIdx, snapToday).then(r=>{ if(!stop) setStart({ ...r, forKey: dateKey }); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null, forKey: dateKey}); });
         return ()=>{ stop=true; };
       },[ready, dateKey, flIdx, sheetFlag]);
       const faitToday = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
       // V9.59 — commandes exactes : chargement manuel (prépa, 10h) prioritaire ; sinon commandes de la
       // distribution suivante déjà présentes dans l'appli (PrestaShop / export Mongo) chargées après 10h.
-      const nextDay = muTargetDay(dateKey);
+      const nextDay = targetDay || muTargetDay(dateKey); // V11.26
       const [nextOrders, setNextOrders] = React.useState(null);
       // V9.63 — après 10h (clôture des commandes), les commandes présentes dans l'appli font foi,
       // même si elles ont été chargées avant 10h (on regarde l'HEURE ACTUELLE, plus l'heure de chargement).
@@ -13491,7 +13522,7 @@
         const nPs = (nextOrders.orders||[]).filter(o=>o && o._ps && !o._test).length, nOld = (nextOrders.orders||[]).filter(o=>o && !o._ps).length;
         storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: json, exactFor: nextDay, exactSource:'auto', exactFile:`commandes de l’appli : ancien site ${nOld}${nPs ? ' + nouveau site '+nPs : ' · nouveau site : pas encore chargé'}`, exactAt: Date.now(), exactBy:'auto', exactLines: res.matched, exactUnmatched: res.unmatched, exactRedirected: res.redirected || {} }).catch(()=>{});
       },[ready, nextOrders, flIdx, snapToday && snapToday.exactJson, snapToday && snapToday.exactSource, snapToday && snapToday.exactAt, dateKey, nextDay]);
-      const exact = muExactOf(snapToday);
+      const exact = (snapToday && snapToday.exactFor && snapToday.exactFor!==nextDay) ? null : muExactOf(snapToday); // V11.26 — commandes exactes d'un autre jour ignorées
       const rows = React.useMemo(()=>{
         const out = [];
         (items||[]).forEach(it=>{
@@ -13514,7 +13545,7 @@
       // Photo du jour (stock auto + commandes ESTIMÉES ; les exactes sont dans exactJson) → report du lendemain
       const lastSaved = React.useRef('');
       React.useEffect(()=>{
-        if(!start || !ready || start.source==='erreur' || !rows.length) return;
+        if(!start || start.forKey!==dateKey || !ready || start.source==='erreur' || !rows.length) return; // V11.26 — jamais la photo d'une autre journée
         const itemsMap = {}; rows.forEach(r=>{ itemsMap[r.key] = { product:r.name, stock:r.auto, commandes:r.estim }; });
         const sig = JSON.stringify(itemsMap);
         if(sig===lastSaved.current) return;
@@ -13616,7 +13647,7 @@
     }
     function MuDuJourPage({ session, setTab }) {
       const operator = session.name;
-      const { key: dateKey, extra: muExtraKey } = useMuWorkDay(); // V11.25
+      const muWork = useMuWorkDay(); const dateKey = muWork.key, muExtraKey = muWork.extra; // V11.26
       const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [error,setError]=React.useState('');
@@ -13657,7 +13688,7 @@
       React.useEffect(()=>{ loadList(); },[loadList]);
       useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
       // V9.58 — MU réelle : stock PDP reporté, à faire = commandes − stock
-      const reel = useMuReel(dateKey, items, flRows, entries);
+      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target); // V11.26
 
       const byProduct = React.useMemo(()=>{
         const idx={};
@@ -13809,6 +13840,7 @@
             <div style={{textAlign:'right',fontSize:12,color:'var(--ink-mute)'}}>Tes sachets : <b style={{color:'#ef6c00'}}>{totals.mine}</b><br/>Total du jour : <b>{totals.all}</b></div>
           </div>
           <MuLoadBar busy={busy} onRetry={()=>{loadList();loadFl();}} />
+          <MuModeSwitch work={muWork} />
           <MuDayStockBar reel={reel} operator={operator} onReload={loadFl} />
           <MuCmdBanner info={reel.cmdInfo} setTab={setTab} />
           {flErr && <div style={{background:'#fff3e0',border:'1px solid #ffcc80',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#bf6000'}}>⚠️ {flErr} — stock PDP et commandes non fiables.</div>}
@@ -13950,7 +13982,7 @@
        ============================================================ */
     function MuReelPage({ session, setTab }) {
       const operator = (session && session.name) || '—';
-      const { key: dateKey, extra: muExtraKey } = useMuWorkDay(); // V11.25
+      const muWork = useMuWorkDay(); const dateKey = muWork.key, muExtraKey = muWork.extra; // V11.26
       const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
       const items = React.useMemo(()=>kbMuMergeFl(itemsSrv, flRows), [itemsSrv, flRows]); // V10.08
@@ -13976,7 +14008,7 @@
       },[]);
       React.useEffect(()=>{ load(); },[load]);
       useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
-      const reel = useMuReel(dateKey, items, flRows, entries);
+      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target); // V11.26
 
       const q = search.trim() ? muStrip(search.toLowerCase()) : null;
       const rows = React.useMemo(()=>{
@@ -14015,6 +14047,7 @@
             )}
           </div>
           <MuLoadBar busy={busy} onRetry={load} />
+          <MuModeSwitch work={muWork} />
           <MuDayStockBar reel={reel} operator={operator} onReload={load} />
           <div style={{background:'#f7f9ff',border:'1px solid #d6e0f5',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#2c4a8c'}}>
             <div style={{fontWeight:600,marginBottom:4}}>{srcLabel}</div>
