@@ -785,7 +785,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.24';
+    const APP_VERSION = 'V11.25';
+    // V11.25 — (12/11/2026) 🧺 MU + prépa le jour même : la MU faite la veille pour ce jour est reprise (plus de MU à 0 ni de double comptage).
     // V11.24 — (10/11/2026) 🔌 Master › Températures : état de branchement secteur des hubs Koovea (branché / débranché / injoignable),
     //   lieu de chaque hub réglable, alerte mail « coupure électricité probable » à hg@ / rr@ / ga@ envoyée par le serveur (proxy KBG FRESHDESK, toutes les 5 min).
     //   Identifiants Koovea uniquement dans les propriétés du script — jamais dans l'appli.
@@ -13395,6 +13396,37 @@
     //   ne sert plus de source : c'est l'appli qui y écrit le stock MU (colonne STOCK MU du Sheet).
     //   Point de départ si aucun calcul antérieur (≤ 14 j) : colonne STOCK MU du Sheet.
     // V9.63 — jour de distribution servi par la MU de dateKey = jour prépa (activeDay) s'il est futur, sinon J+1
+    // V11.25 — MU + PRÉPA LE JOUR MÊME (ex. prépa commencée mer. 11 pour jeu. 12, finie jeu. 12 matin) :
+    //   la MU de la veille visait déjà ce jour (mu_<veille>, cible = jour même). Tant que la prépa du jour
+    //   n'est pas clôturée, l'écran MU continue sur la MÊME journée MU (mu_<veille>) : ce qui a été fait
+    //   la veille reste compté, le stock PDP n'est pas déduit deux fois, les commandes visées = celles du jour.
+    //   Les MU saisies le matin dans mu_<jour> (avant V11.25) sont ajoutées à l'affichage.
+    //   Dès la clôture de la prépa du jour → retour normal sur mu_<jour> (cible = lendemain), contrôle chaque minute.
+    function useMuWorkDay(){
+      const [st,setSt] = React.useState(()=>({ key: todayKey(), extra: null }));
+      React.useEffect(()=>{
+        let stop=false;
+        const chk = async ()=>{
+          const t = todayKey(); let open=false;
+          try { open = await kbSameDayOpen(t); } catch(e){}
+          const v = open ? { key: muShiftDate(t,-1), extra: t } : { key: t, extra: null };
+          if(!stop) setSt(s=> (s.key===v.key && s.extra===v.extra) ? s : v);
+        };
+        chk(); const iv=setInterval(chk, 60000);
+        return ()=>{ stop=true; clearInterval(iv); };
+      },[]);
+      return st;
+    }
+    function useMuEntries(dateKey, extraKey, setEntries){
+      React.useEffect(()=>{
+        let a={}, b={};
+        const push=()=>{ const map={ ...b }; Object.values(a).forEach(e=>{ map[e.id]=e; }); setEntries(map); };
+        const u1=storage.subscribe('mu_'+dateKey, arr=>{ a={}; (arr||[]).forEach(e=>{ if(e) a[e.id]=e; }); push(); });
+        let u2=null;
+        if(extraKey && extraKey!==dateKey) u2=storage.subscribe('mu_'+extraKey, arr=>{ b={}; (arr||[]).forEach(e=>{ if(e && e.id!==MU_REEL_DOC && e.status==='done') b['x_'+extraKey+'_'+e.id]={ ...e, _muColl:'mu_'+extraKey }; }); push(); });
+        return ()=>{ try{u1&&u1();}catch(e){} try{u2&&u2();}catch(e){} };
+      },[dateKey, extraKey]);
+    }
     function muTargetDay(dateKey){
       const ad = activeDay();
       return (ad && (ad > dateKey || (ad === dateKey && kbIsSameDay(ad)))) ? ad : muShiftDate(dateKey, 1); // V10.91 — prépa le jour même : MU du jour
@@ -13584,7 +13616,7 @@
     }
     function MuDuJourPage({ session, setTab }) {
       const operator = session.name;
-      const dateKey = todayKey();
+      const { key: dateKey, extra: muExtraKey } = useMuWorkDay(); // V11.25
       const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [busy,setBusy]=React.useState({ list:false, fl:false, t0:Date.now() });
       const [error,setError]=React.useState('');
@@ -13623,7 +13655,7 @@
         finally{ setBusy(b=>({ ...b, list:false })); }
       },[]);
       React.useEffect(()=>{ loadList(); },[loadList]);
-      React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; arr.forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
+      useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
       // V9.58 — MU réelle : stock PDP reporté, à faire = commandes − stock
       const reel = useMuReel(dateKey, items, flRows, entries);
 
@@ -13918,7 +13950,7 @@
        ============================================================ */
     function MuReelPage({ session, setTab }) {
       const operator = (session && session.name) || '—';
-      const dateKey = todayKey();
+      const { key: dateKey, extra: muExtraKey } = useMuWorkDay(); // V11.25
       const [itemsSrv,setItems]=React.useState(()=>kbMuCacheGet('list'));
       const [flRows,setFlRows]=React.useState(()=>kbMuCacheGet('fl'));
       const items = React.useMemo(()=>kbMuMergeFl(itemsSrv, flRows), [itemsSrv, flRows]); // V10.08
@@ -13943,7 +13975,7 @@
         finally{ setBusy(b=>({ ...b, list:false, fl:false })); }
       },[]);
       React.useEffect(()=>{ load(); },[load]);
-      React.useEffect(()=>{ const u=storage.subscribe('mu_'+dateKey, arr=>{ const map={}; (arr||[]).forEach(e=>{ if(e) map[e.id]=e; }); setEntries(map); }); return u; },[dateKey]);
+      useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
       const reel = useMuReel(dateKey, items, flRows, entries);
 
       const q = search.trim() ? muStrip(search.toLowerCase()) : null;
