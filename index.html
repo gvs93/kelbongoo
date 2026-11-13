@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.26) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.29) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -703,7 +703,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.26';
+const APP_VERSION = 'V11.29';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -36251,7 +36251,7 @@ function PrepaDuJourPage({
       showToast(`Termine toutes les références d'abord (${globalProg.d}/${globalProg.t})`);
       return;
     }
-    if (pdpBoard.ready && pdpBoard.blocking || dlcBoard.ready && dlcBoard.total) {
+    if (pdpBoard.ready && pdpBoard.blocking || dlcBoard.ready && (dlcBoard.total || dlcBoard.corr.length)) {
       setCloseBlock(true);
       return;
     }
@@ -37927,7 +37927,7 @@ function PrepaDuJourPage({
         showToast('Erreur : ' + e.message);
       }
     }
-  }, "🔑 Débloquer la clôture (clé master)"), dlcBoard.total > 0 && React.createElement("button", {
+  }, "🔑 Débloquer la clôture (clé master)"), dlcBoard.total + dlcBoard.corr.length > 0 && React.createElement("button", {
     className: "btn-primary",
     style: {
       fontSize: 19,
@@ -37941,7 +37941,7 @@ function PrepaDuJourPage({
         detail: 'dlcwatch'
       }));
     }
-  }, "🧹 ", dlcBoard.total, " DLC à retirer")), React.createElement("button", {
+  }, "🧹 ", dlcBoard.total + dlcBoard.corr.length, dlcBoard.corr.length ? " DLC à retirer / remettre en rayon" : " DLC à retirer")), React.createElement("button", {
     className: "btn-ghost",
     style: {
       marginTop: 10
@@ -68627,12 +68627,14 @@ function kbDlcInfo(i, lv, sales) {
     found: false
   };
   const atDlc = Math.max(0, Math.round(base.qty || 0));
-  const n = atDlc;
+  const cmd = Math.max(0, Math.round(Number(i.cmd) || 0));
+  const n = Math.max(0, atDlc - cmd);
   const sold = sd.found ? Math.round(sd.sold) : null;
   const resteTh = sold != null && atDlc ? Math.max(0, atDlc - sold) : null;
   return {
     n,
     atDlc,
+    cmd,
     from: base.from,
     stockTh,
     sold,
@@ -68647,7 +68649,7 @@ function DlcRotationLine({
   if (info.atDlc) bits.push(`×${info.atDlc} à cette DLC (${info.from === today ? 'vu aujourd’hui' : 'inventaire ' + formatDateShort(info.from)})`);
   if (info.stockTh != null) bits.push(`stock théorique ×${info.stockTh}`);
   if (info.sold != null) bits.push(`vendus depuis ×${info.sold}`);
-  if (!bits.length) return null;
+  if (!bits.length && !info.cmd) return null;
   return React.createElement("div", {
     style: {
       fontSize: 13,
@@ -68655,7 +68657,13 @@ function DlcRotationLine({
       marginTop: 4,
       lineHeight: 1.3
     }
-  }, bits.join(' · '), info.resteTh === 0 && React.createElement("div", {
+  }, info.cmd > 0 && React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: '#1565c0',
+      fontWeight: 700
+    }
+  }, "\uD83D\uDED2 \xD7", info.cmd, " partent dans les commandes \u2192 \xE0 laisser en rayon (en casier en premier)"), bits.join(' · '), info.resteTh === 0 && React.createElement("div", {
     style: {
       color: '#2e7d32',
       fontWeight: 700
@@ -68667,24 +68675,118 @@ function DlcRotationLine({
     }
   }, "\uD83D\uDD04 M\xEAme avec une bonne rotation, il en reste \u2248\xD7", info.resteTh));
 }
+function useDlcNextOrders(day) {
+  const [st, setSt] = React.useState({
+    ready: false,
+    loaded: false,
+    byId: {},
+    byName: {},
+    byProd: {},
+    count: 0,
+    at: ''
+  });
+  React.useEffect(() => {
+    if (!day) return;
+    const apply = d => {
+      const orders = d && d.orders || [];
+      const byId = {},
+        byName = {},
+        byProd = {};
+      orders.forEach(o => {
+        if (!o || o._test) return;
+        (o.items || []).forEach(it => {
+          const q = Number(it.qty) || 0;
+          if (q <= 0) return;
+          if (it.id) byId[it.id] = (byId[it.id] || 0) + q;
+          const kn = kbDlcKeyName(it.produit, it.producteur);
+          byName[kn] = (byName[kn] || 0) + q;
+          const kp = normalizeText(kbProdName(it.produit || '')).trim();
+          byProd[kp] = (byProd[kp] || 0) + q;
+        });
+      });
+      setSt({
+        ready: true,
+        loaded: orders.length > 0,
+        byId,
+        byName,
+        byProd,
+        count: orders.filter(o => o && !o._test).length,
+        at: d && (d.psLoadedAt || d.uploadedAt) || ''
+      });
+    };
+    if (firebaseConfigured && fb && fb.onSnapshot) {
+      try {
+        return fb.onSnapshot(fb.doc(fb.db, `day_${day}_orders`, 'data'), s => apply(s.exists() ? s.data() : null), () => apply(null));
+      } catch (e) {}
+    }
+    let stop = false;
+    const load = () => storage.getDoc(`day_${day}_orders`, 'data').then(d => {
+      if (!stop) apply(d);
+    }).catch(() => {
+      if (!stop) apply(null);
+    });
+    load();
+    const t = setInterval(load, 120000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [day]);
+  return st;
+}
+function kbDlcOrdered(i, od) {
+  if (!od || !od.loaded) return 0;
+  if (i.productId && od.byId[i.productId] != null) return od.byId[i.productId];
+  const kn = kbDlcKeyName(i.produit, i.producteur);
+  if (od.byName[kn] != null) return od.byName[kn];
+  if (!i.producteur) return od.byProd[normalizeText(kbProdName(i.produit || '')).trim()] || 0;
+  return 0;
+}
+const kbDlcGroupKey = i => i.productId ? 'id:' + i.productId : 'n:' + kbDlcKeyName(i.produit, i.producteur);
 function useDlcBoard() {
   const rules = useKbDlcRules();
   const [items, setItems] = React.useState(null);
   React.useEffect(() => storage.subscribe('dlc_watch', arr => setItems(arr || [])), []);
   const today = todayKey();
+  const nextDistrib = kbNextDistribDay(today);
+  const od = useDlcNextOrders(nextDistrib);
   return React.useMemo(() => {
-    const nextDistrib = kbNextDistribDay(today);
-    if (!items) return {
+    const ordersLoaded = !!od.loaded;
+    if (!items || !od.ready) return {
       ready: false,
       list: [],
       done: [],
+      corr: [],
       total: 0,
       morning: null,
       today,
-      nextDistrib
+      nextDistrib,
+      ordersLoaded,
+      ordersCount: 0,
+      ordersAt: ''
     };
     const morning = items.find(i => i.id === kbMorningId(today)) || null;
     const real = items.filter(i => !String(i.id || '').startsWith('_'));
+    const sellable = i => kbDlcValid(i.dlc) && dlcDaysLeft(i.dlc, nextDistrib) >= kbDlcMinDays(i);
+    const cmdOf = {};
+    if (ordersLoaded) {
+      const pool = real.filter(i => sellable(i) && (!i.status || i.status === 'watch' || i.retirerDay === today && i.outcome !== 'vide'));
+      const groups = {};
+      pool.forEach(i => {
+        const k = kbDlcGroupKey(i);
+        (groups[k] = groups[k] || []).push(i);
+      });
+      Object.values(groups).forEach(g => {
+        let left = kbDlcOrdered(g[0], od);
+        g.sort((a, b) => String(a.dlc).localeCompare(String(b.dlc)) || String(a.id).localeCompare(String(b.id)));
+        g.forEach(i => {
+          const have = Math.max(0, Math.round(kbDlcBase(i).qty || 0));
+          const take = Math.min(have, left);
+          cmdOf[i.id] = take;
+          left -= take;
+        });
+      });
+    }
     const list = real.filter(i => (!i.status || i.status === 'watch') && i.dlc && kbDlcToRemove(i, today)).map(i => {
       const need = kbDlcMinDays(i);
       const early = kbDlcValid(i.dlc) && dlcDaysLeft(i.dlc, nextDistrib) >= need ? kbDlcAnticipe(i, today, need) : null;
@@ -68692,20 +68794,505 @@ function useDlcBoard() {
         ...i,
         need,
         early,
+        cmd: cmdOf[i.id] || 0,
         days: kbDlcValid(i.dlc) ? dlcDaysLeft(i.dlc, today) : null
       };
     }).sort((a, b) => String(a.dlc).localeCompare(String(b.dlc)) || String(a.produit).localeCompare(String(b.produit)));
     const done = real.filter(i => i.retirerDay === today && i.status && i.status !== 'watch').sort((a, b) => String(b.resolvedAt || '').localeCompare(String(a.resolvedAt || '')));
+    const corr = ordersLoaded ? done.filter(i => (i.status === 'rob' || i.status === 'perte') && !i.corrDone && (Number(i.qtyRetired) || 0) > 0 && (cmdOf[i.id] || 0) > 0).map(i => ({
+      ...i,
+      remettre: Math.min(Number(i.qtyRetired) || 0, cmdOf[i.id] || 0)
+    })) : [];
     return {
       ready: true,
       list,
       done,
+      corr,
       total: list.length,
       morning,
       today,
-      nextDistrib
+      nextDistrib,
+      ordersLoaded,
+      ordersCount: od.count,
+      ordersAt: od.at
     };
-  }, [items, today, rules]);
+  }, [items, today, rules, od]);
+}
+async function kbDlcCorrSendMail(day, nextDistrib, by) {
+  const arr = await storage.getAll('dlc_watch').catch(() => []);
+  const real = (arr || []).filter(x => !String(x.id || '').startsWith('_'));
+  const corr = real.filter(x => x.retirerDay === day && x.corrDone);
+  const done = real.filter(x => x.retirerDay === day && x.status && x.status !== 'watch');
+  if (!corr.length) return {
+    ok: false,
+    error: 'aucune correction'
+  };
+  const sh = await kbDlcSheetWrite(day, done, by);
+  const remis = corr.filter(x => (Number(x.corrQty) || 0) > 0),
+    deja = x => /déjà remis/.test(String(x.corrNote || '')),
+    pasPossible = corr.filter(x => !(Number(x.corrQty) || 0));
+  const nRemis = remis.reduce((a, x) => a + (Number(x.corrQty) || 0), 0);
+  const line = (i, right) => `<tr><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:16px"><b>${kbEsc(kbProdName(i.produit))}</b>${i.producteur ? ` <span style="color:#888;font-size:13px">· ${kbEsc(i.producteur)}</span>` : ''}<div style="font-size:13px;color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</div></td><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:15px;text-align:right">${right}</td></tr>`;
+  const dest = i => i.status === 'rob' ? `ROB${i.navetteDate ? ' ' + kbEsc(formatDateShort(i.navetteDate)) : ''}` : i.status === 'perte' ? 'partage' : 'plus de perte';
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#1565c0;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">↩️ Correction DLC du ${kbEsc(kbCmDate(day))}</div><div style="font-size:15px;opacity:.95">Retirés ce matin alors qu'ils partent dans les commandes du ${kbEsc(kbCmDate(nextDistrib))}</div></div>` + `<div style="margin-top:10px;background:#e3f2fd;border-left:8px solid #1565c0;border-radius:12px;padding:12px 14px"><div style="font-size:13px;color:#555">Remis en rayon</div><div style="font-size:36px;font-weight:900;color:#1565c0;line-height:1.1">×${nRemis}</div></div>` + (remis.length ? `<div style="margin-top:16px;font-size:18px;font-weight:900;color:#1565c0">↩️ Remis en rayon (perte annulée)</div><table role="presentation" width="100%" style="border-collapse:collapse;border-left:6px solid #1565c0">${remis.map(i => line(i, `<b style="font-size:20px">↩️ ×${Number(i.corrQty) || 0}</b>${deja(i) ? '<div style="color:#1565c0;font-size:13px;font-weight:700">🛒 déjà remis en vente avant la correction</div>' : ''}<div style="color:#555;font-size:13px">perte restante ×${Number(i.qtyRetired) || 0} · ${dest(i)}</div><div style="color:#888;font-size:12px">${kbEsc(i.corrBy || '')} ${i.corrAt ? kbHhmm(i.corrAt) : ''}</div>`)).join('')}</table>` : '') + (pasPossible.length ? `<div style="margin-top:16px;font-size:18px;font-weight:900;color:#c62828">⚠️ Pas pu être remis (déjà parti / introuvable)</div><table role="presentation" width="100%" style="border-collapse:collapse;border-left:6px solid #c62828">${pasPossible.map(i => line(i, `<b>×${Number(i.qtyRetired) || 0}</b> · ${dest(i)}<div style="color:#888;font-size:12px">${kbEsc(i.corrBy || '')} ${i.corrAt ? kbHhmm(i.corrAt) : ''}</div>`)).join('')}</table>` : '') + (sh.ok && sh.url ? `<a href="${kbEsc(sh.url)}" style="display:block;margin-top:14px;background:#ef6c00;color:#fff;text-decoration:none;border-radius:12px;padding:16px 18px;font-size:20px;font-weight:900;text-align:center">📋 Feuille « DLC retirées » du jour (corrigée)<br><span style="font-size:14px;font-weight:400">colonne orange = à recopier dans PURGE (remplace la version de ce matin)</span></a>` : `<div style="margin-top:12px;color:#c62828;font-size:13px">⚠️ Feuille « DLC retirées » non réécrite : ${kbEsc(sh.error || '')}</div>`) + `<p style="color:#999;font-size:12px;margin-top:18px">Règle : les DLC à retirer se calculent après le chargement des commandes · Appli Kelbongoo ${APP_VERSION}</p></div>`;
+  const text = [`Correction DLC du ${kbCmDate(day)} — retirés alors qu'ils partent dans les commandes du ${kbCmDate(nextDistrib)}`, ''].concat(remis.map(i => `- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · ${deja(i) ? 'déjà remis en vente' : 'remis en rayon'} x${i.corrQty} · perte restante x${i.qtyRetired || 0}`)).concat(pasPossible.map(i => `- ${kbProdName(i.produit)} · DLC ${kbDlcFmt(i.dlc, day)} · PAS remis (déjà parti / introuvable)`)).concat(sh.url ? ['', 'Feuille DLC retirées corrigée : ' + sh.url] : []).join('\n');
+  let r;
+  try {
+    r = await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'send_mail',
+      to: KB_DLC_RECAP_TO,
+      subject: `↩️ Correction DLC ${formatDateShort(day)} · ×${nRemis} remis en rayon (commandes du ${formatDateShort(nextDistrib)})`,
+      body: text,
+      htmlBody: html
+    });
+  } catch (e) {
+    r = {
+      ok: false,
+      error: e.message
+    };
+  }
+  const ok = !!(r && r.ok);
+  try {
+    await storage.setDoc('dlc_watch', kbMorningId(day), {
+      id: kbMorningId(day),
+      day,
+      corrMailAt: ok ? new Date().toISOString() : '',
+      corrMailN: ok ? corr.length : 0,
+      corrMailErr: ok ? '' : String(r && r.error || 'inconnue'),
+      sheetUrl: sh.url || ''
+    });
+  } catch (_) {}
+  return {
+    ok,
+    error: ok ? '' : String(r && r.error || 'inconnue')
+  };
+}
+function DlcCorrectionPanel({
+  session,
+  board
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [busy, setBusy] = React.useState(false);
+  if (!session || !board || !board.ready || !board.corr.length) return null;
+  const finish = async left => {
+    if (left > 0) return;
+    try {
+      kbCelebrate({
+        title: 'Correction faite 🎉',
+        sub: 'Stock et pertes à jour · merci !'
+      });
+    } catch (_) {}
+    const r = await kbDlcCorrSendMail(board.today, board.nextDistrib, session.name);
+    showToast(r.ok ? '✉️ Correction envoyée à rr@ et hg@' : '⚠️ Mail correction non envoyé : ' + r.error);
+  };
+  const remis = async (i, deja) => {
+    setBusy(true);
+    try {
+      const k = Math.max(0, Math.min(Number(i.qtyRetired) || 0, Number(i.remettre) || 0));
+      const reste = Math.max(0, (Number(i.qtyRetired) || 0) - k);
+      const now = new Date().toISOString();
+      if (i.lossId) {
+        if (reste > 0) {
+          const l = await storage.getDoc('losses', i.lossId).catch(() => null);
+          const up = Number(l && l.unitPrice) || 0;
+          await storage.setDoc('losses', i.lossId, {
+            quantity: reste,
+            totalValue: up * reste,
+            updatedAt: now,
+            remark: (l && l.remark || '') + ` · corrigé : ×${k} remis en rayon (commandes ${formatDateShort(board.nextDistrib)})`
+          });
+        } else await storage.deleteDoc('losses', i.lossId).catch(() => {});
+      }
+      await storage.setDoc('dlc_watch', i.id, {
+        qtyRetired: reste,
+        ...(reste > 0 ? {} : {
+          status: 'ecoule',
+          outcome: 'commandes',
+          lossId: '',
+          navetteDate: '',
+          navetteLabel: ''
+        }),
+        corrDone: true,
+        corrQty: k,
+        qtyRetiredAvant: Number(i.qtyRetired) || 0,
+        corrBy: session.name,
+        corrAt: now,
+        qtyCmd: Number(i.remettre) || 0,
+        corrNote: deja ? 'déjà remis en vente avant la correction' : 'remis en rayon'
+      });
+      muCelebrate(k, 'remis');
+      showToast(deja ? `🛒 ${kbProdName(i.produit)} : déjà en vente, perte corrigée (×${k})` : `↩️ ${kbProdName(i.produit)} : ×${k} remis en rayon`);
+      await finish(board.corr.length - 1);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const pasPossible = async i => {
+    if (!confirm(`« ${kbProdName(i.produit)} » ne peut plus être remis en rayon (déjà parti / introuvable) ?`)) return;
+    setBusy(true);
+    try {
+      await storage.setDoc('dlc_watch', i.id, {
+        corrDone: true,
+        corrQty: 0,
+        corrBy: session.name,
+        corrAt: new Date().toISOString(),
+        corrNote: 'pas remis (déjà parti / introuvable)',
+        qtyCmd: Number(i.remettre) || 0
+      });
+      await finish(board.corr.length - 1);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const m = board.morning || {};
+  return React.createElement("div", {
+    style: {
+      border: '3px solid #1565c0',
+      borderRadius: 18,
+      overflow: 'hidden',
+      background: 'var(--bg-card)'
+    }
+  }, React.createElement("div", null, React.createElement("div", {
+    style: {
+      background: '#1565c0',
+      color: '#fff',
+      padding: '14px 16px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontWeight: 700
+    }
+  }, "\u21A9\uFE0F \xC0 remettre en rayon \xB7 ", board.corr.length), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 600
+    }
+  }, "Retir\xE9 ce matin, mais command\xE9 pour la distrib du ", formatDateShort(board.nextDistrib), m.corrTakenBy ? ` · ${m.corrTakenBy} s'en occupe` : '')), React.createElement("div", {
+    style: {
+      padding: '10px 14px 14px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: 'var(--ink-soft)',
+      marginBottom: 8
+    }
+  }, "Va chercher ces produits (zone ROB / cagette partage) et ", React.createElement("b", null, "remets-les en rayon"), " : ils partent dans les casiers des clients. Mets-les en casier ", React.createElement("b", null, "en premier"), " (DLC la plus courte)."), board.corr.map(i => React.createElement("div", {
+    key: i.id,
+    style: {
+      border: '3px solid #1565c0',
+      borderRadius: 14,
+      padding: 12,
+      marginBottom: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 10,
+      alignItems: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      minWidth: 0
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 21,
+      fontWeight: 700,
+      lineHeight: 1.15
+    }
+  }, kbProdName(i.produit)), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600,
+      color: '#b26a00'
+    }
+  }, "DLC ", kbDlcFmt(i.dlc, board.today)), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-mute)'
+    }
+  }, "Retir\xE9 \xD7", i.qtyRetired, " \u2192 ", i.status === 'rob' ? `🚚 zone ROB` : '🤝 cagette partage', i.resolvedBy ? ` · ${i.resolvedBy}` : '')), React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      minWidth: 86,
+      background: '#1565c0',
+      color: '#fff',
+      borderRadius: 12,
+      padding: '4px 8px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 10,
+      fontWeight: 700,
+      textTransform: 'uppercase'
+    }
+  }, "Remettre"), React.createElement("div", {
+    style: {
+      fontSize: 34,
+      fontWeight: 900,
+      lineHeight: 1
+    }
+  }, "\xD7", i.remettre))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 10
+    }
+  }, React.createElement("button", {
+    disabled: busy,
+    onClick: () => remis(i, false),
+    style: {
+      flex: 1,
+      minHeight: 62,
+      fontSize: 19,
+      fontWeight: 700,
+      borderRadius: 14,
+      border: 'none',
+      background: '#2e7d32',
+      color: '#fff'
+    }
+  }, "\u2705 Remis en rayon \xD7", i.remettre), React.createElement("button", {
+    disabled: busy,
+    onClick: () => pasPossible(i),
+    style: {
+      flex: '0 0 30%',
+      minHeight: 62,
+      fontSize: 14,
+      fontWeight: 700,
+      borderRadius: 14,
+      border: '2px solid var(--line)',
+      background: 'var(--bg-card)',
+      color: 'var(--ink)'
+    }
+  }, "D\xE9j\xE0 parti")), React.createElement("button", {
+    disabled: busy,
+    onClick: () => remis(i, true),
+    style: {
+      width: '100%',
+      marginTop: 8,
+      minHeight: 54,
+      fontSize: 17,
+      fontWeight: 700,
+      borderRadius: 14,
+      border: '2px solid #1565c0',
+      background: '#e3f2fd',
+      color: '#0d47a1'
+    }
+  }, "\uD83D\uDED2 D\xE9j\xE0 remis en vente (avant cette popup)"))), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)',
+      textAlign: 'center'
+    }
+  }, "Obligatoire \xB7 la cl\xF4ture de la pr\xE9pa reste bloqu\xE9e tant que ce n'est pas fait \xB7 mail de correction \xE0 rr@ \xE0 la fin."))));
+}
+function DlcCorrectionPopup({
+  session,
+  setTab
+}) {
+  const showToast = React.useContext(ToastContext);
+  const board = useDlcBoard();
+  const [code, setCode] = React.useState('');
+  const [err, setErr] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  if (!session || session._masterView || session.role !== 'prep' || kbIsPdpDriver()) return null;
+  if (!board.ready || !board.corr.length) return null;
+  const m = board.morning || {};
+  if (m.corrTakenBy && Number(m.corrTakenN || 0) >= board.corr.length) return null;
+  const valider = async () => {
+    const c = String(code).trim();
+    if (!c) {
+      setErr('Tape ton code perso');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    try {
+      let name = '';
+      try {
+        const r = await kbCallable('kbgLogin')({
+          code: c,
+          role: 'prep',
+          site: ''
+        });
+        name = String(r && r.data && r.data.name || '').trim();
+      } catch (e) {
+        setErr('Code non reconnu : ' + kbErrMsg(e));
+        return;
+      }
+      if (!name) {
+        setErr('Code reconnu mais nom absent du registre Salariés');
+        return;
+      }
+      await storage.setDoc('dlc_watch', kbMorningId(board.today), {
+        id: kbMorningId(board.today),
+        day: board.today,
+        corrTakenBy: name,
+        corrTakenAt: new Date().toISOString(),
+        corrTakenN: board.corr.length
+      });
+      setCode('');
+      showToast(`💪 ${name} s'occupe de remettre en rayon`);
+      if (setTab) setTab('dlcwatch');
+    } catch (e) {
+      setErr('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return React.createElement("div", {
+    className: "modal-backdrop",
+    style: {
+      zIndex: 3001,
+      alignItems: 'center'
+    }
+  }, React.createElement("div", {
+    className: "modal",
+    style: {
+      maxWidth: 520,
+      padding: 0,
+      overflow: 'hidden',
+      borderRadius: 18
+    }
+  }, React.createElement("div", {
+    style: {
+      background: '#1565c0',
+      color: '#fff',
+      padding: '16px 18px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 700
+    }
+  }, "\u21A9\uFE0F \xC0 remettre en rayon"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 600
+    }
+  }, board.corr.length, " produit", board.corr.length > 1 ? 's' : '', " retir\xE9", board.corr.length > 1 ? 's' : '', " ce matin mais command\xE9", board.corr.length > 1 ? 's' : '', " pour le ", formatDateShort(board.nextDistrib))), React.createElement("div", {
+    style: {
+      padding: '10px 18px 18px',
+      maxHeight: '74vh',
+      overflowY: 'auto'
+    }
+  }, React.createElement("div", {
+    style: {
+      border: '2px solid #1565c0',
+      borderRadius: 12
+    }
+  }, board.corr.map((i, k) => React.createElement("div", {
+    key: i.id,
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 10,
+      padding: '10px 12px',
+      borderTop: k ? '1px solid var(--line)' : 'none'
+    }
+  }, React.createElement("div", {
+    style: {
+      minWidth: 0
+    }
+  }, React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 19,
+      lineHeight: 1.15
+    }
+  }, kbProdName(i.produit)), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-mute)'
+    }
+  }, "DLC ", kbDlcFmt(i.dlc, board.today), " \xB7 retir\xE9 \xD7", i.qtyRetired, " \u2192 ", i.status === 'rob' ? 'zone ROB' : 'partage')), React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      minWidth: 78,
+      background: '#1565c0',
+      color: '#fff',
+      borderRadius: 12,
+      padding: '4px 8px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 10,
+      fontWeight: 700,
+      textTransform: 'uppercase'
+    }
+  }, "Remettre"), React.createElement("div", {
+    style: {
+      fontSize: 30,
+      fontWeight: 900,
+      lineHeight: 1
+    }
+  }, "\xD7", i.remettre))))), React.createElement("div", {
+    style: {
+      marginTop: 16,
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, "Qui s'en occupe ? Tape ton code perso"), React.createElement("input", {
+    type: "password",
+    inputMode: "numeric",
+    autoComplete: "off",
+    value: code,
+    onChange: e => {
+      setCode(e.target.value);
+      setErr('');
+    },
+    onKeyDown: e => {
+      if (e.key === 'Enter') valider();
+    },
+    placeholder: "\u2022\u2022\u2022\u2022",
+    style: {
+      width: '100%',
+      boxSizing: 'border-box',
+      marginTop: 6,
+      fontSize: 28,
+      letterSpacing: 8,
+      textAlign: 'center',
+      padding: '12px',
+      border: '3px solid var(--ink)',
+      borderRadius: 14
+    }
+  }), err && React.createElement("div", {
+    style: {
+      color: 'var(--danger)',
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 4
+    }
+  }, err), React.createElement("button", {
+    className: "btn-primary",
+    disabled: busy,
+    onClick: valider,
+    style: {
+      width: '100%',
+      marginTop: 10,
+      fontSize: 21,
+      padding: '17px',
+      background: '#2e7d32',
+      borderColor: '#2e7d32',
+      borderRadius: 14
+    }
+  }, busy ? 'Vérification…' : "💪 Je m'en occupe"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)',
+      marginTop: 8,
+      textAlign: 'center'
+    }
+  }, "Une fois pris en charge, la popup se ferme pour tout le monde \xB7 la correction se fait dans Pr\xE9pa \u203A DLC \xB7 cl\xF4ture bloqu\xE9e tant que ce n'est pas fait."))));
 }
 function kbDlcRecapHtml(day, done, m) {
   const rob = done.filter(i => i.status === 'rob'),
@@ -68720,7 +69307,7 @@ function kbDlcRecapHtml(day, done, m) {
     (byNav[k] = byNav[k] || []).push(i);
   });
   const robHtml = Object.keys(byNav).sort().map(k => sec(`🚚 Navette Robespierre · ${k === '?' ? 'date ?' : kbCmDate(k)}${byNav[k][0].navetteLabel ? ' (' + kbEsc(byNav[k][0].navetteLabel) + ')' : ''}`, '#6e4a9c', byNav[k].map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join(''))).join('');
-  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Vendu · pas de perte', vide.length, '#2e7d32')}</tr></table>` + (m && m.sheetUrl ? `<a href="${kbEsc(m.sheetUrl)}" style="display:block;margin-top:14px;background:#ef6c00;color:#fff;text-decoration:none;border-radius:12px;padding:16px 18px;font-size:20px;font-weight:900;text-align:center">📋 Ouvrir la feuille « DLC retirées » du jour<br><span style="font-size:14px;font-weight:400">colonne orange = à copier-coller dans la colonne PURGE de la feuille de stock${m.sheetUnmatched ? ' · ⚠️ ' + m.sheetUnmatched + ' produit(s) à saisir à la main' : ''}</span></a>` : m && m.sheetErr ? `<div style="margin-top:12px;color:#c62828;font-size:13px">⚠️ Feuille « DLC retirées » non générée : ${kbEsc(m.sheetErr)}</div>` : '') + robHtml + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + sec('✅ Vendu · pas de perte', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px"><div style="font-size:22px;font-weight:900">📅 DLC du jour traitées</div><div style="font-size:15px;opacity:.95;text-transform:capitalize">${kbEsc(kbCmDate(day))}${m && m.takenBy ? ' · ' + kbEsc(m.takenBy) : ''}</div></div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:10px"><tr>${box('Navette ROB', rob.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#6e4a9c')}${box('Partage équipe', part.reduce((a, i) => a + (i.qtyRetired || 0), 0), '#c62828')}${box('Vendu · pas de perte', vide.length, '#2e7d32')}</tr></table>` + (m && m.sheetUrl ? `<a href="${kbEsc(m.sheetUrl)}" style="display:block;margin-top:14px;background:#ef6c00;color:#fff;text-decoration:none;border-radius:12px;padding:16px 18px;font-size:20px;font-weight:900;text-align:center">📋 Ouvrir la feuille « DLC retirées » du jour<br><span style="font-size:14px;font-weight:400">colonne orange = à copier-coller dans la colonne PURGE de la feuille de stock${m.sheetUnmatched ? ' · ⚠️ ' + m.sheetUnmatched + ' produit(s) à saisir à la main' : ''}</span></a>` : m && m.sheetErr ? `<div style="margin-top:12px;color:#c62828;font-size:13px">⚠️ Feuille « DLC retirées » non générée : ${kbEsc(m.sheetErr)}</div>` : '') + robHtml + sec('🤝 Partage équipe (perte sèche)', '#c62828', part.map(i => line(i, `<b style="font-size:20px">×${i.qtyRetired || 0}</b> <span style="color:#555">· DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + sec('✅ Vendu · pas de perte', '#2e7d32', vide.map(i => line(i, `<span style="color:#555">${i.outcome === 'commandes' ? `🛒 ×${i.qtyCmd || 0} dans les commandes · ` : ''}DLC ${kbEsc(kbDlcFmt(i.dlc, day))}</span>`)).join('')) + `<p style="color:#999;font-size:12px;margin-top:18px">${m && m.takenAt ? 'Pris en charge à ' + kbHhmm(m.takenAt) : ''}${m && m.doneAt ? ' · terminé à ' + kbHhmm(m.doneAt) : ''} · Appli Kelbongoo ${APP_VERSION}</p></div>`;
 }
 function kbDlcRecapText(day, done) {
   const L = [`DLC du jour traitées — ${kbCmDate(day)}`, ''];
@@ -68831,6 +69418,28 @@ function DlcMorningBanner({
 }) {
   if (!board || !board.ready) return null;
   const m = board.morning;
+  if (board.total && !board.ordersLoaded) return React.createElement("div", {
+    style: {
+      background: '#e3f2fd',
+      border: '2px solid #1565c0',
+      borderRadius: 12,
+      padding: '10px 12px',
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#0d47a1'
+    }
+  }, "\u23F3 ", board.total, " produit", board.total > 1 ? 's' : '', " DLC \xE0 contr\xF4ler \xB7 en attente du chargement des commandes du ", formatDateShort(board.nextDistrib), " (on ne retire qu'apr\xE8s, pour garder ce qui est vendu)");
+  if (board.corr && board.corr.length) return React.createElement("div", {
+    style: {
+      background: '#e3f2fd',
+      border: '2px solid #1565c0',
+      borderRadius: 12,
+      padding: '10px 12px',
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#0d47a1'
+    }
+  }, "\u21A9\uFE0F ", board.corr.length, " produit", board.corr.length > 1 ? 's' : '', " retir\xE9", board.corr.length > 1 ? 's' : '', " alors qu'ils sont command\xE9s \xB7 \xE0 remettre en rayon", m && m.corrTakenBy ? ` · ${m.corrTakenBy} s'en occupe depuis ${kbHhmm(m.corrTakenAt)}` : ' · personne ne s\'en occupe');
   if (!board.total && board.done.length) return React.createElement("div", {
     style: {
       background: '#e8f5e9',
@@ -68884,6 +69493,8 @@ function DlcMorningPopup({
   }, []);
   if (!session || session._masterView || session.role !== 'prep' || kbIsPdpDriver()) return null;
   if (!board.ready || !board.total) return null;
+  if (!board.ordersLoaded) return null;
+  if (board.corr && board.corr.length) return null;
   if (board.morning && board.morning.takenBy) return null;
   const now = new Date();
   if (!_kbDlcRules.checkDow.includes(now.getDay()) || now.getHours() < 5) return null;
@@ -68960,7 +69571,7 @@ function DlcMorningPopup({
       fontSize: 15,
       fontWeight: 600
     }
-  }, board.total, " produit", board.total > 1 ? 's' : '', " ne peuvent plus partir \xE0 la distrib du ", formatDateShort(board.nextDistrib))), React.createElement("div", {
+  }, board.total, " produit", board.total > 1 ? 's' : '', " DLC \xE0 contr\xF4ler \xB7 commandes du ", formatDateShort(board.nextDistrib), " d\xE9j\xE0 d\xE9duites")), React.createElement("div", {
     style: {
       padding: '10px 18px 18px',
       maxHeight: '74vh',
@@ -68972,7 +69583,7 @@ function DlcMorningPopup({
       color: 'var(--ink-soft)',
       marginBottom: 6
     }
-  }, "Le client doit avoir une ", React.createElement("b", null, "DLC \u2265 jour de retrait + 3 jours"), ". Quantit\xE9 = ce qui a \xE9t\xE9 compt\xE9 \xE0 cette DLC (inventaire ou vu en rayon)."), React.createElement("div", {
+  }, "Le client doit avoir une ", React.createElement("b", null, "DLC \u2265 jour de retrait + 3 jours"), ". Quantit\xE9 = ce qui a \xE9t\xE9 compt\xE9 \xE0 cette DLC ", React.createElement("b", null, "moins ce qui part dans les commandes"), " du ", formatDateShort(board.nextDistrib), " (", board.ordersCount, " commandes charg\xE9es)."), React.createElement("div", {
     style: {
       border: '2px solid #c62828',
       borderRadius: 12
@@ -69029,7 +69640,7 @@ function DlcMorningPopup({
         fontWeight: 900,
         lineHeight: 1
       }
-    }, e.n ? '×' + e.n : '?')));
+    }, e.n ? '×' + e.n : e.cmd ? '0' : '?')));
   })), React.createElement("div", {
     style: {
       marginTop: 16,
@@ -69388,6 +69999,7 @@ function DlcWatchPage({
       await storage.setDoc('dlc_watch', i.id, {
         status: toRob ? 'rob' : 'perte',
         qtyRetired: q,
+        qtyCmd: Number(i.cmd) || 0,
         retirerDay: today,
         outcome: toRob ? 'rob' : 'partage',
         navetteDate: toRob ? route.navette.date : '',
@@ -69411,6 +70023,27 @@ function DlcWatchPage({
         name: kbProdName(i.produit)
       });
       muCelebrate(q);
+      await finishIfDone(board.total - 1);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const partCommandes = async i => {
+    setBusy(true);
+    try {
+      await storage.setDoc('dlc_watch', i.id, {
+        status: 'ecoule',
+        qtyRetired: 0,
+        qtyCmd: Number(i.cmd) || 0,
+        retirerDay: today,
+        outcome: 'commandes',
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: session.name
+      });
+      muCelebrate(0);
+      showToast(`🛒 ${kbProdName(i.produit)} : part dans les commandes, rien à retirer`);
       await finishIfDone(board.total - 1);
     } catch (e) {
       showToast('Erreur : ' + e.message);
@@ -69490,7 +70123,16 @@ function DlcWatchPage({
     }
   }, "Distrib du ", React.createElement("b", null, formatDateShort(board.nextDistrib)), React.createElement("br", null), "DLC mini ", React.createElement("b", null, formatDateShort(addDays(board.nextDistrib, kbDlcRules().minDays))))), React.createElement(DlcMorningBanner, {
     board: board
-  }), !showForm && React.createElement("button", {
+  }), React.createElement(DlcCorrectionPanel, {
+    session: session,
+    board: board
+  }), board.ready && board.ordersLoaded && board.total > 0 && React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: '#1565c0',
+      fontWeight: 600
+    }
+  }, "\uD83D\uDED2 ", board.ordersCount, " commandes du ", formatDateShort(board.nextDistrib), " charg\xE9es \xB7 d\xE9j\xE0 d\xE9duites des quantit\xE9s"), !showForm && React.createElement("button", {
     onClick: () => setShowForm(true),
     style: {
       minHeight: 60,
@@ -69663,7 +70305,18 @@ function DlcWatchPage({
         fontWeight: 900,
         lineHeight: 1
       }
-    }, e.n ? '×' + e.n : '?'))), React.createElement("div", {
+    }, e.n ? '×' + e.n : '?'))), !board.ordersLoaded ? React.createElement("div", {
+      style: {
+        marginTop: 12,
+        padding: '12px',
+        borderRadius: 14,
+        background: '#e3f2fd',
+        color: '#0d47a1',
+        fontSize: 16,
+        fontWeight: 700,
+        textAlign: 'center'
+      }
+    }, "\u23F3 Attends le chargement des commandes du ", formatDateShort(board.nextDistrib)) : React.createElement("div", {
       style: {
         display: 'flex',
         gap: 8,
@@ -69672,7 +70325,10 @@ function DlcWatchPage({
     }, e.n > 0 && React.createElement(BigBtn, {
       bg: "#ef6c00",
       onClick: () => ilEnReste(i, e.n)
-    }, "\uD83E\uDDF9 Retirer \xD7", e.n), React.createElement("button", {
+    }, "\uD83E\uDDF9 Retirer \xD7", e.n), e.n === 0 && e.cmd > 0 && React.createElement(BigBtn, {
+      bg: "#2e7d32",
+      onClick: () => partCommandes(i)
+    }, "\uD83D\uDED2 Tout part dans les commandes \xB7 rien \xE0 retirer"), React.createElement("button", {
       disabled: busy,
       onClick: () => setSheet({
         i,
@@ -69680,9 +70336,9 @@ function DlcWatchPage({
         expected: e.n || 0
       }),
       style: {
-        flex: e.n > 0 ? '0 0 34%' : 1,
+        flex: e.n > 0 || e.cmd > 0 ? '0 0 34%' : 1,
         minHeight: 64,
-        fontSize: e.n > 0 ? 15 : 19,
+        fontSize: e.n > 0 || e.cmd > 0 ? 15 : 19,
         fontWeight: 700,
         borderRadius: 14,
         border: '2px solid var(--line)',
@@ -69690,7 +70346,7 @@ function DlcWatchPage({
         color: 'var(--ink)',
         cursor: 'pointer'
       }
-    }, "\u270F\uFE0F ", e.n > 0 ? 'Autre quantité' : 'Indiquer la quantité')));
+    }, "\u270F\uFE0F ", e.n > 0 || e.cmd > 0 ? 'Autre quantité' : 'Indiquer la quantité')));
   }), board.done.length > 0 && React.createElement("details", {
     className: "card",
     style: {
@@ -69734,7 +70390,11 @@ function DlcWatchPage({
       fontWeight: 600,
       color: i.status === 'rob' ? '#6e4a9c' : i.status === 'perte' ? '#c62828' : '#2e7d32'
     }
-  }, i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : '✅ vendu, pas de perte', " \xB7 ", i.resolvedBy, " ", kbHhmm(i.resolvedAt))), React.createElement("button", {
+  }, i.status === 'rob' ? `🚚 ×${i.qtyRetired} · navette ${i.navetteLabel || ''} ${i.navetteDate ? formatDateShort(i.navetteDate) : ''}` : i.status === 'perte' ? `🤝 ×${i.qtyRetired} · partage équipe` : i.outcome === 'commandes' ? '🛒 part dans les commandes, pas de perte' : '✅ vendu, pas de perte', " \xB7 ", i.resolvedBy, " ", kbHhmm(i.resolvedAt), i.corrDone && React.createElement("span", {
+    style: {
+      color: '#1565c0'
+    }
+  }, " \xB7 \u21A9\uFE0F ", Number(i.corrQty) ? `×${i.corrQty} remis en rayon` : 'pas remis', " (", i.corrBy, ")"))), React.createElement("button", {
     className: "btn-ghost",
     style: {
       fontSize: 12
@@ -78426,6 +79086,9 @@ function App() {
     return React.createElement("div", {
       className: "app-shell"
     }, overlay, React.createElement(UpdateChecker, null), React.createElement(DlcMorningPopup, {
+      session: effSession,
+      setTab: setTab
+    }), React.createElement(DlcCorrectionPopup, {
       session: effSession,
       setTab: setTab
     }), React.createElement(KbAncienAutoRun, {
