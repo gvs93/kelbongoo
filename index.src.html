@@ -786,7 +786,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.31';
+    const APP_VERSION = 'V11.32';
+    // V11.32 — (13/11/2026) Facturation web : les RETRAITS distrib (remise 100 %) partent à part des RUPTURES (ligne remise_pct 100) →
+    //   module kbfacturation ≥ 1.9.1 : avoir pour les deux, mais ajustement de stock WRUP seulement pour les ruptures (le retiré revient en stock via Retour PDP).
     // V11.31 — (13/11/2026) Master : sélecteur de DATE dans la barre du haut (vue master et vue distrib) → ouvrir la distrib d'un autre jour (commande test du 18).
     //   Lieu « clôturé » reconnu même si la clôture a été faite un autre jour que la distribution.
     // V11.30 — (13/11/2026) Prépa : « 🚫 Rupture tout » ne touche plus les clients déjà mis en casier (devient « Rupture du reste ») ; ligne entamée → rupture partielle.
@@ -27306,7 +27308,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     const q = parseInt(it.qty, 10) || 1;
     let manque = 0,
       pct = 0,
-      rq = 0;
+      rq = 0,
+      ret = 0;
     if (!fix[k]) {
       if (prep.status[k] === 'rupture') manque = q;else manque = kbPartMiss(prep, k, q);
     }
@@ -27332,11 +27335,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         arr[i] = 100;
         legMiss--;
       }
-      manque += arr.filter(x => x >= 100).length;
+      ret = arr.filter(x => x >= 100).length; // V11.32 — retraits distrib comptés à part (pas des ruptures)
       // V11.01 — une ligne d'écart PAR taux de remise (plus de % moyen arrondi : 30 % + 15 % ≠ 2 × 23 %)
       const grp = {};
       for (const x of arr) if (x > 0 && x < 100) grp[x] = (grp[x] || 0) + 1;
       manque = Math.min(manque, q);
+      ret = Math.min(ret, q - manque);
       const base = {
         ean: it.ean || '',
         produit: String(produit).replace(/^\[TEST\]\s*/, ''),
@@ -27346,21 +27350,22 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const taux = Object.keys(grp).map(Number).sort((x, y) => y - x);
       if (!taux.length) {
         if (manque > 0) out.push({ ...base, manque, remise_pct: 0, remise_qte: 0 });
-        continue;
-      }
-      taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: grp[t] }));
+      } else taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: grp[t] }));
+      if (ret > 0) out.push({ ...base, manque: 0, remise_pct: 100, remise_qte: ret, retrait: true });
       continue;
     }
     for (const r of refunds) {
       if (r.orderId !== o.orderId || r.produit !== produit) continue;
-      const rqty = Math.min(parseInt(r.qty, 10) || 1, q - manque);
-      if ((Number(r.pct) || 0) >= 100) manque += rqty;else if ((Number(r.pct) || 0) > pct) {
+      const rqty = Math.min(parseInt(r.qty, 10) || 1, q - manque - ret);
+      if ((Number(r.pct) || 0) >= 100) ret += rqty;else if ((Number(r.pct) || 0) > pct) {
         pct = Number(r.pct) || 0;
         rq = Math.min(Math.max(rq, rqty), q - manque);
       }
     }
     manque = Math.min(manque, q);
-    if (rq > q - manque) rq = q - manque;
+    ret = Math.min(ret, q - manque);
+    if (rq > q - manque - ret) rq = Math.max(0, q - manque - ret);
+    if (ret > 0) out.push({ ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), manque: 0, remise_pct: 100, remise_qte: ret, retrait: true, qty: q, prix: it.consumer_price || 0 });
     if (manque > 0 || pct > 0 && rq > 0) out.push({
       ean: it.ean || '',
       produit: String(produit).replace(/^\[TEST\]\s*/, ''),
@@ -27574,11 +27579,13 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               </div>
               <table style={{ width: '100%', fontSize: 12, marginBottom: 10 }}><tbody>
                 {(S.o.items || []).map((it, i) => {
-                  const e = (sEcarts || []).find(x => x.produit === String(it.produit || '').replace(/^\[TEST\]\s*/, ''));
-                  const gone = e && e.manque >= (parseInt(it.qty, 10) || 1);
+                  const es = (sEcarts || []).filter(x => x.produit === String(it.produit || '').replace(/^\[TEST\]\s*/, ''));
+                  const e = es.length ? es : null; // V11.32 — toutes les lignes de l'article (rupture, retrait, remises)
+                  const eMq = es.reduce((t, x) => t + (x.manque || 0), 0), eRt = es.filter(x => x.retrait).reduce((t, x) => t + (x.remise_qte || 0), 0);
+                  const gone = e && eMq + eRt >= (parseInt(it.qty, 10) || 1);
                   return <tr key={i} style={{ borderTop: '1px solid var(--line)', color: gone ? 'var(--ink-mute)' : undefined }}>
                     <td style={{ padding: 4 }}>{gone ? <s>{it.produit}</s> : it.produit}</td><td>×{it.qty}</td><td style={{ textAlign: 'right' }}>{kbFwEur((Number(it.consumer_price) || 0) * (parseInt(it.qty, 10) || 1) / 100)}</td>
-                    <td style={{ fontWeight: 700, color: e ? 'var(--danger)' : 'var(--accent-dark)' }}>{e ? [e.manque ? `rupture ×${e.manque}` : '', e.remise_pct ? `remise -${e.remise_pct}% ×${e.remise_qte}` : ''].filter(Boolean).join(' · ') : 'fourni'}</td>
+                    <td style={{ fontWeight: 700, color: e ? 'var(--danger)' : 'var(--accent-dark)' }}>{e ? [eMq ? `rupture ×${eMq}` : '', eRt ? `retiré ×${eRt}` : '', ...es.filter(x => !x.retrait && x.remise_pct).map(x => `remise -${x.remise_pct}% ×${x.remise_qte}`)].filter(Boolean).join(' · ') : 'fourni'}</td>
                   </tr>;
                 })}
               </tbody></table>
