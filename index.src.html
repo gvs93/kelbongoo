@@ -786,7 +786,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.34';
+    const APP_VERSION = 'V11.35';
+    // V11.35 — (14/11/2026) Distrib › Retrait total : POURQUOI obligatoire — 🙅 le client n'en veut pas (Retour PDP + DLC, revient en stock) ·
+    //   ❓ pas dans le casier (= rupture → facturation : ajustement WRUP) · 🗑️ abîmé, jeté en boutique (= perte « pertes prépa », destination jeté).
     // V11.34 — (14/11/2026) Master : clôture de prépa jamais bloquée par les DLC / Retours PDP.
     //   Facturation web : même client, même lieu, plusieurs commandes le même jour (fusionnées en prépa et en distrib) →
     //   ruptures partielles, remises « ×n » et retraits répartis entre ses commandes, plus jamais comptés deux fois.
@@ -5751,6 +5753,8 @@
       const [dlcDate, setDlcDate] = React.useState((existing && existing.dlc) || '');
       // V10.80 — « Retrait total » : le client (même déjà PASSÉ) laisse le produit → il repart en Retour PDP (chauffeur → entrepôt)
       const [retPdp, setRetPdp] = React.useState(!!(existing && existing.retourPdp));
+      // V11.35 — pourquoi le retrait : 'refus' (client n'en veut pas → Retour PDP) · 'absent' (pas dans le casier = rupture) · 'jete' (abîmé, jeté en boutique)
+      const [retWhy, setRetWhy] = React.useState((existing && existing.retWhy) || (existing && existing.retourPdp ? 'refus' : ''));
       const [retDlc, setRetDlc] = React.useState((existing && existing.retourDlc) || '');
       // V10.56 — ligne ×2 ou plus : la remise peut ne porter que sur une partie des articles (ex. 1 sachet de poires sur 2)
       const lineQ = Math.max(1, Number(product.qty) || 1);
@@ -5780,7 +5784,9 @@
       const save = async () => {
         if (pct <= 0) { showToast("Indique d'abord la remise"); return; }
         if (onPrep && pct <= Number(prepPct)) { showToast(`Déjà −${prepPct}% en prépa : choisis plus, ou Retrait total`); return; }
-        const wantRet = mode === 'total' && retPdp;
+        if (mode === 'total' && !retWhy) { showToast('Retrait total : choisis pourquoi (client, casier ou abîmé)'); return; }
+        const why = mode === 'total' ? retWhy : '';
+        const wantRet = why === 'refus';
         if (wantRet && !retDlc) { showToast('Retour PDP : indique la DLC du produit'); return; }
         const dayKey = activeDay();
         const id = refId;
@@ -5792,13 +5798,23 @@
           client: order.name || displayName(order), email: order.email || '', site: order.site,
           qty: partQ, qtyLine: lineQ, lineCents: baseCents, pct, refundCents, mode, detail,
           status: 'a_qualifier', reason: '', createdBy: (session && session.name) || '', createdAt: new Date().toISOString(),
-          retourPdp: wantRet, retourDlc: wantRet ? retDlc : '',
+          retourPdp: wantRet, retourDlc: wantRet ? retDlc : '', retWhy: why, // V11.35
           unit: unit || 0, prepPct: Number(prepPct) || 0, prepN: Number(prepN) || 0, dlc: mode === 'dlc' ? dlcDate : '', // V10.95
           onPrep, // V10.96 — remplace la remise prépa de cet article (pct = % total de l'article)
         });
         let retMsg = '';
-        try { retMsg = await kbRefundRetourPdp(id, order, product, partQ, wantRet ? retDlc : '', session, dayKey); }
-        catch (e) { retMsg = ' · ⚠️ retour PDP non enregistré (' + (e && e.message || e) + ')'; }
+        try {
+          retMsg = await kbRefundRetourPdp(id, order, product, partQ, wantRet ? retDlc : '', session, dayKey);
+          if (why === 'jete') { // V11.35 — abîmé / jeté en boutique → perte (même fiche que « DLC trop courte »)
+            const rid = 'rf_' + String(id).replace(/[\/]/g, '_'), now = new Date().toISOString(), pr = product.produit || '', pc = product.producteur || '';
+            await storage.setDoc('losses', `lossret_${rid}`, { id: `lossret_${rid}`, productKey: `${pc}|${pr}`, producteur: pc, produit: pr, unite: '', destination: 'jete', reason: 'abime',
+              usingWeight: false, quantity: partQ || 1, weight: 0, unitPrice: 0, totalValue: 0, dlc: '', recupPerso: false,
+              remark: `Abîmé, jeté en boutique — client ${order.name || displayName(order)} — distrib ${order.site}`, day: dayKey, fromDistrib: true,
+              createdBy: (session && session.name) || '', createdAt: now, updatedAt: now });
+            retMsg = ' · 🗑️ perte enregistrée (pertes prépa)';
+          } else if (why === 'absent') retMsg = ' · ❓ compté comme rupture';
+        }
+        catch (e) { retMsg = ' · ⚠️ retour PDP / perte non enregistré (' + (e && e.message || e) + ')'; }
         showToast(`✓ Remboursement ${pct}% (${fmtEuro(refundCents)}) → Qualité${retMsg}`);
         onClose();
       };
@@ -5902,12 +5918,16 @@
               <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--ink-soft)' }}>Produit entièrement retiré → remboursement de 100 %.</div>
             )}
             {mode === 'total' && (
-              <div style={{ marginBottom: 12, border: '2px solid #1565c0', borderRadius: 12, padding: '8px 10px', background: retPdp ? '#e3f2fd' : 'var(--bg-card,#fff)' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 16, fontWeight: 700, color: '#0d47a1', cursor: 'pointer' }}>
-                  <input type="checkbox" checked={retPdp} onChange={e => setRetPdp(e.target.checked)} style={{ width: 22, height: 22 }} />
-                  ↩️ Le client laisse le produit : Retour PDP
-                </label>
-                {retPdp && (
+              <div style={{ marginBottom: 12, border: '2px solid #1565c0', borderRadius: 12, padding: '8px 10px', background: retWhy ? '#e3f2fd' : '#fff8e1' }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: '#0d47a1', marginBottom: 6 }}>Pourquoi ? (obligatoire)</div>
+                {[['refus', "🙅 Le client n'en veut pas → Retour PDP"], ['absent', '❓ Pas dans le casier (introuvable)'], ['jete', '🗑️ Abîmé, jeté en boutique']].map(([k, l]) => (
+                  <button key={k} type="button" onClick={() => { setRetWhy(k); setRetPdp(k === 'refus'); }}
+                    style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: 6, minHeight: 46, fontSize: 16, fontWeight: 700, borderRadius: 10, cursor: 'pointer', padding: '8px 10px',
+                      border: retWhy === k ? '2px solid #0d47a1' : '1px solid var(--border)', background: retWhy === k ? '#0d47a1' : '#fff', color: retWhy === k ? '#fff' : 'var(--ink)' }}>{l}</button>
+                ))}
+                {retWhy === 'absent' && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Compté comme une rupture (le produit n'était pas là).</div>}
+                {retWhy === 'jete' && <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Enregistré en perte (pertes prépa, destination jeté).</div>}
+                {retWhy === 'refus' && (
                   <div style={{ marginTop: 8 }}>
                     <div style={{ fontSize: 13, marginBottom: 4 }}>DLC du produit (le chauffeur le ramène à l'entrepôt ; DLC trop courte → perte) :</div>
                     <input type="date" value={retDlc} onChange={e => setRetDlc(e.target.value)} style={{ fontSize: 18, padding: 8, width: '100%' }} />
@@ -27343,14 +27363,14 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const mine = refs.filter(r => r.produit === produit);
       for (const r of mine) {
         const ix = Number(r.unit) - 1;
-        if (Number(r.unit) > 0 && ix >= 0 && ix < arr.length) arr[ix] = Math.min(100, Number(r.pct) || 0);
+        if (Number(r.unit) > 0 && ix >= 0 && ix < arr.length) arr[ix] = r.retWhy === 'absent' ? 'M' : Math.min(100, Number(r.pct) || 0); // V11.35 — pas dans le casier = rupture
       }
       for (const r of mine) {
         if (Number(r.unit) > 0) continue;
         const rp = Math.min(100, Number(r.pct) || 0);
         let c = parseInt(r.qty, 10) || 1;
-        if (rp >= 100) { for (let i = arr.length - 1; i >= 0 && c > 0; i--) if (arr[i] < 100) { arr[i] = 100; c--; } }
-        else if (rp > 0) { for (let i = 0; i < arr.length && c > 0; i++) if (arr[i] < rp) { arr[i] = rp; c--; } }
+        if (rp >= 100) { for (let i = arr.length - 1; i >= 0 && c > 0; i--) if (arr[i] !== 'M' && arr[i] < 100) { arr[i] = r.retWhy === 'absent' ? 'M' : 100; c--; } }
+        else if (rp > 0) { for (let i = 0; i < arr.length && c > 0; i++) if (arr[i] !== 'M' && arr[i] < rp) { arr[i] = rp; c--; } }
       }
       return [...Array(manque).fill('M'), ...arr];
     }
