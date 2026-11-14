@@ -786,7 +786,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.33';
+    const APP_VERSION = 'V11.34';
+    // V11.34 — (14/11/2026) Master : clôture de prépa jamais bloquée par les DLC / Retours PDP.
+    //   Facturation web : même client, même lieu, plusieurs commandes le même jour (fusionnées en prépa et en distrib) →
+    //   ruptures partielles, remises « ×n » et retraits répartis entre ses commandes, plus jamais comptés deux fois.
     // V11.33 — (13/11/2026) Prépa clôturée : bouton « 🔓 Rouvrir la prépa (master) » (Master en vue prépa) → les commandes chargées après la clôture
     //   (ex. 2e commande test pour le même jour) se préparent ; re-clôturer ensuite comme d'habitude.
     // V11.32 — (13/11/2026) Facturation web : les RETRAITS distrib (remise 100 %) partent à part des RUPTURES (ligne remise_pct 100) →
@@ -20117,7 +20120,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       showToast(`Termine toutes les références d'abord (${globalProg.d}/${globalProg.t})`);
       return;
     }
-    if (pdpBoard.ready && pdpBoard.blocking || dlcBoard.ready && (dlcBoard.total || dlcBoard.corr.length)) {
+    // V11.34 — le Master n'est jamais bloqué par les DLC / Retours PDP (c'est le travail de l'équipe prépa)
+    const kbIsMaster = !!(session && (session._masterView || session.isMaster));
+    if (!kbIsMaster && (pdpBoard.ready && pdpBoard.blocking || dlcBoard.ready && (dlcBoard.total || dlcBoard.corr.length))) {
       setCloseBlock(true);
       return;
     }
@@ -27317,91 +27322,73 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       ]);
       return { orders: (od && od.orders) || [], prep: parsePrepDocs(prepArr), fix: parseDistribFix(fixArr), refunds: (refArr || []).filter(r => r && r.orderId) };
     }
-    function kbFactuEcarts(o, data) {
-  const site = String(o.site || '').toUpperCase(),
-    client = o.name || '(client)';
-  const {
-    prep,
-    fix,
-    refunds
-  } = data;
-  const out = [];
-  for (const it of o.items || []) {
-    const produit = it.produit || '';
-    const k = site + '||' + client + '||' + produit;
-    const q = parseInt(it.qty, 10) || 1;
-    let manque = 0,
-      pct = 0,
-      rq = 0,
-      ret = 0;
-    if (!fix[k]) {
-      if (prep.status[k] === 'rupture') manque = q;else manque = kbPartMiss(prep, k, q);
-    }
-    const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
-    if (rc && rc.pct && q - manque > 0) {
-      pct = Number(rc.pct) || 0;
-      rq = rc.n ? Math.min(rc.n, q - manque) : q - manque;
-    }
-    const unitDocs = refunds.filter(r => r.orderId === o.orderId && r.produit === produit && Number(r.unit) > 0);
-    const artsArr = rc && rc.arts && q - manque > 0 ? kbRcArr(rc, q - manque) : null;
-    if (unitDocs.length || artsArr) {
-      const n = q - manque,
-        arr = artsArr ? [...artsArr] : Array.from({
-          length: Math.max(0, n)
-        }, (_, i) => i < rq ? pct : 0);
-      for (const r of unitDocs) {
+    // V11.34 — écarts d'UNE commande web. Le même client (même lieu + même nom) peut avoir PLUSIEURS commandes le même jour :
+    //   la prépa les fusionne (une ligne par produit, quantités additionnées) et la distrib aussi (un client = une ligne).
+    //   On calcule donc l'état unité par unité sur la quantité FUSIONNÉE (rupture, partiel, remises prépa, retraits/remises distrib
+    //   de toutes ses commandes), puis on découpe : chaque commande prend ses unités à la suite (commandes site d'abord,
+    //   la plus grosse en premier, comme la distrib). Plus de rupture partielle ni de remise « ×n » comptée deux fois.
+    function kbFactuUnits(prep, fix, refs, k, site, produit, Q) {
+      let manque = 0;
+      if (!fix[k]) manque = prep.status[k] === 'rupture' ? Q : kbPartMiss(prep, k, Q);
+      manque = Math.min(manque, Q);
+      const n = Q - manque;
+      const rc = prep.remiseCli[k] || prep.remiseAll[site + '||' + produit];
+      let arr;
+      if (rc && rc.arts && n > 0) arr = [...kbRcArr(rc, n)];
+      else {
+        const pct = rc && rc.pct ? Number(rc.pct) || 0 : 0;
+        const rq = pct && n > 0 ? (rc.n ? Math.min(rc.n, n) : n) : 0;
+        arr = Array.from({ length: Math.max(0, n) }, (_, i) => i < rq ? pct : 0);
+      }
+      const mine = refs.filter(r => r.produit === produit);
+      for (const r of mine) {
         const ix = Number(r.unit) - 1;
-        if (ix >= 0 && ix < arr.length) arr[ix] = Math.min(100, Number(r.pct) || 0);
+        if (Number(r.unit) > 0 && ix >= 0 && ix < arr.length) arr[ix] = Math.min(100, Number(r.pct) || 0);
       }
-      const leg = refunds.filter(r => r.orderId === o.orderId && r.produit === produit && !(Number(r.unit) > 0) && (Number(r.pct) || 0) >= 100);
-      let legMiss = leg.reduce((t, r) => t + (parseInt(r.qty, 10) || 1), 0);
-      for (let i = arr.length - 1; i >= 0 && legMiss > 0; i--) if (arr[i] < 100) {
-        arr[i] = 100;
-        legMiss--;
+      for (const r of mine) {
+        if (Number(r.unit) > 0) continue;
+        const rp = Math.min(100, Number(r.pct) || 0);
+        let c = parseInt(r.qty, 10) || 1;
+        if (rp >= 100) { for (let i = arr.length - 1; i >= 0 && c > 0; i--) if (arr[i] < 100) { arr[i] = 100; c--; } }
+        else if (rp > 0) { for (let i = 0; i < arr.length && c > 0; i++) if (arr[i] < rp) { arr[i] = rp; c--; } }
       }
-      ret = arr.filter(x => x >= 100).length; // V11.32 — retraits distrib comptés à part (pas des ruptures)
-      // V11.01 — une ligne d'écart PAR taux de remise (plus de % moyen arrondi : 30 % + 15 % ≠ 2 × 23 %)
-      const grp = {};
-      for (const x of arr) if (x > 0 && x < 100) grp[x] = (grp[x] || 0) + 1;
-      manque = Math.min(manque, q);
-      ret = Math.min(ret, q - manque);
-      const base = {
-        ean: it.ean || '',
-        produit: String(produit).replace(/^\[TEST\]\s*/, ''),
-        qty: q,
-        prix: it.consumer_price || 0
-      };
-      const taux = Object.keys(grp).map(Number).sort((x, y) => y - x);
-      if (!taux.length) {
-        if (manque > 0) out.push({ ...base, manque, remise_pct: 0, remise_qte: 0 });
-      } else taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: grp[t] }));
-      if (ret > 0) out.push({ ...base, manque: 0, remise_pct: 100, remise_qte: ret, retrait: true });
-      continue;
+      return [...Array(manque).fill('M'), ...arr];
     }
-    for (const r of refunds) {
-      if (r.orderId !== o.orderId || r.produit !== produit) continue;
-      const rqty = Math.min(parseInt(r.qty, 10) || 1, q - manque - ret);
-      if ((Number(r.pct) || 0) >= 100) ret += rqty;else if ((Number(r.pct) || 0) > pct) {
-        pct = Number(r.pct) || 0;
-        rq = Math.min(Math.max(rq, rqty), q - manque);
+    function kbFactuEcarts(o, data) {
+      const site = String(o.site || '').toUpperCase(),
+        client = o.name || '(client)';
+      const { prep, fix, refunds } = data;
+      const all = (data.orders || []).filter(x => String(x.site || '').toUpperCase() === site && (x.name || '(client)') === client);
+      if (!all.some(x => x.orderId === o.orderId)) all.push(o);
+      const grp = all.length > 1 ? [...all].sort((a, b) => ((b._ps ? 1 : 0) - (a._ps ? 1 : 0)) || (orderAmounts(b).theorique - orderAmounts(a).theorique) || String(a.orderId).localeCompare(String(b.orderId))) : [o];
+      const ids = new Set(grp.map(x => x.orderId));
+      const refs = (refunds || []).filter(r => ids.has(r.orderId));
+      const out = [];
+      for (const it of o.items || []) {
+        const produit = it.produit || '';
+        const k = site + '||' + client + '||' + produit;
+        const q = parseInt(it.qty, 10) || 1;
+        let Q = 0, off = -1;
+        for (const x of grp) for (const y of x.items || []) {
+          if ((y.produit || '') !== produit) continue;
+          if (x.orderId === o.orderId && (y === it || off < 0 && x !== o && (y.id || '') === (it.id || ''))) off = Q;
+          Q += parseInt(y.qty, 10) || 1;
+        }
+        if (off < 0) { off = 0; Q = Math.max(Q, q); }
+        const units = kbFactuUnits(prep, fix, refs, k, site, produit, Q).slice(off, off + q);
+        const manque = units.filter(u => u === 'M').length;
+        const ret = units.filter(u => u !== 'M' && u >= 100).length;
+        const tx = {};
+        units.forEach(u => { if (u !== 'M' && u > 0 && u < 100) tx[u] = (tx[u] || 0) + 1; });
+        const base = { ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), qty: q, prix: it.consumer_price || 0 };
+        const taux = Object.keys(tx).map(Number).sort((x, y) => y - x);
+        if (!taux.length) {
+          if (manque > 0) out.push({ ...base, manque, remise_pct: 0, remise_qte: 0 });
+        } else taux.forEach((t, i) => out.push({ ...base, manque: i === 0 ? manque : 0, remise_pct: t, remise_qte: tx[t] }));
+        if (ret > 0) out.push({ ...base, manque: 0, remise_pct: 100, remise_qte: ret, retrait: true });
       }
+      return out;
     }
-    manque = Math.min(manque, q);
-    ret = Math.min(ret, q - manque);
-    if (rq > q - manque - ret) rq = Math.max(0, q - manque - ret);
-    if (ret > 0) out.push({ ean: it.ean || '', produit: String(produit).replace(/^\[TEST\]\s*/, ''), manque: 0, remise_pct: 100, remise_qte: ret, retrait: true, qty: q, prix: it.consumer_price || 0 });
-    if (manque > 0 || pct > 0 && rq > 0) out.push({
-      ean: it.ean || '',
-      produit: String(produit).replace(/^\[TEST\]\s*/, ''),
-      manque,
-      remise_pct: pct,
-      remise_qte: rq,
-      qty: q,
-      prix: it.consumer_price || 0
-    });
-  }
-  return out;
-}
     async function kbFacturerCommande(o, data, dry) {
       if (!o || !o.psRef) throw new Error('Commande sans référence site');
       const ecarts = kbFactuEcarts(o, data);
