@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.34) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.35) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -704,7 +704,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.34';
+const APP_VERSION = 'V11.35';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -7646,6 +7646,7 @@ function RefundModal({
   const [pctDlc, setPctDlc] = React.useState(existing && existing.mode === 'dlc' ? String(existing.pct || 30) : '30');
   const [dlcDate, setDlcDate] = React.useState(existing && existing.dlc || '');
   const [retPdp, setRetPdp] = React.useState(!!(existing && existing.retourPdp));
+  const [retWhy, setRetWhy] = React.useState(existing && existing.retWhy || (existing && existing.retourPdp ? 'refus' : ''));
   const [retDlc, setRetDlc] = React.useState(existing && existing.retourDlc || '');
   const lineQ = Math.max(1, Number(product.qty) || 1);
   const [onN, setOnN] = React.useState(() => Math.min(lineQ, Math.max(1, existing && existing.mode !== 'units' && Number(existing.qty) || lineQ)));
@@ -7708,7 +7709,12 @@ function RefundModal({
       showToast(`Déjà −${prepPct}% en prépa : choisis plus, ou Retrait total`);
       return;
     }
-    const wantRet = mode === 'total' && retPdp;
+    if (mode === 'total' && !retWhy) {
+      showToast('Retrait total : choisis pourquoi (client, casier ou abîmé)');
+      return;
+    }
+    const why = mode === 'total' ? retWhy : '';
+    const wantRet = why === 'refus';
     if (wantRet && !retDlc) {
       showToast('Retour PDP : indique la DLC du produit');
       return;
@@ -7738,6 +7744,7 @@ function RefundModal({
       createdAt: new Date().toISOString(),
       retourPdp: wantRet,
       retourDlc: wantRet ? retDlc : '',
+      retWhy: why,
       unit: unit || 0,
       prepPct: Number(prepPct) || 0,
       prepN: Number(prepN) || 0,
@@ -7747,8 +7754,37 @@ function RefundModal({
     let retMsg = '';
     try {
       retMsg = await kbRefundRetourPdp(id, order, product, partQ, wantRet ? retDlc : '', session, dayKey);
+      if (why === 'jete') {
+        const rid = 'rf_' + String(id).replace(/[\/]/g, '_'),
+          now = new Date().toISOString(),
+          pr = product.produit || '',
+          pc = product.producteur || '';
+        await storage.setDoc('losses', `lossret_${rid}`, {
+          id: `lossret_${rid}`,
+          productKey: `${pc}|${pr}`,
+          producteur: pc,
+          produit: pr,
+          unite: '',
+          destination: 'jete',
+          reason: 'abime',
+          usingWeight: false,
+          quantity: partQ || 1,
+          weight: 0,
+          unitPrice: 0,
+          totalValue: 0,
+          dlc: '',
+          recupPerso: false,
+          remark: `Abîmé, jeté en boutique — client ${order.name || displayName(order)} — distrib ${order.site}`,
+          day: dayKey,
+          fromDistrib: true,
+          createdBy: session && session.name || '',
+          createdAt: now,
+          updatedAt: now
+        });
+        retMsg = ' · 🗑️ perte enregistrée (pertes prépa)';
+      } else if (why === 'absent') retMsg = ' · ❓ compté comme rupture';
     } catch (e) {
-      retMsg = ' · ⚠️ retour PDP non enregistré (' + (e && e.message || e) + ')';
+      retMsg = ' · ⚠️ retour PDP / perte non enregistré (' + (e && e.message || e) + ')';
     }
     showToast(`✓ Remboursement ${pct}% (${fmtEuro(refundCents)}) → Qualité${retMsg}`);
     onClose();
@@ -8049,27 +8085,48 @@ function RefundModal({
       border: '2px solid #1565c0',
       borderRadius: 12,
       padding: '8px 10px',
-      background: retPdp ? '#e3f2fd' : 'var(--bg-card,#fff)'
+      background: retWhy ? '#e3f2fd' : '#fff8e1'
     }
-  }, React.createElement("label", {
+  }, React.createElement("div", {
     style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 8,
-      fontSize: 16,
+      fontSize: 15,
       fontWeight: 700,
       color: '#0d47a1',
-      cursor: 'pointer'
+      marginBottom: 6
     }
-  }, React.createElement("input", {
-    type: "checkbox",
-    checked: retPdp,
-    onChange: e => setRetPdp(e.target.checked),
+  }, "Pourquoi ? (obligatoire)"), [['refus', "🙅 Le client n'en veut pas → Retour PDP"], ['absent', '❓ Pas dans le casier (introuvable)'], ['jete', '🗑️ Abîmé, jeté en boutique']].map(([k, l]) => React.createElement("button", {
+    key: k,
+    type: "button",
+    onClick: () => {
+      setRetWhy(k);
+      setRetPdp(k === 'refus');
+    },
     style: {
-      width: 22,
-      height: 22
+      display: 'block',
+      width: '100%',
+      textAlign: 'left',
+      marginBottom: 6,
+      minHeight: 46,
+      fontSize: 16,
+      fontWeight: 700,
+      borderRadius: 10,
+      cursor: 'pointer',
+      padding: '8px 10px',
+      border: retWhy === k ? '2px solid #0d47a1' : '1px solid var(--border)',
+      background: retWhy === k ? '#0d47a1' : '#fff',
+      color: retWhy === k ? '#fff' : 'var(--ink)'
     }
-  }), "\u21A9\uFE0F Le client laisse le produit : Retour PDP"), retPdp && React.createElement("div", {
+  }, l)), retWhy === 'absent' && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "Compt\xE9 comme une rupture (le produit n'\xE9tait pas l\xE0)."), retWhy === 'jete' && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "Enregistr\xE9 en perte (pertes pr\xE9pa, destination jet\xE9)."), retWhy === 'refus' && React.createElement("div", {
     style: {
       marginTop: 8
     }
@@ -50074,19 +50131,19 @@ function kbFactuUnits(prep, fix, refs, k, site, produit, Q) {
   const mine = refs.filter(r => r.produit === produit);
   for (const r of mine) {
     const ix = Number(r.unit) - 1;
-    if (Number(r.unit) > 0 && ix >= 0 && ix < arr.length) arr[ix] = Math.min(100, Number(r.pct) || 0);
+    if (Number(r.unit) > 0 && ix >= 0 && ix < arr.length) arr[ix] = r.retWhy === 'absent' ? 'M' : Math.min(100, Number(r.pct) || 0);
   }
   for (const r of mine) {
     if (Number(r.unit) > 0) continue;
     const rp = Math.min(100, Number(r.pct) || 0);
     let c = parseInt(r.qty, 10) || 1;
     if (rp >= 100) {
-      for (let i = arr.length - 1; i >= 0 && c > 0; i--) if (arr[i] < 100) {
-        arr[i] = 100;
+      for (let i = arr.length - 1; i >= 0 && c > 0; i--) if (arr[i] !== 'M' && arr[i] < 100) {
+        arr[i] = r.retWhy === 'absent' ? 'M' : 100;
         c--;
       }
     } else if (rp > 0) {
-      for (let i = 0; i < arr.length && c > 0; i++) if (arr[i] < rp) {
+      for (let i = 0; i < arr.length && c > 0; i++) if (arr[i] !== 'M' && arr[i] < rp) {
         arr[i] = rp;
         c--;
       }
