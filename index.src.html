@@ -792,6 +792,7 @@
     //   ruptures et leur effet (CA perdu, clients touchés, retour la semaine suivante, CA indirect, décrochages après ruptures). ca_history.siteDetailJ.cl = [CA, cmd, CA manquant].
     //   🥬 F&L › Contrôle auto : statut 📦 « Stock seulement » (en vente / en stock mais plus commandable chez Rungis) : Sheet « Non actif », appli ACTIF (MU, prépa, inventaire),
     //   plus d'alerte ni de commande Rungis 5h (app_config/fl_stock_only + clé serveur « stock| » lue par KBG_FL_Auto v1.6).
+    //   🔄 Mise à jour OBLIGATOIRE : popup plein écran qui bloque l'appli (OK = actualise, sinon auto au bout de 30 s) ; actualisation silencieuse si l'appli est en arrière-plan ; vérif chaque minute ; jamais de retour à une version plus ancienne.
     // V11.37.1 — (17/11/2026) Sapins : adresses @probon.fr + @probon.org (transition).
     // V11.37 — (16/11/2026) 🎄 Sapins : cœur commun à jour (Kelbongoo sans prévision automatique, adresses @probon.org).
     // V11.36 — (14/11/2026) 🎄 Espace Rungis › Sapins en lecture seule (le jour se change seulement depuis le mail de 2 h : confirmer / changer le jour) ; « ✅ confirmé » affiché.
@@ -38295,10 +38296,28 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       );
     }
 
-    // Vérifie en arrière-plan si une version plus récente est en ligne (re-fetch du
-    // fichier sans cache, comparaison de APP_VERSION) et propose un bandeau « mettre à jour ».
+    // Vérifie en arrière-plan si une version plus récente est en ligne (re-fetch du fichier sans cache, comparaison de APP_VERSION).
+    // V11.38 — MISE À JOUR OBLIGATOIRE : plus de simple bandeau qu'on peut ignorer.
+    //   • Onglet en arrière-plan / téléphone en veille → actualisation SILENCIEUSE dès qu'on revient sur l'appli.
+    //   • Appli ouverte → popup plein écran qui BLOQUE l'appli : « OK, mettre à jour » actualise tout de suite,
+    //     sinon actualisation automatique au bout de 30 s (le temps de finir un geste en cours).
+    //   • Vérification toutes les minutes + au retour sur l'onglet. Seulement si la version en ligne est PLUS RÉCENTE
+    //     (jamais de retour en arrière si GitHub sert encore l'ancien fichier). Anti-boucle : 2 essais max par version,
+    //     ensuite simple bandeau (cache du téléphone à vider).
+    function kbVerCmp(a, b) {
+      const p = (v) => String(v || '').replace(/^V/i, '').split('.').map(x => parseInt(x, 10) || 0);
+      const x = p(a), y = p(b);
+      for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d; }
+      return 0;
+    }
     function UpdateChecker() {
       const [newVersion, setNewVersion] = React.useState(null);
+      const [left, setLeft] = React.useState(30);
+      const tries = (v) => { try { return Number(sessionStorage.getItem('kb_upd_try_' + v) || 0); } catch (e) { return 0; } };
+      const update = React.useCallback((v) => {
+        try { sessionStorage.setItem('kb_upd_try_' + v, String(tries(v) + 1)); } catch (e) {}
+        location.replace(location.pathname + '?v=' + encodeURIComponent(v) + '&t=' + Date.now() + location.hash);
+      }, []);
       React.useEffect(() => {
         let stopped = false;
         const check = async () => {
@@ -38307,23 +38326,43 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             if (!res.ok) return;
             const text = await res.text();
             const m = text.match(/const APP_VERSION ?= ?['"]([^'"]+)['"]/);
-            if (m && m[1] && m[1] !== APP_VERSION && !stopped) setNewVersion(m[1]);
+            if (!m || !m[1] || stopped || kbVerCmp(m[1], APP_VERSION) <= 0) return;
+            if (document.visibilityState === 'hidden' && tries(m[1]) < 2) { update(m[1]); return; } // personne ne regarde → on actualise
+            setNewVersion(v => v || m[1]);
           } catch (e) {}
         };
         check();
-        const iv = setInterval(check, 3 * 60 * 1000);
+        const iv = setInterval(check, 60 * 1000);
         const onVis = () => { if (document.visibilityState === 'visible') check(); };
         document.addEventListener('visibilitychange', onVis);
-        return () => { stopped = true; clearInterval(iv); document.removeEventListener('visibilitychange', onVis); };
-      }, []);
+        window.addEventListener('focus', onVis);
+        return () => { stopped = true; clearInterval(iv); document.removeEventListener('visibilitychange', onVis); window.removeEventListener('focus', onVis); };
+      }, [update]);
+      const blocking = !!newVersion && tries(newVersion) < 2;
+      React.useEffect(() => {
+        if (!blocking) return;
+        setLeft(30);
+        const t = setInterval(() => setLeft(n => { if (n <= 1) { clearInterval(t); update(newVersion); return 0; } return n - 1; }), 1000);
+        return () => clearInterval(t);
+      }, [blocking, newVersion, update]);
       if (!newVersion) return null;
-      const update = () => { location.replace(location.pathname + '?v=' + encodeURIComponent(newVersion)); };
+      if (!blocking) return (
+        <div onClick={() => update(newVersion)} role="button"
+          style={{position:'fixed',left:0,right:0,top:0,zIndex:99999,background:'#c62828',color:'#fff',
+            padding:'10px 16px',textAlign:'center',fontWeight:700,fontSize:14,cursor:'pointer',boxShadow:'0 2px 10px rgba(0,0,0,0.25)'}}>
+          ⚠️ Version {newVersion} en ligne mais le téléphone garde l'ancienne ({APP_VERSION}) : fermer l'appli et la rouvrir, ou vider le cache du navigateur
+        </div>
+      );
       return (
-        <div onClick={update} role="button"
-          style={{position:'fixed',left:0,right:0,top:0,zIndex:99999,background:'var(--master)',color:'#fff',
-            padding:'10px 16px',textAlign:'center',fontWeight:600,fontSize:14,cursor:'pointer',
-            boxShadow:'0 2px 10px rgba(0,0,0,0.25)'}}>
-          🔄 Nouvelle version {newVersion} disponible — toucher pour mettre à jour
+        <div role="dialog" aria-modal="true"
+          style={{position:'fixed',inset:0,zIndex:100000,background:'rgba(0,0,0,0.72)',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+          <div style={{background:'#fff',borderRadius:18,padding:'24px 22px',maxWidth:420,width:'100%',textAlign:'center',boxShadow:'0 10px 40px rgba(0,0,0,0.4)',borderTop:'8px solid #ef6c00'}}>
+            <div style={{fontSize:46}}>🔄</div>
+            <div style={{fontSize:22,fontWeight:800,marginTop:6}}>Mise à jour obligatoire</div>
+            <div style={{fontSize:15,marginTop:8,lineHeight:1.45}}>Une nouvelle version de l'appli est en ligne (<b>{newVersion}</b>, tu as la {APP_VERSION}).<br />L'appli se met à jour <b>automatiquement dans {left} s</b>.</div>
+            <div style={{fontSize:13,color:'#666',marginTop:6}}>Tout ce qui est enregistré est gardé (prépa, distrib, casiers…).</div>
+            <button className="btn-primary" onClick={() => update(newVersion)} style={{marginTop:16,width:'100%',fontSize:18,fontWeight:800,padding:'14px 16px',background:'#2e7d32',borderColor:'#2e7d32'}}>OK, mettre à jour maintenant</button>
+          </div>
         </div>
       );
     }
