@@ -47305,7 +47305,7 @@ function kbConsNew(st, today) {
   };
 }
 const KB_WB_SEUIL_RUPT = 15;
-function kbWbIndex(docs) {
+function kbWbIndex(docs, prep) {
   const list = (docs || []).map(d => ({
     d,
     dk: d && (d.date || d.id)
@@ -47344,6 +47344,17 @@ function kbWbIndex(docs) {
       if (!first[cid] || m < first[cid]) first[cid] = m;
     }
   }
+  const g = {};
+  list.forEach(({
+    d
+  }) => [...(d.salesByProduct || []), ...(d.manquantsByProduct || [])].forEach(p => {
+    if (p.qty && p.ca_cents) g[kbANorm(p.produit)] = p.ca_cents / p.qty;
+  }));
+  const priceOf = (d, name) => {
+    const k = kbANorm(name);
+    const hit = [...(d.salesByProduct || []), ...(d.manquantsByProduct || [])].find(p => kbANorm(p.produit) === k && p.qty);
+    return hit ? hit.ca_cents / hit.qty : g[k] || 0;
+  };
   return {
     list,
     wk,
@@ -47351,8 +47362,39 @@ function kbWbIndex(docs) {
     detailFrom,
     firstDk: list.length ? list[0].dk : null,
     lastDk: list.length ? list[list.length - 1].dk : null,
-    segCache: {}
+    segCache: {},
+    prep: prep || {},
+    priceOf
   };
+}
+function kbWbPrepa(I, d, dk) {
+  const L = I.prep[dk];
+  if (!L || !L.length) return null;
+  const json = new Set((d.manquantsByProduct || []).map(p => kbANorm(p.produit)));
+  const r = {
+    c: 0,
+    site: {},
+    prod: []
+  };
+  for (const m of L) {
+    if (!(m.source === 'prepa' && m.status === 'rupture') || json.has(kbANorm(m.produit))) continue;
+    const q = m.manque || m.total || 0,
+      u = I.priceOf(d, m.produit);
+    if (!q) continue;
+    const c = Math.round(q * u);
+    r.c += c;
+    Object.entries(m.bySite || {}).forEach(([s, n]) => {
+      r.site[s] = (r.site[s] || 0) + Math.round(n * u);
+    });
+    r.prod.push({
+      produit: m.produit,
+      producteur: m.producteur || '',
+      qty: q,
+      cents: c,
+      sites: m.bySite || {}
+    });
+  }
+  return r;
 }
 function kbWbSum(I, from, to) {
   const r = {
@@ -47380,16 +47422,35 @@ function kbWbSum(I, from, to) {
     if (dk < from || dk > to) continue;
     r.nd++;
     const t = d.totals || totalsFromCaBySite(d.caBySite);
-    r.ca += t.reel || 0;
-    r.manq += t.manquant || 0;
+    const pp = kbWbPrepa(I, d, dk);
+    r.ca += (t.reel || 0) - (pp ? pp.c : 0);
+    r.manq += (t.manquant || 0) + (pp ? pp.c : 0);
     r.rem += t.remise || 0;
     r.cmd += d.ordersCount || 0;
     for (const [s, v] of Object.entries(d.caBySite || {})) {
-      const x = S(s);
-      x.ca += v.reel_cents || 0;
+      const x = S(s),
+        ps = pp ? pp.site[s] || 0 : 0;
+      x.ca += (v.reel_cents || 0) - ps;
       x.cmd += v.orders || 0;
-      x.manq += v.manquant_cents || 0;
+      x.manq += (v.manquant_cents || 0) + ps;
     }
+    if (pp) pp.prod.forEach(p => {
+      const k = kbANorm(p.produit),
+        e = r.manqProd[k] || (r.manqProd[k] = {
+          produit: p.produit,
+          producteur: p.producteur,
+          qty: 0,
+          cents: 0,
+          days: 0,
+          sites: {}
+        });
+      e.qty += p.qty;
+      e.cents += p.cents;
+      e.days++;
+      Object.entries(p.sites).forEach(([s, q]) => {
+        e.sites[s] = (e.sites[s] || 0) + q;
+      });
+    });
     for (const p of d.manquantsByProduct || []) {
       const k = p.id || kbANorm(p.produit),
         e = r.manqProd[k] || (r.manqProd[k] = {
@@ -47776,7 +47837,8 @@ function kbWbHead(R) {
     })).filter(r => Math.sign(r.d) === sg).sort((x, y) => sg * (y.d - x.d)).slice(0, 2);
     const totD = A.cmd - B.cmd;
     if (top.length && Math.abs(top.reduce((t, r) => t + r.d, 0)) >= Math.abs(totD) * 0.5) {
-      const segs = top.map(r => r.sa && r.sb ? ['fid', 'occ', 'nouv'].map(k => [k, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => sg * (y[1] - x[1]))[0][0] : null);
+      const okSeg = R.segA && R.segA.histOk && (R.ref === 'N' ? R.segN && R.segN.histOk : R.segP && R.segP.histOk);
+      const segs = top.map(r => okSeg && r.sa && r.sb ? ['fid', 'occ', 'nouv'].map(k => [k, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => sg * (y[1] - x[1]))[0][0] : null);
       const same = segs[0] && segs.every(x => x === segs[0]);
       const lbl = {
         fid: 'fidèles',
@@ -47830,7 +47892,7 @@ function kbWbText(R) {
     d: r.cmd - r.cmdB
   })).filter(r => r.d >= 10 || r.cmdB && r.d / r.cmdB >= 0.1).sort((x, y) => y.d - x.d).slice(0, 3);
   const segTxt = r => {
-    if (!r.sa || !r.sb) return '';
+    if (!r.sa || !r.sb || !(R.segA && R.segA.histOk)) return '';
     const L = [['fid', 'fidèles'], ['occ', 'occasionnels'], ['nouv', 'nouveaux']].map(([k, l]) => [l, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1]));
     return L[0][1] ? `${L[0][1] > 0 ? 'gagne' : 'perd'} surtout des ${L[0][0]} (${L[0][1] > 0 ? '+' : ''}${L[0][1]})` : '';
   };
@@ -48348,13 +48410,142 @@ function KbWbRuptures({
     }
   }, "CA indirect = (taux de retour des non touch\xE9s \u2212 taux des touch\xE9s) \xD7 clients touch\xE9s \xD7 leur panier. Estimation : d'autres causes jouent (vacances, m\xE9t\xE9o\u2026)."));
 }
+function KbWbHistLoad({
+  I
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [open, setOpen] = React.useState(false);
+  const [file, setFile] = React.useState(null);
+  const [from, setFrom] = React.useState(() => addDays(kbMondayOf(todayKey()), -364 - 63));
+  const [to, setTo] = React.useState(() => addDays(todayKey(), -1));
+  const [busy, setBusy] = React.useState('');
+  const [done, setDone] = React.useState(null);
+  const withM = I ? I.list.filter(x => {
+    const sd = kbDocJ(x.d, 'siteDetailJ');
+    return sd && Object.values(sd).some(v => Object.values(v.cl || {}).some(c => c.length > 2));
+  }).length : 0;
+  const run = async () => {
+    if (!file) {
+      showToast('Choisis le fichier JSON des commandes');
+      return;
+    }
+    setBusy('Lecture du fichier…');
+    setDone(null);
+    try {
+      const prodById = await readCache('products');
+      if (!prodById) throw new Error('Pas de fichier Produits en mémoire : charge-le dans Chargement d\'abord');
+      const text = await file.text();
+      setBusy('Analyse des commandes…');
+      await new Promise(r => setTimeout(r, 30));
+      const docsW = buildDailyAnalytics(text, prodById, {
+        fromKey: from,
+        toKey: to
+      });
+      const dates = Object.keys(docsW).sort();
+      if (!dates.length) throw new Error('Aucune distribution entre ces dates dans le fichier');
+      let i = 0;
+      for (const dk of dates) {
+        i++;
+        setBusy(`Écriture ${i}/${dates.length} · ${formatDateShort(dk)}`);
+        await storage.setDoc('ca_history', dk, docsW[dk], {
+          replace: true
+        });
+      }
+      setDone({
+        n: dates.length,
+        a: dates[0],
+        b: dates[dates.length - 1]
+      });
+      showToast(`✓ ${dates.length} distributions enregistrées — recharge la page pour voir le bilan à jour`);
+    } catch (e) {
+      showToast('Erreur : ' + (e.message || e));
+    } finally {
+      setBusy('');
+    }
+  };
+  return React.createElement("div", {
+    style: {
+      marginTop: 14,
+      padding: '10px 12px',
+      borderRadius: 10,
+      background: '#f5f7fb',
+      border: '1px solid var(--line)'
+    }
+  }, React.createElement("div", {
+    onClick: () => setOpen(!open),
+    style: {
+      cursor: 'pointer',
+      fontSize: 14,
+      fontWeight: 700
+    }
+  }, "\uD83D\uDCE5 Compl\xE9ter l'historique (N-1, fid\xE8les, ruptures par client) ", open ? '▾' : '▸'), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-soft)',
+      marginTop: 2
+    }
+  }, "Historique en m\xE9moire : ", I && I.firstDk ? `${formatDateShort(I.firstDk)} → ${formatDateShort(I.lastDk)}` : 'vide', " \xB7 d\xE9tail clients depuis ", I && I.detailFrom ? formatDateShort(I.detailFrom) : '—', " \xB7 ", withM, " jour(s) avec les ruptures par client."), open && React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontSize: 13,
+      lineHeight: 1.45
+    }
+  }, React.createElement("ol", {
+    style: {
+      margin: '4px 0 8px',
+      paddingLeft: 18
+    }
+  }, React.createElement("li", null, "MongoDB Compass \u203A base ", React.createElement("b", null, "kelbongoo-prod"), " \u203A vue ", React.createElement("b", null, "orders-since-2023"), "."), React.createElement("li", null, "Filtre (au lieu du globalorder_id du jour) : ", React.createElement("code", {
+    style: {
+      background: '#fff',
+      padding: '1px 4px'
+    }
+  }, '{ distribution_date: { $gte: ISODate("' + from + '") } }')), React.createElement("li", null, "Export Collection \u203A JSON \u203A enregistrer le fichier."), React.createElement("li", null, "Le choisir ici, puis \xAB Enregistrer l'historique \xBB (sur PC : fichier lourd).")), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap',
+      alignItems: 'center'
+    }
+  }, React.createElement("input", {
+    type: "file",
+    accept: ".json,application/json",
+    onChange: e => setFile(e.target.files[0] || null)
+  }), React.createElement("label", null, "du ", React.createElement("input", {
+    type: "date",
+    value: from,
+    onChange: e => setFrom(e.target.value)
+  })), React.createElement("label", null, "au ", React.createElement("input", {
+    type: "date",
+    value: to,
+    onChange: e => setTo(e.target.value)
+  })), React.createElement("button", {
+    className: "btn-primary",
+    disabled: !!busy || !file,
+    onClick: run
+  }, busy || 'Enregistrer l\'historique')), React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--ink-mute)',
+      marginTop: 6
+    }
+  }, "Remplace les jours existants entre ces dates. Par d\xE9faut : depuis la m\xEAme p\xE9riode l'an dernier moins 9 semaines (N-1 du graphique + 12 semaines pour les fid\xE8les). Les ruptures faites en pr\xE9pa dans l'appli restent prises en compte \xE0 part."), done && React.createElement("div", {
+    style: {
+      marginTop: 6,
+      fontWeight: 700,
+      color: '#2e7d32'
+    }
+  }, "\u2713 ", done.n, " distributions du ", formatDateShort(done.a), " au ", formatDateShort(done.b), ". Recharge la page.")));
+}
 function KbWeekBilanCard({
   docs,
   full,
-  onMore
+  onMore,
+  session
 }) {
   const today = todayKey();
-  const I = React.useMemo(() => docs ? kbWbIndex(docs) : null, [docs]);
+  const [prep, setPrep] = React.useState({});
+  const I = React.useMemo(() => docs ? kbWbIndex(docs, prep) : null, [docs, prep]);
   const defMon = React.useMemo(() => {
     if (!I) return kbMondayOf(today);
     const m = kbMondayOf(today);
@@ -48362,6 +48553,29 @@ function KbWeekBilanCard({
   }, [I, today]);
   const [mon, setMon] = React.useState(null);
   const M = mon || defMon;
+  React.useEffect(() => {
+    if (!I) return;
+    let alive = true;
+    const dates = I.list.map(x => x.dk).filter(dk => dk >= addDays(M, -63) && dk <= addDays(M, 6) && !(dk in prep));
+    if (!dates.length) return;
+    (async () => {
+      const res = {};
+      for (let i = 0; i < dates.length; i += 8) {
+        const ch = dates.slice(i, i + 8);
+        const got = await Promise.all(ch.map(dk => storage.getAll(`day_${dk}_manquants`).catch(() => [])));
+        ch.forEach((dk, j) => {
+          res[dk] = got[j] || [];
+        });
+      }
+      if (alive) setPrep(p => ({
+        ...p,
+        ...res
+      }));
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [I && I.list.length, M]);
   const R = React.useMemo(() => I && I.list.length ? kbWeekBilan(I, M, today) : null, [I, M, today]);
   const [copied, setCopied] = React.useState(false);
   if (!docs) return React.createElement("div", {
@@ -48454,9 +48668,14 @@ function KbWeekBilanCard({
       fontSize: 13,
       fontWeight: 700
     }
-  }, "CA livr\xE9 sur 8 semaines"), React.createElement(KbWbChart, {
-    weeks: R.weeks
-  }), React.createElement("div", {
+  }, "CA livr\xE9 sur 8 semaines"), React.createElement("div", {
+    style: {
+      maxWidth: full ? 720 : 460
+    }
+  }, React.createElement(KbWbChart, {
+    weeks: R.weeks,
+    h: full ? 190 : 170
+  })), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 14,
@@ -48487,7 +48706,11 @@ function KbWeekBilanCard({
       borderTop: '2px dashed #e64a19',
       verticalAlign: 'middle'
     }
-  }), " N-1")), full && React.createElement(React.Fragment, null, R.text.filter(x => x.k === 'pont' || x.k === 'perim').map(x => React.createElement("div", {
+  }), " N-1", R.weeks.every(w => w.n1 == null) ? React.createElement("b", {
+    style: {
+      color: '#e64a19'
+    }
+  }, " : pas de donn\xE9es ", R.mon.slice(0, 4) - 1, " dans l'appli \u2192 Bilan complet \u203A \uD83D\uDCE5 Compl\xE9ter l'historique") : '')), full && React.createElement(React.Fragment, null, R.text.filter(x => x.k === 'pont' || x.k === 'perim').map(x => React.createElement("div", {
     key: x.k,
     style: {
       fontSize: 13.5,
@@ -48516,6 +48739,9 @@ function KbWeekBilanCard({
     }
   }, "\uD83D\uDEAB Ruptures et leur effet"), React.createElement(KbWbRuptures, {
     R: R
+  }), React.createElement(KbWbHistLoad, {
+    I: I,
+    session: session
   })));
 }
 function KbHomeStats({
