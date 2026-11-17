@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.40) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.41) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.40';
+const APP_VERSION = 'V11.41';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -5606,6 +5606,67 @@ function useKbClientOrders(site, email, name, nDays) {
   }, [site, email, name, nDays]);
   return st;
 }
+const KB_QERR_TYPES = ['manque', 'erreur_produit', 'inversion_casier', 'en_trop'];
+const KB_QPROD_TYPES = ['casse', 'pourri', 'dlc', 'dlc_courte'];
+const kbIsPrepErr = a => (a.anomalyTypes || []).some(t => KB_QERR_TYPES.includes(t));
+const kbQualDecode = s => {
+  s = String(s || '');
+  for (let i = 0; i < 2 && /%[0-9A-Fa-f]{2}/.test(s); i++) {
+    try {
+      s = decodeURIComponent(s);
+    } catch (_) {
+      break;
+    }
+  }
+  return s;
+};
+async function kbQualPrepBy({
+  day,
+  site,
+  oname,
+  produit,
+  email,
+  name
+}) {
+  if (!day || !site) return null;
+  const S = String(site).toUpperCase();
+  try {
+    if (oname && produit) {
+      const key = S + '||' + oname + '||' + produit;
+      const d = await storage.getDoc(`day_${day}_prep`, 'st|' + encodeURIComponent(key));
+      if (d && d.by) return {
+        prepBy: String(d.by),
+        prepHow: 'ligne',
+        prepKey: key,
+        prepDay: day
+      };
+    }
+    let on = oname;
+    if (!on) {
+      const em = String(email || '').trim().toLowerCase(),
+        nm = normalizeText(name || '');
+      const o = (await kbDayOrders(day)).find(o => String(o.site || '').toUpperCase() === S && (em && String(o.email || '').trim().toLowerCase() === em || nm && normalizeText(displayName(o)) === nm));
+      on = o && (o.name || '(client)');
+    }
+    if (!on) return null;
+    const pre = S + '||' + on + '||',
+      n = {};
+    (await storage.getAll(`day_${day}_prep`)).forEach(d => {
+      const id = String(d.id || '');
+      if (!id.startsWith('st|') || !d.by || !(d.v === 'done' || d.v === 'partiel')) return;
+      if (kbQualDecode(id.slice(3)).startsWith(pre)) n[d.by] = (n[d.by] || 0) + 1;
+    });
+    const best = Object.keys(n).sort((a, b) => n[b] - n[a])[0];
+    return best ? {
+      prepBy: best,
+      prepHow: 'client',
+      prepKey: pre + (produit || ''),
+      prepDay: day
+    } : null;
+  } catch (_) {
+    return null;
+  }
+}
 function AnomalyForm({
   orders,
   products,
@@ -5613,7 +5674,8 @@ function AnomalyForm({
   currentSite,
   onClose,
   editing,
-  consumersByEmail
+  consumersByEmail,
+  sav
 }) {
   const showToast = React.useContext(ToastContext);
   const [selectedKey, setSelectedKey] = React.useState(editing?.orderId || '');
@@ -5633,7 +5695,8 @@ function AnomalyForm({
   const [busy, setBusy] = React.useState(false);
   const [coDay, setCoDay] = React.useState('');
   const [coPick, setCoPick] = React.useState({});
-  const coAll = useKbClientOrders(currentSite, clientEmail, clientName, 21);
+  const coAll = useKbClientOrders(currentSite, clientEmail, clientName, sav ? 35 : 21);
+  const anDay = sav ? editing?.day || todayKey() : activeDay();
   React.useEffect(() => {
     setCoDay('');
     setCoPick({});
@@ -5663,7 +5726,7 @@ function AnomalyForm({
   const isOubli = anomalyTypes.includes('oubli_casier');
   const isWhole = isOubli && wholeCas;
   const orderMode = !editing && !!clientName && !!(selectedKey || clientEmail) && !isEnTrop && !isWhole && (coAll.loading || coAll.list.length > 0);
-  const needsDlc = isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion;
+  const needsDlc = !sav && (isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion);
   const isOrphan = isRetourPdp || isEnTrop;
   const isQualityIssue = anomalyTypes.some(t => ['pourri', 'casse', 'dlc'].includes(t));
   const nextDelivForSite = needsDlc ? nextDistribDateForSite(currentSite, activeDay()) : null;
@@ -5687,6 +5750,16 @@ function AnomalyForm({
     const dlcBeforePickup = retourDlc && nextDelivForSite && retourDlc < nextDelivForSite;
     const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
     const isPerteSeche = needsDlc && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
+    const qDay = L.day || (sav ? '' : activeDay());
+    const qProd = L.produit || (productKey.startsWith('FREE:') ? '' : productKey.split('|').slice(1).join('|'));
+    const qual = anomalyTypes.some(t => KB_QERR_TYPES.includes(t)) ? await kbQualPrepBy({
+      day: qDay,
+      site: currentSite,
+      oname: L.oname,
+      produit: qProd,
+      email: clientEmail,
+      name: clientName
+    }) : null;
     let productLabel = '';
     let prodName = '',
       prodProducer = '';
@@ -5732,7 +5805,13 @@ function AnomalyForm({
       orderLineId: L.lineId || '',
       swapKey: isInversion ? swapKey : '',
       swapLabel: isInversion ? retLabel : '',
-      day: activeDay(),
+      day: anDay,
+      source: sav ? 'sav' : 'distrib',
+      srcOrderId: L.orderId || '',
+      prepBy: qual ? qual.prepBy : '',
+      prepHow: qual ? qual.prepHow : '',
+      prepKey: qual ? qual.prepKey : '',
+      prepDay: qual ? qual.prepDay : qDay || '',
       anomalyTypes,
       actions,
       wholeCasier: !!isWhole,
@@ -5747,7 +5826,7 @@ function AnomalyForm({
       createdAt: L.id && editing?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
-    await storage.setDoc(`day_${activeDay()}_anomalies`, id, data);
+    await storage.setDoc(`day_${anDay}_anomalies`, id, data);
     L.label = productLabel;
     let oubliMsg = '';
     if (anomalyTypes.includes('oubli_casier')) {
@@ -5763,14 +5842,15 @@ function AnomalyForm({
         productLabel,
         wholeCasier: !!isWhole,
         remark,
-        day: activeDay(),
+        day: anDay,
+        source: sav ? 'sav' : 'distrib',
         status: 'pending',
         createdBy: session.name,
         createdAt: L.id && editing?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
       const prevF = await storage.getDoc('forgotten_items', forgottenId).catch(() => null);
-      if (!L.noMail && !(prevF && prevF.mailSentAt)) {
+      if (!sav && !L.noMail && !(prevF && prevF.mailSentAt)) {
         if (clientEmail) {
           const mr = await kbSendOubliMail({
             email: clientEmail,
@@ -5899,7 +5979,8 @@ function AnomalyForm({
         id: editing?.id,
         productKey: 'FREE:📦 Tout le casier' + (casW.length ? ' n° ' + casW.join(', ') : ''),
         qty: 1,
-        dlc: retourDlc
+        dlc: retourDlc,
+        day: coDay || ''
       }];
     } else if (orderMode && !editing) {
       if (!coDay) {
@@ -5926,6 +6007,8 @@ function AnomalyForm({
         day: coDay,
         lineId: String(l.it.id || l.key),
         orderId: String(l.order.orderId || ''),
+        oname: l.order.name || '(client)',
+        produit: l.it.produit,
         noMail: i > 0,
         mailLabel: labels.join(', ')
       }));
@@ -5938,12 +6021,16 @@ function AnomalyForm({
         showToast('Indique la DLC du produit');
         return;
       }
+      if (sav && !coDay && anomalyTypes.some(t => KB_QERR_TYPES.includes(t)) && coAll.list.length) {
+        showToast('Choisis la date de distribution');
+        return;
+      }
       list = [{
         id: editing?.id,
         productKey: productKey0,
         qty: parseInt(retourQty, 10) || 1,
         dlc: retourDlc,
-        day: editing?.distribDate || ''
+        day: editing?.distribDate || coDay || ''
       }];
     }
     setBusy(true);
@@ -5967,7 +6054,7 @@ function AnomalyForm({
     className: "modal"
   }, React.createElement("div", {
     className: "modal-header"
-  }, React.createElement("h2", null, editing ? 'Modifier anomalie' : 'Nouvelle anomalie'), React.createElement("button", {
+  }, React.createElement("h2", null, editing ? 'Modifier anomalie' : sav ? `📧 Qualité SAV · ${currentSite}` : 'Nouvelle anomalie'), React.createElement("button", {
     className: "modal-close",
     onClick: onClose
   }, "\xD7")), React.createElement("div", {
@@ -5993,7 +6080,7 @@ function AnomalyForm({
     className: "field"
   }, React.createElement("label", null, "Probl\xE8me(s)"), React.createElement("div", {
     className: "chip-group"
-  }, ANOMALIES.map(a => React.createElement("div", {
+  }, ANOMALIES.filter(a => !(sav && a.id === 'retour_pdp')).map(a => React.createElement("div", {
     key: a.id,
     className: `chip chip-${a.color} ${anomalyTypes.includes(a.id) ? 'selected' : ''}`,
     onClick: () => toggle(anomalyTypes, setAnomalyTypes, a.id)
@@ -6030,7 +6117,40 @@ function AnomalyForm({
       color: 'var(--ink-soft)',
       marginTop: 6
     }
-  }, "Pas besoin de lister les produits : toute la commande", selectedOrder && kbCasiersShown(selectedOrder).length ? ` (casier ${kbCasiersShown(selectedOrder).join(', ')})` : '', " est not\xE9e oubli\xE9e et le client re\xE7oit un mail.")), !isWhole && orderMode && (() => {
+  }, "Pas besoin de lister les produits : toute la commande", selectedOrder && kbCasiersShown(selectedOrder).length ? ` (casier ${kbCasiersShown(selectedOrder).join(', ')})` : '', " est not\xE9e oubli\xE9e et le client re\xE7oit un mail.")), sav && !editing && !orderMode && !!clientName && coAll.list.length > 0 && React.createElement("div", {
+    className: "field",
+    style: {
+      border: '2px solid var(--accent-dark)',
+      borderRadius: 12,
+      padding: 10
+    }
+  }, React.createElement("label", {
+    style: {
+      fontWeight: 700,
+      fontSize: 16
+    }
+  }, "\uD83D\uDCC5 Date de distribution concern\xE9e"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, [...new Set(coAll.list.map(x => x.day))].sort().reverse().map(d => React.createElement("button", {
+    key: d,
+    type: "button",
+    onClick: () => setCoDay(d),
+    style: {
+      minHeight: 52,
+      padding: '6px 14px',
+      fontSize: 16,
+      fontWeight: 700,
+      borderRadius: 12,
+      cursor: 'pointer',
+      border: '3px solid ' + (coDay === d ? 'var(--accent-dark)' : 'var(--border)'),
+      background: coDay === d ? 'var(--accent-soft)' : '#fff',
+      color: 'var(--ink)'
+    }
+  }, coDay === d ? '✓ ' : '', dayLabelShort(d))))), !isWhole && orderMode && (() => {
     const days = [...new Set(coAll.list.map(x => x.day))].sort().reverse();
     const nOn = coLines.filter(l => coPick[l.key] && coPick[l.key].on).length;
     const upd = (k, patch) => setCoPick(p => ({
@@ -17151,12 +17271,107 @@ function FreshdeskRecupButton({
     clientEmail: email
   }));
 }
+function KbSavQualite({
+  session,
+  consumersByEmail,
+  products,
+  onClose
+}) {
+  const [site, setSite] = React.useState('');
+  const [orders, setOrders] = React.useState(null);
+  React.useEffect(() => {
+    if (!site) return;
+    let stop = false;
+    setOrders(null);
+    const t = todayKey(),
+      days = [];
+    for (let i = 0; i <= 35; i++) days.push(addDays(t, -i));
+    Promise.all(days.map(d => kbDayOrders(d))).then(res => {
+      if (stop) return;
+      const seen = {},
+        out = [];
+      res.forEach(list => list.forEach(o => {
+        if (String(o.site || '').toUpperCase() !== site) return;
+        const k = String(o.email || '').trim().toLowerCase() || displayName(o);
+        if (seen[k]) return;
+        seen[k] = 1;
+        out.push(o);
+      }));
+      setOrders(out.sort((a, b) => displayName(a).localeCompare(displayName(b), 'fr')));
+    });
+    return () => {
+      stop = true;
+    };
+  }, [site]);
+  if (site && orders) return React.createElement(AnomalyForm, {
+    sav: true,
+    orders: orders,
+    products: products || [],
+    session: session,
+    currentSite: site,
+    consumersByEmail: consumersByEmail,
+    onClose: onClose
+  });
+  return React.createElement("div", {
+    className: "modal-backdrop",
+    onClick: e => {
+      if (e.target.className === 'modal-backdrop') onClose();
+    }
+  }, React.createElement("div", {
+    className: "modal"
+  }, React.createElement("div", {
+    className: "modal-header"
+  }, React.createElement("h2", null, "\uD83D\uDCE7 Qualit\xE9 SAV \u2014 quel lieu ?"), React.createElement("button", {
+    className: "modal-close",
+    onClick: onClose
+  }, "\xD7")), site ? React.createElement("p", {
+    style: {
+      fontSize: 16,
+      padding: 12
+    }
+  }, "\u23F3 Chargement des commandes ", site, " (35 derniers jours)\u2026") : React.createElement(React.Fragment, null, React.createElement("p", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)',
+      marginTop: 0
+    }
+  }, "R\xE9clamation re\xE7ue par mail : choisis le lieu de retrait du client, puis le client, la date de distribution et les produits. L'erreur est compt\xE9e dans le suivi qualit\xE9 (taux d'erreur de la personne qui a pr\xE9par\xE9)."), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fill,minmax(96px,1fr))',
+      gap: 8
+    }
+  }, SITES.map(c => React.createElement("button", {
+    key: c,
+    type: "button",
+    onClick: () => setSite(c),
+    style: {
+      minHeight: 64,
+      borderRadius: 12,
+      border: '3px solid ' + kbSiteColor(c),
+      background: kbSiteColor(c) + '1F',
+      color: 'var(--ink)',
+      cursor: 'pointer',
+      fontWeight: 800,
+      fontSize: 18,
+      lineHeight: 1.1
+    }
+  }, c === 'DOM' ? '🏠 ' : '', c, React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 600,
+      color: 'var(--ink-soft)'
+    }
+  }, siteLabel(c))))))));
+}
 function MasterRecapPage({
   session,
   consumersByEmail,
-  catalogue
+  catalogue,
+  products
 }) {
   const showToast = React.useContext(ToastContext);
+  const [savQ, setSavQ] = React.useState(false);
   const [consignes, setConsignes] = React.useState([]);
   const [followups, setFollowups] = React.useState([]);
   const [forgottens, setForgottens] = React.useState([]);
@@ -17595,7 +17810,35 @@ function MasterRecapPage({
     session: session,
     catalogue: catalogue,
     onClose: () => setNrOpen(null)
-  }), React.createElement("h1", null, "\uD83D\uDCCB R\xE9cap master \u2014 tous locaux"), React.createElement("p", {
+  }), savQ && React.createElement(KbSavQualite, {
+    session: session,
+    consumersByEmail: consumersByEmail,
+    products: products,
+    onClose: () => setSavQ(false)
+  }), React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 10,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("h1", {
+    style: {
+      margin: 0
+    }
+  }, "\uD83D\uDCCB R\xE9cap master \u2014 tous locaux"), React.createElement("button", {
+    className: "btn-primary",
+    onClick: () => setSavQ(true),
+    style: {
+      fontSize: 17,
+      fontWeight: 800,
+      padding: '12px 18px',
+      borderRadius: 12,
+      background: '#c62828',
+      borderColor: '#c62828'
+    }
+  }, "\uD83D\uDCE7 Qualit\xE9 SAV")), React.createElement("p", {
     style: {
       color: 'var(--ink-soft)',
       fontSize: 13,
@@ -36524,9 +36767,9 @@ function PrepaDuJourPage({
       agg[p].clients++;
       agg[p].bySite[r.site] = (agg[p].bySite[r.site] || 0) + mq;
     });
-    for (const m of Object.values(agg)) {
+    await Promise.all(Object.values(agg).map(m => {
       const id = dispatchNorm(m.producteur + '|' + m.produit) || ('m_' + m.produit).slice(0, 80);
-      await storage.setDoc(`day_${day}_manquants`, id, {
+      return storage.setDoc(`day_${day}_manquants`, id, {
         produit: m.produit,
         producteur: m.producteur,
         cond: '',
@@ -36543,7 +36786,7 @@ function PrepaDuJourPage({
         uploadedBy: user,
         uploadedAt: new Date().toISOString()
       });
-    }
+    }));
     await storage.setDoc(`day_${day}_prep`, 'meta', {
       closed: true,
       closedBy: user,
@@ -36553,6 +36796,16 @@ function PrepaDuJourPage({
       ancienTry: null
     });
     showToast(`✅ Prépa clôturée · ${Object.keys(agg).length} produit(s) → Manquants & ND`);
+    setRg(null);
+    setRgBusy(false);
+    kbCelebrate({
+      title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`,
+      sub: `${rows.length} lignes préparées · merci l'équipe 💚`
+    });
+    showToast('📨 Envois Rungis / Dromy / mails clients en cours en arrière-plan — tu peux continuer');
+    kbAfterPrepClose(rungisList);
+  };
+  const kbAfterPrepClose = async rungisList => {
     if (KB_COHABITATION) kbAncienLaunch(day, user).then(ar => showToast(ar && ar.ok ? `🤖 Ancien site : report lancé${ar.result && ar.result.n ? ` (${ar.result.n} produits)` : ''}` : ar && ar.pending ? '🤖 Ancien site : report déjà en cours' : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — nouvel essai automatique')).catch(e => showToast('⚠️ Report ancien site : ' + e.message));
     if (rungisList && rungisList.length) {
       try {
@@ -36589,10 +36842,6 @@ function PrepaDuJourPage({
     } catch (e) {
       showToast('⚠️ Mails clients : ' + e.message);
     }
-    kbCelebrate({
-      title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`,
-      sub: `${rows.length} lignes préparées · merci l'équipe 💚`
-    });
     if (KB_COHABITATION) {
       try {
         const lg = await kbSendRuptures(day, user, {
@@ -42907,6 +43156,214 @@ function InfosPage({
     }
   }, "\u2212", m.manque, "/", m.total))))))));
 }
+function kbQualCompute(anoms, people) {
+  const P = {},
+    pp = n => P[n] || (P[n] = {
+      name: n,
+      lines: 0,
+      errs: []
+    });
+  (people || []).forEach(x => {
+    pp(x.name).lines += x.lines;
+  });
+  const errs = (anoms || []).filter(kbIsPrepErr),
+    none = [],
+    prod = {};
+  errs.forEach(a => {
+    if (a.prepBy) pp(a.prepBy).errs.push(a);else none.push(a);
+  });
+  (anoms || []).filter(a => (a.anomalyTypes || []).some(t => KB_QPROD_TYPES.includes(t))).forEach(a => {
+    prod[a.site || '?'] = (prod[a.site || '?'] || 0) + 1;
+  });
+  const lines = Object.values(P).reduce((t, x) => t + x.lines, 0);
+  const rows = Object.values(P).filter(x => x.lines > 0 || x.errs.length).map(x => ({
+    ...x,
+    rate: x.lines ? 100 * x.errs.length / x.lines : null
+  })).sort((a, b) => (b.rate == null ? 1e9 : b.rate) - (a.rate == null ? 1e9 : a.rate) || b.errs.length - a.errs.length);
+  return {
+    rows,
+    none,
+    lines,
+    nErr: errs.length,
+    rate: lines ? 100 * errs.length / lines : 0,
+    prod,
+    sav: errs.filter(a => a.source === 'sav').length
+  };
+}
+const kbQRate = r => r == null ? '—' : r.toFixed(2).replace('.', ',') + ' %';
+function KbQualTeamCard({
+  anomalies,
+  from,
+  to
+}) {
+  const [people, setPeople] = React.useState(null);
+  const [open, setOpen] = React.useState('');
+  React.useEffect(() => {
+    let stop = false;
+    setPeople(null);
+    kbPsRange(from, to).then(days => {
+      if (stop) return;
+      const out = [];
+      days.forEach(d => (d.people || []).forEach(p => {
+        if (p.lines > 0) out.push({
+          name: p.name,
+          lines: p.lines
+        });
+      }));
+      setPeople(out);
+    }).catch(() => !stop && setPeople([]));
+    return () => {
+      stop = true;
+    };
+  }, [from, to]);
+  if (!people) return React.createElement("div", {
+    className: "card"
+  }, "\uD83C\uDFAF Calcul du taux d'erreur\u2026");
+  const Q = kbQualCompute(anomalies, people);
+  const typ = a => (a.anomalyTypes || []).filter(t => KB_QERR_TYPES.includes(t)).map(t => (ANOMALIES.find(x => x.id === t) || {}).label || t).join(', ');
+  const line = (a, i) => React.createElement("div", {
+    key: i,
+    style: {
+      fontSize: 13,
+      padding: '5px 0',
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("b", null, a.site), " \xB7 ", formatDateShort(a.prepDay || a.distribDate || a.day), " \xB7 ", a.clientName || '—', " \xB7 ", a.productLabel || '', " \u2014 ", React.createElement("span", {
+    style: {
+      color: 'var(--danger)'
+    }
+  }, typ(a)), a.source === 'sav' ? ' · 📧 SAV' : '', a.prepHow === 'client' ? ' · (resp. = préparateur du client)' : '');
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      borderLeft: '5px solid #c62828'
+    }
+  }, React.createElement("h3", {
+    style: {
+      marginBottom: 6
+    }
+  }, "\uD83C\uDFAF Taux d'erreur pr\xE9pa"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      flexWrap: 'wrap',
+      marginBottom: 8
+    }
+  }, React.createElement("div", {
+    style: {
+      borderRadius: 12,
+      padding: '10px 14px',
+      background: '#c62828',
+      color: '#fff'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, "\xC9quipe"), React.createElement("div", {
+    style: {
+      fontSize: 28,
+      fontWeight: 900
+    }
+  }, kbQRate(Q.rate))), React.createElement("div", {
+    style: {
+      borderRadius: 12,
+      padding: '10px 14px',
+      background: 'var(--bg-muted)'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, "Erreurs"), React.createElement("div", {
+    style: {
+      fontSize: 28,
+      fontWeight: 900
+    }
+  }, Q.nErr), React.createElement("div", {
+    style: {
+      fontSize: 11
+    }
+  }, "dont ", Q.sav, " par mail SAV")), React.createElement("div", {
+    style: {
+      borderRadius: 12,
+      padding: '10px 14px',
+      background: 'var(--bg-muted)'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, "Lignes pr\xE9par\xE9es"), React.createElement("div", {
+    style: {
+      fontSize: 28,
+      fontWeight: 900
+    }
+  }, Q.lines.toLocaleString('fr-FR')))), Q.rows.map(r => React.createElement("div", {
+    key: r.name,
+    style: {
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("div", {
+    onClick: () => setOpen(o => o === r.name ? '' : r.name),
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '8px 2px',
+      cursor: 'pointer'
+    }
+  }, React.createElement("span", {
+    style: {
+      flex: 1,
+      fontSize: 16,
+      fontWeight: 700
+    }
+  }, r.name), React.createElement("span", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)'
+    }
+  }, r.errs.length, " err. / ", r.lines, " lignes"), React.createElement("span", {
+    style: {
+      minWidth: 76,
+      textAlign: 'right',
+      fontSize: 17,
+      fontWeight: 900,
+      color: r.rate == null ? 'var(--ink-mute)' : r.rate > Q.rate ? '#c62828' : '#2e7d32'
+    }
+  }, kbQRate(r.rate))), open === r.name && React.createElement("div", {
+    style: {
+      padding: '0 4px 8px'
+    }
+  }, r.errs.length ? r.errs.map(line) : React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#2e7d32'
+    }
+  }, "\u2705 Aucune erreur sur la p\xE9riode")))), Q.none.length > 0 && React.createElement("details", {
+    style: {
+      marginTop: 8
+    }
+  }, React.createElement("summary", {
+    style: {
+      cursor: 'pointer',
+      fontWeight: 700
+    }
+  }, "\u2753 ", Q.none.length, " erreur(s) non attribu\xE9e(s) (pas de pr\xE9pa retrouv\xE9e)"), Q.none.map(line)), Object.keys(Q.prod).length > 0 && React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontSize: 13,
+      color: 'var(--ink-soft)'
+    }
+  }, "Qualit\xE9 produit (casse, ab\xEEm\xE9, DLC \u2014 pas une erreur de pr\xE9pa) : ", Object.entries(Q.prod).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ')), React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "Erreur de pr\xE9pa = manque, erreur produit, inversion casier, en trop. Oubli dans casier et poids inf\xE9rieur ne comptent pas. Bilan envoy\xE9 chaque samedi 8h \xE0 rr@ et hg@."));
+}
 function StatsPage({
   session
 }) {
@@ -43013,7 +43470,11 @@ function StatsPage({
   })))), React.createElement(KbPrepRentaStats, {
     from: from,
     to: to
-  }), React.createElement("h3", null, "Qualit\xE9"), React.createElement("div", {
+  }), React.createElement("h3", null, "Qualit\xE9"), React.createElement(KbQualTeamCard, {
+    anomalies: allAnomalies,
+    from: from,
+    to: to
+  }), React.createElement("div", {
     className: "stat-grid"
   }, React.createElement("div", {
     className: "stat"
@@ -81587,7 +82048,8 @@ function App() {
   }), tab === 'masterrecap' && effSession.isMaster && React.createElement(MasterRecapPage, {
     session: effSession,
     consumersByEmail: consumersByEmail,
-    catalogue: catalogue
+    catalogue: catalogue,
+    products: products
   }), tab === 'push' && effSession.isMaster && React.createElement(PushComposerPage, {
     session: effSession,
     availableSites: availableSites,

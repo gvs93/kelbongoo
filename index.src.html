@@ -795,7 +795,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.40';
+    const APP_VERSION = 'V11.41';
+    // V11.41 — (17/11/2026) 📧 Qualité SAV (Master › SAV · consignes) : réclamation reçue par mail saisie comme en distrib, lieu au choix (DOM compris),
+    //   client → date de distribution → produits ; pas de retour PDP / perte / mail auto au client (Henry répond lui-même).
+    //   🎯 Taux d'erreur prépa : chaque erreur (manque, erreur produit, inversion casier, en trop) est attribuée à la personne qui a préparé
+    //   la ligne (day_<distrib>_prep) → Statistiques équipes : taux équipe + par personne (détail au clic). Bilan mail samedi 8h (KBG_Qualite.gs).
+    //   ⚡ Clôture prépa instantanée : la fenêtre se ferme dès la clôture, les envois (Rungis, Dromy, mails clients, ruptures) partent en arrière-plan.
     // V11.40 — (17/11/2026) La semaine en bref : an dernier = 2e barre orange à côté de chaque semaine + écart en % (accueil et Bilan) ;
     //   Bilan complet : 🏭 Entrepôt & pertes (personnes, heures prépa + MU, lignes, sachets, CA par heure, ruptures prépa, pertes par motif / destination) + 📄 PDF.
     //   Commande pain (master) : s'ouvre sur la PROCHAINE distribution. Menu de gauche : rubriques en blocs colorés.
@@ -4637,7 +4642,45 @@
       return st;
     }
 
-    function AnomalyForm({ orders, products, session, currentSite, onClose, editing, consumersByEmail }) {
+    // ============================================================
+    // V11.41 — SUIVI QUALITÉ : erreurs de prépa attribuées à la personne qui a préparé la ligne
+    //   Erreur de prépa = manque · erreur produit (inversion) · inversion casier · en trop.
+    //   PAS des erreurs de prépa (16/11) : article oublié dans casier, poids inférieur. Casse / pourri / DLC = qualité produit.
+    //   Responsable = « by » du document st|LIEU||client||produit de day_<distrib>_prep (la ligne précise) ;
+    //   sinon (produit hors commande, inversion casier) = la personne qui a préparé le plus de lignes de ce client.
+    //   Taux = erreurs ÷ lignes préparées (st done/partiel, comme les stats prépa). Bilan mail samedi 8h : KBG_Qualite.gs.
+    // ============================================================
+    const KB_QERR_TYPES = ['manque', 'erreur_produit', 'inversion_casier', 'en_trop'];
+    const KB_QPROD_TYPES = ['casse', 'pourri', 'dlc', 'dlc_courte'];
+    const kbIsPrepErr = (a) => (a.anomalyTypes || []).some(t => KB_QERR_TYPES.includes(t));
+    const kbQualDecode = (s) => { s = String(s || ''); for (let i = 0; i < 2 && /%[0-9A-Fa-f]{2}/.test(s); i++) { try { s = decodeURIComponent(s); } catch (_) { break; } } return s; };
+    async function kbQualPrepBy({ day, site, oname, produit, email, name }) {
+      if (!day || !site) return null;
+      const S = String(site).toUpperCase();
+      try {
+        if (oname && produit) {
+          const key = S + '||' + oname + '||' + produit;
+          const d = await storage.getDoc(`day_${day}_prep`, 'st|' + encodeURIComponent(key));
+          if (d && d.by) return { prepBy: String(d.by), prepHow: 'ligne', prepKey: key, prepDay: day };
+        }
+        let on = oname;
+        if (!on) {
+          const em = String(email || '').trim().toLowerCase(), nm = normalizeText(name || '');
+          const o = (await kbDayOrders(day)).find(o => String(o.site || '').toUpperCase() === S && ((em && String(o.email || '').trim().toLowerCase() === em) || (nm && normalizeText(displayName(o)) === nm)));
+          on = o && (o.name || '(client)');
+        }
+        if (!on) return null;
+        const pre = S + '||' + on + '||', n = {};
+        (await storage.getAll(`day_${day}_prep`)).forEach(d => {
+          const id = String(d.id || ''); if (!id.startsWith('st|') || !d.by || !(d.v === 'done' || d.v === 'partiel')) return;
+          if (kbQualDecode(id.slice(3)).startsWith(pre)) n[d.by] = (n[d.by] || 0) + 1;
+        });
+        const best = Object.keys(n).sort((a, b) => n[b] - n[a])[0];
+        return best ? { prepBy: best, prepHow: 'client', prepKey: pre + (produit || ''), prepDay: day } : null;
+      } catch (_) { return null; }
+    }
+
+    function AnomalyForm({ orders, products, session, currentSite, onClose, editing, consumersByEmail, sav }) {
       const showToast = React.useContext(ToastContext);
       const [selectedKey, setSelectedKey] = React.useState(editing?.orderId || '');
       const [clientName, setClientName] = React.useState(editing?.clientName || '');
@@ -4657,7 +4700,8 @@
       // V11.06 — produits pris DANS la commande du client : date de distribution → cocher les produits
       const [coDay, setCoDay] = React.useState('');
       const [coPick, setCoPick] = React.useState({}); // { lineKey: { on, qty, dlc } }
-      const coAll = useKbClientOrders(currentSite, clientEmail, clientName, 21);
+      const coAll = useKbClientOrders(currentSite, clientEmail, clientName, sav ? 35 : 21);
+      const anDay = sav ? (editing?.day || todayKey()) : activeDay(); // V11.41 — SAV : rangé au jour du signalement
       React.useEffect(() => { setCoDay(''); setCoPick({}); }, [clientEmail, clientName]);
       React.useEffect(() => { if (!coDay && coAll.list.length) { const days = [...new Set(coAll.list.map(x => x.day))]; if (days.length === 1) setCoDay(days[0]); } }, [coAll.list]);
       const coLines = React.useMemo(() => {
@@ -4675,7 +4719,8 @@
       // V11.06 — client choisi → le produit se choisit dans SA commande (sauf « en trop » : pas commandé, et inversion : produit reçu à côté)
       const orderMode = !editing && !!clientName && !!(selectedKey || clientEmail) && !isEnTrop && !isWhole && (coAll.loading || coAll.list.length > 0);
       // Anomalies qui nécessitent une décision DLC (envoi PDP ou perte sèche) — V9.1
-      const needsDlc = isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion;
+      // V11.41 — SAV (réclamation par mail, le produit est chez le client) : pas de retour PDP / perte / DLC
+      const needsDlc = !sav && (isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion);
       // Produit non rattaché à un client précis (client peut rester vide)
       const isOrphan = isRetourPdp || isEnTrop;
       // Problème de qualité (fruit/légume abîmé, casse, DLC dépassée) → invendable, donc perte sèche même si DLC longue.
@@ -4703,6 +4748,11 @@
           const dlcBeforePickup = retourDlc && nextDelivForSite && retourDlc < nextDelivForSite;
           const dlcToday = retourDlc && isDlcToday(retourDlc, activeDay());
           const isPerteSeche = needsDlc && retourDlc && (dlcToday || dlcBeforePickup || isQualityIssue);
+          // V11.41 — qui a préparé ? (erreurs de prépa seulement)
+          const qDay = L.day || (sav ? '' : activeDay());
+          const qProd = L.produit || (productKey.startsWith('FREE:') ? '' : productKey.split('|').slice(1).join('|'));
+          const qual = anomalyTypes.some(t => KB_QERR_TYPES.includes(t))
+            ? await kbQualPrepBy({ day: qDay, site: currentSite, oname: L.oname, produit: qProd, email: clientEmail, name: clientName }) : null;
           let productLabel = '';
           let prodName = '', prodProducer = '';
           if (productKey.startsWith('FREE:')) { productLabel = productKey.substring(5); prodName = productLabel; }
@@ -4729,7 +4779,8 @@
             hasOrderToday: !!selectedOrder,
             productKey, productLabel, distribDate: L.day || '', fromOrderDay: L.day || '', orderLineId: L.lineId || '',
             swapKey: isInversion ? swapKey : '', swapLabel: isInversion ? retLabel : '',
-            day: activeDay(),
+            day: anDay, source: sav ? 'sav' : 'distrib', srcOrderId: L.orderId || '',
+            prepBy: qual ? qual.prepBy : '', prepHow: qual ? qual.prepHow : '', prepKey: qual ? qual.prepKey : '', prepDay: qual ? qual.prepDay : (qDay || ''),
             anomalyTypes, actions, wholeCasier: !!isWhole,
             amountRefund: parseFloat(amountRefund) || 0,
             amountCredit: parseFloat(amountCredit) || 0,
@@ -4742,7 +4793,7 @@
             createdAt: (L.id && editing?.createdAt) || new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
-          await storage.setDoc(`day_${activeDay()}_anomalies`, id, data);
+          await storage.setDoc(`day_${anDay}_anomalies`, id, data);
           L.label = productLabel;
           let oubliMsg = '';
 
@@ -4758,7 +4809,7 @@
               clientEmail: data.clientEmail,
               productKey, productLabel, wholeCasier: !!isWhole,
               remark,
-              day: activeDay(),
+              day: anDay, source: sav ? 'sav' : 'distrib',
               status: 'pending', // 'pending' | 'picked_up' | 'returned'
               createdBy: session.name,
               createdAt: (L.id && editing?.createdAt) || new Date().toISOString(),
@@ -4766,7 +4817,7 @@
             });
             // V10.47 — mail AUTOMATIQUE au client dès le signalement (une seule fois par oubli)
             const prevF = await storage.getDoc('forgotten_items', forgottenId).catch(() => null);
-            if (!L.noMail && !(prevF && prevF.mailSentAt)) {
+            if (!sav && !L.noMail && !(prevF && prevF.mailSentAt)) {
               if (clientEmail) {
                 const mr = await kbSendOubliMail({ email: clientEmail, clientName: data.clientName, site: currentSite, productLabel: L.mailLabel || productLabel, whole: !!isWhole, casiers: isWhole ? kbCasiersShown(selectedOrder || {}) : [] });
                 if (mr.ok) { await storage.setDoc('forgotten_items', forgottenId, { mailSentAt: new Date().toISOString(), mailSentBy: session.name }); oubliMsg = ' · ✉️ mail envoyé au client'; }
@@ -4865,18 +4916,19 @@
         let list;
         if (isWhole) {
           const casW = selectedOrder ? kbCasiersShown(selectedOrder) : [];
-          list = [{ id: editing?.id, productKey: 'FREE:📦 Tout le casier' + (casW.length ? ' n° ' + casW.join(', ') : ''), qty: 1, dlc: retourDlc }];
+          list = [{ id: editing?.id, productKey: 'FREE:📦 Tout le casier' + (casW.length ? ' n° ' + casW.join(', ') : ''), qty: 1, dlc: retourDlc, day: coDay || '' }];
         } else if (orderMode && !editing) {
           if (!coDay) { showToast('Choisis la date de distribution'); return; }
           const sel = coLines.filter(l => coPick[l.key] && coPick[l.key].on);
           if (!sel.length) { showToast('Coche au moins un produit de la commande'); return; }
           if (needsDlc) { const noD = sel.find(l => !coPick[l.key].dlc); if (noD) { showToast('Indique la DLC de « ' + noD.it.produit + ' »'); return; } }
           const labels = sel.map(l => l.it.produit + ((coPick[l.key].qty || 1) > 1 ? ' ×' + coPick[l.key].qty : ''));
-          list = sel.map((l, i) => ({ productKey: (l.it.producteur || '') + '|' + l.it.produit, qty: coPick[l.key].qty || 1, dlc: coPick[l.key].dlc || '', day: coDay, lineId: String(l.it.id || l.key), orderId: String(l.order.orderId || ''), noMail: i > 0, mailLabel: labels.join(', ') }));
+          list = sel.map((l, i) => ({ productKey: (l.it.producteur || '') + '|' + l.it.produit, qty: coPick[l.key].qty || 1, dlc: coPick[l.key].dlc || '', day: coDay, lineId: String(l.it.id || l.key), orderId: String(l.order.orderId || ''), oname: l.order.name || '(client)', produit: l.it.produit, noMail: i > 0, mailLabel: labels.join(', ') }));
         } else {
           if (!productKey0) { showToast('Choisis un produit'); return; }
           if (needsDlc && !retourDlc) { showToast('Indique la DLC du produit'); return; }
-          list = [{ id: editing?.id, productKey: productKey0, qty: parseInt(retourQty, 10) || 1, dlc: retourDlc, day: editing?.distribDate || '' }];
+          if (sav && !coDay && anomalyTypes.some(t => KB_QERR_TYPES.includes(t)) && coAll.list.length) { showToast('Choisis la date de distribution'); return; }
+          list = [{ id: editing?.id, productKey: productKey0, qty: parseInt(retourQty, 10) || 1, dlc: retourDlc, day: editing?.distribDate || coDay || '' }];
         }
         setBusy(true);
         try {
@@ -4892,7 +4944,7 @@
         <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') onClose(); }}>
           <div className="modal">
             <div className="modal-header">
-              <h2>{editing ? 'Modifier anomalie' : 'Nouvelle anomalie'}</h2>
+              <h2>{editing ? 'Modifier anomalie' : sav ? `📧 Qualité SAV · ${currentSite}` : 'Nouvelle anomalie'}</h2>
               <button className="modal-close" onClick={onClose}>×</button>
             </div>
             <div className="field">
@@ -4912,7 +4964,7 @@
             <div className="field">
               <label>Problème(s)</label>
               <div className="chip-group">
-                {ANOMALIES.map(a => (
+                {ANOMALIES.filter(a => !(sav && a.id === 'retour_pdp')).map(a => (
                   <div key={a.id} className={`chip chip-${a.color} ${anomalyTypes.includes(a.id) ? 'selected' : ''}`} onClick={() => toggle(anomalyTypes, setAnomalyTypes, a.id)}>{a.label}</div>
                 ))}
               </div>
@@ -4926,6 +4978,16 @@
                       style={{ flex: '1 1 140px', minHeight: 56, fontSize: 17, fontWeight: 700, borderRadius: 12, cursor: 'pointer', border: '3px solid ' + (wholeCas === v ? 'var(--accent-dark)' : 'var(--border)'), background: wholeCas === v ? 'var(--accent-soft)' : '#fff', color: 'var(--ink)' }}>{wholeCas === v ? '✓ ' : ''}{l}</button>))}
                 </div>
                 {wholeCas && <p style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 6 }}>Pas besoin de lister les produits : toute la commande{selectedOrder && kbCasiersShown(selectedOrder).length ? ` (casier ${kbCasiersShown(selectedOrder).join(', ')})` : ''} est notée oubliée et le client reçoit un mail.</p>}
+              </div>
+            )}
+            {sav && !editing && !orderMode && !!clientName && coAll.list.length > 0 && (
+              <div className="field" style={{ border: '2px solid var(--accent-dark)', borderRadius: 12, padding: 10 }}>
+                <label style={{ fontWeight: 700, fontSize: 16 }}>📅 Date de distribution concernée</label>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {[...new Set(coAll.list.map(x => x.day))].sort().reverse().map(d => <button key={d} type="button" onClick={() => setCoDay(d)}
+                    style={{ minHeight: 52, padding: '6px 14px', fontSize: 16, fontWeight: 700, borderRadius: 12, cursor: 'pointer', border: '3px solid ' + (coDay === d ? 'var(--accent-dark)' : 'var(--border)'), background: coDay === d ? 'var(--accent-soft)' : '#fff', color: 'var(--ink)' }}>
+                    {coDay === d ? '✓ ' : ''}{dayLabelShort(d)}</button>)}
+                </div>
               </div>
             )}
             {!isWhole && orderMode && (() => {
@@ -10822,8 +10884,48 @@
       );
     }
 
-    function MasterRecapPage({ session, consumersByEmail, catalogue }) {
+    // V11.41 — 📧 Qualité SAV : Henry saisit un problème reçu par mail client (manquant, erreur, casse…)
+    //   comme un distributeur, en choisissant le lieu (DOM compris). Clients = commandes du lieu sur 35 jours.
+    function KbSavQualite({ session, consumersByEmail, products, onClose }) {
+      const [site, setSite] = React.useState('');
+      const [orders, setOrders] = React.useState(null);
+      React.useEffect(() => {
+        if (!site) return;
+        let stop = false; setOrders(null);
+        const t = todayKey(), days = []; for (let i = 0; i <= 35; i++) days.push(addDays(t, -i));
+        Promise.all(days.map(d => kbDayOrders(d))).then(res => {
+          if (stop) return;
+          const seen = {}, out = [];
+          res.forEach(list => list.forEach(o => {
+            if (String(o.site || '').toUpperCase() !== site) return;
+            const k = String(o.email || '').trim().toLowerCase() || displayName(o);
+            if (seen[k]) return; seen[k] = 1; out.push(o);
+          }));
+          setOrders(out.sort((a, b) => displayName(a).localeCompare(displayName(b), 'fr')));
+        });
+        return () => { stop = true; };
+      }, [site]);
+      if (site && orders) return <AnomalyForm sav orders={orders} products={products || []} session={session} currentSite={site} consumersByEmail={consumersByEmail} onClose={onClose} />;
+      return (
+        <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') onClose(); }}>
+          <div className="modal">
+            <div className="modal-header"><h2>📧 Qualité SAV — quel lieu ?</h2><button className="modal-close" onClick={onClose}>×</button></div>
+            {site ? <p style={{ fontSize: 16, padding: 12 }}>⏳ Chargement des commandes {site} (35 derniers jours)…</p> : <>
+              <p style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 0 }}>Réclamation reçue par mail : choisis le lieu de retrait du client, puis le client, la date de distribution et les produits. L'erreur est comptée dans le suivi qualité (taux d'erreur de la personne qui a préparé).</p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(96px,1fr))', gap: 8 }}>
+                {SITES.map(c => <button key={c} type="button" onClick={() => setSite(c)}
+                  style={{ minHeight: 64, borderRadius: 12, border: '3px solid ' + kbSiteColor(c), background: kbSiteColor(c) + '1F', color: 'var(--ink)', cursor: 'pointer', fontWeight: 800, fontSize: 18, lineHeight: 1.1 }}>
+                  {c === 'DOM' ? '🏠 ' : ''}{c}<div style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-soft)' }}>{siteLabel(c)}</div></button>)}
+              </div>
+            </>}
+          </div>
+        </div>
+      );
+    }
+
+    function MasterRecapPage({ session, consumersByEmail, catalogue, products }) {
       const showToast = React.useContext(ToastContext);
+      const [savQ, setSavQ] = React.useState(false); // V11.41
       const [consignes, setConsignes] = React.useState([]);
       const [followups, setFollowups] = React.useState([]);
       const [forgottens, setForgottens] = React.useState([]);
@@ -11078,7 +11180,11 @@
           {nrPick && <KbPdpReturnPicker f={nrPick} by={session.name} onClose={() => setNrPick(null)} onDone={() => setNrPick(null)}
             extra={() => storage.setDoc('followups', nrPick.id || nrPick.orderId, { pdpDecision: 'retour', decidedBy: session.name, decidedAt: new Date().toISOString() })} />}
           {nrOpen && <KbNrOrderSheet key={nrOpen.id || nrOpen.orderId} f={followups.find(x => (x.id || x.orderId) === (nrOpen.id || nrOpen.orderId)) || nrOpen} session={session} catalogue={catalogue} onClose={() => setNrOpen(null)} />}
-          <h1>📋 Récap master — tous locaux</h1>
+          {savQ && <KbSavQualite session={session} consumersByEmail={consumersByEmail} products={products} onClose={() => setSavQ(false)} />}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <h1 style={{ margin: 0 }}>📋 Récap master — tous locaux</h1>
+            <button className="btn-primary" onClick={() => setSavQ(true)} style={{ fontSize: 17, fontWeight: 800, padding: '12px 18px', borderRadius: 12, background: '#c62828', borderColor: '#c62828' }}>📧 Qualité SAV</button>
+          </div>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Vue globale pour traiter sans changer de local : clients à rappeler, consignes en attente, oublis casier.          </p>
 
@@ -20265,6 +20371,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     }
   };
   const doCloseDay = async rungisList => {
+    // V11.41 — clôture INSTANTANÉE : manquants écrits en parallèle, meta closed tout de suite,
+    //   la fenêtre se ferme et les envois (Rungis, Dromy, mails clients, ruptures) partent EN ARRIÈRE-PLAN.
+    //   Avant : la fenêtre restait sur « Envoi en cours… » jusqu'au dernier mail → l'opérateur attendait
+    //   alors que la prépa était déjà clôturée.
     const agg = {};
     rows.forEach(r => {
       const lmR = isLmRow(r),
@@ -20284,9 +20394,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       agg[p].clients++;
       agg[p].bySite[r.site] = (agg[p].bySite[r.site] || 0) + mq;
     });
-    for (const m of Object.values(agg)) {
+    await Promise.all(Object.values(agg).map(m => {
       const id = dispatchNorm(m.producteur + '|' + m.produit) || ('m_' + m.produit).slice(0, 80);
-      await storage.setDoc(`day_${day}_manquants`, id, {
+      return storage.setDoc(`day_${day}_manquants`, id, {
         produit: m.produit,
         producteur: m.producteur,
         cond: '',
@@ -20303,7 +20413,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         uploadedBy: user,
         uploadedAt: new Date().toISOString()
       });
-    }
+    }));
     await storage.setDoc(`day_${day}_prep`, 'meta', {
       closed: true,
       closedBy: user,
@@ -20313,6 +20423,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       ancienTry: null
     });
     showToast(`✅ Prépa clôturée · ${Object.keys(agg).length} produit(s) → Manquants & ND`);
+    setRg(null);
+    setRgBusy(false);
+    kbCelebrate({
+      title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`,
+      sub: `${rows.length} lignes préparées · merci l'équipe 💚`
+    });
+    showToast('📨 Envois Rungis / Dromy / mails clients en cours en arrière-plan — tu peux continuer');
+    kbAfterPrepClose(rungisList);
+  };
+  const kbAfterPrepClose = async rungisList => {
     // V11.07 — report ancien site lancé TOUT DE SUITE (sans attendre la suite) ; relance auto par les postes ouverts si besoin
     if (KB_COHABITATION) kbAncienLaunch(day, user).then(ar => showToast(ar && ar.ok ? `🤖 Ancien site : report lancé${ar.result && ar.result.n ? ` (${ar.result.n} produits)` : ''}` : (ar && ar.pending) ? '🤖 Ancien site : report déjà en cours' : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — nouvel essai automatique')).catch(e => showToast('⚠️ Report ancien site : ' + e.message));
     if (rungisList && rungisList.length) {
@@ -20350,10 +20470,6 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     } catch (e) {
       showToast('⚠️ Mails clients : ' + e.message);
     }
-    kbCelebrate({
-      title: `Bravo ${String(user).split(' ')[0]}, prépa bouclée !`,
-      sub: `${rows.length} lignes préparées · merci l'équipe 💚`
-    });
     if (KB_COHABITATION) {
       // V11.07 — report ancien site : lancé plus haut, dès la clôture (kbAncienLaunch)
       try {
@@ -24527,6 +24643,55 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     // ============================================================
     // PAGE STATS (master uniquement)
     // ============================================================
+    // V11.41 — 🎯 TAUX D'ERREUR ÉQUIPE (même calcul que le bilan mail du samedi 8h, KBG_Qualite.gs)
+    function kbQualCompute(anoms, people) {
+      const P = {}, pp = (n) => P[n] || (P[n] = { name: n, lines: 0, errs: [] });
+      (people || []).forEach(x => { pp(x.name).lines += x.lines; });
+      const errs = (anoms || []).filter(kbIsPrepErr), none = [], prod = {};
+      errs.forEach(a => { if (a.prepBy) pp(a.prepBy).errs.push(a); else none.push(a); });
+      (anoms || []).filter(a => (a.anomalyTypes || []).some(t => KB_QPROD_TYPES.includes(t))).forEach(a => { prod[a.site || '?'] = (prod[a.site || '?'] || 0) + 1; });
+      const lines = Object.values(P).reduce((t, x) => t + x.lines, 0);
+      const rows = Object.values(P).filter(x => x.lines > 0 || x.errs.length).map(x => ({ ...x, rate: x.lines ? 100 * x.errs.length / x.lines : null }))
+        .sort((a, b) => (b.rate == null ? 1e9 : b.rate) - (a.rate == null ? 1e9 : a.rate) || b.errs.length - a.errs.length);
+      return { rows, none, lines, nErr: errs.length, rate: lines ? 100 * errs.length / lines : 0, prod, sav: errs.filter(a => a.source === 'sav').length };
+    }
+    const kbQRate = (r) => r == null ? '—' : r.toFixed(2).replace('.', ',') + ' %';
+    function KbQualTeamCard({ anomalies, from, to }) {
+      const [people, setPeople] = React.useState(null);
+      const [open, setOpen] = React.useState('');
+      React.useEffect(() => {
+        let stop = false; setPeople(null);
+        kbPsRange(from, to).then(days => { if (stop) return; const out = []; days.forEach(d => (d.people || []).forEach(p => { if (p.lines > 0) out.push({ name: p.name, lines: p.lines }); })); setPeople(out); }).catch(() => !stop && setPeople([]));
+        return () => { stop = true; };
+      }, [from, to]);
+      if (!people) return <div className="card">🎯 Calcul du taux d'erreur…</div>;
+      const Q = kbQualCompute(anomalies, people);
+      const typ = (a) => (a.anomalyTypes || []).filter(t => KB_QERR_TYPES.includes(t)).map(t => (ANOMALIES.find(x => x.id === t) || {}).label || t).join(', ');
+      const line = (a, i) => <div key={i} style={{ fontSize: 13, padding: '5px 0', borderTop: '1px solid var(--line)' }}>
+        <b>{a.site}</b> · {formatDateShort(a.prepDay || a.distribDate || a.day)} · {a.clientName || '—'} · {a.productLabel || ''} — <span style={{ color: 'var(--danger)' }}>{typ(a)}</span>{a.source === 'sav' ? ' · 📧 SAV' : ''}{a.prepHow === 'client' ? ' · (resp. = préparateur du client)' : ''}</div>;
+      return (
+        <div className="card" style={{ borderLeft: '5px solid #c62828' }}>
+          <h3 style={{ marginBottom: 6 }}>🎯 Taux d'erreur prépa</h3>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
+            <div style={{ borderRadius: 12, padding: '10px 14px', background: '#c62828', color: '#fff' }}><div style={{ fontSize: 12 }}>Équipe</div><div style={{ fontSize: 28, fontWeight: 900 }}>{kbQRate(Q.rate)}</div></div>
+            <div style={{ borderRadius: 12, padding: '10px 14px', background: 'var(--bg-muted)' }}><div style={{ fontSize: 12 }}>Erreurs</div><div style={{ fontSize: 28, fontWeight: 900 }}>{Q.nErr}</div><div style={{ fontSize: 11 }}>dont {Q.sav} par mail SAV</div></div>
+            <div style={{ borderRadius: 12, padding: '10px 14px', background: 'var(--bg-muted)' }}><div style={{ fontSize: 12 }}>Lignes préparées</div><div style={{ fontSize: 28, fontWeight: 900 }}>{Q.lines.toLocaleString('fr-FR')}</div></div>
+          </div>
+          {Q.rows.map(r => <div key={r.name} style={{ borderTop: '1px solid var(--line)' }}>
+            <div onClick={() => setOpen(o => o === r.name ? '' : r.name)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 2px', cursor: 'pointer' }}>
+              <span style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{r.name}</span>
+              <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{r.errs.length} err. / {r.lines} lignes</span>
+              <span style={{ minWidth: 76, textAlign: 'right', fontSize: 17, fontWeight: 900, color: r.rate == null ? 'var(--ink-mute)' : r.rate > Q.rate ? '#c62828' : '#2e7d32' }}>{kbQRate(r.rate)}</span>
+            </div>
+            {open === r.name && <div style={{ padding: '0 4px 8px' }}>{r.errs.length ? r.errs.map(line) : <div style={{ fontSize: 13, color: '#2e7d32' }}>✅ Aucune erreur sur la période</div>}</div>}
+          </div>)}
+          {Q.none.length > 0 && <details style={{ marginTop: 8 }}><summary style={{ cursor: 'pointer', fontWeight: 700 }}>❓ {Q.none.length} erreur(s) non attribuée(s) (pas de prépa retrouvée)</summary>{Q.none.map(line)}</details>}
+          {Object.keys(Q.prod).length > 0 && <div style={{ marginTop: 8, fontSize: 13, color: 'var(--ink-soft)' }}>Qualité produit (casse, abîmé, DLC — pas une erreur de prépa) : {Object.entries(Q.prod).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ')}</div>}
+          <div style={{ marginTop: 8, fontSize: 12, color: 'var(--ink-mute)' }}>Erreur de prépa = manque, erreur produit, inversion casier, en trop. Oubli dans casier et poids inférieur ne comptent pas. Bilan envoyé chaque samedi 8h à rr@ et hg@.</div>
+        </div>
+      );
+    }
+
     function StatsPage({ session }) {
       const [allAnomalies, setAllAnomalies] = React.useState([]);
       const [allConsignes, setAllConsignes] = React.useState([]);
@@ -24620,6 +24785,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <KbPrepRentaStats from={from} to={to} />
 
           <h3>Qualité</h3>
+          <KbQualTeamCard anomalies={allAnomalies} from={from} to={to} />
           <div className="stat-grid">
             <div className="stat"><div className="stat-value">{totalAnoms}</div><div className="stat-label">Anomalies</div></div>
             <div className="stat"><div className="stat-value">{totalRefund.toFixed(0)}€</div><div className="stat-label">Remb.</div></div>
@@ -39629,7 +39795,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {tab === 'closure' && <ClosurePage session={effSession} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
           </React.Fragment>
           {effSession.isMaster && tab !== 'today' && <KbMasterChips tab={tab} setTab={setTab} />}
-          {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} catalogue={catalogue} />}
+          {tab === 'masterrecap' && effSession.isMaster && <MasterRecapPage session={effSession} consumersByEmail={consumersByEmail} catalogue={catalogue} products={products} />}
           {tab === 'push' && effSession.isMaster && <PushComposerPage session={effSession} availableSites={availableSites} pushMessages={pushMessages} orders={orders} setTab={setTab} />}
           {tab === 'suivi' && effSession.isMaster && <SuiviGeneralPage session={effSession} />}
           {tab === 'fl' && effSession.isMaster && <FLPage session={effSession} />}
