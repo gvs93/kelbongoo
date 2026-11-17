@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.37) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.38) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -704,7 +704,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.37.1';
+const APP_VERSION = 'V11.38';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -914,6 +914,82 @@ async function kbDlcRulesLoad(force) {
     _kbDlcRulesAt = Date.now();
   } catch (_) {}
   return _kbDlcRules;
+}
+const kbFlSoKey = des => normalizeText(String(des || '')).replace(/[^a-z0-9]+/g, ' ').trim();
+let _kbFlSo = (() => {
+    try {
+      return JSON.parse(localStorage.getItem('kb_fl_so') || '{}') || {};
+    } catch (_) {
+      return {};
+    }
+  })(),
+  _kbFlSoAt = 0;
+function kbFlSoItems() {
+  return _kbFlSo;
+}
+function kbFlSoHas(des, row) {
+  if (!_kbFlSoAt) kbFlSoLoad();
+  const k = kbFlSoKey(des);
+  if (k && _kbFlSo[k]) return true;
+  return row != null && row !== '' && Object.values(_kbFlSo).some(x => String(x.row || '') === String(row) && kbFlSoKey(x.des) === k);
+}
+function kbFlSoApply(items) {
+  _kbFlSo = items || {};
+  try {
+    localStorage.setItem('kb_fl_so', JSON.stringify(_kbFlSo));
+  } catch (_) {}
+  try {
+    window.dispatchEvent(new CustomEvent('kb:fl-so'));
+  } catch (_) {}
+}
+let _kbFlSoP = null,
+  _kbFlSoTry = 0;
+async function kbFlSoLoad(force) {
+  if (!force && _kbFlSoAt && Date.now() - _kbFlSoAt < 120000) return _kbFlSo;
+  if (_kbFlSoP) return _kbFlSoP;
+  if (!force && !_kbFlSoAt && Date.now() - _kbFlSoTry < 10000) return _kbFlSo;
+  _kbFlSoTry = Date.now();
+  _kbFlSoP = (async () => {
+    try {
+      const d = await storage.getDoc('app_config', 'fl_stock_only');
+      kbFlSoApply(d && d.items || {});
+      _kbFlSoAt = Date.now();
+    } catch (_) {}
+    _kbFlSoP = null;
+    return _kbFlSo;
+  })();
+  return _kbFlSoP;
+}
+async function kbFlSoSet(des, on, extra) {
+  const cur = {
+      ...(await kbFlSoLoad(true))
+    },
+    k = kbFlSoKey(des);
+  if (!k) return cur;
+  if (on) cur[k] = {
+    des,
+    row: extra && extra.row || '',
+    prod: extra && extra.prod || '',
+    at: new Date().toISOString(),
+    by: extra && extra.by || ''
+  };else delete cur[k];
+  await storage.setDoc('app_config', 'fl_stock_only', {
+    items: cur
+  }, {
+    replace: true
+  });
+  kbFlSoApply(cur);
+  return cur;
+}
+function useKbFlSo() {
+  const [, tick] = React.useState(0);
+  React.useEffect(() => {
+    const h = () => tick(t => t + 1);
+    window.addEventListener('kb:fl-so', h);
+    kbFlSoLoad(true);
+    return () => window.removeEventListener('kb:fl-so', h);
+  }, []);
+  return _kbFlSo;
 }
 function useKbDlcRules() {
   const [, tick] = React.useState(0);
@@ -3052,10 +3128,13 @@ function kbDetailAcc(acc, o, site, prodById, distribKey) {
     }
   }
   const cid = oid(o.consumer_id) || String(o.consumer_email || o.email || '').trim().toLowerCase();
+  let manqC = 0;
+  for (const r of o.removed || []) manqC += (r.consumer_price || 0) * (r.quantity || 1);
   if (cid) {
-    const x = S.cl[cid] || (S.cl[cid] = [0, 0]);
+    const x = S.cl[cid] || (S.cl[cid] = [0, 0, 0]);
     x[0] += cents;
     x[1] += 1;
+    x[2] = (x[2] || 0) + manqC;
   }
   const hk = kbHourKey(o, distribKey);
   if (hk) {
@@ -3698,6 +3777,11 @@ setTimeout(() => {
     kbDlcRulesLoad();
   } catch (e) {}
 }, 2500);
+setTimeout(() => {
+  try {
+    kbFlSoLoad();
+  } catch (e) {}
+}, 3000);
 setTimeout(() => {
   try {
     kbDlcRulesLoad();
@@ -13471,6 +13555,7 @@ function FLInventoryPage({
     setLoading(true);
     setErr('');
     try {
+      await kbFlSoLoad();
       const data = await flPost({
         secret: FRESHDESK_SECRET,
         action: 'fl_read',
@@ -13507,7 +13592,7 @@ function FLInventoryPage({
         const muKilo = String((iMuKilo >= 0 ? row[iMuKilo] : '') || '').trim();
         const code = String((iCode >= 0 ? row[iCode] : '') || '').trim();
         const actRaw = iAct >= 0 ? String(row[iAct] || '').trim().toLowerCase() : '';
-        const isActive = iAct < 0 ? true : actRaw === '' ? true : actRaw.indexOf('non') !== 0 && actRaw !== 'inactif';
+        const isActive = iAct < 0 ? true : (actRaw === '' ? true : actRaw.indexOf('non') !== 0 && actRaw !== 'inactif') || kbFlSoHas(produit, r + 1);
         const it = {
           key: `${producer}__${produit}`,
           producer,
@@ -22709,7 +22794,7 @@ function kbMuMergeFl(list, flRows) {
     if (!name) continue;
     const typ = normalizeText(String(row[iT] || '')).trim();
     if (typ !== 'sachet' && typ !== 'mu') continue;
-    if (iA >= 0 && !/^actif/.test(normalizeText(String(row[iA] || '')).trim())) continue;
+    if (iA >= 0 && !/^actif/.test(normalizeText(String(row[iA] || '')).trim()) && !kbFlSoHas(name, r + 1)) continue;
     const k = muKey(name);
     if (have.has(k)) continue;
     have.add(k);
@@ -43604,7 +43689,7 @@ function kbCaReport(A, B, notes, f, t, fB, tB, diagOf) {
     kpis: [['CA réel', A.reel, B.reel, kbEur, true], ['CA commandé (prévisionnel)', A.prev, B.prev, kbEur, true], ['Nb distributions', A.nb, B.nb, v => String(v), true], ['CA moyen / distribution', A.caMoy, B.caMoy, kbEur, true], ['Commandes', A.orders, B.orders, v => Math.round(v).toLocaleString('fr-FR').replace(/[  ]/g, ' '), true], ['Panier moyen', A.panier, B.panier, v => (v / 100).toFixed(2).replace('.', ',') + ' €', true], ['Manquants', A.manq, B.manq, kbEur, false], ['Taux de manquants', A.tauxManq, B.tauxManq, v => v.toFixed(1).replace('.', ',') + ' %', false, 'pt'], ['Remises', A.rem, B.rem, kbEur, false]]
   };
 }
-const KB_VACANCES_C = [['2025-10-18', '2025-11-02', 'vacances de la Toussaint'], ['2025-12-20', '2026-01-04', 'vacances de Noël'], ['2026-02-21', '2026-03-08', "vacances d'hiver"], ['2026-04-18', '2026-05-03', 'vacances de printemps'], ['2026-07-04', '2026-08-31', "vacances d'été"], ['2026-10-17', '2026-11-01', 'vacances de la Toussaint'], ['2026-12-19', '2027-01-03', 'vacances de Noël'], ['2027-02-06', '2027-02-21', "vacances d'hiver"], ['2027-04-03', '2027-04-18', 'vacances de printemps'], ['2027-07-03', '2027-09-01', "vacances d'été"]];
+const KB_VACANCES_C = [['2025-02-15', '2025-03-02', "vacances d'hiver"], ['2025-04-12', '2025-04-27', 'vacances de printemps'], ['2025-07-05', '2025-08-31', "vacances d'été"], ['2025-10-18', '2025-11-02', 'vacances de la Toussaint'], ['2025-12-20', '2026-01-04', 'vacances de Noël'], ['2026-02-21', '2026-03-08', "vacances d'hiver"], ['2026-04-18', '2026-05-03', 'vacances de printemps'], ['2026-07-04', '2026-08-31', "vacances d'été"], ['2026-10-17', '2026-11-01', 'vacances de la Toussaint'], ['2026-12-19', '2027-01-03', 'vacances de Noël'], ['2027-02-06', '2027-02-21', "vacances d'hiver"], ['2027-04-03', '2027-04-18', 'vacances de printemps'], ['2027-07-03', '2027-09-01', "vacances d'été"]];
 const kbFeriesCache = {};
 function kbFeries(y) {
   if (kbFeriesCache[y]) return kbFeriesCache[y];
@@ -46225,7 +46310,10 @@ function CaDashboard({
   const maxProd = Math.max(...bestSellers.map(p => metric === 'qty' ? p.qty : p.ca_cents), 1);
   return React.createElement("div", {
     className: "stack"
-  }, React.createElement("div", {
+  }, React.createElement(KbWeekBilanCard, {
+    docs: all,
+    full: true
+  }), " ", React.createElement("div", {
     className: "card"
   }, React.createElement("div", {
     className: "date-range"
@@ -47216,6 +47304,1220 @@ function kbConsNew(st, today) {
     fo: set(st.fo, st.foSite)
   };
 }
+const KB_WB_SEUIL_RUPT = 15;
+function kbWbIndex(docs) {
+  const list = (docs || []).map(d => ({
+    d,
+    dk: d && (d.date || d.id)
+  })).filter(x => x.d && /^\d{4}-\d{2}-\d{2}$/.test(x.dk || '')).sort((a, b) => a.dk.localeCompare(b.dk));
+  const wk = {},
+    first = {};
+  let detailFrom = null;
+  for (const {
+    d,
+    dk
+  } of list) {
+    const sd = kbDocJ(d, 'siteDetailJ');
+    if (!sd) continue;
+    if (!detailFrom) detailFrom = dk;
+    const m = kbMondayOf(dk),
+      W = wk[m] || (wk[m] = {});
+    for (const [s, v] of Object.entries(sd)) for (const [cid, x] of Object.entries(v.cl || {})) {
+      const c = W[cid] || (W[cid] = {
+        sites: {},
+        cents: 0,
+        cmd: 0,
+        manq: 0,
+        hasM: false
+      });
+      const e = c.sites[s] || (c.sites[s] = [0, 0, 0, false]);
+      e[0] += x[0] || 0;
+      e[1] += x[1] || 0;
+      if (x.length > 2) {
+        e[2] += x[2] || 0;
+        e[3] = true;
+        c.manq += x[2] || 0;
+        c.hasM = true;
+      }
+      c.cents += x[0] || 0;
+      c.cmd += x[1] || 0;
+      if (!first[cid] || m < first[cid]) first[cid] = m;
+    }
+  }
+  return {
+    list,
+    wk,
+    first,
+    detailFrom,
+    firstDk: list.length ? list[0].dk : null,
+    lastDk: list.length ? list[list.length - 1].dk : null,
+    segCache: {}
+  };
+}
+function kbWbSum(I, from, to) {
+  const r = {
+    ca: 0,
+    cmd: 0,
+    manq: 0,
+    rem: 0,
+    nd: 0,
+    sites: {},
+    manqProd: {}
+  };
+  const cl = new Set();
+  let det = 0;
+  const S = s => r.sites[s] || (r.sites[s] = {
+    ca: 0,
+    cmd: 0,
+    cmdSd: 0,
+    manq: 0,
+    cl: new Set()
+  });
+  for (const {
+    d,
+    dk
+  } of I.list) {
+    if (dk < from || dk > to) continue;
+    r.nd++;
+    const t = d.totals || totalsFromCaBySite(d.caBySite);
+    r.ca += t.reel || 0;
+    r.manq += t.manquant || 0;
+    r.rem += t.remise || 0;
+    r.cmd += d.ordersCount || 0;
+    for (const [s, v] of Object.entries(d.caBySite || {})) {
+      const x = S(s);
+      x.ca += v.reel_cents || 0;
+      x.cmd += v.orders || 0;
+      x.manq += v.manquant_cents || 0;
+    }
+    for (const p of d.manquantsByProduct || []) {
+      const k = p.id || kbANorm(p.produit),
+        e = r.manqProd[k] || (r.manqProd[k] = {
+          produit: p.produit,
+          producteur: p.producteur || '',
+          qty: 0,
+          cents: 0,
+          days: 0,
+          sites: {}
+        });
+      e.qty += p.qty || 0;
+      e.cents += p.ca_cents || 0;
+      e.days++;
+      Object.entries(p.bySite || {}).forEach(([s, q]) => {
+        e.sites[s] = (e.sites[s] || 0) + q;
+      });
+    }
+    const sd = kbDocJ(d, 'siteDetailJ');
+    if (sd) {
+      det++;
+      for (const [s, v] of Object.entries(sd)) for (const [cid, x] of Object.entries(v.cl || {})) {
+        cl.add(cid);
+        const y = S(s);
+        y.cl.add(cid);
+        y.cmdSd += x[1] || 0;
+      }
+    }
+  }
+  for (const x of Object.values(r.sites)) if (!x.cmd && x.cmdSd) x.cmd = x.cmdSd;
+  r.cl = det ? cl.size : null;
+  r.full = r.nd > 0 && det === r.nd;
+  r.pm = r.cmd ? r.ca / r.cmd : 0;
+  r.tx = r.ca + r.manq ? r.manq / (r.ca + r.manq) * 100 : 0;
+  return r;
+}
+function kbWbCtx(from, to, I) {
+  const vac = new Set(),
+    fer = [];
+  for (let k = from; k <= to; k = kbShiftKey(k, 1)) {
+    const c = kbDayCtx(k);
+    if (c.vac) vac.add(c.vac);
+    if (c.ferie) fer.push(k);
+  }
+  return {
+    vac: [...vac],
+    fer
+  };
+}
+function kbWbFid(I, cid, m) {
+  let n = 0;
+  for (let i = 1; i <= 12; i++) {
+    const w = I.wk[addDays(m, -7 * i)];
+    if (w && w[cid]) n += w[cid].cmd || 1;
+    if (n >= 4) return true;
+  }
+  return false;
+}
+function kbWbSeg(I, m) {
+  if (I.segCache[m]) return I.segCache[m];
+  const W = I.wk[m];
+  if (!W) return I.segCache[m] = null;
+  const prev = [1, 2, 3, 4].map(i => I.wk[addDays(m, -7 * i)] || null);
+  const histOk = !!(I.detailFrom && I.detailFrom <= addDays(m, -84));
+  const out = {
+    histOk,
+    sites: {},
+    tot: {
+      fid: 0,
+      occ: 0,
+      nouv: 0,
+      dec: 0,
+      decAilleurs: 0
+    },
+    decList: []
+  };
+  const S = s => out.sites[s] || (out.sites[s] = {
+    fid: 0,
+    occ: 0,
+    nouv: 0,
+    dec: 0,
+    decAilleurs: 0
+  });
+  for (const [cid, c] of Object.entries(W)) {
+    const seg = I.first[cid] === m ? 'nouv' : kbWbFid(I, cid, m) ? 'fid' : 'occ';
+    out.tot[seg]++;
+    for (const s of Object.keys(c.sites)) S(s)[seg]++;
+  }
+  const seen = new Set();
+  prev.slice(0, 4).forEach(w => w && Object.keys(w).forEach(cid => seen.add(cid)));
+  for (const cid of seen) {
+    const per = {};
+    prev.forEach(w => {
+      const c = w && w[cid];
+      if (c) Object.keys(c.sites).forEach(s => {
+        per[s] = (per[s] || 0) + 1;
+      });
+    });
+    for (const [s, n] of Object.entries(per)) {
+      if (n < 3 || W[cid] && W[cid].sites[s]) continue;
+      const ailleurs = !!W[cid];
+      const x = S(s);
+      x.dec++;
+      out.tot.dec++;
+      if (ailleurs) {
+        x.decAilleurs++;
+        out.tot.decAilleurs++;
+      }
+      out.decList.push({
+        cid,
+        site: s,
+        ailleurs,
+        rupt: kbWbClientRupt(I, cid, s, m)
+      });
+    }
+  }
+  return I.segCache[m] = out;
+}
+function kbWbClientRupt(I, cid, s, m) {
+  let c = 0,
+    mq = 0,
+    n = 0,
+    known = false;
+  for (let i = 1; i <= 12 && n < 3; i++) {
+    const w = I.wk[addDays(m, -7 * i)];
+    const e = w && w[cid] && w[cid].sites[s];
+    if (!e) continue;
+    n++;
+    c += e[0];
+    mq += e[2];
+    if (e[3]) known = true;
+  }
+  return known && c + mq ? mq / (c + mq) * 100 : null;
+}
+function kbWbRuptRetour(I, m0) {
+  const W0 = I.wk[m0],
+    W1 = I.wk[addDays(m0, 7)];
+  if (!W0 || !W1) return null;
+  const t = {
+      n: 0,
+      back: 0,
+      pm: 0
+    },
+    o = {
+      n: 0,
+      back: 0
+    },
+    h = {
+      n: 0,
+      back: 0
+    };
+  let known = false;
+  for (const [cid, c] of Object.entries(W0)) {
+    if (!c.hasM) continue;
+    known = true;
+    const pct = c.cents + c.manq ? c.manq / (c.cents + c.manq) * 100 : 0;
+    const g = c.manq > 0 ? t : o;
+    g.n++;
+    if (W1[cid]) g.back++;
+    if (c.manq > 0) t.pm += c.cents;
+    if (pct >= KB_WB_SEUIL_RUPT) {
+      h.n++;
+      if (W1[cid]) h.back++;
+    }
+  }
+  if (!known || !t.n || !o.n) return null;
+  const rt = t.back / t.n,
+    ro = o.back / o.n,
+    rh = h.n ? h.back / h.n : null;
+  const panier = t.n ? t.pm / t.n : 0;
+  const perdus = Math.max(0, (ro - rt) * t.n);
+  return {
+    m0,
+    touches: t.n,
+    rt,
+    ro,
+    fort: h.n,
+    rh,
+    perdus,
+    cout: Math.round(perdus * panier)
+  };
+}
+function kbWbMoy4(I, s, mon, off) {
+  const vals = [];
+  for (let i = 1; i <= 10 && vals.length < 4; i++) {
+    const f = addDays(mon, -7 * i),
+      t = addDays(f, off);
+    if (kbWbCtx(f, t).vac.length) continue;
+    const r = kbWbSum(I, f, t);
+    if (!r.nd) continue;
+    vals.push(s ? (r.sites[s] || {}).cmd || 0 : r.cmd);
+  }
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+function kbWeekBilan(I, mon, today) {
+  const sun = addDays(mon, 6);
+  const inWk = I.list.filter(x => x.dk >= mon && x.dk <= sun && x.dk <= today).map(x => x.dk);
+  const end = inWk.length ? inWk[inWk.length - 1] : sun;
+  const off = kbDaysBetween(mon, end);
+  const A = kbWbSum(I, mon, end);
+  const pF = addDays(mon, -7),
+    pT = addDays(pF, off),
+    P = kbWbSum(I, pF, pT);
+  const nM = addDays(mon, -364),
+    nT = addDays(nM, off),
+    N = kbWbSum(I, nM, nT);
+  const ctx = {
+    A: kbWbCtx(mon, end),
+    P: kbWbCtx(pF, pT),
+    N: kbWbCtx(nM, nT)
+  };
+  const segA = kbWbSeg(I, mon),
+    segP = kbWbSeg(I, pF),
+    segN = kbWbSeg(I, nM);
+  const R = {
+    mon,
+    sun,
+    end,
+    off,
+    partial: end < sun && today <= sun,
+    A,
+    P,
+    N,
+    pF,
+    pT,
+    nM,
+    nT,
+    ctx,
+    segA,
+    segP,
+    segN
+  };
+  R.ref = N.nd && N.ca ? 'N' : P.nd ? 'P' : null;
+  R.refLbl = R.ref === 'N' ? 'N-1' : 'S-1';
+  R.weeks = [];
+  for (let i = 7; i >= 0; i--) {
+    const m = addDays(mon, -7 * i),
+      last = i === 0,
+      t = last ? end : addDays(m, 6),
+      o = kbDaysBetween(m, t);
+    const a = kbWbSum(I, m, t),
+      n = kbWbSum(I, addDays(m, -364), addDays(addDays(m, -364), o));
+    const vacD = [];
+    for (let k = m; k <= addDays(m, 6); k = kbShiftKey(k, 1)) if (kbDayCtx(k).vac) vacD.push(k);
+    R.weeks.push({
+      m,
+      t: addDays(m, 6),
+      ca: a.ca,
+      cmd: a.cmd,
+      n1: n.nd ? n.ca : null,
+      vac: vacD.length >= 3,
+      cur: last
+    });
+  }
+  const all = new Set([...Object.keys(A.sites), ...Object.keys(R.ref === 'N' ? N.sites : P.sites)]);
+  const B = R.ref === 'N' ? N : P,
+    segB = R.ref === 'N' ? segN : segP;
+  let rows = [...all].map(s => {
+    const a = A.sites[s] || {
+        ca: 0,
+        cmd: 0,
+        cl: new Set()
+      },
+      b = B.sites[s] || {
+        ca: 0,
+        cmd: 0,
+        cl: new Set()
+      };
+    const sa = segA && segA.sites[s] || null,
+      sb = segB && segB.sites[s] || null;
+    const dec4 = [0, 1, 2, 3].reduce((t, i) => {
+      const g = kbWbSeg(I, addDays(mon, -7 * i));
+      return t + (g && g.sites[s] && g.sites[s].dec || 0);
+    }, 0);
+    return {
+      s,
+      ca: a.ca,
+      caB: b.ca,
+      cmd: a.cmd,
+      cmdB: b.cmd,
+      moy: kbWbMoy4(I, s, mon, off),
+      sa,
+      sb,
+      dec4
+    };
+  }).filter(r => r.ca || r.caB);
+  const tot = A.ca || 1;
+  const big = rows.filter(r => r.ca / tot >= 0.04 || r.caB / (B.ca || 1) >= 0.06).sort((x, y) => y.ca - x.ca);
+  const small = rows.filter(r => !big.includes(r));
+  if (small.length) {
+    const add = k => small.reduce((t, r) => t + (r[k] || 0), 0);
+    const sg = (key, f) => small.some(r => r[key]) ? ['fid', 'occ', 'nouv', 'dec'].reduce((o, k) => {
+      o[k] = small.reduce((t, r) => t + (r[key] && r[key][k] || 0), 0);
+      return o;
+    }, {}) : null;
+    big.push({
+      s: `Petits (${small.length})`,
+      petits: small.map(r => r.s),
+      ca: add('ca'),
+      caB: add('caB'),
+      cmd: add('cmd'),
+      cmdB: add('cmdB'),
+      moy: small.every(r => r.moy == null) ? null : small.reduce((t, r) => t + (r.moy || 0), 0),
+      sa: sg('sa'),
+      sb: sg('sb'),
+      dec4: add('dec4'),
+      group: true,
+      members: small
+    });
+  }
+  R.rows = big;
+  R.manqTop = Object.values(A.manqProd).sort((x, y) => y.cents - x.cents).slice(0, 6);
+  R.retour = kbWbRuptRetour(I, R.partial ? addDays(mon, -14) : addDays(mon, -7));
+  const dl = [];
+  [0, 1, 2, 3].forEach(i => {
+    const g = kbWbSeg(I, addDays(mon, -7 * i));
+    if (g) dl.push(...g.decList);
+  });
+  const wR = dl.filter(x => x.rupt != null);
+  R.dec4 = {
+    n: dl.length,
+    ailleurs: dl.filter(x => x.ailleurs).length,
+    known: wR.length,
+    fort: wR.filter(x => x.rupt > KB_WB_SEUIL_RUPT).length
+  };
+  if (segA && I.wk[mon]) {
+    let n = 0,
+      f = 0;
+    const prev = [1, 2, 3, 4].map(i => I.wk[addDays(mon, -7 * i)] || null);
+    for (const [cid, c] of Object.entries(I.wk[mon])) {
+      if (!kbWbFid(I, cid, mon)) continue;
+      for (const s of Object.keys(c.sites)) {
+        const r = kbWbClientRupt(I, cid, s, mon);
+        if (r == null) continue;
+        n++;
+        if (r > KB_WB_SEUIL_RUPT) f++;
+      }
+    }
+    R.dec4.fidRef = n ? f / n * 100 : null;
+  }
+  const Wc = I.wk[mon];
+  if (Wc) {
+    const L = Object.values(Wc).filter(c => c.hasM);
+    R.touches = L.length ? {
+      n: L.filter(c => c.manq > 0).length,
+      sur: L.length,
+      fort: L.filter(c => c.cents + c.manq && c.manq / (c.cents + c.manq) * 100 >= KB_WB_SEUIL_RUPT).length
+    } : null;
+  }
+  R.head = kbWbHead(R);
+  R.text = kbWbText(R);
+  return R;
+}
+const kbWbP = (a, b) => b ? (a - b) / b * 100 : null;
+const kbWbPt = (p, d) => p == null ? 'n/d' : `${p > 0 ? '+' : p < 0 ? '−' : ''}${Math.abs(p).toFixed(d || 0).replace('.', ',')} %`;
+const kbWbK = c => {
+  const v = (c || 0) / 100;
+  return Math.abs(v) >= 1000 ? (v / 1000).toFixed(1).replace('.', ',') + ' k€' : Math.round(v).toLocaleString('fr-FR') + ' €';
+};
+const kbWbKs = c => (c > 0 ? '+' : c < 0 ? '−' : '') + kbWbK(Math.abs(c));
+const kbWbE2 = c => ((c || 0) / 100).toFixed(2).replace('.', ',') + ' €';
+function kbWbHead(R) {
+  const B = R.ref === 'N' ? R.N : R.P,
+    A = R.A;
+  if (!R.ref || !A.nd) return {
+    title: A.nd ? 'Semaine sans comparaison' : 'Pas encore de distribution cette semaine',
+    sent: '',
+    tone: 'flat'
+  };
+  const dCa = kbWbP(A.ca, B.ca),
+    dCmd = kbWbP(A.cmd, B.cmd),
+    dPan = kbWbP(A.pm, B.pm);
+  const tone = dCa >= 2 ? 'up' : dCa <= -2 ? 'down' : 'flat';
+  const title = `Semaine ${tone === 'up' ? 'en hausse' : tone === 'down' ? 'en recul' : 'stable'} (${kbWbPt(dCa)} vs ${R.refLbl})`;
+  const pP = `le panier ${dPan >= 0 ? 'en hausse' : 'en baisse'} (${kbWbPt(dPan)})`,
+    cP = `${dCmd >= 0 ? 'le gain' : 'la perte'} de commandes (${kbWbPt(dCmd)})`;
+  let sent;
+  if (dCmd < -1 && dPan > 1) sent = dCa < 0 ? `${kbCap(pP)} ne compense pas ${cP}` : `${kbCap(pP)} compense ${cP}`;else if (dCmd > 1 && dPan < -1) sent = dCa >= 0 ? `Plus de commandes (${kbWbPt(dCmd)}) malgré un panier plus petit (${kbWbPt(dPan)})` : `Le panier en baisse (${kbWbPt(dPan)}) efface le gain de commandes (${kbWbPt(dCmd)})`;else if (dCmd >= -1 && dPan >= -1) sent = `Commandes (${kbWbPt(dCmd)}) et panier (${kbWbPt(dPan)}) ${dCmd > 1 || dPan > 1 ? 'en hausse' : 'stables'}`;else sent = `Commandes (${kbWbPt(dCmd)}) et panier (${kbWbPt(dPan)}) en baisse`;
+  const rows = (R.rows || []).filter(r => !r.group && r.cmdB);
+  const sg = Math.sign(A.cmd - B.cmd);
+  if (sg && rows.length) {
+    const top = rows.map(r => ({
+      ...r,
+      d: r.cmd - r.cmdB
+    })).filter(r => Math.sign(r.d) === sg).sort((x, y) => sg * (y.d - x.d)).slice(0, 2);
+    const totD = A.cmd - B.cmd;
+    if (top.length && Math.abs(top.reduce((t, r) => t + r.d, 0)) >= Math.abs(totD) * 0.5) {
+      const segs = top.map(r => r.sa && r.sb ? ['fid', 'occ', 'nouv'].map(k => [k, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => sg * (y[1] - x[1]))[0][0] : null);
+      const same = segs[0] && segs.every(x => x === segs[0]);
+      const lbl = {
+        fid: 'fidèles',
+        occ: 'occasionnels',
+        nouv: 'nouveaux clients'
+      };
+      sent += `, ${sg < 0 ? 'concentrée' : 'portée surtout'} ${same ? `par les ${lbl[segs[0]]} de` : 'à'} ${top.map(r => r.s).join(' et ')}`.replace(`${sg < 0 ? 'concentrée' : 'portée surtout'} par les`, sg < 0 ? 'concentrée chez les' : 'portée surtout par les');
+    }
+  }
+  return {
+    title,
+    sent: sent + '.',
+    tone,
+    dCa,
+    dCmd,
+    dPan
+  };
+}
+function kbCap(s) {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+function kbWbText(R) {
+  const out = [],
+    A = R.A,
+    B = R.ref === 'N' ? R.N : R.P;
+  if (!R.ref || !A.nd) return out;
+  const eff1 = Math.round((A.cmd - B.cmd) * B.pm),
+    eff2 = Math.round((A.pm - B.pm) * A.cmd);
+  out.push({
+    k: 'pont',
+    t: `Écart vs ${R.refLbl} : ${kbWbKs(A.ca - B.ca)} = effet commandes (${A.cmd - B.cmd >= 0 ? '+' : '−'}${Math.abs(A.cmd - B.cmd)} × ${kbWbE2(B.pm)} de panier ${R.refLbl} = ${kbWbKs(eff1)}) + effet panier (${A.pm - B.pm >= 0 ? '+' : '−'}${kbWbE2(Math.abs(A.pm - B.pm))} × ${A.cmd} = ${kbWbKs(eff2)}).`
+  });
+  if (R.ref === 'N') {
+    const open = Object.keys(B.sites).filter(s => (B.sites[s].ca || 0) > 0);
+    const a = open.reduce((t, s) => t + ((A.sites[s] || {}).ca || 0), 0),
+      b = open.reduce((t, s) => t + (B.sites[s].ca || 0), 0);
+    const neu = Object.keys(A.sites).filter(s => !open.includes(s)),
+      nc = neu.reduce((t, s) => t + (A.sites[s].ca || 0), 0);
+    out.push({
+      k: 'perim',
+      t: `Sur les seuls points ouverts en N-1 : ${kbWbK(a)} contre ${kbWbK(b)} (${kbWbPt(kbWbP(a, b))})${neu.length ? ` ; les nouveaux points (${neu.join(', ')}) apportent ${kbWbK(nc)}` : ''}.`
+    });
+  }
+  const rows = (R.rows || []).filter(r => !r.group && r.cmdB);
+  const dn = rows.map(r => ({
+    ...r,
+    d: r.cmd - r.cmdB
+  })).filter(r => r.d <= -10 || r.cmdB && r.d / r.cmdB <= -0.1).sort((x, y) => x.d - y.d).slice(0, 3);
+  const up = rows.map(r => ({
+    ...r,
+    d: r.cmd - r.cmdB
+  })).filter(r => r.d >= 10 || r.cmdB && r.d / r.cmdB >= 0.1).sort((x, y) => y.d - x.d).slice(0, 3);
+  const segTxt = r => {
+    if (!r.sa || !r.sb) return '';
+    const L = [['fid', 'fidèles'], ['occ', 'occasionnels'], ['nouv', 'nouveaux']].map(([k, l]) => [l, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1]));
+    return L[0][1] ? `${L[0][1] > 0 ? 'gagne' : 'perd'} surtout des ${L[0][0]} (${L[0][1] > 0 ? '+' : ''}${L[0][1]})` : '';
+  };
+  if (dn.length) out.push({
+    k: 'dn',
+    t: `Vs ${R.refLbl}, en baisse : ` + dn.map(r => `${r.s} (${r.d} commandes${segTxt(r) ? ', ' + segTxt(r) : ''})`).join(' · ') + '.'
+  });
+  if (up.length) out.push({
+    k: 'up',
+    t: `En hausse : ` + up.map(r => `${r.s} (+${r.d} commandes${segTxt(r) ? ', ' + segTxt(r) : ''})`).join(' · ') + '.'
+  });
+  const D = R.dec4;
+  if (D && D.n) {
+    let t = `Sur 4 semaines, ${D.n} décrochage${D.n > 1 ? 's' : ''} (clients réguliers d'un lieu qui ne sont pas venus)`;
+    if (D.known >= 5) t += ` : ${D.fort} sur ${D.known} avaient eu plus de ${KB_WB_SEUIL_RUPT} % de manquants sur leurs 3 dernières commandes` + (D.fidRef != null ? `, contre ${Math.round(D.fidRef)} % des fidèles restés actifs` : '') + (D.known < 30 ? ' (signal à confirmer, effectifs faibles)' : '');else t += ' — lien avec les ruptures : données insuffisantes (recharger l\'historique CA multi-dates pour avoir les manquants par client)';
+    if (D.ailleurs) t += ` ; ${D.ailleurs} commande${D.ailleurs > 1 ? 'nt' : ''} désormais sur un autre point`;
+    out.push({
+      k: 'dec',
+      t: t + '.'
+    });
+  }
+  const g = (R.rows || []).find(r => r.group);
+  if (g && g.members) {
+    const mv = g.members.filter(r => r.moy != null && r.moy >= 3 && Math.abs(r.cmd - r.moy) / r.moy >= 0.3).map(r => `${r.s} ${r.cmd} cmd (moy. ${Math.round(r.moy)})`);
+    out.push({
+      k: 'petits',
+      t: `Petits points (${g.members.map(r => r.s).join(', ')}) : ${kbWbK(g.ca)} (${kbWbPt(kbWbP(g.ca, g.caB))} vs ${R.refLbl})` + (mv.length ? ` — écarts nets vs moyenne 4 sem. : ${mv.join(' · ')}.` : ' — rien au-delà des seuils.')
+    });
+  }
+  return out;
+}
+function KbWbChart({
+  weeks,
+  h
+}) {
+  const W = 640,
+    H = h || 190,
+    padL = 34,
+    padB = 34,
+    padT = 14,
+    iw = W - padL - 6,
+    ih = H - padB - padT;
+  const max = Math.max(1, ...weeks.map(w => Math.max(w.ca || 0, w.n1 || 0)));
+  const step = max > 2500000 ? 1000000 : max > 1200000 ? 500000 : 200000;
+  const top = Math.ceil(max / step) * step,
+    y = v => padT + ih - v / top * ih;
+  const bw = iw / weeks.length,
+    ticks = [];
+  for (let v = 0; v <= top; v += step) ticks.push(v);
+  const pts = weeks.map((w, i) => w.n1 == null ? null : [padL + bw * i + bw / 2, y(w.n1)]);
+  const d = pts.reduce((s, p, i) => p ? s + (s && pts[i - 1] ? ' L' : ' M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1) : s, '');
+  const lbl = k => k.slice(8, 10) + '/' + k.slice(5, 7);
+  return React.createElement("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    style: {
+      width: '100%',
+      height: 'auto',
+      display: 'block'
+    },
+    role: "img",
+    "aria-label": "CA des 8 derni\xE8res semaines et N-1"
+  }, ticks.map(v => React.createElement("g", {
+    key: v
+  }, React.createElement("line", {
+    x1: padL,
+    x2: W - 4,
+    y1: y(v),
+    y2: y(v),
+    stroke: "#e6e6e6"
+  }), React.createElement("text", {
+    x: padL - 4,
+    y: y(v) + 4,
+    fontSize: "11",
+    textAnchor: "end",
+    fill: "#888"
+  }, Math.round(v / 100000), " k\u20AC"))), weeks.map((w, i) => {
+    const x = padL + bw * i + bw * 0.14,
+      bh = Math.max(1, padT + ih - y(w.ca || 0));
+    const col = w.vac ? '#bdbdbd' : w.cur ? '#1565c0' : '#42a5f5';
+    return React.createElement("g", {
+      key: w.m
+    }, React.createElement("rect", {
+      x: x,
+      y: y(w.ca || 0),
+      width: bw * 0.72,
+      height: bh,
+      rx: "3",
+      fill: col
+    }, React.createElement("title", null, `Sem. du ${lbl(w.m)} : ${kbWbK(w.ca)}${w.n1 != null ? ' · N-1 ' + kbWbK(w.n1) : ''}${w.vac ? ' · vacances' : ''}`)), w.cur && w.ca > 0 && React.createElement("text", {
+      x: x + bw * 0.36,
+      y: y(w.ca) + 15,
+      fontSize: "11.5",
+      fontWeight: "700",
+      textAnchor: "middle",
+      fill: "#fff"
+    }, (w.ca / 100000).toFixed(1).replace('.', ',')), w.cur && w.ca > 0 && React.createElement("text", {
+      x: x + bw * 0.36,
+      y: y(w.ca) + 28,
+      fontSize: "10",
+      textAnchor: "middle",
+      fill: "#fff"
+    }, "k\u20AC"), React.createElement("text", {
+      x: x + bw * 0.36,
+      y: H - padB + 14,
+      fontSize: "10.5",
+      textAnchor: "middle",
+      fill: "#666"
+    }, lbl(w.m)), React.createElement("text", {
+      x: x + bw * 0.36,
+      y: H - padB + 27,
+      fontSize: "10.5",
+      textAnchor: "middle",
+      fill: "#666"
+    }, lbl(w.t)));
+  }), d && React.createElement("path", {
+    d: d,
+    fill: "none",
+    stroke: "#e64a19",
+    strokeWidth: "2",
+    strokeDasharray: "6 5"
+  }), pts.map((p, i) => p && React.createElement("circle", {
+    key: i,
+    cx: p[0],
+    cy: p[1],
+    r: "3",
+    fill: "#e64a19"
+  })));
+}
+function KbWbArrow({
+  p,
+  goodUp = true,
+  pt
+}) {
+  if (p == null || isNaN(p)) return React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "\u2014");
+  const z = pt ? Math.abs(p) < 0.1 : Math.abs(p) < 0.5;
+  const good = z ? null : p > 0 === goodUp;
+  const c = z ? 'var(--ink-mute)' : good ? '#2e7d32' : 'var(--danger)';
+  const txt = pt ? `${Math.abs(p).toFixed(1).replace('.', ',')} pt${Math.abs(p) >= 2 ? 's' : ''}` : `${Math.abs(Math.round(p))} %`;
+  return React.createElement("span", {
+    style: {
+      color: c,
+      fontWeight: 700,
+      whiteSpace: 'nowrap'
+    }
+  }, z ? '= ' : p > 0 ? '▲ ' : '▼ ', txt);
+}
+function KbWbTable({
+  R
+}) {
+  const A = R.A,
+    P = R.P,
+    N = R.N;
+  const L = [['CA livré', kbWbK(A.ca), kbWbP(A.ca, P.ca), N.nd ? kbWbP(A.ca, N.ca) : null, true], ['Commandes', A.cmd, kbWbP(A.cmd, P.cmd), N.nd ? kbWbP(A.cmd, N.cmd) : null, true], ['Clients', A.cl == null ? '—' : A.cl, A.cl != null && P.cl ? kbWbP(A.cl, P.cl) : null, A.cl != null && N.cl ? kbWbP(A.cl, N.cl) : null, true], ['Panier moyen', Math.round(A.pm / 100) + ' €', kbWbP(A.pm, P.pm), N.nd ? kbWbP(A.pm, N.pm) : null, true], ['Manquants', A.tx.toFixed(1).replace('.', ',') + ' %', P.nd ? A.tx - P.tx : null, N.nd ? A.tx - N.tx : null, false, true]];
+  const td = {
+    padding: '7px 6px',
+    borderBottom: '1px solid var(--line)',
+    fontSize: 14
+  };
+  const lbl = (a, b) => kbRangeLbl(a, b);
+  return React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse'
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, React.createElement("th", {
+    style: {
+      ...td,
+      textAlign: 'left',
+      fontSize: 12
+    }
+  }), React.createElement("th", {
+    style: {
+      ...td,
+      textAlign: 'right',
+      fontSize: 12
+    }
+  }, "Semaine"), React.createElement("th", {
+    style: {
+      ...td,
+      textAlign: 'right',
+      fontSize: 12
+    }
+  }, "vs S-1"), React.createElement("th", {
+    style: {
+      ...td,
+      textAlign: 'right',
+      fontSize: 12
+    }
+  }, "vs N-1"))), React.createElement("tbody", null, L.map(([l, v, p1, p2, up, pt]) => React.createElement("tr", {
+    key: l
+  }, React.createElement("td", {
+    style: td
+  }, l), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right',
+      fontWeight: 700
+    }
+  }, v), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, React.createElement(KbWbArrow, {
+    p: p1,
+    goodUp: up,
+    pt: pt
+  })), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, React.createElement(KbWbArrow, {
+    p: p2,
+    goodUp: up,
+    pt: pt
+  })))))), React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "S-1 = ", lbl(R.pF, R.pT), " \xB7 N-1 = ", N.nd ? lbl(R.nM, R.nT) : 'pas de données ' + lbl(R.nM, R.nT), R.partial ? ' · semaine en cours : mêmes jours comparés' : '', ". ", kbWbCtxTxt(R)));
+}
+function kbWbCtxTxt(R) {
+  const c = R.ctx,
+    f = x => x.vac.length ? x.vac.join(', ') : null;
+  const parts = [];
+  const va = f(c.A),
+    vp = f(c.P),
+    vn = f(c.N);
+  if (!va && !vp && !vn) parts.push('Pas de vacances cette semaine, ni en S-1 ni en N-1');else parts.push(`Vacances : ${va ? 'cette semaine (' + va + ')' : 'pas cette semaine'}${vp ? ' · S-1 (' + vp + ')' : ''}${vn ? ' · N-1 (' + vn + ')' : ''}`);
+  const fa = c.A.fer.map(k => k.slice(8, 10) + '/' + k.slice(5, 7)),
+    fn = c.N.fer.map(k => k.slice(8, 10) + '/' + k.slice(5, 7));
+  if (fa.length && fa.join() === fn.join()) parts.push(`jour férié le ${fa.join(', ')} les deux années`);else {
+    if (fa.length) parts.push(`férié le ${fa.join(', ')}`);
+    if (fn.length) parts.push(`férié N-1 le ${fn.join(', ')}`);
+  }
+  return parts.join(' ; ') + '.';
+}
+function KbWbHead({
+  R
+}) {
+  const H = R.head,
+    col = H.tone === 'up' ? '#2e7d32' : H.tone === 'down' ? '#c62828' : '#555';
+  return React.createElement("div", null, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "Semaine du ", formatDateShort(R.mon), " au ", formatDateShort(R.sun), R.partial ? ` (jusqu'au ${formatDateShort(R.end)})` : '', " \xB7 compar\xE9e \xE0 S-1 et N-1"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 800,
+      color: col,
+      marginTop: 6
+    }
+  }, H.title), H.sent && React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      lineHeight: 1.3,
+      marginTop: 2
+    }
+  }, H.sent));
+}
+function KbWbSites({
+  R
+}) {
+  const td = {
+    padding: '7px 5px',
+    borderBottom: '1px solid var(--line)',
+    fontSize: 13.5,
+    verticalAlign: 'top'
+  };
+  const segC = (r, k) => {
+    const a = r.sa ? r.sa[k] || 0 : null,
+      b = r.sb ? r.sb[k] || 0 : null;
+    if (a == null) return '—';
+    return React.createElement("span", {
+      style: {
+        whiteSpace: 'nowrap'
+      }
+    }, a, " ", b != null && a !== b ? React.createElement("span", {
+      style: {
+        color: a > b ? '#2e7d32' : 'var(--danger)',
+        fontSize: 11
+      }
+    }, a > b ? '▲' : '▼') : null);
+  };
+  return React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      minWidth: 520
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--ink-mute)'
+    }
+  }, ['Point', 'CA', 'Cdes vs moy.', 'Fidèles', 'Occas.', 'Nouv.', 'Décroch. sem./4 s.'].map((h, i) => React.createElement("th", {
+    key: h,
+    style: {
+      ...td,
+      fontSize: 11.5,
+      textAlign: i ? 'right' : 'left'
+    }
+  }, h)))), React.createElement("tbody", null, R.rows.map(r => React.createElement("tr", {
+    key: r.s
+  }, React.createElement("td", {
+    style: {
+      ...td,
+      fontWeight: 700
+    }
+  }, r.s, r.group && React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      fontWeight: 400,
+      color: 'var(--ink-mute)'
+    }
+  }, r.petits.join(' '))), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, React.createElement("b", null, kbWbK(r.ca)), React.createElement("div", {
+    style: {
+      fontSize: 11
+    }
+  }, React.createElement(KbWbArrow, {
+    p: r.caB ? kbWbP(r.ca, r.caB) : null
+  }), " ", React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, R.refLbl))), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, React.createElement("b", null, r.cmd), React.createElement("div", {
+    style: {
+      fontSize: 11
+    }
+  }, r.moy ? React.createElement(KbWbArrow, {
+    p: kbWbP(r.cmd, r.moy)
+  }) : '—')), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, segC(r, 'fid')), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, segC(r, 'occ')), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, segC(r, 'nouv')), React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: 'right'
+    }
+  }, r.sa ? `${r.sa.dec || 0} / ${r.dec4}` : '—'))))), React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "Cdes vs moyenne des 4 semaines hors vacances (m\xEAmes jours). Segments : clients de la semaine, fl\xE8che vs m\xEAme semaine ", R.refLbl, ". Fid\xE8le = au moins 4 commandes sur les 12 semaines pr\xE9c\xE9dentes \xB7 Nouveau = jamais vu avant \xB7 D\xE9crochage = r\xE9gulier du lieu (3 des 4 semaines) absent cette semaine.", R.segA && !R.segA.histOk ? ' ⚠️ Historique client court : « nouveaux » surestimés (recharger l\'historique CA multi-dates).' : ''));
+}
+function KbWbRuptures({
+  R
+}) {
+  const A = R.A,
+    P = R.P,
+    N = R.N,
+    T = R.touches,
+    Rt = R.retour;
+  const b = {
+    padding: '10px 12px',
+    borderRadius: 10,
+    background: '#fafafa',
+    border: '1px solid var(--line)'
+  };
+  return React.createElement("div", null, React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))',
+      gap: 10
+    }
+  }, React.createElement("div", {
+    style: b
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      fontWeight: 600
+    }
+  }, "\uD83D\uDCB8 CA perdu (ruptures)"), React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontWeight: 700
+    }
+  }, kbWbK(A.manq)), React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, A.tx.toFixed(1).replace('.', ','), " % du command\xE9 \xB7 S-1 ", P.nd ? P.tx.toFixed(1).replace('.', ',') + ' %' : '—', " \xB7 N-1 ", N.nd ? N.tx.toFixed(1).replace('.', ',') + ' %' : '—')), React.createElement("div", {
+    style: b
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      fontWeight: 600
+    }
+  }, "\uD83D\uDC65 Clients touch\xE9s cette semaine"), T ? React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontWeight: 700
+    }
+  }, T.n, " ", React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: 'var(--ink-mute)'
+    }
+  }, "/ ", T.sur, " (", Math.round(100 * T.n / (T.sur || 1)), " %)")), React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, "dont ", T.fort, " avec \u2265 ", KB_WB_SEUIL_RUPT, " % de leur commande manquante")) : React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, "Pas de d\xE9tail par client (recharger l'historique CA)")), React.createElement("div", {
+    style: b
+  }, React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      fontWeight: 600
+    }
+  }, "\u21A9\uFE0F Reviennent la semaine suivante ?"), Rt ? React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 2
+    }
+  }, "Touch\xE9s ", Math.round(Rt.rt * 100), " % \xB7 non touch\xE9s ", Math.round(Rt.ro * 100), " %"), React.createElement("div", {
+    style: {
+      fontSize: 12
+    }
+  }, Rt.rh != null ? `fortement touchés (≥ ${KB_WB_SEUIL_RUPT} %) : ${Math.round(Rt.rh * 100)} % · ` : '', "sem. du ", formatDateShort(Rt.m0), " \u2192 suivante"), Rt.perdus >= 1 && React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      fontWeight: 700,
+      color: 'var(--danger)',
+      marginTop: 2
+    }
+  }, "\u2248 ", Math.round(Rt.perdus), " client(s) de moins \u2192 \u2248 ", kbWbK(Rt.cout), " de CA indirect")) : React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, "Pas encore assez de donn\xE9es par client"))), R.manqTop.length > 0 && React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, "Principales ruptures de la semaine"), R.manqTop.map(p => React.createElement("div", {
+    key: p.produit,
+    style: {
+      fontSize: 13,
+      padding: '3px 0',
+      borderBottom: '1px dashed var(--line)'
+    }
+  }, React.createElement("b", null, p.produit), " ", React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, p.producteur), " \u2014 ", kbWbK(p.cents), " \xB7 ", p.qty, " u. \xB7 ", p.days, " jour", p.days > 1 ? 's' : '', Object.keys(p.sites).length > 0 && React.createElement("span", {
+    style: {
+      color: 'var(--ink-soft)'
+    }
+  }, " \xB7 ", Object.entries(p.sites).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([s, q]) => `${s} ${q}`).join(' · '))))), React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ink-mute)',
+      marginTop: 6
+    }
+  }, "CA indirect = (taux de retour des non touch\xE9s \u2212 taux des touch\xE9s) \xD7 clients touch\xE9s \xD7 leur panier. Estimation : d'autres causes jouent (vacances, m\xE9t\xE9o\u2026)."));
+}
+function KbWeekBilanCard({
+  docs,
+  full,
+  onMore
+}) {
+  const today = todayKey();
+  const I = React.useMemo(() => docs ? kbWbIndex(docs) : null, [docs]);
+  const defMon = React.useMemo(() => {
+    if (!I) return kbMondayOf(today);
+    const m = kbMondayOf(today);
+    return I.list.some(x => x.dk >= m && x.dk <= today) ? m : addDays(m, -7);
+  }, [I, today]);
+  const [mon, setMon] = React.useState(null);
+  const M = mon || defMon;
+  const R = React.useMemo(() => I && I.list.length ? kbWeekBilan(I, M, today) : null, [I, M, today]);
+  const [copied, setCopied] = React.useState(false);
+  if (!docs) return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14
+    }
+  }, "\uD83D\uDCC5 Bilan semaine : chargement\u2026");
+  if (!R) return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14,
+      fontSize: 13
+    }
+  }, "\uD83D\uDCC5 Pas encore d'historique CA (Chargement \u2192 Historique CA).");
+  const copy = () => {
+    const L = [`Semaine du ${formatDateShort(R.mon)} au ${formatDateShort(R.sun)}`, R.head.title, R.head.sent, '', `CA livré ${kbWbK(R.A.ca)} · ${R.A.cmd} commandes · ${R.A.cl == null ? '' : R.A.cl + ' clients · '}panier ${Math.round(R.A.pm / 100)} € · manquants ${R.A.tx.toFixed(1).replace('.', ',')} %`, ...R.text.map(x => x.t), '', 'Points de vente :', ...R.rows.map(r => `${r.s} : ${kbWbK(r.ca)} (${kbWbPt(kbWbP(r.ca, r.caB))} ${R.refLbl}) · ${r.cmd} cmd${r.sa ? ` · fidèles ${r.sa.fid || 0} · occas. ${r.sa.occ || 0} · nouv. ${r.sa.nouv || 0} · décroch. ${r.sa.dec || 0}/${r.dec4}` : ''}`)];
+    try {
+      navigator.clipboard.writeText(L.join('\n'));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {}
+  };
+  const nav = n => setMon(addDays(M, 7 * n));
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: '12px 14px',
+      borderTop: '5px solid ' + (R.head.tone === 'up' ? '#2e7d32' : R.head.tone === 'down' ? '#c62828' : '#9e9e9e')
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      flexWrap: 'wrap',
+      marginBottom: 6
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, "\uD83D\uDCC5 Bilan semaine"), full && React.createElement(React.Fragment, null, React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      fontSize: 13,
+      padding: '4px 10px'
+    },
+    onClick: () => nav(-1)
+  }, "\u25C0"), React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      fontSize: 13,
+      padding: '4px 10px'
+    },
+    disabled: addDays(M, 7) > today,
+    onClick: () => nav(1)
+  }, "\u25B6"), mon && React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      fontSize: 12
+    },
+    onClick: () => setMon(null)
+  }, "\u21A9 derni\xE8re"), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginLeft: 'auto',
+      fontSize: 12
+    },
+    onClick: copy
+  }, copied ? '✓ Copié' : '📋 Copier')), !full && onMore && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginLeft: 'auto',
+      fontSize: 12
+    },
+    onClick: onMore
+  }, "Bilan complet \u203A")), React.createElement(KbWbHead, {
+    R: R
+  }), React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, React.createElement(KbWbTable, {
+    R: R
+  })), React.createElement("div", {
+    style: {
+      marginTop: 12,
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, "CA livr\xE9 sur 8 semaines"), React.createElement(KbWbChart, {
+    weeks: R.weeks
+  }), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 14,
+      fontSize: 11.5,
+      color: 'var(--ink-mute)',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("span", null, React.createElement("span", {
+    style: {
+      display: 'inline-block',
+      width: 10,
+      height: 10,
+      background: '#1565c0',
+      borderRadius: 2
+    }
+  }), " ", R.mon.slice(0, 4)), React.createElement("span", null, React.createElement("span", {
+    style: {
+      display: 'inline-block',
+      width: 10,
+      height: 10,
+      background: '#bdbdbd',
+      borderRadius: 2
+    }
+  }), " vacances"), React.createElement("span", null, React.createElement("span", {
+    style: {
+      display: 'inline-block',
+      width: 16,
+      borderTop: '2px dashed #e64a19',
+      verticalAlign: 'middle'
+    }
+  }), " N-1")), full && React.createElement(React.Fragment, null, R.text.filter(x => x.k === 'pont' || x.k === 'perim').map(x => React.createElement("div", {
+    key: x.k,
+    style: {
+      fontSize: 13.5,
+      marginTop: 8
+    }
+  }, x.t)), React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 15,
+      fontWeight: 700
+    }
+  }, "Points de vente"), React.createElement(KbWbSites, {
+    R: R
+  }), R.text.filter(x => !['pont', 'perim'].includes(x.k)).map(x => React.createElement("div", {
+    key: x.k,
+    style: {
+      fontSize: 13.5,
+      marginTop: 8,
+      lineHeight: 1.4
+    }
+  }, x.t)), React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 15,
+      fontWeight: 700
+    }
+  }, "\uD83D\uDEAB Ruptures et leur effet"), React.createElement(KbWbRuptures, {
+    R: R
+  })));
+}
 function KbHomeStats({
   goSub
 }) {
@@ -47388,8 +48690,16 @@ function KbHomeStats({
       marginTop: 2
     }
   }, sub, " : ", eur(prev.ca), " \xB7 ", prev.cmd, " cmd"));
-  const maxW = Math.max(1, ...S.weeks.map(w => w.ca));
-  return React.createElement("div", {
+  const more = () => {
+    try {
+      localStorage.setItem('kb_ca_view', 'bilan');
+    } catch (_) {}
+    goSub('ca');
+  };
+  return React.createElement(React.Fragment, null, React.createElement(KbWeekBilanCard, {
+    docs: docs,
+    onMore: more
+  }), React.createElement("div", {
     className: "card",
     style: {
       padding: '12px 14px'
@@ -47406,14 +48716,14 @@ function KbHomeStats({
       fontSize: 17,
       fontWeight: 700
     }
-  }, "\uD83D\uDCC8 Clients & CA"), React.createElement("button", {
+  }, "\uD83C\uDD95 Nouveaux clients"), React.createElement("button", {
     className: "btn-secondary",
     style: {
       marginLeft: 'auto',
       fontSize: 12
     },
-    onClick: () => goSub('ca')
-  }, "Suivi CA \u203A")), cst === undefined ? React.createElement("div", {
+    onClick: more
+  }, "Bilan complet \u203A")), cst === undefined ? React.createElement("div", {
     style: {
       fontSize: 13
     }
@@ -47427,16 +48737,11 @@ function KbHomeStats({
     }
   }, "\uD83C\uDD95 Nouveaux clients : recharge le fichier ", React.createElement("b", null, "Consommateurs"), " (Chargement) pour activer les stats (dates d'inscription et de 1re commande).") : React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
-      fontSize: 13,
-      fontWeight: 700,
-      margin: '2px 0 6px'
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      margin: '0 0 6px'
     }
-  }, "\uD83C\uDD95 Nouveaux clients ", React.createElement("span", {
-    style: {
-      fontWeight: 500,
-      color: 'var(--ink-mute)'
-    }
-  }, "\xB7 fichier clients du ", formatDateShort(C.fileDay), " (", C.total.toLocaleString('fr-FR'), " comptes)")), React.createElement("div", {
+  }, "fichier clients du ", formatDateShort(C.fileDay), " (", C.total.toLocaleString('fr-FR'), " comptes)"), React.createElement("div", {
     style: {
       display: 'grid',
       gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))',
@@ -47454,72 +48759,11 @@ function KbHomeStats({
     x: C.fo.w
   }))), React.createElement("div", {
     style: {
-      display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))',
-      gap: 10,
-      marginTop: 10
-    }
-  }, React.createElement(CaTile, {
-    l: `CA semaine (${kbRangeLbl(kbMondayOf(today), S.wMax)})`,
-    now: S.wNow,
-    prev: S.wPrev,
-    sub: `vs ${kbRangeLbl(S.wPrevFrom, S.wPrevTo)}`
-  })), React.createElement("div", {
-    style: {
-      marginTop: 12,
-      fontSize: 13,
-      fontWeight: 700
-    }
-  }, "CA des 8 derni\xE8res semaines"), React.createElement("div", {
-    style: {
-      display: 'flex',
-      alignItems: 'flex-end',
-      gap: 6,
-      height: 110,
-      marginTop: 6
-    }
-  }, S.weeks.map((w, i) => {
-    const cur = i === S.weeks.length - 1;
-    return React.createElement("div", {
-      key: w.m,
-      title: `Sem. du ${formatDateShort(w.m)} : ${eur(w.ca)} · ${w.cmd} cmd`,
-      onClick: () => goSub('ca'),
-      style: {
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        cursor: 'pointer',
-        height: '100%',
-        justifyContent: 'flex-end'
-      }
-    }, React.createElement("div", {
-      style: {
-        fontSize: 10,
-        fontWeight: 700,
-        whiteSpace: 'nowrap'
-      }
-    }, w.ca ? Math.round(w.ca / 100000) + 'k' : ''), React.createElement("div", {
-      style: {
-        width: '100%',
-        height: Math.max(2, Math.round(80 * w.ca / maxW)),
-        background: cur ? '#1565c0' : '#90caf9',
-        borderRadius: '4px 4px 0 0'
-      }
-    }), React.createElement("div", {
-      style: {
-        fontSize: 10,
-        color: 'var(--ink-mute)',
-        marginTop: 2
-      }
-    }, formatDateShort(w.m)));
-  })), React.createElement("div", {
-    style: {
       fontSize: 11,
       color: 'var(--ink-mute)',
       marginTop: 8
     }
-  }, "CA = commandes livr\xE9es (apr\xE8s ruptures, prix plein ; remises boutique non d\xE9duites) \xB7 comparaisons \xE0 jours de distribution comparables \xB7 semaine en cours incluse jusqu'\xE0 la derni\xE8re date charg\xE9e.", ' ', "Inscrits = date de cr\xE9ation du compte \xB7 1re commande = first_order_date du fichier clients (\xE0 recharger pour \xEAtre \xE0 jour)."));
+  }, "CA = commandes livr\xE9es (apr\xE8s ruptures, prix plein ; remises boutique non d\xE9duites) \xB7 comparaisons \xE0 jours de distribution comparables.", ' ', "Inscrits = date de cr\xE9ation du compte \xB7 1re commande = first_order_date du fichier clients (\xE0 recharger pour \xEAtre \xE0 jour).")));
 }
 const KB_TODO_GROUPS = [{
   k: 'me',
@@ -47988,7 +49232,7 @@ function KbTodayPage({
         on: () => go('fl')
       });
     }
-    const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type));
+    const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type) && !kbFlSoHas(i.des, i.row));
     if (fa.length) {
       const cnt = {};
       fa.forEach(i => {
@@ -51801,7 +53045,16 @@ function CaSuiviPage({
 }) {
   const [ca, setCa] = React.useState(null);
   const [anomalies, setAnomalies] = React.useState([]);
-  const [view, setView] = React.useState('jour');
+  const [view, setView] = React.useState(() => {
+    try {
+      const v = localStorage.getItem('kb_ca_view');
+      if (v) {
+        localStorage.removeItem('kb_ca_view');
+        return v;
+      }
+    } catch (_) {}
+    return 'jour';
+  });
   const Header = () => React.createElement("div", {
     style: {
       display: 'flex',
@@ -57425,7 +58678,7 @@ function kbFlInfoIssues(rows, withInactive) {
     const row = rows[r] || [];
     const des = String(row[iD] || '').trim();
     if (!des) continue;
-    const actif = iA < 0 || /^actif/i.test(String(row[iA] || '').trim());
+    const actif = iA < 0 || /^actif/i.test(String(row[iA] || '').trim()) || kbFlSoHas(des, r + 1);
     if (!actif && !withInactive) continue;
     const uv = String(row[iUv] || '').trim(),
       type = String(row[iT] || '').trim(),
@@ -57942,7 +59195,7 @@ function kbFlaWhen(iso) {
 }
 function kbFlaCount(rep) {
   if (!rep || !rep.issues) return null;
-  const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type)).length;
+  const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type) && !kbFlSoHas(i.des, i.row)).length;
   const m = rep.meta || {};
   return n + (m.ventesErr ? 1 : 0) + (kbFlaMissing(m).list.length ? 1 : 0);
 }
@@ -57954,7 +59207,7 @@ function kbFlaMissing(m, done) {
     w = m && m.veille || null;
   const pick = w && !w.none && (!v || String(w.at || '') > String(v.at || '')) ? w : v && !v.none ? v : null;
   const at = pick ? String(pick.at || '') : '';
-  const list = (pick && pick.soldMissing || []).filter(x => !(done && x.why === 'inactif' && x.row && done[kbFlaDoneKey(x)] && done[kbFlaDoneKey(x)] > at));
+  const list = (pick && pick.soldMissing || []).filter(x => !(done && x.why === 'inactif' && x.row && done[kbFlaDoneKey(x)] && done[kbFlaDoneKey(x)] > at) && !kbFlSoHas(x.des, x.row));
   return {
     list,
     day: pick ? pick.day : '',
@@ -58011,9 +59264,11 @@ function FlAutoCard({
     } catch (_) {}
   }, [flDone]);
   const by = session && session.name;
+  const so = useKbFlSo();
   const load = React.useCallback(async () => {
     setErr('');
     try {
+      await kbFlSoLoad();
       const d = await flPost({
         secret: FRESHDESK_SECRET,
         action: 'fl_auto_report',
@@ -58122,6 +59377,108 @@ function FlAutoCard({
     why: i.type,
     _type: i.type
   }, actif ? `✓ ${i.des} passé Actif` : `✓ ${i.des} passé Non actif`);
+  const SO_KINDS = ['stock', 'saleInactif', 'red', 'absentRungis'];
+  const soOne = async i => {
+    await kbFlSoSet(i.des, true, {
+      row: i.row || '',
+      prod: i.prod || '',
+      by: by || ''
+    });
+    if (i.type !== 'saleInactif' && i.type !== 'ventes' && i.row) {
+      const d = await flPost({
+        secret: FRESHDESK_SECRET,
+        action: 'fl_auto_actif',
+        row: i.row,
+        des: i.des,
+        actif: false,
+        why: 'stock seulement (plus chez Rungis)',
+        by
+      });
+      if (!d || d.ok === false) throw new Error(d && d.error || 'Sheet non mis à jour');
+    }
+    for (const kind of SO_KINDS) {
+      try {
+        await flPost({
+          secret: FRESHDESK_SECRET,
+          action: 'fl_auto_ignore',
+          kind,
+          des: i.des,
+          row: i.row || '',
+          by
+        });
+      } catch (_) {}
+    }
+  };
+  const stockOnly = async items => {
+    items = (items || []).filter(Boolean);
+    if (!items.length) return;
+    if (!confirm(`📦 Stock seulement — plus commandable chez Rungis : ${items.length} produit(s)\n\n${items.slice(0, 12).map(i => '• ' + i.des).join('\n')}${items.length > 12 ? '\n…' : ''}\n\n→ Sheet : « Non actif » (Rungis ne le commande plus)\n→ Appli : reste ACTIF pour la MU, la prépa et l'inventaire\n→ Plus d'alerte « en vente mais Non actif » / « rouge » / « absent PVTTC »`)) return;
+    setBusy('so');
+    setBulk({
+      done: 0,
+      total: items.length
+    });
+    const ok = [],
+      ko = [];
+    for (const i of items) {
+      try {
+        await soOne(i);
+        ok.push(i);
+      } catch (e) {
+        ko.push(i.des + ' : ' + (e.message || e));
+      }
+      setBulk(b => b ? {
+        ...b,
+        done: b.done + 1
+      } : b);
+    }
+    const okD = new Set(ok.map(i => kbFlSoKey(i.des)));
+    setRep(r => r ? {
+      ...r,
+      issues: r.issues.filter(x => !okD.has(kbFlSoKey(x.des)) || x.type === 'dup')
+    } : r);
+    setPick({});
+    setBulk(null);
+    setBusy('');
+    showToast(ko.length ? `⚠️ ${ok.length} fait(s), ${ko.length} erreur(s) : ${ko[0]}` : `✓ ${ok.length} produit(s) en 📦 stock seulement`);
+  };
+  const soUndo = async (x, actif) => {
+    if (!confirm(actif ? `↩️ ${x.des} : de nouveau commandable chez Rungis ?\n→ repasse « Actif » dans le Sheet (Rungis le commande).` : `🛑 ${x.des} : plus en vente du tout ?\n→ reste « Non actif » dans le Sheet et n'est plus traité comme actif dans l'appli (MU, prépa).`)) return;
+    setBusy('so');
+    try {
+      if (actif && x.row) {
+        const d = await flPost({
+          secret: FRESHDESK_SECRET,
+          action: 'fl_auto_actif',
+          row: x.row,
+          des: x.des,
+          actif: true,
+          why: 'de nouveau chez Rungis',
+          by
+        });
+        if (!d || d.ok === false) throw new Error(d && d.error || 'Sheet non mis à jour');
+      }
+      for (const kind of SO_KINDS) {
+        try {
+          await flPost({
+            secret: FRESHDESK_SECRET,
+            action: 'fl_auto_ignore',
+            kind,
+            des: x.des,
+            row: x.row || '',
+            undo: true,
+            by
+          });
+        } catch (_) {}
+      }
+      await kbFlSoSet(x.des, false);
+      showToast(actif ? `✓ ${x.des} repassé Actif (Rungis)` : `✓ ${x.des} retiré du stock seulement`);
+    } catch (e) {
+      showToast('Erreur : ' + (e.message || e));
+    } finally {
+      setBusy('');
+    }
+  };
   const pkey = i => i.type + '|' + i.row + '|' + i.des;
   const runBulk = async (items, actif, ignoreLabel) => {
     if (!items.length) return;
@@ -58303,9 +59660,10 @@ function FlAutoCard({
   const m = rep && rep.meta || {};
   const V = m.ventes || null,
     Ct = m.controle || null;
-  const issues = rep && rep.issues || [];
+  const issues = (rep && rep.issues || []).filter(i => i.type === 'dup' || !kbFlSoHas(i.des, i.row));
   const byType = {};
   issues.forEach(i => (byType[i.type] = byType[i.type] || []).push(i));
+  const soList = Object.values(so || {}).sort((a, b) => String(a.des).localeCompare(String(b.des), 'fr'));
   const nAct = kbFlaCount(rep) || 0;
   const big = {
     fontSize: 15,
@@ -58690,13 +60048,80 @@ function FlAutoCard({
         fontWeight: 600,
         color: 'var(--ink-mute)'
       }
-    }, x.why === 'inactif' ? ` · ligne ${x.row} « Non actif »` : x.why === 'absent' ? ' · absent du Sheet' : ''))), m.veilleErr && React.createElement("div", {
+    }, x.why === 'inactif' ? ` · ligne ${x.row} « Non actif »` : x.why === 'absent' ? ' · absent du Sheet' : ''), x.why === 'inactif' && x.row ? React.createElement("span", null, " ", chip('📦 Stock seulement', () => stockOnly([{
+      type: 'ventes',
+      row: x.row,
+      des: x.des
+    }]), 'so' + x.row)) : null)), m.veilleErr && React.createElement("div", {
       style: {
         fontSize: 12,
         color: 'var(--danger)'
       }
     }, "Veille horaire : ", m.veilleErr)));
-  })(), section('concord', (byType.concord || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
+  })(), soList.length > 0 && React.createElement("div", {
+    style: {
+      marginTop: 12,
+      borderLeft: '6px solid #6d4c41',
+      background: '#6d4c4112',
+      borderRadius: 10,
+      padding: '10px 12px'
+    }
+  }, React.createElement("div", {
+    onClick: () => setOpen(o => ({
+      ...o,
+      so: !o.so
+    })),
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      cursor: 'pointer'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 24
+    }
+  }, "\uD83D\uDCE6"), React.createElement("strong", {
+    style: {
+      fontSize: 16
+    }
+  }, "Stock seulement \u2014 en vente mais plus commandable chez Rungis"), React.createElement("span", {
+    className: "badge",
+    style: {
+      background: '#6d4c41',
+      color: '#fff',
+      fontWeight: 700,
+      fontSize: 14
+    }
+  }, soList.length), React.createElement("span", {
+    style: {
+      marginLeft: 'auto'
+    }
+  }, open.so ? '▾' : '▸')), open.so && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: 'var(--ink-soft)',
+      marginTop: 4
+    }
+  }, "\xAB Non actif \xBB dans le Sheet (Rungis ne le commande pas) mais ", React.createElement("b", null, "actif dans l'appli"), " : MU, pr\xE9pa et inventaire le voient. Aucune alerte tant qu'il est ici. Quand le stock est fini et que le produit n'est plus en vente \u2192 \uD83D\uDED1 ; s'il revient chez Rungis \u2192 \u21A9\uFE0F."), soList.map(x => React.createElement("div", {
+    key: x.des,
+    style: {
+      padding: '8px 10px',
+      borderRadius: 10,
+      marginTop: 6,
+      background: '#fff',
+      border: '2px solid var(--line)'
+    }
+  }, React.createElement("strong", {
+    style: {
+      fontSize: 15
+    }
+  }, x.des), " ", React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, x.prod, x.row ? ' · ligne ' + x.row : '', " \xB7 depuis ", formatDateShort(String(x.at || '').slice(0, 10)), x.by ? ' · ' + x.by : ''), React.createElement("div", null, chip('↩️ De nouveau chez Rungis (Actif)', () => soUndo(x, true), 'u'), chip('🛑 Plus en vente', () => soUndo(x, false), 'n')))))), section('concord', (byType.concord || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-soft)',
@@ -58708,7 +60133,15 @@ function FlAutoCard({
       color: 'var(--ink-soft)',
       marginTop: 4
     }
-  }, "Choisis le code Rungis pour ajouter la ligne (elle se compl\xE8te seule), ou ajoute-la sans code."), list('newSale', i => React.createElement(React.Fragment, null, rungisChips(i, code => add(i, code), '➕'), chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc'), chip('Ignorer', () => ignore(i), 'ign'))))), section('saleInactif', (byType.saleInactif || []).length, React.createElement(React.Fragment, null, bulkBar('saleInactif', [['🟢 Passer Actif', sel => runBulk(sel, true), '#2e7d32'], ['Laisser Non actif', sel => runBulk(sel, false, 'Laisser Non actif'), '#757575']]), list('saleInactif', i => React.createElement("div", null, checkRow(i), chip('🟢 Passer Actif', () => setActif(i, true), 'a'), chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign'))))), section('red', (byType.red || []).length, React.createElement(React.Fragment, null, bulkBar('red', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('red', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('absentRungis', (byType.absentRungis || []).length, React.createElement(React.Fragment, null, bulkBar('absentRungis', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('absentRungis', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('incoh', (byType.incoh || []).length, React.createElement(React.Fragment, null, list('incoh', i => React.createElement("div", null, chip('Vu', () => ignore(i, 'Vu'), 'ign'))))), section('pa', (byType.pa || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
+  }, "Choisis le code Rungis pour ajouter la ligne (elle se compl\xE8te seule), ou ajoute-la sans code."), list('newSale', i => React.createElement(React.Fragment, null, rungisChips(i, code => add(i, code), '➕'), chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc'), chip('Ignorer', () => ignore(i), 'ign'))))), section('saleInactif', (byType.saleInactif || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 4,
+      padding: '6px 10px',
+      borderRadius: 8,
+      background: '#fff'
+    }
+  }, "Encore en vente ", React.createElement("b", null, "et"), " commandable chez Rungis \u2192 \uD83D\uDFE2 Passer Actif \xB7 en vente gr\xE2ce au stock mais ", React.createElement("b", null, "plus chez Rungis"), " \u2192 \uD83D\uDCE6 Stock seulement (reste actif pour la MU et la pr\xE9pa, plus d'alerte)."), bulkBar('saleInactif', [['🟢 Passer Actif', sel => runBulk(sel, true), '#2e7d32'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Laisser Non actif', sel => runBulk(sel, false, 'Laisser Non actif'), '#757575']]), list('saleInactif', i => React.createElement("div", null, checkRow(i), chip('🟢 Passer Actif', () => setActif(i, true), 'a'), chip('📦 Stock seulement (plus chez Rungis)', () => stockOnly([i]), 'so'), chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign'))))), section('red', (byType.red || []).length, React.createElement(React.Fragment, null, bulkBar('red', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('red', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('📦 Stock seulement (on en a encore)', () => stockOnly([i]), 'so'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('absentRungis', (byType.absentRungis || []).length, React.createElement(React.Fragment, null, bulkBar('absentRungis', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']]), list('absentRungis', i => React.createElement("div", null, checkRow(i), chip('⛔ Passer Non actif', () => setActif(i, false), 'na'), chip('📦 Stock seulement (on en a encore)', () => stockOnly([i]), 'so'), chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign'))))), section('incoh', (byType.incoh || []).length, React.createElement(React.Fragment, null, list('incoh', i => React.createElement("div", null, chip('Vu', () => ignore(i, 'Vu'), 'ign'))))), section('pa', (byType.pa || []).length, React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-soft)',

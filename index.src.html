@@ -786,7 +786,14 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.36';
+    const APP_VERSION = 'V11.38';
+    // V11.38 — (17/11/2026) 📅 Bilan semaine : Master › Aujourd'hui = phrase de synthèse + tableau Semaine / vs S-1 / vs N-1 + CA 8 semaines avec ligne N-1 (rouge pointillé) et vacances en gris + nouveaux clients ;
+    //   Suivi CA › 📈 Bilan = idem + navigation ◀ ▶ + pont de l'écart (effet commandes / panier), périmètre N-1, points de vente (fidèles / occasionnels / nouveaux / décrochages),
+    //   ruptures et leur effet (CA perdu, clients touchés, retour la semaine suivante, CA indirect, décrochages après ruptures). ca_history.siteDetailJ.cl = [CA, cmd, CA manquant].
+    //   🥬 F&L › Contrôle auto : statut 📦 « Stock seulement » (en vente / en stock mais plus commandable chez Rungis) : Sheet « Non actif », appli ACTIF (MU, prépa, inventaire),
+    //   plus d'alerte ni de commande Rungis 5h (app_config/fl_stock_only + clé serveur « stock| » lue par KBG_FL_Auto v1.6).
+    // V11.37.1 — (17/11/2026) Sapins : adresses @probon.fr + @probon.org (transition).
+    // V11.37 — (16/11/2026) 🎄 Sapins : cœur commun à jour (Kelbongoo sans prévision automatique, adresses @probon.org).
     // V11.36 — (14/11/2026) 🎄 Espace Rungis › Sapins en lecture seule (le jour se change seulement depuis le mail de 2 h : confirmer / changer le jour) ; « ✅ confirmé » affiché.
     // V11.35 — (14/11/2026) Distrib › Retrait total : POURQUOI obligatoire — 🙅 le client n'en veut pas (Retour PDP + DLC, revient en stock) ·
     //   ❓ pas dans le casier (= rupture → facturation : ajustement WRUP) · 🗑️ abîmé, jeté en boutique (= perte « pertes prépa », destination jeté).
@@ -1411,6 +1418,43 @@
       if (!force && _kbDlcRulesAt && Date.now() - _kbDlcRulesAt < 60000) return _kbDlcRules;
       try { const d = await storage.getDoc('app_config', 'dlc_rules'); if (d) kbDlcRulesApply(d); _kbDlcRulesAt = Date.now(); } catch (_) {}
       return _kbDlcRules;
+    }
+    // V11.38 — 📦 F&L « STOCK SEULEMENT » : produit ACTIF chez nous (en vente, on a du stock → MU, prépa, inventaire)
+    //   mais PLUS COMMANDABLE chez Rungis. Dans le Sheet COMMANDE FL la ligne est « Non actif » (Rungis ne le commande pas) ;
+    //   l'appli le traite comme actif partout ailleurs et le contrôle auto ne le remonte plus en alerte.
+    //   Données : app_config/fl_stock_only = { items: { clé: { des, row, prod, at, by } } }.
+    const kbFlSoKey = (des) => normalizeText(String(des || '')).replace(/[^a-z0-9]+/g, ' ').trim();
+    let _kbFlSo = (() => { try { return JSON.parse(localStorage.getItem('kb_fl_so') || '{}') || {}; } catch (_) { return {}; } })(), _kbFlSoAt = 0;
+    function kbFlSoItems() { return _kbFlSo; }
+    function kbFlSoHas(des, row) {
+      if (!_kbFlSoAt) kbFlSoLoad();
+      const k = kbFlSoKey(des); if (k && _kbFlSo[k]) return true;
+      return row != null && row !== '' && Object.values(_kbFlSo).some(x => String(x.row || '') === String(row) && kbFlSoKey(x.des) === k);
+    }
+    function kbFlSoApply(items) { _kbFlSo = items || {}; try { localStorage.setItem('kb_fl_so', JSON.stringify(_kbFlSo)); } catch (_) {} try { window.dispatchEvent(new CustomEvent('kb:fl-so')); } catch (_) {} }
+    let _kbFlSoP = null, _kbFlSoTry = 0;
+    async function kbFlSoLoad(force) {
+      if (!force && _kbFlSoAt && Date.now() - _kbFlSoAt < 120000) return _kbFlSo;
+      if (_kbFlSoP) return _kbFlSoP;
+      if (!force && !_kbFlSoAt && Date.now() - _kbFlSoTry < 10000) return _kbFlSo; // échec récent (Firebase pas prêt) : on réessaie 10 s plus tard
+      _kbFlSoTry = Date.now();
+      _kbFlSoP = (async () => {
+        try { const d = await storage.getDoc('app_config', 'fl_stock_only'); kbFlSoApply((d && d.items) || {}); _kbFlSoAt = Date.now(); } catch (_) {}
+        _kbFlSoP = null; return _kbFlSo;
+      })();
+      return _kbFlSoP;
+    }
+    async function kbFlSoSet(des, on, extra) {
+      const cur = { ...(await kbFlSoLoad(true)) }, k = kbFlSoKey(des); if (!k) return cur;
+      if (on) cur[k] = { des, row: (extra && extra.row) || '', prod: (extra && extra.prod) || '', at: new Date().toISOString(), by: (extra && extra.by) || '' };
+      else delete cur[k];
+      await storage.setDoc('app_config', 'fl_stock_only', { items: cur }, { replace: true });
+      kbFlSoApply(cur); return cur;
+    }
+    function useKbFlSo() {
+      const [, tick] = React.useState(0);
+      React.useEffect(() => { const h = () => tick(t => t + 1); window.addEventListener('kb:fl-so', h); kbFlSoLoad(true); return () => window.removeEventListener('kb:fl-so', h); }, []);
+      return _kbFlSo;
     }
     // Recharge la page quand les règles changent (dlc board, popup, réglages)
     function useKbDlcRules() {
@@ -2858,7 +2902,9 @@
         if (p) { try { if (isFLProduct(p)) fl += q; } catch (e) {} }
       }
       const cid = oid(o.consumer_id) || String(o.consumer_email || o.email || '').trim().toLowerCase();
-      if (cid) { const x = S.cl[cid] || (S.cl[cid] = [0, 0]); x[0] += cents; x[1] += 1; }
+      // V11.38 — 3e valeur = CA manquant (ruptures) de ce client → effet des ruptures sur les décrochages
+      let manqC = 0; for (const r of (o.removed || [])) manqC += (r.consumer_price || 0) * (r.quantity || 1);
+      if (cid) { const x = S.cl[cid] || (S.cl[cid] = [0, 0, 0]); x[0] += cents; x[1] += 1; x[2] = (x[2] || 0) + manqC; }
       const hk = kbHourKey(o, distribKey);
       if (hk) {
         const h = acc.hours[hk] || (acc.hours[hk] = [0, 0, 0]); h[0] += 1; h[1] += fl; h[2] += cents;
@@ -3430,6 +3476,7 @@
     }
     // V11.14 — règles DLC chargées tôt (navettes ROB utilisées partout : retours PDP, pertes, historique)
     setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 2500);
+    setTimeout(() => { try { kbFlSoLoad(); } catch (e) {} }, 3000); // V11.38
     setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 15000);
     async function kbSameDayOpen(day) {
       await kbSameDayLoad();
@@ -8928,6 +8975,7 @@
       const loadFL = React.useCallback(async () => {
         setLoading(true); setErr('');
         try {
+          await kbFlSoLoad(); // V11.38 — produits « stock seulement » comptés actifs
           const data = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() });
           if (!data.ok) throw new Error(data.error || 'réponse proxy invalide');
           const rows = data.rows || [];
@@ -8955,7 +9003,7 @@
             const muKilo = String((iMuKilo >= 0 ? row[iMuKilo] : '') || '').trim();
             const code   = String((iCode   >= 0 ? row[iCode]   : '') || '').trim();
             const actRaw = iAct >= 0 ? String(row[iAct] || '').trim().toLowerCase() : '';
-            const isActive = iAct < 0 ? true : (actRaw === '' ? true : (actRaw.indexOf('non') !== 0 && actRaw !== 'inactif'));
+            const isActive = iAct < 0 ? true : (actRaw === '' ? true : (actRaw.indexOf('non') !== 0 && actRaw !== 'inactif')) || kbFlSoHas(produit, r + 1); // V11.38 — stock seulement
             const it = { key: `${producer}__${produit}`, producer, produit, uv, type, muKilo, code, actif: isActive };
             (isActive ? actifs : inactifs).push(it);
           }
@@ -13234,7 +13282,7 @@
       for(let r=1;r<flRows.length;r++){
         const row=flRows[r]||[]; const name=String(row[iD]==null?'':row[iD]).trim(); if(!name) continue;
         const typ=normalizeText(String(row[iT]||'')).trim(); if(typ!=='sachet' && typ!=='mu') continue;
-        if(iA>=0 && !/^actif/.test(normalizeText(String(row[iA]||'')).trim())) continue;
+        if(iA>=0 && !/^actif/.test(normalizeText(String(row[iA]||'')).trim()) && !kbFlSoHas(name, r+1)) continue; // V11.38 — stock seulement = actif pour la MU
         const k=muKey(name); if(have.has(k)) continue; have.add(k);
         const est=parseFloat(String(iE>=0&&row[iE]!=null?row[iE]:'').replace(',','.'));
         add.push({ produit:name, producteur: iP>=0?String(row[iP]||'').trim():'', uv: iU>=0?String(row[iU]||'').trim():'', estimation: isNaN(est)?0:est,
@@ -24927,6 +24975,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     //   4. Contexte : reste du réseau, vacances / fériés, météo, jours de distribution, qualité, non récupérées, notes
     // ============================================================
     const KB_VACANCES_C = [ // zone C (Paris) — début = 1er jour de vacances, fin = dernier jour avant la reprise
+      ['2025-02-15', '2025-03-02', "vacances d'hiver"], ['2025-04-12', '2025-04-27', 'vacances de printemps'],
+      ['2025-07-05', '2025-08-31', "vacances d'été"],
       ['2025-10-18', '2025-11-02', 'vacances de la Toussaint'], ['2025-12-20', '2026-01-04', 'vacances de Noël'],
       ['2026-02-21', '2026-03-08', "vacances d'hiver"], ['2026-04-18', '2026-05-03', 'vacances de printemps'],
       ['2026-07-04', '2026-08-31', "vacances d'été"], ['2026-10-17', '2026-11-01', 'vacances de la Toussaint'],
@@ -25928,6 +25978,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
       return (
         <div className="stack">
+          <KbWeekBilanCard docs={all} full /> {/* V11.38 — bilan semaine complet */}
           {/* Période */}
           <div className="card">
             <div className="date-range">
@@ -26344,6 +26395,452 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       };
       return { total: st.total || 0, fileDay: st.maxDay || (st.at || '').slice(0, 10), ins: set(st.ins, st.insSite), fo: set(st.fo, st.foSite) };
     }
+    // ============================================================
+    // V11.38 — 📅 BILAN SEMAINE (Master › Aujourd'hui = résumé · Suivi CA › 📈 Bilan = complet)
+    //   Phrase de synthèse auto · tableau Semaine / vs S-1 / vs N-1 (mêmes jours de distribution) ·
+    //   CA des 8 dernières semaines + ligne N-1 (rouge pointillé) + semaines de vacances en gris ·
+    //   pont de l'écart (effet commandes / effet panier) · points de vente : fidèles / occasionnels / nouveaux /
+    //   décrochages · effet des ruptures (CA perdu direct, clients touchés, retour la semaine suivante, décrochages).
+    //   Sources : ca_history (totals, caBySite, siteDetailJ.cl = {client: [CA, nb cmd, CA manquant]}, manquantsByProduct).
+    //   Définitions : FIDÈLE = au moins 4 commandes sur les 12 semaines précédentes (comme l'analyse de Raimbaud) · NOUVEAU = jamais vu avant dans
+    //   l'historique · OCCASIONNEL = les autres · DÉCROCHAGE (lieu) = commandait sur ce lieu au moins 3 des 4 semaines
+    //   précédentes et rien cette semaine sur ce lieu.
+    // ============================================================
+    const KB_WB_SEUIL_RUPT = 15; // % de manquants sur les 3 dernières commandes = « fortement touché »
+    function kbWbIndex(docs) {
+      const list = (docs || []).map(d => ({ d, dk: d && (d.date || d.id) })).filter(x => x.d && /^\d{4}-\d{2}-\d{2}$/.test(x.dk || '')).sort((a, b) => a.dk.localeCompare(b.dk));
+      const wk = {}, first = {}; let detailFrom = null;
+      for (const { d, dk } of list) {
+        const sd = kbDocJ(d, 'siteDetailJ'); if (!sd) continue;
+        if (!detailFrom) detailFrom = dk;
+        const m = kbMondayOf(dk), W = wk[m] || (wk[m] = {});
+        for (const [s, v] of Object.entries(sd)) for (const [cid, x] of Object.entries(v.cl || {})) {
+          const c = W[cid] || (W[cid] = { sites: {}, cents: 0, cmd: 0, manq: 0, hasM: false });
+          const e = c.sites[s] || (c.sites[s] = [0, 0, 0, false]);
+          e[0] += x[0] || 0; e[1] += x[1] || 0; if (x.length > 2) { e[2] += x[2] || 0; e[3] = true; c.manq += x[2] || 0; c.hasM = true; }
+          c.cents += x[0] || 0; c.cmd += x[1] || 0;
+          if (!first[cid] || m < first[cid]) first[cid] = m;
+        }
+      }
+      return { list, wk, first, detailFrom, firstDk: list.length ? list[0].dk : null, lastDk: list.length ? list[list.length - 1].dk : null, segCache: {} };
+    }
+    function kbWbSum(I, from, to) {
+      const r = { ca: 0, cmd: 0, manq: 0, rem: 0, nd: 0, sites: {}, manqProd: {} };
+      const cl = new Set(); let det = 0;
+      const S = (s) => r.sites[s] || (r.sites[s] = { ca: 0, cmd: 0, cmdSd: 0, manq: 0, cl: new Set() });
+      for (const { d, dk } of I.list) {
+        if (dk < from || dk > to) continue;
+        r.nd++;
+        const t = d.totals || totalsFromCaBySite(d.caBySite);
+        r.ca += t.reel || 0; r.manq += t.manquant || 0; r.rem += t.remise || 0; r.cmd += d.ordersCount || 0;
+        for (const [s, v] of Object.entries(d.caBySite || {})) { const x = S(s); x.ca += v.reel_cents || 0; x.cmd += v.orders || 0; x.manq += v.manquant_cents || 0; }
+        for (const p of (d.manquantsByProduct || [])) {
+          const k = p.id || kbANorm(p.produit), e = r.manqProd[k] || (r.manqProd[k] = { produit: p.produit, producteur: p.producteur || '', qty: 0, cents: 0, days: 0, sites: {} });
+          e.qty += p.qty || 0; e.cents += p.ca_cents || 0; e.days++; Object.entries(p.bySite || {}).forEach(([s, q]) => { e.sites[s] = (e.sites[s] || 0) + q; });
+        }
+        const sd = kbDocJ(d, 'siteDetailJ');
+        if (sd) { det++; for (const [s, v] of Object.entries(sd)) for (const [cid, x] of Object.entries(v.cl || {})) { cl.add(cid); const y = S(s); y.cl.add(cid); y.cmdSd += x[1] || 0; } }
+      }
+      for (const x of Object.values(r.sites)) if (!x.cmd && x.cmdSd) x.cmd = x.cmdSd;
+      r.cl = det ? cl.size : null; r.full = r.nd > 0 && det === r.nd;
+      r.pm = r.cmd ? r.ca / r.cmd : 0; r.tx = (r.ca + r.manq) ? r.manq / (r.ca + r.manq) * 100 : 0;
+      return r;
+    }
+    function kbWbCtx(from, to, I) {
+      const vac = new Set(), fer = [];
+      for (let k = from; k <= to; k = kbShiftKey(k, 1)) { const c = kbDayCtx(k); if (c.vac) vac.add(c.vac); if (c.ferie) fer.push(k); }
+      return { vac: [...vac], fer };
+    }
+    // Fidèle = au moins 4 commandes sur les 12 semaines précédentes (même définition que l'analyse Mongo de Raimbaud, nov. 2026)
+    function kbWbFid(I, cid, m) { let n = 0; for (let i = 1; i <= 12; i++) { const w = I.wk[addDays(m, -7 * i)]; if (w && w[cid]) n += w[cid].cmd || 1; if (n >= 4) return true; } return false; }
+    // Segments de la semaine m (lundi) — par lieu et total
+    function kbWbSeg(I, m) {
+      if (I.segCache[m]) return I.segCache[m];
+      const W = I.wk[m]; if (!W) return (I.segCache[m] = null);
+      const prev = [1, 2, 3, 4].map(i => I.wk[addDays(m, -7 * i)] || null);
+      const histOk = !!(I.detailFrom && I.detailFrom <= addDays(m, -84));
+      const out = { histOk, sites: {}, tot: { fid: 0, occ: 0, nouv: 0, dec: 0, decAilleurs: 0 }, decList: [] };
+      const S = (s) => out.sites[s] || (out.sites[s] = { fid: 0, occ: 0, nouv: 0, dec: 0, decAilleurs: 0 });
+      for (const [cid, c] of Object.entries(W)) {
+        const seg = I.first[cid] === m ? 'nouv' : kbWbFid(I, cid, m) ? 'fid' : 'occ';
+        out.tot[seg]++;
+        for (const s of Object.keys(c.sites)) S(s)[seg]++;
+      }
+      // décrochages : réguliers d'un lieu (≥ 3 des 4 semaines) absents de ce lieu cette semaine
+      const seen = new Set();
+      prev.slice(0, 4).forEach(w => w && Object.keys(w).forEach(cid => seen.add(cid)));
+      for (const cid of seen) {
+        const per = {};
+        prev.forEach(w => { const c = w && w[cid]; if (c) Object.keys(c.sites).forEach(s => { per[s] = (per[s] || 0) + 1; }); });
+        for (const [s, n] of Object.entries(per)) {
+          if (n < 3 || (W[cid] && W[cid].sites[s])) continue;
+          const ailleurs = !!W[cid];
+          const x = S(s); x.dec++; out.tot.dec++; if (ailleurs) { x.decAilleurs++; out.tot.decAilleurs++; }
+          out.decList.push({ cid, site: s, ailleurs, rupt: kbWbClientRupt(I, cid, s, m) });
+        }
+      }
+      return (I.segCache[m] = out);
+    }
+    // % de manquants sur les 3 dernières semaines où le client a commandé sur ce lieu (avant la semaine m)
+    function kbWbClientRupt(I, cid, s, m) {
+      let c = 0, mq = 0, n = 0, known = false;
+      for (let i = 1; i <= 12 && n < 3; i++) {
+        const w = I.wk[addDays(m, -7 * i)]; const e = w && w[cid] && w[cid].sites[s]; if (!e) continue;
+        n++; c += e[0]; mq += e[2]; if (e[3]) known = true;
+      }
+      return known && (c + mq) ? mq / (c + mq) * 100 : null;
+    }
+    // Effet des ruptures : clients touchés la semaine m0 → reviennent-ils la semaine suivante ?
+    function kbWbRuptRetour(I, m0) {
+      const W0 = I.wk[m0], W1 = I.wk[addDays(m0, 7)];
+      if (!W0 || !W1) return null;
+      const t = { n: 0, back: 0, pm: 0 }, o = { n: 0, back: 0 }, h = { n: 0, back: 0 };
+      let known = false;
+      for (const [cid, c] of Object.entries(W0)) {
+        if (!c.hasM) continue; known = true;
+        const pct = (c.cents + c.manq) ? c.manq / (c.cents + c.manq) * 100 : 0;
+        const g = c.manq > 0 ? t : o; g.n++; if (W1[cid]) g.back++;
+        if (c.manq > 0) t.pm += c.cents;
+        if (pct >= KB_WB_SEUIL_RUPT) { h.n++; if (W1[cid]) h.back++; }
+      }
+      if (!known || !t.n || !o.n) return null;
+      const rt = t.back / t.n, ro = o.back / o.n, rh = h.n ? h.back / h.n : null;
+      const panier = t.n ? t.pm / t.n : 0;
+      const perdus = Math.max(0, (ro - rt) * t.n);
+      return { m0, touches: t.n, rt, ro, fort: h.n, rh, perdus, cout: Math.round(perdus * panier) };
+    }
+    function kbWbMoy4(I, s, mon, off) {
+      // moyenne des commandes du lieu sur les 4 semaines précédentes hors vacances (mêmes jours)
+      const vals = [];
+      for (let i = 1; i <= 10 && vals.length < 4; i++) {
+        const f = addDays(mon, -7 * i), t = addDays(f, off);
+        if (kbWbCtx(f, t).vac.length) continue;
+        const r = kbWbSum(I, f, t); if (!r.nd) continue;
+        vals.push(s ? ((r.sites[s] || {}).cmd || 0) : r.cmd);
+      }
+      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    }
+    function kbWeekBilan(I, mon, today) {
+      const sun = addDays(mon, 6);
+      const inWk = I.list.filter(x => x.dk >= mon && x.dk <= sun && x.dk <= today).map(x => x.dk);
+      const end = inWk.length ? inWk[inWk.length - 1] : sun;
+      const off = kbDaysBetween(mon, end);
+      const A = kbWbSum(I, mon, end);
+      const pF = addDays(mon, -7), pT = addDays(pF, off), P = kbWbSum(I, pF, pT);
+      const nM = addDays(mon, -364), nT = addDays(nM, off), N = kbWbSum(I, nM, nT);
+      const ctx = { A: kbWbCtx(mon, end), P: kbWbCtx(pF, pT), N: kbWbCtx(nM, nT) };
+      const segA = kbWbSeg(I, mon), segP = kbWbSeg(I, pF), segN = kbWbSeg(I, nM);
+      const R = { mon, sun, end, off, partial: end < sun && today <= sun, A, P, N, pF, pT, nM, nT, ctx, segA, segP, segN };
+      R.ref = N.nd && N.ca ? 'N' : (P.nd ? 'P' : null);
+      R.refLbl = R.ref === 'N' ? 'N-1' : 'S-1';
+      // ---- 8 dernières semaines (+ N-1) ----
+      R.weeks = [];
+      for (let i = 7; i >= 0; i--) {
+        const m = addDays(mon, -7 * i), last = i === 0, t = last ? end : addDays(m, 6), o = kbDaysBetween(m, t);
+        const a = kbWbSum(I, m, t), n = kbWbSum(I, addDays(m, -364), addDays(addDays(m, -364), o));
+        const vacD = []; for (let k = m; k <= addDays(m, 6); k = kbShiftKey(k, 1)) if (kbDayCtx(k).vac) vacD.push(k);
+        R.weeks.push({ m, t: addDays(m, 6), ca: a.ca, cmd: a.cmd, n1: n.nd ? n.ca : null, vac: vacD.length >= 3, cur: last });
+      }
+      // ---- points de vente ----
+      const all = new Set([...Object.keys(A.sites), ...Object.keys(R.ref === 'N' ? N.sites : P.sites)]);
+      const B = R.ref === 'N' ? N : P, segB = R.ref === 'N' ? segN : segP;
+      let rows = [...all].map(s => {
+        const a = A.sites[s] || { ca: 0, cmd: 0, cl: new Set() }, b = B.sites[s] || { ca: 0, cmd: 0, cl: new Set() };
+        const sa = segA && segA.sites[s] || null, sb = segB && segB.sites[s] || null;
+        const dec4 = [0, 1, 2, 3].reduce((t, i) => { const g = kbWbSeg(I, addDays(mon, -7 * i)); return t + ((g && g.sites[s] && g.sites[s].dec) || 0); }, 0);
+        return { s, ca: a.ca, caB: b.ca, cmd: a.cmd, cmdB: b.cmd, moy: kbWbMoy4(I, s, mon, off), sa, sb, dec4 };
+      }).filter(r => r.ca || r.caB);
+      const tot = A.ca || 1;
+      const big = rows.filter(r => r.ca / tot >= 0.04 || r.caB / (B.ca || 1) >= 0.06).sort((x, y) => y.ca - x.ca);
+      const small = rows.filter(r => !big.includes(r));
+      if (small.length) {
+        const add = (k) => small.reduce((t, r) => t + (r[k] || 0), 0);
+        const sg = (key, f) => small.some(r => r[key]) ? ['fid', 'occ', 'nouv', 'dec'].reduce((o, k) => { o[k] = small.reduce((t, r) => t + ((r[key] && r[key][k]) || 0), 0); return o; }, {}) : null;
+        big.push({ s: `Petits (${small.length})`, petits: small.map(r => r.s), ca: add('ca'), caB: add('caB'), cmd: add('cmd'), cmdB: add('cmdB'),
+          moy: small.every(r => r.moy == null) ? null : small.reduce((t, r) => t + (r.moy || 0), 0), sa: sg('sa'), sb: sg('sb'), dec4: add('dec4'), group: true, members: small });
+      }
+      R.rows = big;
+      // ---- ruptures ----
+      R.manqTop = Object.values(A.manqProd).sort((x, y) => y.cents - x.cents).slice(0, 6);
+      R.retour = kbWbRuptRetour(I, R.partial ? addDays(mon, -14) : addDays(mon, -7));
+      // décrochages des 4 dernières semaines × ruptures
+      const dl = []; [0, 1, 2, 3].forEach(i => { const g = kbWbSeg(I, addDays(mon, -7 * i)); if (g) dl.push(...g.decList); });
+      const wR = dl.filter(x => x.rupt != null);
+      R.dec4 = { n: dl.length, ailleurs: dl.filter(x => x.ailleurs).length, known: wR.length, fort: wR.filter(x => x.rupt > KB_WB_SEUIL_RUPT).length };
+      // référence : fidèles toujours actifs cette semaine — part d'entre eux > seuil sur leurs 3 dernières commandes
+      if (segA && I.wk[mon]) {
+        let n = 0, f = 0;
+        const prev = [1, 2, 3, 4].map(i => I.wk[addDays(mon, -7 * i)] || null);
+        for (const [cid, c] of Object.entries(I.wk[mon])) {
+          if (!kbWbFid(I, cid, mon)) continue;
+          for (const s of Object.keys(c.sites)) { const r = kbWbClientRupt(I, cid, s, mon); if (r == null) continue; n++; if (r > KB_WB_SEUIL_RUPT) f++; }
+        }
+        R.dec4.fidRef = n ? f / n * 100 : null;
+      }
+      // clients touchés cette semaine
+      const Wc = I.wk[mon];
+      if (Wc) { const L = Object.values(Wc).filter(c => c.hasM); R.touches = L.length ? { n: L.filter(c => c.manq > 0).length, sur: L.length, fort: L.filter(c => (c.cents + c.manq) && c.manq / (c.cents + c.manq) * 100 >= KB_WB_SEUIL_RUPT).length } : null; }
+      R.head = kbWbHead(R);
+      R.text = kbWbText(R);
+      return R;
+    }
+    const kbWbP = (a, b) => (b ? (a - b) / b * 100 : null);
+    const kbWbPt = (p, d) => p == null ? 'n/d' : `${p > 0 ? '+' : p < 0 ? '−' : ''}${Math.abs(p).toFixed(d || 0).replace('.', ',')} %`;
+    const kbWbK = (c) => { const v = (c || 0) / 100; return Math.abs(v) >= 1000 ? (v / 1000).toFixed(1).replace('.', ',') + ' k€' : Math.round(v).toLocaleString('fr-FR') + ' €'; };
+    const kbWbKs = (c) => (c > 0 ? '+' : c < 0 ? '−' : '') + kbWbK(Math.abs(c));
+    const kbWbE2 = (c) => ((c || 0) / 100).toFixed(2).replace('.', ',') + ' €';
+    function kbWbHead(R) {
+      const B = R.ref === 'N' ? R.N : R.P, A = R.A;
+      if (!R.ref || !A.nd) return { title: A.nd ? 'Semaine sans comparaison' : 'Pas encore de distribution cette semaine', sent: '', tone: 'flat' };
+      const dCa = kbWbP(A.ca, B.ca), dCmd = kbWbP(A.cmd, B.cmd), dPan = kbWbP(A.pm, B.pm);
+      const tone = dCa >= 2 ? 'up' : dCa <= -2 ? 'down' : 'flat';
+      const title = `Semaine ${tone === 'up' ? 'en hausse' : tone === 'down' ? 'en recul' : 'stable'} (${kbWbPt(dCa)} vs ${R.refLbl})`;
+      const pP = `le panier ${dPan >= 0 ? 'en hausse' : 'en baisse'} (${kbWbPt(dPan)})`, cP = `${dCmd >= 0 ? 'le gain' : 'la perte'} de commandes (${kbWbPt(dCmd)})`;
+      let sent;
+      if (dCmd < -1 && dPan > 1) sent = dCa < 0 ? `${kbCap(pP)} ne compense pas ${cP}` : `${kbCap(pP)} compense ${cP}`;
+      else if (dCmd > 1 && dPan < -1) sent = dCa >= 0 ? `Plus de commandes (${kbWbPt(dCmd)}) malgré un panier plus petit (${kbWbPt(dPan)})` : `Le panier en baisse (${kbWbPt(dPan)}) efface le gain de commandes (${kbWbPt(dCmd)})`;
+      else if (dCmd >= -1 && dPan >= -1) sent = `Commandes (${kbWbPt(dCmd)}) et panier (${kbWbPt(dPan)}) ${dCmd > 1 || dPan > 1 ? 'en hausse' : 'stables'}`;
+      else sent = `Commandes (${kbWbPt(dCmd)}) et panier (${kbWbPt(dPan)}) en baisse`;
+      // où se concentre l'écart de commandes ?
+      const rows = (R.rows || []).filter(r => !r.group && r.cmdB);
+      const sg = Math.sign(A.cmd - B.cmd);
+      if (sg && rows.length) {
+        const top = rows.map(r => ({ ...r, d: r.cmd - r.cmdB })).filter(r => Math.sign(r.d) === sg).sort((x, y) => sg * (y.d - x.d)).slice(0, 2);
+        const totD = A.cmd - B.cmd;
+        if (top.length && Math.abs(top.reduce((t, r) => t + r.d, 0)) >= Math.abs(totD) * 0.5) {
+          const segs = top.map(r => r.sa && r.sb ? ['fid', 'occ', 'nouv'].map(k => [k, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => sg * (y[1] - x[1]))[0][0] : null);
+          const same = segs[0] && segs.every(x => x === segs[0]);
+          const lbl = { fid: 'fidèles', occ: 'occasionnels', nouv: 'nouveaux clients' };
+          sent += `, ${sg < 0 ? 'concentrée' : 'portée surtout'} ${same ? `par les ${lbl[segs[0]]} de` : 'à'} ${top.map(r => r.s).join(' et ')}`.replace(`${sg < 0 ? 'concentrée' : 'portée surtout'} par les`, sg < 0 ? 'concentrée chez les' : 'portée surtout par les');
+        }
+      }
+      return { title, sent: sent + '.', tone, dCa, dCmd, dPan };
+    }
+    function kbCap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
+    function kbWbText(R) {
+      const out = [], A = R.A, B = R.ref === 'N' ? R.N : R.P;
+      if (!R.ref || !A.nd) return out;
+      // pont de l'écart
+      const eff1 = Math.round((A.cmd - B.cmd) * B.pm), eff2 = Math.round((A.pm - B.pm) * A.cmd);
+      out.push({ k: 'pont', t: `Écart vs ${R.refLbl} : ${kbWbKs(A.ca - B.ca)} = effet commandes (${A.cmd - B.cmd >= 0 ? '+' : '−'}${Math.abs(A.cmd - B.cmd)} × ${kbWbE2(B.pm)} de panier ${R.refLbl} = ${kbWbKs(eff1)}) + effet panier (${A.pm - B.pm >= 0 ? '+' : '−'}${kbWbE2(Math.abs(A.pm - B.pm))} × ${A.cmd} = ${kbWbKs(eff2)}).` });
+      if (R.ref === 'N') {
+        const open = Object.keys(B.sites).filter(s => (B.sites[s].ca || 0) > 0);
+        const a = open.reduce((t, s) => t + ((A.sites[s] || {}).ca || 0), 0), b = open.reduce((t, s) => t + (B.sites[s].ca || 0), 0);
+        const neu = Object.keys(A.sites).filter(s => !open.includes(s)), nc = neu.reduce((t, s) => t + (A.sites[s].ca || 0), 0);
+        out.push({ k: 'perim', t: `Sur les seuls points ouverts en N-1 : ${kbWbK(a)} contre ${kbWbK(b)} (${kbWbPt(kbWbP(a, b))})${neu.length ? ` ; les nouveaux points (${neu.join(', ')}) apportent ${kbWbK(nc)}` : ''}.` });
+      }
+      // lieux : qui perd / gagne et quels clients
+      const rows = (R.rows || []).filter(r => !r.group && r.cmdB);
+      const dn = rows.map(r => ({ ...r, d: r.cmd - r.cmdB })).filter(r => r.d <= -10 || (r.cmdB && r.d / r.cmdB <= -0.1)).sort((x, y) => x.d - y.d).slice(0, 3);
+      const up = rows.map(r => ({ ...r, d: r.cmd - r.cmdB })).filter(r => r.d >= 10 || (r.cmdB && r.d / r.cmdB >= 0.1)).sort((x, y) => y.d - x.d).slice(0, 3);
+      const segTxt = (r) => { if (!r.sa || !r.sb) return ''; const L = [['fid', 'fidèles'], ['occ', 'occasionnels'], ['nouv', 'nouveaux']].map(([k, l]) => [l, (r.sa[k] || 0) - (r.sb[k] || 0)]).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1])); return L[0][1] ? `${L[0][1] > 0 ? 'gagne' : 'perd'} surtout des ${L[0][0]} (${L[0][1] > 0 ? '+' : ''}${L[0][1]})` : ''; };
+      if (dn.length) out.push({ k: 'dn', t: `Vs ${R.refLbl}, en baisse : ` + dn.map(r => `${r.s} (${r.d} commandes${segTxt(r) ? ', ' + segTxt(r) : ''})`).join(' · ') + '.' });
+      if (up.length) out.push({ k: 'up', t: `En hausse : ` + up.map(r => `${r.s} (+${r.d} commandes${segTxt(r) ? ', ' + segTxt(r) : ''})`).join(' · ') + '.' });
+      // décrochages × ruptures
+      const D = R.dec4;
+      if (D && D.n) {
+        let t = `Sur 4 semaines, ${D.n} décrochage${D.n > 1 ? 's' : ''} (clients réguliers d'un lieu qui ne sont pas venus)`;
+        if (D.known >= 5) t += ` : ${D.fort} sur ${D.known} avaient eu plus de ${KB_WB_SEUIL_RUPT} % de manquants sur leurs 3 dernières commandes` + (D.fidRef != null ? `, contre ${Math.round(D.fidRef)} % des fidèles restés actifs` : '') + (D.known < 30 ? ' (signal à confirmer, effectifs faibles)' : '');
+        else t += ' — lien avec les ruptures : données insuffisantes (recharger l\'historique CA multi-dates pour avoir les manquants par client)';
+        if (D.ailleurs) t += ` ; ${D.ailleurs} commande${D.ailleurs > 1 ? 'nt' : ''} désormais sur un autre point`;
+        out.push({ k: 'dec', t: t + '.' });
+      }
+      // petits points
+      const g = (R.rows || []).find(r => r.group);
+      if (g && g.members) {
+        const mv = g.members.filter(r => r.moy != null && r.moy >= 3 && Math.abs(r.cmd - r.moy) / r.moy >= 0.3).map(r => `${r.s} ${r.cmd} cmd (moy. ${Math.round(r.moy)})`);
+        out.push({ k: 'petits', t: `Petits points (${g.members.map(r => r.s).join(', ')}) : ${kbWbK(g.ca)} (${kbWbPt(kbWbP(g.ca, g.caB))} vs ${R.refLbl})` + (mv.length ? ` — écarts nets vs moyenne 4 sem. : ${mv.join(' · ')}.` : ' — rien au-delà des seuils.') });
+      }
+      return out;
+    }
+    // ---------- affichage ----------
+    function KbWbChart({ weeks, h }) {
+      const W = 640, H = h || 190, padL = 34, padB = 34, padT = 14, iw = W - padL - 6, ih = H - padB - padT;
+      const max = Math.max(1, ...weeks.map(w => Math.max(w.ca || 0, w.n1 || 0)));
+      const step = max > 2500000 ? 1000000 : max > 1200000 ? 500000 : 200000; // centimes
+      const top = Math.ceil(max / step) * step, y = (v) => padT + ih - (v / top) * ih;
+      const bw = iw / weeks.length, ticks = []; for (let v = 0; v <= top; v += step) ticks.push(v);
+      const pts = weeks.map((w, i) => w.n1 == null ? null : [padL + bw * i + bw / 2, y(w.n1)]);
+      const d = pts.reduce((s, p, i) => p ? s + (s && pts[i - 1] ? ' L' : ' M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1) : s, '');
+      const lbl = (k) => k.slice(8, 10) + '/' + k.slice(5, 7);
+      return (
+        <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label="CA des 8 dernières semaines et N-1">
+          {ticks.map(v => <g key={v}><line x1={padL} x2={W - 4} y1={y(v)} y2={y(v)} stroke="#e6e6e6" /><text x={padL - 4} y={y(v) + 4} fontSize="11" textAnchor="end" fill="#888">{Math.round(v / 100000)} k€</text></g>)}
+          {weeks.map((w, i) => { const x = padL + bw * i + bw * 0.14, bh = Math.max(1, padT + ih - y(w.ca || 0)); const col = w.vac ? '#bdbdbd' : w.cur ? '#1565c0' : '#42a5f5';
+            return <g key={w.m}>
+              <rect x={x} y={y(w.ca || 0)} width={bw * 0.72} height={bh} rx="3" fill={col}><title>{`Sem. du ${lbl(w.m)} : ${kbWbK(w.ca)}${w.n1 != null ? ' · N-1 ' + kbWbK(w.n1) : ''}${w.vac ? ' · vacances' : ''}`}</title></rect>
+              {w.cur && w.ca > 0 && <text x={x + bw * 0.36} y={y(w.ca) + 15} fontSize="11.5" fontWeight="700" textAnchor="middle" fill="#fff">{(w.ca / 100000).toFixed(1).replace('.', ',')}</text>}
+              {w.cur && w.ca > 0 && <text x={x + bw * 0.36} y={y(w.ca) + 28} fontSize="10" textAnchor="middle" fill="#fff">k€</text>}
+              <text x={x + bw * 0.36} y={H - padB + 14} fontSize="10.5" textAnchor="middle" fill="#666">{lbl(w.m)}</text>
+              <text x={x + bw * 0.36} y={H - padB + 27} fontSize="10.5" textAnchor="middle" fill="#666">{lbl(w.t)}</text>
+            </g>; })}
+          {d && <path d={d} fill="none" stroke="#e64a19" strokeWidth="2" strokeDasharray="6 5" />}
+          {pts.map((p, i) => p && <circle key={i} cx={p[0]} cy={p[1]} r="3" fill="#e64a19" />)}
+        </svg>
+      );
+    }
+    function KbWbArrow({ p, goodUp = true, pt }) {
+      if (p == null || isNaN(p)) return <span style={{ color: 'var(--ink-mute)' }}>—</span>;
+      const z = pt ? Math.abs(p) < 0.1 : Math.abs(p) < 0.5;
+      const good = z ? null : (p > 0) === goodUp;
+      const c = z ? 'var(--ink-mute)' : good ? '#2e7d32' : 'var(--danger)';
+      const txt = pt ? `${Math.abs(p).toFixed(1).replace('.', ',')} pt${Math.abs(p) >= 2 ? 's' : ''}` : `${Math.abs(Math.round(p))} %`;
+      return <span style={{ color: c, fontWeight: 700, whiteSpace: 'nowrap' }}>{z ? '= ' : p > 0 ? '▲ ' : '▼ '}{txt}</span>;
+    }
+    function KbWbTable({ R }) {
+      const A = R.A, P = R.P, N = R.N;
+      const L = [
+        ['CA livré', kbWbK(A.ca), kbWbP(A.ca, P.ca), N.nd ? kbWbP(A.ca, N.ca) : null, true],
+        ['Commandes', A.cmd, kbWbP(A.cmd, P.cmd), N.nd ? kbWbP(A.cmd, N.cmd) : null, true],
+        ['Clients', A.cl == null ? '—' : A.cl, A.cl != null && P.cl ? kbWbP(A.cl, P.cl) : null, A.cl != null && N.cl ? kbWbP(A.cl, N.cl) : null, true],
+        ['Panier moyen', Math.round(A.pm / 100) + ' €', kbWbP(A.pm, P.pm), N.nd ? kbWbP(A.pm, N.pm) : null, true],
+        ['Manquants', A.tx.toFixed(1).replace('.', ',') + ' %', P.nd ? A.tx - P.tx : null, N.nd ? A.tx - N.tx : null, false, true],
+      ];
+      const td = { padding: '7px 6px', borderBottom: '1px solid var(--line)', fontSize: 14 };
+      const lbl = (a, b) => kbRangeLbl(a, b);
+      return (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
+              <th style={{ ...td, textAlign: 'left', fontSize: 12 }}></th><th style={{ ...td, textAlign: 'right', fontSize: 12 }}>Semaine</th>
+              <th style={{ ...td, textAlign: 'right', fontSize: 12 }}>vs S-1</th><th style={{ ...td, textAlign: 'right', fontSize: 12 }}>vs N-1</th></tr></thead>
+            <tbody>{L.map(([l, v, p1, p2, up, pt]) => (
+              <tr key={l}><td style={td}>{l}</td><td style={{ ...td, textAlign: 'right', fontWeight: 700 }}>{v}</td>
+                <td style={{ ...td, textAlign: 'right' }}><KbWbArrow p={p1} goodUp={up} pt={pt} /></td>
+                <td style={{ ...td, textAlign: 'right' }}><KbWbArrow p={p2} goodUp={up} pt={pt} /></td></tr>))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 4 }}>
+            S-1 = {lbl(R.pF, R.pT)} · N-1 = {N.nd ? lbl(R.nM, R.nT) : 'pas de données ' + lbl(R.nM, R.nT)}{R.partial ? ' · semaine en cours : mêmes jours comparés' : ''}. {kbWbCtxTxt(R)}
+          </div>
+        </div>
+      );
+    }
+    function kbWbCtxTxt(R) {
+      const c = R.ctx, f = (x) => x.vac.length ? x.vac.join(', ') : null;
+      const parts = [];
+      const va = f(c.A), vp = f(c.P), vn = f(c.N);
+      if (!va && !vp && !vn) parts.push('Pas de vacances cette semaine, ni en S-1 ni en N-1');
+      else parts.push(`Vacances : ${va ? 'cette semaine (' + va + ')' : 'pas cette semaine'}${vp ? ' · S-1 (' + vp + ')' : ''}${vn ? ' · N-1 (' + vn + ')' : ''}`);
+      const fa = c.A.fer.map(k => k.slice(8, 10) + '/' + k.slice(5, 7)), fn = c.N.fer.map(k => k.slice(8, 10) + '/' + k.slice(5, 7));
+      if (fa.length && fa.join() === fn.join()) parts.push(`jour férié le ${fa.join(', ')} les deux années`);
+      else { if (fa.length) parts.push(`férié le ${fa.join(', ')}`); if (fn.length) parts.push(`férié N-1 le ${fn.join(', ')}`); }
+      return parts.join(' ; ') + '.';
+    }
+    function KbWbHead({ R }) {
+      const H = R.head, col = H.tone === 'up' ? '#2e7d32' : H.tone === 'down' ? '#c62828' : '#555';
+      return (
+        <div>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Semaine du {formatDateShort(R.mon)} au {formatDateShort(R.sun)}{R.partial ? ` (jusqu'au ${formatDateShort(R.end)})` : ''} · comparée à S-1 et N-1</div>
+          <div style={{ fontSize: 13, fontWeight: 800, color: col, marginTop: 6 }}>{H.title}</div>
+          {H.sent && <div style={{ fontSize: 17, fontWeight: 700, lineHeight: 1.3, marginTop: 2 }}>{H.sent}</div>}
+        </div>
+      );
+    }
+    function KbWbSites({ R }) {
+      const td = { padding: '7px 5px', borderBottom: '1px solid var(--line)', fontSize: 13.5, verticalAlign: 'top' };
+      const segC = (r, k) => { const a = r.sa ? r.sa[k] || 0 : null, b = r.sb ? r.sb[k] || 0 : null; if (a == null) return '—';
+        return <span style={{ whiteSpace: 'nowrap' }}>{a} {b != null && a !== b ? <span style={{ color: (a > b) ? '#2e7d32' : 'var(--danger)', fontSize: 11 }}>{a > b ? '▲' : '▼'}</span> : null}</span>; };
+      return (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 520 }}>
+            <thead><tr style={{ fontSize: 11.5, color: 'var(--ink-mute)' }}>
+              {['Point', 'CA', 'Cdes vs moy.', 'Fidèles', 'Occas.', 'Nouv.', 'Décroch. sem./4 s.'].map((h, i) => <th key={h} style={{ ...td, fontSize: 11.5, textAlign: i ? 'right' : 'left' }}>{h}</th>)}</tr></thead>
+            <tbody>{R.rows.map(r => (
+              <tr key={r.s}>
+                <td style={{ ...td, fontWeight: 700 }}>{r.s}{r.group && <div style={{ fontSize: 10.5, fontWeight: 400, color: 'var(--ink-mute)' }}>{r.petits.join(' ')}</div>}</td>
+                <td style={{ ...td, textAlign: 'right' }}><b>{kbWbK(r.ca)}</b><div style={{ fontSize: 11 }}><KbWbArrow p={r.caB ? kbWbP(r.ca, r.caB) : null} /> <span style={{ color: 'var(--ink-mute)' }}>{R.refLbl}</span></div></td>
+                <td style={{ ...td, textAlign: 'right' }}><b>{r.cmd}</b><div style={{ fontSize: 11 }}>{r.moy ? <KbWbArrow p={kbWbP(r.cmd, r.moy)} /> : '—'}</div></td>
+                <td style={{ ...td, textAlign: 'right' }}>{segC(r, 'fid')}</td><td style={{ ...td, textAlign: 'right' }}>{segC(r, 'occ')}</td><td style={{ ...td, textAlign: 'right' }}>{segC(r, 'nouv')}</td>
+                <td style={{ ...td, textAlign: 'right' }}>{r.sa ? `${r.sa.dec || 0} / ${r.dec4}` : '—'}</td>
+              </tr>))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 4 }}>Cdes vs moyenne des 4 semaines hors vacances (mêmes jours). Segments : clients de la semaine, flèche vs même semaine {R.refLbl}. Fidèle = au moins 4 commandes sur les 12 semaines précédentes · Nouveau = jamais vu avant · Décrochage = régulier du lieu (3 des 4 semaines) absent cette semaine.{R.segA && !R.segA.histOk ? ' ⚠️ Historique client court : « nouveaux » surestimés (recharger l\'historique CA multi-dates).' : ''}</div>
+        </div>
+      );
+    }
+    function KbWbRuptures({ R }) {
+      const A = R.A, P = R.P, N = R.N, T = R.touches, Rt = R.retour;
+      const b = { padding: '10px 12px', borderRadius: 10, background: '#fafafa', border: '1px solid var(--line)' };
+      return (
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: 10 }}>
+            <div style={b}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 600 }}>💸 CA perdu (ruptures)</div>
+              <div style={{ fontSize: 24, fontWeight: 700 }}>{kbWbK(A.manq)}</div>
+              <div style={{ fontSize: 12 }}>{A.tx.toFixed(1).replace('.', ',')} % du commandé · S-1 {P.nd ? P.tx.toFixed(1).replace('.', ',') + ' %' : '—'} · N-1 {N.nd ? N.tx.toFixed(1).replace('.', ',') + ' %' : '—'}</div></div>
+            <div style={b}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 600 }}>👥 Clients touchés cette semaine</div>
+              {T ? <><div style={{ fontSize: 24, fontWeight: 700 }}>{T.n} <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-mute)' }}>/ {T.sur} ({Math.round(100 * T.n / (T.sur || 1))} %)</span></div>
+                <div style={{ fontSize: 12 }}>dont {T.fort} avec ≥ {KB_WB_SEUIL_RUPT} % de leur commande manquante</div></>
+                : <div style={{ fontSize: 13 }}>Pas de détail par client (recharger l'historique CA)</div>}</div>
+            <div style={b}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 600 }}>↩️ Reviennent la semaine suivante ?</div>
+              {Rt ? <><div style={{ fontSize: 15, fontWeight: 700, marginTop: 2 }}>Touchés {Math.round(Rt.rt * 100)} % · non touchés {Math.round(Rt.ro * 100)} %</div>
+                <div style={{ fontSize: 12 }}>{Rt.rh != null ? `fortement touchés (≥ ${KB_WB_SEUIL_RUPT} %) : ${Math.round(Rt.rh * 100)} % · ` : ''}sem. du {formatDateShort(Rt.m0)} → suivante</div>
+                {Rt.perdus >= 1 && <div style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--danger)', marginTop: 2 }}>≈ {Math.round(Rt.perdus)} client(s) de moins → ≈ {kbWbK(Rt.cout)} de CA indirect</div>}</>
+                : <div style={{ fontSize: 13 }}>Pas encore assez de données par client</div>}</div>
+          </div>
+          {R.manqTop.length > 0 && <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 700 }}>Principales ruptures de la semaine</div>
+            {R.manqTop.map(p => <div key={p.produit} style={{ fontSize: 13, padding: '3px 0', borderBottom: '1px dashed var(--line)' }}>
+              <b>{p.produit}</b> <span style={{ color: 'var(--ink-mute)' }}>{p.producteur}</span> — {kbWbK(p.cents)} · {p.qty} u. · {p.days} jour{p.days > 1 ? 's' : ''}
+              {Object.keys(p.sites).length > 0 && <span style={{ color: 'var(--ink-soft)' }}> · {Object.entries(p.sites).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([s, q]) => `${s} ${q}`).join(' · ')}</span>}
+            </div>)}
+          </div>}
+          <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 6 }}>CA indirect = (taux de retour des non touchés − taux des touchés) × clients touchés × leur panier. Estimation : d'autres causes jouent (vacances, météo…).</div>
+        </div>
+      );
+    }
+    function KbWeekBilanCard({ docs, full, onMore }) {
+      const today = todayKey();
+      const I = React.useMemo(() => docs ? kbWbIndex(docs) : null, [docs]);
+      const defMon = React.useMemo(() => {
+        if (!I) return kbMondayOf(today);
+        const m = kbMondayOf(today);
+        return I.list.some(x => x.dk >= m && x.dk <= today) ? m : addDays(m, -7);
+      }, [I, today]);
+      const [mon, setMon] = React.useState(null);
+      const M = mon || defMon;
+      const R = React.useMemo(() => I && I.list.length ? kbWeekBilan(I, M, today) : null, [I, M, today]);
+      const [copied, setCopied] = React.useState(false);
+      if (!docs) return <div className="card" style={{ padding: 14 }}>📅 Bilan semaine : chargement…</div>;
+      if (!R) return <div className="card" style={{ padding: 14, fontSize: 13 }}>📅 Pas encore d'historique CA (Chargement → Historique CA).</div>;
+      const copy = () => {
+        const L = [`Semaine du ${formatDateShort(R.mon)} au ${formatDateShort(R.sun)}`, R.head.title, R.head.sent, '',
+          `CA livré ${kbWbK(R.A.ca)} · ${R.A.cmd} commandes · ${R.A.cl == null ? '' : R.A.cl + ' clients · '}panier ${Math.round(R.A.pm / 100)} € · manquants ${R.A.tx.toFixed(1).replace('.', ',')} %`,
+          ...R.text.map(x => x.t), '', 'Points de vente :', ...R.rows.map(r => `${r.s} : ${kbWbK(r.ca)} (${kbWbPt(kbWbP(r.ca, r.caB))} ${R.refLbl}) · ${r.cmd} cmd${r.sa ? ` · fidèles ${r.sa.fid || 0} · occas. ${r.sa.occ || 0} · nouv. ${r.sa.nouv || 0} · décroch. ${r.sa.dec || 0}/${r.dec4}` : ''}`)];
+        try { navigator.clipboard.writeText(L.join('\n')); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) {}
+      };
+      const nav = (n) => setMon(addDays(M, 7 * n));
+      return (
+        <div className="card" style={{ padding: '12px 14px', borderTop: '5px solid ' + (R.head.tone === 'up' ? '#2e7d32' : R.head.tone === 'down' ? '#c62828' : '#9e9e9e') }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+            <div style={{ fontSize: 17, fontWeight: 700 }}>📅 Bilan semaine</div>
+            {full && <><button className="btn-ghost" style={{ fontSize: 13, padding: '4px 10px' }} onClick={() => nav(-1)}>◀</button>
+              <button className="btn-ghost" style={{ fontSize: 13, padding: '4px 10px' }} disabled={addDays(M, 7) > today} onClick={() => nav(1)}>▶</button>
+              {mon && <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => setMon(null)}>↩ dernière</button>}
+              <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={copy}>{copied ? '✓ Copié' : '📋 Copier'}</button></>}
+            {!full && onMore && <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={onMore}>Bilan complet ›</button>}
+          </div>
+          <KbWbHead R={R} />
+          <div style={{ marginTop: 10 }}><KbWbTable R={R} /></div>
+          <div style={{ marginTop: 12, fontSize: 13, fontWeight: 700 }}>CA livré sur 8 semaines</div>
+          <KbWbChart weeks={R.weeks} />
+          <div style={{ display: 'flex', gap: 14, fontSize: 11.5, color: 'var(--ink-mute)', flexWrap: 'wrap' }}>
+            <span><span style={{ display: 'inline-block', width: 10, height: 10, background: '#1565c0', borderRadius: 2 }} /> {R.mon.slice(0, 4)}</span>
+            <span><span style={{ display: 'inline-block', width: 10, height: 10, background: '#bdbdbd', borderRadius: 2 }} /> vacances</span>
+            <span><span style={{ display: 'inline-block', width: 16, borderTop: '2px dashed #e64a19', verticalAlign: 'middle' }} /> N-1</span>
+          </div>
+          {full && <>
+            {R.text.filter(x => x.k === 'pont' || x.k === 'perim').map(x => <div key={x.k} style={{ fontSize: 13.5, marginTop: 8 }}>{x.t}</div>)}
+            <div style={{ marginTop: 14, fontSize: 15, fontWeight: 700 }}>Points de vente</div>
+            <KbWbSites R={R} />
+            {R.text.filter(x => !['pont', 'perim'].includes(x.k)).map(x => <div key={x.k} style={{ fontSize: 13.5, marginTop: 8, lineHeight: 1.4 }}>{x.t}</div>)}
+            <div style={{ marginTop: 14, fontSize: 15, fontWeight: 700 }}>🚫 Ruptures et leur effet</div>
+            <KbWbRuptures R={R} />
+          </>}
+        </div>
+      );
+    }
     function KbHomeStats({ goSub }) {
       const [docs, setDocs] = React.useState(null);
       const [open, setOpen] = React.useState('');
@@ -26375,40 +26872,30 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 2 }}>{sub} : {eur(prev.ca)} · {prev.cmd} cmd</div>
         </div>
       );
-      const maxW = Math.max(1, ...S.weeks.map(w => w.ca));
+      const more = () => { try { localStorage.setItem('kb_ca_view', 'bilan'); } catch (_) {} goSub('ca'); };
       return (
+        <>
+        <KbWeekBilanCard docs={docs} onMore={more} />
         <div className="card" style={{ padding: '12px 14px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <div style={{ fontSize: 17, fontWeight: 700 }}>📈 Clients & CA</div>
-            <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => goSub('ca')}>Suivi CA ›</button>
+            <div style={{ fontSize: 17, fontWeight: 700 }}>🆕 Nouveaux clients</div>
+            <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={more}>Bilan complet ›</button>
           </div>
           {cst === undefined ? <div style={{ fontSize: 13 }}>Clients : chargement…</div>
             : !C ? <div style={{ fontSize: 13, padding: '8px 10px', borderRadius: 8, background: '#fff4e5', fontWeight: 600 }}>🆕 Nouveaux clients : recharge le fichier <b>Consommateurs</b> (Chargement) pour activer les stats (dates d'inscription et de 1re commande).</div>
             : <>
-              <div style={{ fontSize: 13, fontWeight: 700, margin: '2px 0 6px' }}>🆕 Nouveaux clients <span style={{ fontWeight: 500, color: 'var(--ink-mute)' }}>· fichier clients du {formatDateShort(C.fileDay)} ({C.total.toLocaleString('fr-FR')} comptes)</span></div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '0 0 6px' }}>fichier clients du {formatDateShort(C.fileDay)} ({C.total.toLocaleString('fr-FR')} comptes)</div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: 10 }}>
                 <NewTile k="iw" kind="ins" l={`✍️ Inscrits cette semaine (${kbRangeLbl(kbMondayOf(today), today)})`} x={C.ins.w} />
                 <NewTile k="fw" kind="fo" l={`🛒 1re commande cette semaine (${kbRangeLbl(kbMondayOf(today), today)})`} x={C.fo.w} />
               </div>
             </>}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, marginTop: 10 }}>
-            <CaTile l={`CA semaine (${kbRangeLbl(kbMondayOf(today), S.wMax)})`} now={S.wNow} prev={S.wPrev} sub={`vs ${kbRangeLbl(S.wPrevFrom, S.wPrevTo)}`} />
-          </div>
-          <div style={{ marginTop: 12, fontSize: 13, fontWeight: 700 }}>CA des 8 dernières semaines</div>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 110, marginTop: 6 }}>
-            {S.weeks.map((w, i) => { const cur = i === S.weeks.length - 1; return (
-              <div key={w.m} title={`Sem. du ${formatDateShort(w.m)} : ${eur(w.ca)} · ${w.cmd} cmd`} onClick={() => goSub('ca')} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', cursor: 'pointer', height: '100%', justifyContent: 'flex-end' }}>
-                <div style={{ fontSize: 10, fontWeight: 700, whiteSpace: 'nowrap' }}>{w.ca ? Math.round(w.ca / 100000) + 'k' : ''}</div>
-                <div style={{ width: '100%', height: Math.max(2, Math.round(80 * w.ca / maxW)), background: cur ? '#1565c0' : '#90caf9', borderRadius: '4px 4px 0 0' }} />
-                <div style={{ fontSize: 10, color: 'var(--ink-mute)', marginTop: 2 }}>{formatDateShort(w.m)}</div>
-              </div>
-            ); })}
-          </div>
           <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 8 }}>
-            CA = commandes livrées (après ruptures, prix plein ; remises boutique non déduites) · comparaisons à jours de distribution comparables · semaine en cours incluse jusqu'à la dernière date chargée.
+            CA = commandes livrées (après ruptures, prix plein ; remises boutique non déduites) · comparaisons à jours de distribution comparables.
             {' '}Inscrits = date de création du compte · 1re commande = first_order_date du fichier clients (à recharger pour être à jour).
           </div>
         </div>
+        </>
       );
     }
     // ============================================================
@@ -26544,7 +27031,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const fm = flAuto.meta || {}, fv = fm.ventes || {};
         if (fm.ventesErr) todo.push({ who: 'fl', lv: 'red', ic: '📊', t: 'Ventes 5h NON écrites dans COMMANDE FL', d: fm.ventesErr + ' — Rungis doit remplir la colonne D, ou relancer dans F&L', on: () => go('fl') });
         else { const fmi = kbFlaMissing(fm); if (fmi.list.length) todo.push({ who: 'fl', lv: 'red', ic: '📊', t: `${fmi.list.length} produit(s) vendu(s) pour le ${formatDateShort(fmi.day)} absent(s) de COMMANDE FL — Raimbaud doit mettre le Sheet à jour`, d: fmi.list.slice(0, 4).map(x => x.des + ' (' + x.n + ')').join(' · ') + ' · ajoutés quand même à la commande Rungis', on: () => go('fl') }); }
-        const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type));
+        const fa = (flAuto.issues || []).filter(i => KB_FLA_ACTION.includes(i.type) && !kbFlSoHas(i.des, i.row)); // V11.38
         if (fa.length) {
           const cnt = {}; fa.forEach(i => { cnt[i.type] = (cnt[i.type] || 0) + 1; });
           const lbl = { concord: 'concordance', noPP: 'ID site', newSale: 'absent du Sheet', saleInactif: 'en vente mais inactif', red: 'rouge Rungis', absentRungis: 'absent PVTTC', incoh: 'incohérence' };
@@ -27971,7 +28458,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function CaSuiviPage({ session }) {
       const [ca, setCa] = React.useState(null);
       const [anomalies, setAnomalies] = React.useState([]);
-      const [view, setView] = React.useState('jour'); // jour | bilan
+      const [view, setView] = React.useState(() => { try { const v = localStorage.getItem('kb_ca_view'); if (v) { localStorage.removeItem('kb_ca_view'); return v; } } catch (_) {} return 'jour'; }); // jour | bilan — V11.37 : « Bilan complet › » depuis Aujourd'hui
 
       const Header = () => (
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
@@ -30552,7 +31039,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const out = [];
       for (let r = 1; r < rows.length; r++) {
         const row = rows[r] || []; const des = String(row[iD] || '').trim(); if (!des) continue;
-        const actif = iA < 0 || /^actif/i.test(String(row[iA] || '').trim());
+        const actif = iA < 0 || /^actif/i.test(String(row[iA] || '').trim()) || kbFlSoHas(des, r + 1); // V11.38 — stock seulement = actif (MU nécessaire)
         if (!actif && !withInactive) continue;
         const uv = String(row[iUv] || '').trim(), type = String(row[iT] || '').trim(), mu = String(row[iMu] == null ? '' : row[iMu]).trim(), colis = String(row[iC] == null ? '' : row[iC]).trim();
         const muN = parseFloat(mu.replace(',', '.'));
@@ -30718,7 +31205,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function kbFlaWhen(iso) { if (!iso) return '—'; const d = new Date(iso); return isNaN(d) ? String(iso) : d.toLocaleString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); }
     function kbFlaCount(rep) {
       if (!rep || !rep.issues) return null;
-      const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type)).length;
+      const n = rep.issues.filter(i => KB_FLA_ACTION.includes(i.type) && !kbFlSoHas(i.des, i.row)).length; // V11.38 — stock seulement exclus
       const m = rep.meta || {};
       return n + (m.ventesErr ? 1 : 0) + (kbFlaMissing(m).list.length ? 1 : 0);
     }
@@ -30730,7 +31217,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const pick = w && !w.none && (!v || String(w.at || '') > String(v.at || '')) ? w : (v && !v.none ? v : null);
       const at = pick ? String(pick.at || '') : '';
       // V11.13 — produit passé Actif APRÈS ce relevé → déjà réglé, on ne le montre plus
-      const list = ((pick && pick.soldMissing) || []).filter(x => !(done && x.why === 'inactif' && x.row && done[kbFlaDoneKey(x)] && done[kbFlaDoneKey(x)] > at));
+      const list = ((pick && pick.soldMissing) || []).filter(x => !(done && x.why === 'inactif' && x.row && done[kbFlaDoneKey(x)] && done[kbFlaDoneKey(x)] > at) && !kbFlSoHas(x.des, x.row)); // V11.38 — stock seulement : normal qu'il soit vendu sans ligne active
       return { list, day: pick ? pick.day : '', at, hourly: pick === w };
     }
     function FlAutoCard({ session }) {
@@ -30753,9 +31240,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       }), []);
       React.useEffect(() => { try { localStorage.setItem('kb_fl_ventes_actif', JSON.stringify(flDone)); } catch (_) {} }, [flDone]);
       const by = session && session.name;
+      const so = useKbFlSo(); // V11.38 — 📦 stock seulement (plus commandable chez Rungis)
       const load = React.useCallback(async () => {
         setErr('');
         try {
+          await kbFlSoLoad();
           const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_report', ts: Date.now() });
           if (!d || d.ok === false) throw new Error((d && d.error) || 'réponse vide');
           setRep(d);
@@ -30805,6 +31294,39 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const ignore = (i, label) => act('ign-' + i.type + i.row + i.des, { action: 'fl_auto_ignore', kind: (i.type === 'pa' || i.type === 'pv') && i.data && i.data.rungis != null ? i.type + ':' + i.data.rungis : i.type, des: i.des, row: i.row || '', _type: i.type, _des: i.des }, '✓ ' + (label || 'Ignoré'));
       const concord = (i, code) => act('cc-' + i.row, { action: 'fl_auto_concord', row: i.row, des: i.des, code, _type: 'concord' }, `✓ Concordance ${i.des} ↔ ${code} — mise à jour du Sheet en cours`, true);
       const setActif = (i, actif) => act('ac-' + i.type + i.row, { action: 'fl_auto_actif', row: i.row, des: i.des, actif, why: i.type, _type: i.type }, actif ? `✓ ${i.des} passé Actif` : `✓ ${i.des} passé Non actif`);
+      // V11.38 — 📦 STOCK SEULEMENT : en vente (on a du stock) mais plus commandable chez Rungis.
+      //   Sheet : « Non actif » (Rungis ne le commande plus) · appli : actif pour MU / prépa / inventaire ·
+      //   contrôle auto : plus d'alerte (saleInactif / rouge / absent PVTTC ignorés côté serveur + filtrés ici).
+      const SO_KINDS = ['stock', 'saleInactif', 'red', 'absentRungis']; // 'stock' = lu par KBG_FL_Auto v1.6 → plus dans la commande Rungis 5h
+      const soOne = async (i) => {
+        await kbFlSoSet(i.des, true, { row: i.row || '', prod: i.prod || '', by: by || '' });
+        if (i.type !== 'saleInactif' && i.type !== 'ventes' && i.row) {
+          const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_actif', row: i.row, des: i.des, actif: false, why: 'stock seulement (plus chez Rungis)', by });
+          if (!d || d.ok === false) throw new Error((d && d.error) || 'Sheet non mis à jour');
+        }
+        for (const kind of SO_KINDS) { try { await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_ignore', kind, des: i.des, row: i.row || '', by }); } catch (_) {} }
+      };
+      const stockOnly = async (items) => {
+        items = (items || []).filter(Boolean); if (!items.length) return;
+        if (!confirm(`📦 Stock seulement — plus commandable chez Rungis : ${items.length} produit(s)\n\n${items.slice(0, 12).map(i => '• ' + i.des).join('\n')}${items.length > 12 ? '\n…' : ''}\n\n→ Sheet : « Non actif » (Rungis ne le commande plus)\n→ Appli : reste ACTIF pour la MU, la prépa et l'inventaire\n→ Plus d'alerte « en vente mais Non actif » / « rouge » / « absent PVTTC »`)) return;
+        setBusy('so'); setBulk({ done: 0, total: items.length });
+        const ok = [], ko = [];
+        for (const i of items) { try { await soOne(i); ok.push(i); } catch (e) { ko.push(i.des + ' : ' + (e.message || e)); } setBulk(b => b ? { ...b, done: b.done + 1 } : b); }
+        const okD = new Set(ok.map(i => kbFlSoKey(i.des)));
+        setRep(r => r ? { ...r, issues: r.issues.filter(x => !okD.has(kbFlSoKey(x.des)) || x.type === 'dup') } : r);
+        setPick({}); setBulk(null); setBusy('');
+        showToast(ko.length ? `⚠️ ${ok.length} fait(s), ${ko.length} erreur(s) : ${ko[0]}` : `✓ ${ok.length} produit(s) en 📦 stock seulement`);
+      };
+      const soUndo = async (x, actif) => {
+        if (!confirm(actif ? `↩️ ${x.des} : de nouveau commandable chez Rungis ?\n→ repasse « Actif » dans le Sheet (Rungis le commande).` : `🛑 ${x.des} : plus en vente du tout ?\n→ reste « Non actif » dans le Sheet et n'est plus traité comme actif dans l'appli (MU, prépa).`)) return;
+        setBusy('so');
+        try {
+          if (actif && x.row) { const d = await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_actif', row: x.row, des: x.des, actif: true, why: 'de nouveau chez Rungis', by }); if (!d || d.ok === false) throw new Error((d && d.error) || 'Sheet non mis à jour'); }
+          for (const kind of SO_KINDS) { try { await flPost({ secret: FRESHDESK_SECRET, action: 'fl_auto_ignore', kind, des: x.des, row: x.row || '', undo: true, by }); } catch (_) {} }
+          await kbFlSoSet(x.des, false);
+          showToast(actif ? `✓ ${x.des} repassé Actif (Rungis)` : `✓ ${x.des} retiré du stock seulement`);
+        } catch (e) { showToast('Erreur : ' + (e.message || e)); } finally { setBusy(''); }
+      };
       // V11.05 — multi-coche (Actif / Non actif en une fois, ligne par ligne c'était trop long)
       const pkey = i => i.type + '|' + i.row + '|' + i.des;
       const runBulk = async (items, actif, ignoreLabel) => {
@@ -30857,8 +31379,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
       const m = (rep && rep.meta) || {};
       const V = m.ventes || null, Ct = m.controle || null;
-      const issues = (rep && rep.issues) || [];
+      const issues = ((rep && rep.issues) || []).filter(i => i.type === 'dup' || !kbFlSoHas(i.des, i.row)); // V11.38 — stock seulement : plus d'alerte
       const byType = {}; issues.forEach(i => (byType[i.type] = byType[i.type] || []).push(i));
+      const soList = Object.values(so || {}).sort((a, b) => String(a.des).localeCompare(String(b.des), 'fr'));
       const nAct = kbFlaCount(rep) || 0;
       const big = { fontSize: 15, padding: '10px 14px', fontWeight: 700 };
       const chip = (s, on, k) => (
@@ -30949,9 +31472,24 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 {MI.list.map(x => <div key={x.id} style={{ fontSize: 15, fontWeight: 700, padding: '4px 0' }}>
                   {x.why === 'inactif' && x.row ? checkRow({ type: 'ventes', row: x.row, des: x.des }) : null}• {x.des} — {x.n} vendu(s){x.code ? <span style={{ fontWeight: 600 }}> → code {x.code}, {x.colis != null ? String(x.colis).replace('.', ',') + ' colis' : 'quantité à confirmer'}</span> : <span style={{ color: 'var(--danger)' }}> → pas de code Rungis trouvé</span>}
                   <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-mute)' }}>{x.why === 'inactif' ? ` · ligne ${x.row} « Non actif »` : x.why === 'absent' ? ' · absent du Sheet' : ''}</span>
+                  {x.why === 'inactif' && x.row ? <span> {chip('📦 Stock seulement', () => stockOnly([{ type: 'ventes', row: x.row, des: x.des }]), 'so' + x.row)}</span> : null}
                 </div>)}
                 {m.veilleErr && <div style={{ fontSize: 12, color: 'var(--danger)' }}>Veille horaire : {m.veilleErr}</div>}
               </>); })()}
+            {soList.length > 0 && <div style={{ marginTop: 12, borderLeft: '6px solid #6d4c41', background: '#6d4c4112', borderRadius: 10, padding: '10px 12px' }}>
+              <div onClick={() => setOpen(o => ({ ...o, so: !o.so }))} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <span style={{ fontSize: 24 }}>📦</span><strong style={{ fontSize: 16 }}>Stock seulement — en vente mais plus commandable chez Rungis</strong>
+                <span className="badge" style={{ background: '#6d4c41', color: '#fff', fontWeight: 700, fontSize: 14 }}>{soList.length}</span>
+                <span style={{ marginLeft: 'auto' }}>{open.so ? '▾' : '▸'}</span>
+              </div>
+              {open.so && <>
+                <div style={{ fontSize: 12.5, color: 'var(--ink-soft)', marginTop: 4 }}>« Non actif » dans le Sheet (Rungis ne le commande pas) mais <b>actif dans l'appli</b> : MU, prépa et inventaire le voient. Aucune alerte tant qu'il est ici. Quand le stock est fini et que le produit n'est plus en vente → 🛑 ; s'il revient chez Rungis → ↩️.</div>
+                {soList.map(x => <div key={x.des} style={{ padding: '8px 10px', borderRadius: 10, marginTop: 6, background: '#fff', border: '2px solid var(--line)' }}>
+                  <strong style={{ fontSize: 15 }}>{x.des}</strong> <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{x.prod}{x.row ? ' · ligne ' + x.row : ''} · depuis {formatDateShort(String(x.at || '').slice(0, 10))}{x.by ? ' · ' + x.by : ''}</span>
+                  <div>{chip('↩️ De nouveau chez Rungis (Actif)', () => soUndo(x, true), 'u')}{chip('🛑 Plus en vente', () => soUndo(x, false), 'n')}</div>
+                </div>)}
+              </>}
+            </div>}
             {section('concord', (byType.concord || []).length, <>
               <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Pas de correspondance sûre dans PVTTC. Choisis le produit Rungis : le code est écrit et la ligne se complète seule (colisage, prix…).</div>
               {list('concord', i => <>{rungisChips(i, (code) => concord(i, code))}{chip('🚫 Pas chez Rungis', () => ignore(i, 'Noté : pas chez Rungis'), 'ign')}</>)}
@@ -30964,16 +31502,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               {list('newSale', i => <>{rungisChips(i, (code) => add(i, code), '➕')}{chip('➕ Ajouter sans code Rungis', () => add(i, ''), 'nc')}{chip('Ignorer', () => ignore(i), 'ign')}</>)}
             </>)}
             {section('saleInactif', (byType.saleInactif || []).length, <>
-              {bulkBar('saleInactif', [['🟢 Passer Actif', sel => runBulk(sel, true), '#2e7d32'], ['Laisser Non actif', sel => runBulk(sel, false, 'Laisser Non actif'), '#757575']])}
-              {list('saleInactif', i => <div>{checkRow(i)}{chip('🟢 Passer Actif', () => setActif(i, true), 'a')}{chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign')}</div>)}
+              <div style={{ fontSize: 13, marginTop: 4, padding: '6px 10px', borderRadius: 8, background: '#fff' }}>Encore en vente <b>et</b> commandable chez Rungis → 🟢 Passer Actif · en vente grâce au stock mais <b>plus chez Rungis</b> → 📦 Stock seulement (reste actif pour la MU et la prépa, plus d'alerte).</div>
+              {bulkBar('saleInactif', [['🟢 Passer Actif', sel => runBulk(sel, true), '#2e7d32'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Laisser Non actif', sel => runBulk(sel, false, 'Laisser Non actif'), '#757575']])}
+              {list('saleInactif', i => <div>{checkRow(i)}{chip('🟢 Passer Actif', () => setActif(i, true), 'a')}{chip('📦 Stock seulement (plus chez Rungis)', () => stockOnly([i]), 'so')}{chip('Laisser Non actif', () => ignore(i, 'Laissé Non actif'), 'ign')}</div>)}
             </>)}
             {section('red', (byType.red || []).length, <>
-              {bulkBar('red', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']])}
-              {list('red', i => <div>{checkRow(i)}{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
+              {bulkBar('red', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']])}
+              {list('red', i => <div>{checkRow(i)}{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('📦 Stock seulement (on en a encore)', () => stockOnly([i]), 'so')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
             </>)}
             {section('absentRungis', (byType.absentRungis || []).length, <>
-              {bulkBar('absentRungis', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']])}
-              {list('absentRungis', i => <div>{checkRow(i)}{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
+              {bulkBar('absentRungis', [['⛔ Passer Non actif', sel => runBulk(sel, false), '#c62828'], ['📦 Stock seulement', sel => stockOnly(sel), '#6d4c41'], ['Garder actif', sel => runBulk(sel, true, 'Garder actif'), '#757575']])}
+              {list('absentRungis', i => <div>{checkRow(i)}{chip('⛔ Passer Non actif', () => setActif(i, false), 'na')}{chip('📦 Stock seulement (on en a encore)', () => stockOnly([i]), 'so')}{chip('Garder actif', () => ignore(i, 'Gardé actif'), 'ign')}</div>)}
             </>)}
             {section('incoh', (byType.incoh || []).length, <>
               {list('incoh', i => <div>{chip('Vu', () => ignore(i, 'Vu'), 'ign')}</div>)}
@@ -32074,16 +32613,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         lines:["M80","M100","M125","M150","M175","J80","J100","J125","J150","J175","M200","J200"] },
       { k:"TOL", label:"PRIBON TOLBIAC", short:"Tolbiac", col:"TOLBIAC", cols:["tolbiac","pribon tolbiac","tol"], mail:"tolbiac@pribon.org", color:"#0A84FF",
         lines:["M80","M100","M125","M150","M175","J80","J100","J125","J150","J175","M200","J200"] },
-      { k:"BIC", consoleCmd:true, label:"PRIBON BICHAT", short:"Bichat", col:"BICHAT", cols:["bichat","pribon bichat","bic"], mail:"bichat@pribon.org", color:"#FF1F8E",
+      { k:"BIC", label:"PRIBON BICHAT", short:"Bichat", col:"BICHAT", cols:["bichat","pribon bichat","bic"], mail:"bichat@pribon.org", color:"#FF1F8E",
         lines:["M80","M100","M125","M150","M175","M200"], noProp:true }, // Morvan uniquement, PAS de proposition (pas d'historique)
-      { k:"KBG", masterCmd:true, label:"KELBONGOO", short:"Kelbongoo", col:"KELBONGOO", cols:["kelbongoo","kbg"], mail:"achat@probon.fr", color:"#7C3AED",
+      { k:"KBG", masterCmd:true, manualCmd:true, label:"KELBONGOO", short:"Kelbongoo", col:"KELBONGOO", cols:["kelbongoo","kbg"], mail:"achat@probon.fr,achat@probon.org", color:"#7C3AED",
         lines:["M80","M100","M125","M150"] },                          // Morvan uniquement, sans remplacement
       // 🧪 Magasin TEST : n'existe que sur les journées de test (Console › 🎄 Sapins › 🧪 Test). Tous les mails → hg@ + rr@.
-      { k:"TST", label:"🧪 MAGASIN TEST", short:"Test", col:"TEST", cols:["test"], mail:"hg@probon.fr,rr@pribon.org", color:"#455A64", test:true,
+      { k:"TST", label:"🧪 MAGASIN TEST", short:"Test", col:"TEST", cols:["test"], mail:"hg@probon.fr,hg@probon.org,rr@pribon.org", color:"#455A64", test:true,
         lines:["M80","M100","M125","M150","M175","J80","J100","J125","J150","J175","M200","J200"] }
     ];
     var SAP_MINI_DEF = { ROB:3, TOL:1, BIC:1, KBG:2, TST:3 };
-    var SAP_TEST_TO = "hg@probon.fr,rr@pribon.org";
+    var SAP_TEST_TO = "hg@probon.fr,hg@probon.org,rr@pribon.org";
     function sapLine(k){ for (var i=0;i<SAP_LINES.length;i++) if (SAP_LINES[i].k===k) return SAP_LINES[i]; return null; }
     function sapStore(k){ for (var i=0;i<SAP_STORES.length;i++) if (SAP_STORES[i].k===k) return SAP_STORES[i]; return null; }
     function sapOther(k){ return k.charAt(0)==="M" ? "J"+k.slice(1) : "M"+k.slice(1); }   // même taille, autre gamme
@@ -32179,8 +32718,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       SAP_LINES.forEach(function(L){ out[L.k] = { tot:0, par:{} }; });
       sapStoresFor(config, date).forEach(function(s){
         var c = ((cmds||{})[date]||{})[s.k]; var p = sapPlan(n1, config, date, s.k, cmds, receps); if (!p) return;
-        var validated = !!(c && c.at);   // pas de commande validée = la PRÉVISION part (Bichat : 0, commande saisie dans la console)
-        p.lines.forEach(function(o){ var q = validated ? (o.reel!=null?o.reel:0) : (o.theo||0); if (q>0){ out[o.k].tot += q; out[o.k].par[s.k] = q; } });
+        var validated = !!(c && c.at);   // pas de commande validée = la PRÉVISION part (Bichat : pas de prévision → 0 ; Kelbongoo : rien d'automatique → 0)
+        p.lines.forEach(function(o){ var q = validated ? (o.reel!=null?o.reel:0) : (s.manualCmd ? 0 : (o.theo||0)); if (q>0){ out[o.k].tot += q; out[o.k].par[s.k] = q; } });
       });
       return out;
     }
@@ -32206,7 +32745,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
        Règles : on ajoute seulement un jour futur (commande encore ouverte) ; on retire seulement un jour non figé ;
        on peut DÉPLACER un jour figé (Rungis ne peut pas y aller) tant que le chauffeur n'a rien récupéré : les commandes figées suivent. */
     function sapDayOps(n1, config, cmds, recups, op, from, to, who, src, now){
-      now = now || Date.now(); var act = sapActiveDates(n1, config, ""), P = {}, at = now;
+      now = now || Date.now(); var act = sapActiveDates(n1, config, "all"), P = {}, at = now;
       var fut = function(d){ return /^\d{4}-\d{2}-\d{2}$/.test(d||"") && sapDeadline(d) > now; };
       if (op === "add"){
         if (!fut(to)) return { ok:false, error:"Choisis un jour à venir (au plus tôt après-demain)." };
@@ -32226,6 +32765,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         if (act.indexOf(to) >= 0) return { ok:false, error:"Ce jour est déjà un jour de récupération." };
         P["config/recups/"+from] = { on:false, by:who, at:at, src:src, movedTo:to };
         P["config/recups/"+to]   = { on:true, by:who, at:at, src:src, movedFrom:from };
+        var of = (config.recups||{})[from] || {}; if (of.test){ P["config/recups/"+to].test = true; P["config/recups/"+to].testRungis = !!of.testRungis; P["config/recups/"+from].test = true; }
         var c = (cmds||{})[from]; if (c){ P["cmd/"+to] = c; P["cmd/"+from] = null; }
         P["recap/"+from] = null;
         return { ok:true, patch:P };
@@ -32236,9 +32776,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function sapEffLines(n1, config, d, sk, cmds, receps){
       var c = ((cmds||{})[d]||{})[sk], out = {};
       if (c && c.at){ Object.keys(c.reel||{}).forEach(function(k){ var n = sapNum(c.reel[k]); if (n) out[k] = n; }); return out; }
+      if (sapStore(sk).manualCmd) return out;   // Kelbongoo : la proposition ne part jamais toute seule
       var p = sapPlan(n1, config, d, sk, cmds, receps); if (!p) return out;
       p.lines.forEach(function(o){ if (o.theo) out[o.k] = o.theo; }); return out;
     }
+    /* Proposition calculée (même si elle ne part pas toute seule, ex. Kelbongoo) */
+    function sapPropLines(n1, config, d, sk, cmds, receps){ var p = sapPlan(n1, config, d, sk, cmds, receps), out = {}; if (!p) return out; p.lines.forEach(function(o){ if (o.theo) out[o.k] = o.theo; }); return out; }
     /* Ce que le magasin doit recevoir : la livraison validée par le chauffeur (sapins/livr), sinon la répartition prévue (recup.dispatch). */
     function sapAttendu(recups, livrs, d, sk){ var l = ((livrs||{})[d]||{})[sk]; if (l && l.lines) return l.lines; var rc = (recups||{})[d]; return (rc && rc.dispatch) ? (rc.dispatch[sk] || {}) : null; }
     /* Répartition au prorata (méthode des plus forts restes). want = {mag:n}, total = n disponibles */
