@@ -37134,8 +37134,10 @@ function PrepaDuJourPage({
       rolls: Math.max(0, rg.rolls[s] || 0),
       dolly: Math.max(0, parseInt(rg.dolly[s], 10) || 0)
     }));
+    const kbContOk = list.length ? 1 : 0;
     if (!confirm(prep.closed ? `Envoyer le mail à Probon Rungis ?\n\n${list.map(x => `${x.site} : ${x.rolls} roll(s) + ${x.dolly} dolly`).join('\n')}` : list.length ? `Clôturer la prépa et prévenir Probon Rungis ?\n\n${list.map(x => `${x.site} : ${x.rolls} roll(s) + ${x.dolly} dolly`).join('\n')}` : 'Clôturer la prépa ?\n\nAucun lieu coché : pas de mail à Rungis.')) return;
     setRgBusy(true);
+    if (kbContOk) kbContainersDeliver(day, list);
     try {
       if (prep.closed) {
         if (!list.length) {
@@ -55497,43 +55499,189 @@ function KbPdpRetFixSheet({
     }
   }, busy ? '⏳…' : '🚫 Retirer du suivi')));
 }
+const KB_CONT = [{
+  k: 'roll',
+  ic: '🛒',
+  l: 'Rolls',
+  c: '#6d4c41'
+}, {
+  k: 'dolly',
+  ic: '🛞',
+  l: 'Dollies',
+  c: '#00838f'
+}, {
+  k: 'cagette',
+  ic: '🧺',
+  l: 'Cagettes',
+  c: '#2e7d32'
+}];
+const kbContOf = r => ({
+  roll: Number(r.roll != null ? r.roll : r.kind === 'rolls' && r.dolly == null && r.cagette == null ? r.qty : 0) || 0,
+  dolly: Number(r.dolly) || 0,
+  cagette: Number(r.cagette) || 0
+});
+const kbContLabel = q => KB_CONT.filter(t => q[t.k]).map(t => `${q[t.k]} ${t.l.toLowerCase().replace(/s$/, '')}${q[t.k] > 1 ? 's' : ''}`).join(' · ') || '—';
+async function kbContainersDeliver(day, list) {
+  for (const x of list || []) {
+    if (!x || !x.site) continue;
+    try {
+      await storage.setDoc('kb_containers', x.site, {
+        site: x.site,
+        deliv: {
+          [day]: {
+            roll: Number(x.rolls) || 0,
+            dolly: Number(x.dolly) || 0,
+            at: new Date().toISOString()
+          }
+        }
+      });
+    } catch (_) {}
+  }
+}
+function kbContOnSite(doc, rets) {
+  const since = doc && doc.countedAt || '';
+  const base = {
+    roll: 0,
+    dolly: 0,
+    cagette: 0,
+    ...(doc && doc.count || {})
+  };
+  const out = {
+    ...base
+  };
+  Object.values(doc && doc.deliv || {}).forEach(d => {
+    if (d && String(d.at || '') > since) {
+      out.roll += Number(d.roll) || 0;
+      out.dolly += Number(d.dolly) || 0;
+    }
+  });
+  (rets || []).forEach(r => {
+    if (r.recoveredAt && String(r.recoveredAt) > since && r.status !== 'pending') {
+      const q = kbContOf(r);
+      KB_CONT.forEach(t => {
+        out[t.k] -= q[t.k];
+      });
+    }
+  });
+  KB_CONT.forEach(t => {
+    out[t.k] = Math.max(0, out[t.k]);
+  });
+  return out;
+}
 function KbRollsReturnCard({
   session,
   site
 }) {
   const showToast = React.useContext(ToastContext);
   const [all, setAll] = React.useState([]);
-  const [n, setN] = React.useState(1);
+  const [doc, setDoc] = React.useState(null);
+  const [ask, setAsk] = React.useState({
+    roll: 0,
+    dolly: 0,
+    cagette: 0
+  });
+  const [cnt, setCnt] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
-  React.useEffect(() => storage.subscribe('pdp_returns', a => setAll((a || []).filter(r => r.kind === 'rolls' && r.site === site && r.status !== 'treated'))), [site]);
+  React.useEffect(() => storage.subscribe('pdp_returns', a => setAll((a || []).filter(r => r.kind === 'rolls' && r.site === site))), [site]);
+  React.useEffect(() => storage.subscribe('kb_containers', a => setDoc((a || []).find(d => d.id === site) || null)), [site]);
   if (!site) return null;
+  const onSite = kbContOnSite(doc, all);
+  const open = all.filter(r => r.status !== 'treated');
+  const tot = ask.roll + ask.dolly + ask.cagette;
+  const Step = ({
+    v,
+    set
+  }) => React.createElement("span", {
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6
+    }
+  }, React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 48,
+      minHeight: 48,
+      fontSize: 22
+    },
+    onClick: () => set(Math.max(0, v - 1))
+  }, "\u2212"), React.createElement("b", {
+    style: {
+      fontSize: 26,
+      minWidth: 34,
+      textAlign: 'center'
+    }
+  }, v), React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      minWidth: 48,
+      minHeight: 48,
+      fontSize: 22
+    },
+    onClick: () => set(v + 1)
+  }, "+"));
   const send = async () => {
-    if (!window.confirm(`Demander au chauffeur de récupérer ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à ${site} ?`)) return;
+    if (!tot) {
+      showToast('Mets au moins 1 roll, dolly ou cagette');
+      return;
+    }
+    if (!window.confirm(`Demander au chauffeur de récupérer à ${site} :\n${kbContLabel(ask)} ?`)) return;
     setBusy(true);
     try {
       const id = `pdpret_rolls_${site}_${Date.now()}`,
-        now = new Date().toISOString();
+        now = new Date().toISOString(),
+        lbl = '🛒 ' + kbContLabel(ask);
       await storage.setDoc('pdp_returns', id, {
         id,
         kind: 'rolls',
         site,
-        produit: '🛒 Rolls vides',
+        roll: ask.roll,
+        dolly: ask.dolly,
+        cagette: ask.cagette,
+        produit: lbl,
         producteur: '',
         productKey: 'ROLLS',
-        productLabel: '🛒 Rolls vides',
-        qty: n,
+        productLabel: lbl,
+        qty: tot,
         clientName: '',
         dlc: '',
         pickupDate: nextDistribDateForSite(site, activeDay()) || '',
-        remark: 'Rolls vides à ramener à PDP',
+        remark: 'Contenants vides à ramener à PDP',
         day: activeDay(),
         status: 'pending',
         createdBy: session.name,
         createdAt: now,
         updatedAt: now
       });
-      showToast(`🛒 Demande envoyée : ${n} roll${n > 1 ? 's' : ''} vide${n > 1 ? 's' : ''} à récupérer`);
-      setN(1);
+      showToast(`🛒 Demande envoyée : ${kbContLabel(ask)}`);
+      setAsk({
+        roll: 0,
+        dolly: 0,
+        cagette: 0
+      });
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveCount = async () => {
+    setBusy(true);
+    try {
+      await storage.setDoc('kb_containers', site, {
+        site,
+        count: {
+          roll: cnt.roll,
+          dolly: cnt.dolly,
+          cagette: cnt.cagette
+        },
+        countedAt: new Date().toISOString(),
+        countedBy: session.name
+      });
+      setCnt(null);
+      showToast('📝 Comptage enregistré');
     } catch (e) {
       showToast('Erreur : ' + e.message);
     } finally {
@@ -55552,65 +55700,154 @@ function KbRollsReturnCard({
       fontWeight: 800,
       color: '#4e342e'
     }
-  }, "\uD83D\uDED2 Rolls vides \xE0 faire r\xE9cup\xE9rer"), React.createElement("div", {
+  }, "\uD83D\uDED2 Rolls \xB7 dollies \xB7 cagettes"), React.createElement("div", {
     style: {
       fontSize: 14,
-      marginTop: 2
+      fontWeight: 700,
+      marginTop: 8
     }
-  }, "Les rolls de la distrib sont vides ? Le chauffeur devra les ramener \xE0 PDP."), all.map(r => React.createElement("div", {
+  }, "\uD83D\uDCCD Sur place \xE0 ", site), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 6
+    }
+  }, KB_CONT.map(t => React.createElement("div", {
+    key: t.k,
+    style: {
+      flex: 1,
+      background: '#fff',
+      border: '3px solid ' + t.c,
+      borderRadius: 14,
+      padding: '8px 4px',
+      textAlign: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 22
+    }
+  }, t.ic), React.createElement("div", {
+    style: {
+      fontSize: 30,
+      fontWeight: 900,
+      color: t.c,
+      lineHeight: 1
+    }
+  }, onSite[t.k]), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, t.l)))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, doc && doc.countedAt ? `Compté par ${doc.countedBy} le ${formatDateShort(String(doc.countedAt).slice(0, 10))} · + livraisons Rungis − retours pris depuis` : 'Pas encore compté : touche « Compter » pour démarrer le suivi'), !cnt ? React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    style: {
+      width: '100%',
+      minHeight: 48,
+      marginTop: 8,
+      fontWeight: 700
+    },
+    onClick: () => setCnt({
+      ...onSite
+    })
+  }, "\uD83D\uDCDD Compter ce qu'il y a sur place") : React.createElement("div", {
+    style: {
+      background: '#fff',
+      borderRadius: 12,
+      padding: 10,
+      marginTop: 8
+    }
+  }, KB_CONT.map(t => React.createElement("div", {
+    key: t.k,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      padding: '4px 0'
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 17
+    }
+  }, t.ic, " ", t.l), React.createElement(Step, {
+    v: cnt[t.k],
+    set: v => setCnt(c => ({
+      ...c,
+      [t.k]: v
+    }))
+  }))), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 6
+    }
+  }, React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy,
+    onClick: saveCount,
+    style: {
+      flex: 1,
+      minHeight: 52,
+      fontWeight: 800
+    }
+  }, "\u2705 Enregistrer le comptage"), React.createElement("button", {
+    type: "button",
+    className: "btn-ghost",
+    onClick: () => setCnt(null)
+  }, "Annuler"))), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      marginTop: 12
+    }
+  }, "\uD83D\uDE9A Faire r\xE9cup\xE9rer par le chauffeur (vides)"), KB_CONT.map(t => React.createElement("div", {
+    key: t.k,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      padding: '4px 0'
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 17
+    }
+  }, t.ic, " ", t.l), React.createElement(Step, {
+    v: ask[t.k],
+    set: v => setAsk(a => ({
+      ...a,
+      [t.k]: v
+    }))
+  }))), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: busy || !tot,
+    onClick: send,
+    style: {
+      width: '100%',
+      minHeight: 56,
+      fontSize: 17,
+      fontWeight: 800,
+      marginTop: 6,
+      background: tot ? '#6d4c41' : '#bdbdbd',
+      borderColor: tot ? '#6d4c41' : '#bdbdbd'
+    }
+  }, busy ? '⏳…' : tot ? `🚚 Demander la récupération · ${kbContLabel(ask)}` : 'Choisis au moins un roll, dolly ou cagette'), open.map(r => React.createElement("div", {
     key: r.id,
     style: {
       fontSize: 14,
       fontWeight: 700,
       marginTop: 6,
-      color: r.status === 'recovered' ? '#2e7d32' : '#e65100'
+      color: r.status === 'pending' ? '#e65100' : '#2e7d32'
     }
-  }, r.status === 'recovered' ? '✅' : '⏳', " ", r.qty, " roll", r.qty > 1 ? 's' : '', " \xB7 demand\xE9 par ", r.createdBy, " le ", formatDateShort(String(r.createdAt || '').slice(0, 10)), r.status === 'recovered' ? ' · récupéré par ' + (r.recoveredBy || 'le chauffeur') : ' · en attente du chauffeur')), React.createElement("div", {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 10,
-      marginTop: 10,
-      flexWrap: 'wrap'
-    }
-  }, React.createElement("button", {
-    type: "button",
-    className: "btn-secondary",
-    style: {
-      minWidth: 52,
-      minHeight: 52,
-      fontSize: 22
-    },
-    onClick: () => setN(x => Math.max(1, x - 1))
-  }, "\u2212"), React.createElement("b", {
-    style: {
-      fontSize: 26,
-      minWidth: 30,
-      textAlign: 'center'
-    }
-  }, n), React.createElement("button", {
-    type: "button",
-    className: "btn-secondary",
-    style: {
-      minWidth: 52,
-      minHeight: 52,
-      fontSize: 22
-    },
-    onClick: () => setN(x => x + 1)
-  }, "+"), React.createElement("button", {
-    type: "button",
-    className: "btn-primary",
-    disabled: busy,
-    onClick: send,
-    style: {
-      flex: 1,
-      minHeight: 56,
-      fontSize: 17,
-      fontWeight: 800,
-      background: '#6d4c41',
-      borderColor: '#6d4c41'
-    }
-  }, busy ? '⏳…' : `🛒 Demander la récupération (${n})`)));
+  }, r.status === 'pending' ? '⏳' : '✅', " ", kbContLabel(kbContOf(r)), " \xB7 demand\xE9 par ", r.createdBy, " le ", formatDateShort(String(r.createdAt || '').slice(0, 10)), r.status === 'pending' ? ' · en attente du chauffeur' : ' · pris par ' + (r.recoveredBy || 'le chauffeur'))));
 }
 function PdpReturnsPage({
   session,
@@ -56504,7 +56741,7 @@ function PdpReturnsPage({
           flexWrap: 'wrap',
           marginTop: 6
         }
-      }, r.status !== 'treated' && r.kind !== 'rolls' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)'), r.status === 'recovered' && r.kind === 'rolls' && btn('✓ Rolls reçus à PDP', () => treatRolls(r), '#6d4c41'), (r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0'), ['recovered', 'verified', 'notfound'].includes(r.status) && btn('🏭 Marquer déposé à PDP', async () => {
+      }, r.status !== 'treated' && r.kind !== 'rolls' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)'), ['recovered', 'verified', 'deposited'].includes(r.status) && r.kind === 'rolls' && btn('✓ Reçus à PDP', () => treatRolls(r), '#6d4c41'), (r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0'), ['recovered', 'verified', 'notfound'].includes(r.status) && btn('🏭 Marquer déposé à PDP', async () => {
         await storage.setDoc('pdp_returns', r.id, {
           status: 'deposited',
           depositedBy: session.name + ' (master)',
@@ -56670,7 +56907,7 @@ function PdpReturnsPage({
       fontSize: 15,
       color: 'var(--ink-soft)'
     }
-  }, r.kind === 'rolls' ? 'Rolls vides de la distrib' : React.createElement(React.Fragment, null, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée'), r.depositedBy ? ' · 🏭 déposé par ' + r.depositedBy + (r.depositedAt ? ' à ' + kbHhmm(r.depositedAt) : '') : r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
+  }, r.kind === 'rolls' ? 'Contenants vides : ' + kbContLabel(kbContOf(r)) : React.createElement(React.Fragment, null, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée'), r.depositedBy ? ' · 🏭 déposé par ' + r.depositedBy + (r.depositedAt ? ' à ' + kbHhmm(r.depositedAt) : '') : r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
     r: r
   }), React.createElement(KbPdpPhotoStrip, {
     photos: kbPdpPhotosFor(photosAll, r.site, r.recoveredAt)
@@ -56717,7 +56954,7 @@ function PdpReturnsPage({
       background: '#6d4c41',
       color: '#fff'
     }
-  }, "\u2713 Rolls re\xE7us \xE0 PDP") : React.createElement(DestButtons, {
+  }, "\u2713 Re\xE7us \xE0 PDP (", kbContLabel(kbContOf(r)), ")") : React.createElement(DestButtons, {
     dlc: r.dlc,
     onPick: d => treatManual(r, d)
   }), React.createElement(LostBtn, {
@@ -82175,7 +82412,7 @@ function App() {
     return [...set].sort();
   }, [rawOrders]);
   const availableSites = sitesOfDay.length > 0 ? sitesOfDay : SITES;
-  const isClosed = !!closures.find(c => c.id === currentSite && c.closedAt);
+  const isClosed = !!closures.find(c => c.id === currentSite && c.closedAt && String(c.closedAt).slice(0, 10) >= addDays(activeDay(), -1));
   const myArrival = arrivalsLog.find(a => a.site === currentSite && a.day === todayKey() && a.name === session?.name);
   React.useEffect(() => {
     if (session && !currentSite) setCurrentSite(session.site);
