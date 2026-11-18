@@ -795,7 +795,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.42';
+    const APP_VERSION = 'V11.43';
+    // V11.43 — (18/11/2026) RETOUR PDP de bout en bout : distrib › Suivi « 🙋 Demander à Henry le retour PDP » (produits choisis) → mail hg@ + carte Master › Récap
+    //   (✅ Valider / ✏️ par article / 🙅 Refuser) ; toute validation Henry → POPUP distrib : cocher chaque article mis dans la cagette « Retour PDP »
+    //   (ou ❓ introuvable → mail hg@), le chauffeur ne le voit qu'ensuite. Chauffeur : 📷 photos par lieu + « ✓ Pris » → 🔍 Vérifier (photos en haut,
+    //   ✓ trouvé / ✗ pas trouvé → mail hg@ « le lieu a fait un retour mais le chauffeur n'a pas trouvé ») → 🏭 « Déposé à l'entrepôt ». Prépa : seul le
+    //   DÉPOSÉ arrive à traiter, popup « X a validé le dépôt » (code perso, comme DLC) ou « Plus tard — avant la clôture » ; clôture bloquée (sauf DOM) ;
+    //   « ❓ Pas trouvé à l'entrepôt » → mail rr@ + hg@ (déposé par / pas trouvé par) ; « Pas encore arrivé à PDP » supprimé. Mail de validation :
+    //   feuille XLSX « À remettre dans le stock » jointe (remis en rayon, ancien site ; PDV plus tard). Alertes non récupérées : rr@ retiré.
+    //   Firestore : nouvelle collection pdp_photos + statuts verified / notfound / deposited (règles chauffeur à publier, voir MD V11.43).
     // V11.42 — (18/11/2026) Prépa › Mise en place › « ⏳ En attente du chargement » : affiche l'état de la prévision ≈ du serveur (erreur serveur, vente introuvable sur l'admin + ventes lues, aucune commande, heure de mise à jour) au lieu d'un simple sablier.
     // V11.41 — (17/11/2026) 📧 Qualité SAV (Master › SAV · consignes) : réclamation reçue par mail saisie comme en distrib, lieu au choix (DOM compris),
     //   client → date de distribution → produits ; pas de retour PDP / perte / mail auto au client (Henry répond lui-même).
@@ -4396,7 +4404,7 @@
     //   (relance mail toutes les 48 h tant que ni récupéré par le distributeur ni retour PDP).
     //   Échanges master ↔ distrib : « Demander info » (le distrib répond dans une popup) / « Envoyer info ».
     // ════════════════════════════════════════════════════════════════
-    const KB_NR_TO = 'hg@probon.fr, rr@pribon.org';
+    const KB_NR_TO = 'hg@probon.fr'; // V11.43 — rr@ retiré des alertes « non récupérées »
     const KB_APP_URL = 'https://gvs93.github.io/kelbongoo/';
     function kbNrNotes(f) { return Object.values((f && f.distribNotes) || {}).sort((a, b) => String(a.at || '').localeCompare(String(b.at || ''))); }
     function kbNonRecupHtml(f, kind, extra) {
@@ -4423,6 +4431,62 @@
           htmlBody: kbNonRecupHtml(f, kind, extra), body: `${f.consumer_name || ''} (${f.site}) — commande non récupérée depuis ${days} j. ${extra || ''}\n${KB_APP_URL}#nr=${f.orderId || f.id}` });
         return { ok: !!(r && r.ok), error: (r && r.error) || '' };
       } catch (e) { return { ok: false, error: e.message }; }
+    }
+    // V11.43 — POPUP DISTRIB : Henry a validé un retour PDP → la boutique met les articles dans la cagette « Retour PDP »
+    //   et coche CHAQUE article (ou « introuvable »). Ensuite seulement le chauffeur le voit.
+    function KbPdpReadyOverlay({ followup, count, session, site }) {
+      const f = followup;
+      const items = f.items || [];
+      const [st, setSt] = React.useState({}); // idx → 'ok' | 'ko'
+      const [ini, setIni] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const done = items.length > 0 && items.every((_, i) => st[i]);
+      const ok = done && ini.trim().length >= 2;
+      const save = async () => {
+        setBusy(true);
+        try {
+          const now = new Date().toISOString(), who = `${session.name} (${ini.trim().toUpperCase()})`;
+          const keep = items.filter((_, i) => st[i] === 'ok');
+          const lost = items.filter((_, i) => st[i] === 'ko').map(it => ({ id: it.id || '', produit: it.produit, producteur: it.producteur || '', qty: Number(it.qty) || 1, reason: 'Introuvable en boutique (' + who + ')' }));
+          const patch = { items: keep, pdpNotReturned: [...(f.pdpNotReturned || []), ...lost], pdpReadyAt: now, pdpReadyBy: who, updatedBy: session.name, updatedAt: now,
+            ...(keep.length ? {} : { forceReturnPdp: false, status: 'resolved', resolvedBy: who, resolvedAt: now }) };
+          await storage.setDoc('followups', f.id || f.orderId, patch);
+          if (keep.length) await kbPickupWrite({ ...f, ...patch });
+          if (lost.length) {
+            try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'hg@probon.fr', subject: `⚠️ Retour PDP · ${site} n'a pas trouvé ${lost.length} article(s) · ${f.consumer_name || 'client'}`,
+              body: `${who} (${site}) n'a pas trouvé dans la commande de ${f.consumer_name || ''} :\n` + lost.map(x => `- ${x.produit} x${x.qty}`).join('\n') }); } catch (_) {}
+          }
+          if (keep.length) kbCelebrate({ title: 'Dans la cagette Retour PDP 👍', sub: `${keep.length} article(s) · le chauffeur passera les prendre` });
+        } catch (e) { alert('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const Btn = ({ i, v, c, t }) => <button type="button" disabled={busy} onClick={() => setSt(o => ({ ...o, [i]: o[i] === v ? undefined : v }))}
+        style={{ minHeight: 52, padding: '6px 12px', borderRadius: 12, fontSize: 16, fontWeight: 800, border: '3px solid ' + c, background: st[i] === v ? c : '#fff', color: st[i] === v ? '#fff' : c, cursor: 'pointer' }}>{t}</button>;
+      return (
+        <div className="fs-overlay">
+          <div className="fs-card fs-block" style={{ borderTop: '8px solid #1565c0', maxHeight: '92vh', overflowY: 'auto' }}>
+            <div className="fs-icon">↩️</div>
+            <h2>Retour PDP validé par {String(f.forceReturnPdpBy || 'Henry').split(' ')[0]}</h2>
+            <div style={{ fontSize: 26, fontWeight: 900, margin: '4px 0' }}>{f.consumer_name || 'Client'}</div>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)' }}>Commande du {formatDateShort(f.distribDate || f.day || '')}{f.storedCasier ? <> · casier <b style={{ fontSize: 20 }}>{f.storedCasier}</b></> : ''}</div>
+            <div style={{ margin: '12px 0', padding: '12px', borderRadius: 12, background: '#e3f2fd', fontSize: 17, fontWeight: 700, color: '#0d47a1' }}>Mets chaque article dans la cagette <b>« Retour PDP »</b> du lieu, puis coche-le ✓.</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left' }}>
+              {items.map((it, i) => (
+                <div key={i} style={{ border: '3px solid ' + (st[i] === 'ok' ? '#2e7d32' : st[i] === 'ko' ? '#c62828' : 'var(--line)'), borderRadius: 14, padding: '10px 12px', background: st[i] === 'ok' ? '#e8f5e9' : st[i] === 'ko' ? '#fdecea' : '#fff' }}>
+                  <div style={{ fontSize: 20, fontWeight: 800 }}>{kbProdName(it.produit || '')}{(Number(it.qty) || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{it.qty}</span> : ''}</div>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                    <Btn i={i} v="ok" c="#2e7d32" t="✓ Dans la cagette" />
+                    <Btn i={i} v="ko" c="#c62828" t="❓ Introuvable" />
+                  </div>
+                </div>))}
+            </div>
+            <input value={ini} onChange={e => setIni(e.target.value.toUpperCase().slice(0, 5))} placeholder="Tes initiales" style={{ width: '100%', maxWidth: 200, textAlign: 'center', fontSize: 24, fontWeight: 700, marginTop: 14 }} />
+            <div className="fs-actions" style={{ marginTop: 12 }}>
+              <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={save} style={{ background: '#1565c0', borderColor: '#1565c0', opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : done ? '✅ Valider' : `Coche les ${items.length} article(s)`}</button>
+            </div>
+            {count > 1 && <div className="fs-count">{count - 1} autre(s) retour(s) PDP à préparer</div>}
+          </div>
+        </div>
+      );
     }
     function NonRecupAlertOverlay({ followup, count, onSend }) {
       const f = followup;
@@ -7422,12 +7486,33 @@
     async function kbApplyPdpReturn(f, sel, notRet, by) {
       const now = new Date().toISOString();
       const all = Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : (f.items || []);
-      const patch = { forceReturnPdp: true, forceReturnPdpBy: by, forceReturnPdpAt: now, itemsInit: all, items: sel, pdpNotReturned: notRet, pdpChoiceBy: by, pdpChoiceAt: now, updatedBy: by, updatedAt: now };
+      // V11.43 — validé par Henry → popup sur la distrib : la boutique coche chaque article mis dans la cagette « Retour PDP ».
+      //   Le chauffeur ne le voit qu'APRÈS cette validation boutique (pdpReadyAt).
+      const patch = { forceReturnPdp: true, forceReturnPdpBy: by, forceReturnPdpAt: now, itemsInit: all, items: sel, pdpNotReturned: notRet, pdpChoiceBy: by, pdpChoiceAt: now, updatedBy: by, updatedAt: now,
+        pdpReadyAsk: true, pdpReadyAt: '', pdpReadyBy: '', pdpAsk: f.pdpAsk ? { ...f.pdpAsk, validatedBy: by, validatedAt: now } : null,
+        pdpRecoveredAt: '', pdpRecoveredBy: '', pdpVerifiedAt: '', pdpVerifiedBy: '', pdpDepositedAt: '', pdpDepositedBy: '', pdpCheck: {} };
       await storage.setDoc('followups', f.id || f.orderId, patch);
-      await kbPickupWrite({ ...f, ...patch });
+      try { await storage.deleteDoc('pdp_pickups', String(f.orderId || f.id)); } catch (_) {}
       return patch;
     }
-    function KbPdpReturnPicker({ f, by, onClose, onDone, extra }) {
+    // V11.43 — distrib : « 🙋 Demander à Henry le retour PDP » (produits choisis) → mail hg@ + carte dans Master › Récap
+    async function kbAskPdpReturn(f, sel, notRet, by, site) {
+      const now = new Date().toISOString();
+      const ask = { items: sel, notRet, by, at: now, site: site || f.site || '' };
+      await storage.setDoc('followups', f.id || f.orderId, { pdpAsk: ask, escalated: true, escalatedBy: by, escalatedAt: now, updatedBy: by, updatedAt: now });
+      const li = sel.map(it => `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:17px"><b>${kbEsc(kbProdName(it.produit || ''))}</b></td><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:19px;text-align:right"><b>×${it.qty || 1}</b></td></tr>`).join('');
+      const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
+        + `<div style="background:#1565c0;color:#fff;border-radius:12px;padding:16px 18px"><div style="font-size:24px;font-weight:900">🙋 Demande de retour PDP</div><div style="font-size:17px">${kbEsc(f.site || '')} · ${kbEsc(f.consumer_name || 'client')}</div></div>`
+        + `<div style="font-size:16px;margin:12px 0">Commande du <b>${kbEsc(formatDateShort(f.distribDate || f.day || ''))}</b>${f.storedCasier ? ` · casier <b>${kbEsc(f.storedCasier)}</b>` : ''} · demandé par <b>${kbEsc(by)}</b></div>`
+        + `<table role="presentation" width="100%" style="border-collapse:collapse;border-left:6px solid #1565c0">${li}</table>`
+        + (notRet.length ? `<div style="margin-top:10px;font-size:14px;color:#555">Non retourné : ${notRet.map(x => kbEsc(x.produit + ' (' + x.reason + ')')).join(', ')}</div>` : '')
+        + `<a href="${KB_APP_URL}#nr=${encodeURIComponent(f.orderId || f.id)}" style="display:block;margin-top:16px;background:#1565c0;color:#fff;text-decoration:none;border-radius:12px;padding:14px;font-size:19px;font-weight:900;text-align:center">✅ Valider dans l'appli (Master › Récap)</a>`
+        + `<p style="color:#999;font-size:12px;margin-top:14px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
+      try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'hg@probon.fr', subject: `🙋 Retour PDP demandé · ${f.site || ''} · ${f.consumer_name || 'client'} · ${sel.length} produit(s) · ${by}`, htmlBody: html,
+        body: `Demande de retour PDP — ${f.site} — ${f.consumer_name || ''}\n` + sel.map(it => `- ${it.produit} x${it.qty || 1}`).join('\n') + `\n\nÀ valider : ${KB_APP_URL}` }); } catch (_) {}
+      return ask;
+    }
+    function KbPdpReturnPicker({ f, by, onClose, onDone, extra, ask }) {
       const showToast = React.useContext(ToastContext);
       const all = Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : (f.items || []);
       const lk = (it, i) => String(it.id || '') + '__' + i;
@@ -7444,14 +7529,15 @@
         try {
           const sel = rows.filter(r => r.c.q > 0).map(r => ({ ...r.it, qty: r.c.q }));
           const notRet = rows.filter(r => r.rest > 0).map(r => ({ id: r.it.id || '', produit: r.it.produit, producteur: r.it.producteur || '', qty: r.rest, reason: [r.c.why, String(r.c.txt || '').trim()].filter(Boolean).join(' · ') }));
+          if (ask) { await kbAskPdpReturn(f, sel, notRet, by); showToast(`🙋 Demande envoyée à Henry : ${nRet} article(s)`); onDone && onDone(); return; }
           await kbApplyPdpReturn(f, sel, notRet, by);
           if (extra) await extra();
-          showToast(`↩️ Retour PDP : ${nRet} article(s)${notRet.length ? ` · ${notRet.length} produit(s) non retourné(s) avec raison` : ''}`);
+          showToast(`↩️ Retour PDP validé : ${nRet} article(s) · popup envoyée à ${f.site || 'la boutique'}`);
           onDone && onDone();
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
       return (
-        <KbSheet title={'↩️ Retour PDP — ' + (f.consumer_name || f.clientName || 'client')} onClose={onClose}>
+        <KbSheet title={(ask ? '🙋 Demander à Henry — ' : '↩️ Retour PDP — ') + (f.consumer_name || f.clientName || 'client')} onClose={onClose}>
           <div style={{ fontSize: 15, marginBottom: 8 }}>{f.site} · commande du <b>{formatDateShort(f.distribDate || f.day)}</b>. Coche ce qui <b>repart à PDP</b>. Pour le reste : une raison.</div>
           <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
             <button type="button" className="btn-secondary" style={{ minHeight: 48, fontWeight: 700 }} onClick={() => setPick(p => { const o = { ...p }; rows.forEach(r => { o[r.k] = { ...o[r.k], q: r.q }; }); return o; })}>☑️ Tout retourner</button>
@@ -7482,7 +7568,7 @@
             })}
           </div>
           <button type="button" className="btn-primary" disabled={busy} onClick={save} style={{ width: '100%', minHeight: 60, fontSize: 18, fontWeight: 800, marginTop: 12, background: '#1565c0' }}>
-            {busy ? '⏳…' : `↩️ Valider le retour PDP (${nRet} article${nRet > 1 ? 's' : ''})`}</button>
+            {busy ? '⏳…' : ask ? `🙋 Envoyer la demande à Henry (${nRet} article${nRet > 1 ? 's' : ''})` : `↩️ Valider le retour PDP (${nRet} article${nRet > 1 ? 's' : ''})`}</button>
           {missing.length > 0 && nRet > 0 && <div style={{ fontSize: 13, color: '#e65100', marginTop: 6, fontWeight: 700 }}>⚠️ Raison manquante : {missing.map(r => r.it.produit).join(', ')}</div>}
         </KbSheet>);
     }
@@ -7726,7 +7812,7 @@
 
       return (
         <div className="stack">
-          {pdpPick && <KbPdpReturnPicker f={pdpPick} by={session.name} onClose={() => setPdpPick(null)} onDone={() => setPdpPick(null)} />}
+          {pdpPick && <KbPdpReturnPicker f={pdpPick} by={session.name} ask={!session.isMaster} onClose={() => setPdpPick(null)} onDone={() => setPdpPick(null)} />}
           <h1>Non-récupérés · {currentSite}</h1>
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Distrib : appellent les clients avec téléphone. Master : email aux autres.
@@ -7742,7 +7828,7 @@
 
           {alertCount > 0 && (
             <div className="alert-red">
-              🔴 {alertCount} client{alertCount > 1 ? 's' : ''} non récupéré{alertCount > 1 ? 's' : ''} depuis +{ALERT_DAYS_NON_RECUP}j — Henry / Raimbaud prévenus, ils décident (retour PDP ou SAV)
+              🔴 {alertCount} client{alertCount > 1 ? 's' : ''} non récupéré{alertCount > 1 ? 's' : ''} depuis +{ALERT_DAYS_NON_RECUP}j — Henry prévenu, il décide (retour PDP ou SAV)
             </div>
           )}
 
@@ -7842,11 +7928,13 @@
                               : <span style={{fontSize:12,color:'var(--ink-mute)'}}>Pas de contact</span>
                           )}
                           <button className="btn-primary" style={{padding:'6px 10px',fontSize:12}} onClick={() => setStatus(f, 'resolved')}>✓ Résolu</button>
-                          {!f.forceReturnPdp && daysSince(f.distribDate || f.day) < ALERT_DAYS_NON_RECUP && (
-                            <button className="btn-secondary" style={{padding:'6px 10px',fontSize:12,color:'var(--info)'}} onClick={() => sendToPdpNow(f)}>↩️ Retour PDP maintenant</button>
+                          {!f.forceReturnPdp && (!f.pdpAsk || f.pdpAsk.refusedAt) && (
+                            <button className="btn-secondary" style={{padding:'8px 12px',fontSize:14,fontWeight:700,color:'#1565c0',borderColor:'#1565c0'}} onClick={() => sendToPdpNow(f)}>🙋 Demander à Henry le retour PDP</button>
                           )}
-                          {f.forceReturnPdp && <span style={{fontSize:11,color:'var(--info)',fontWeight:600,padding:'6px 0'}}>↩️ En retour PDP{Array.isArray(f.items) ? ` · ${f.items.reduce((t, x) => t + (Number(x.qty) || 1), 0)} article(s)` : ''}</span>}
-                          {f.forceReturnPdp && !f.pdpRecoveredAt && <button className="btn-ghost" style={{padding:'6px 10px',fontSize:12}} onClick={() => setPdpPick(f)}>✏️ Produits retournés</button>}
+                          {!f.forceReturnPdp && f.pdpAsk && f.pdpAsk.refusedAt && <span style={{fontSize:12,color:'var(--danger)',fontWeight:700,padding:'6px 0'}}>🙅 Refusé par {f.pdpAsk.refusedBy} : {f.pdpAsk.refusedWhy}</span>}
+                          {!f.forceReturnPdp && f.pdpAsk && !f.pdpAsk.refusedAt && <span style={{fontSize:13,color:'#1565c0',fontWeight:700,padding:'6px 0'}}>🙋 Retour PDP demandé à Henry par {f.pdpAsk.by} · en attente de sa validation</span>}
+                          {f.forceReturnPdp && <span style={{fontSize:12,color:'var(--info)',fontWeight:700,padding:'6px 0'}}>↩️ Retour PDP validé{Array.isArray(f.items) ? ` · ${f.items.reduce((t, x) => t + (Number(x.qty) || 1), 0)} article(s)` : ''}{f.pdpReadyAsk && !f.pdpReadyAt ? ' · ⚠️ à mettre dans la cagette (popup)' : f.pdpDepositedAt ? ' · 🏭 déposé à PDP' : f.pdpRecoveredAt ? ' · 🚚 pris par le chauffeur' : ' · attend le chauffeur'}</span>}
+                          {session.isMaster && f.forceReturnPdp && !f.pdpRecoveredAt && <button className="btn-ghost" style={{padding:'6px 10px',fontSize:12}} onClick={() => setPdpPick(f)}>✏️ Produits retournés</button>}
                           {session.isMaster && (
                             <button className="btn-ghost" style={{padding:'6px 10px',fontSize:12}} onClick={() => removeFromFollowUp(f)}>🗑️</button>
                           )}
@@ -11189,6 +11277,43 @@
           <p style={{color:'var(--ink-soft)',fontSize:13,marginTop:-8}}>
             Vue globale pour traiter sans changer de local : clients à rappeler, consignes en attente, oublis casier.          </p>
 
+          {/* V11.43 — demandes de retour PDP envoyées par les boutiques (Suivi › 🙋 Demander à Henry) */}
+          {(() => {
+            const asks = followups.filter(f => f.pdpAsk && !f.pdpAsk.refusedAt && !f.forceReturnPdp && !KB_FU_TERMINAL.includes(f.status));
+            if (!asks.length) return null;
+            const okAsk = async (f) => {
+              try { await kbApplyPdpReturn(f, f.pdpAsk.items || [], f.pdpAsk.notRet || [], session.name);
+                await storage.setDoc('followups', f.id || f.orderId, { pdpDecision: 'retour', decidedBy: session.name, decidedAt: new Date().toISOString() });
+                showToast(`✅ Retour PDP validé · popup envoyée à ${f.site}`); } catch (e) { showToast('Erreur : ' + e.message); }
+            };
+            const noAsk = async (f) => {
+              const why = prompt(`Refuser le retour PDP de ${f.consumer_name || 'ce client'} ? Raison (lue par ${f.site}) :`, 'On garde la commande au casier');
+              if (why === null) return;
+              const now = new Date().toISOString(), pid = 'push_pdpno_' + Date.now();
+              await storage.setDoc('followups', f.id || f.orderId, { pdpAsk: { ...f.pdpAsk, refusedAt: now, refusedBy: session.name, refusedWhy: why } });
+              await storage.setDoc('push_messages', pid, { id: pid, kind: 'info', followupId: f.id || f.orderId, icon: '🙅', title: `Retour PDP refusé : ${f.consumer_name || 'client'}`,
+                body: `${why}\n\n(Commande du ${formatDateShort(f.distribDate || f.day || '')} — ${session.name})`, target: 'some', sites: [f.site], to: [], acks: {}, cancelled: false, createdBy: session.name, createdAt: now });
+              showToast('🙅 Refus envoyé à ' + f.site);
+            };
+            return (
+              <div className="card" style={{ border: '3px solid #1565c0', background: '#e3f2fd' }}>
+                <h3 style={{ margin: '0 0 8px', color: '#0d47a1' }}>🙋 Demandes de retour PDP · {asks.length}</h3>
+                <div className="stack" style={{ gap: 8 }}>
+                  {asks.map(f => (
+                    <div key={f.orderId || f.id} style={{ background: '#fff', borderRadius: 12, padding: '10px 12px', border: '2px solid #1565c0' }}>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}><span className="badge badge-site">{f.site}</span><b style={{ fontSize: 17 }}>{f.consumer_name || '(client)'}</b>
+                        <span style={{ fontSize: 13, color: 'var(--ink-mute)' }}>commande du {formatDateShort(f.distribDate || f.day || '')} · demandé par {f.pdpAsk.by}</span></div>
+                      <div style={{ fontSize: 15, marginTop: 6 }}>{(f.pdpAsk.items || []).map((it, k) => <div key={k}>↩️ <b>{it.produit}</b>{(Number(it.qty) || 1) > 1 ? ' ×' + it.qty : ''}</div>)}</div>
+                      {(f.pdpAsk.notRet || []).length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', marginTop: 4 }}>Reste : {(f.pdpAsk.notRet || []).map(x => x.produit + ' (' + x.reason + ')').join(' · ')}</div>}
+                      <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                        <button className="btn-primary" style={{ fontSize: 15, fontWeight: 800, background: '#1565c0', borderColor: '#1565c0' }} onClick={() => okAsk(f)}>✅ Valider le retour PDP</button>
+                        <button className="btn-secondary" style={{ fontSize: 14 }} onClick={() => setNrOpen(f)}>✏️ Modifier par article</button>
+                        <button className="btn-secondary" style={{ fontSize: 14, color: 'var(--danger)', borderColor: 'var(--danger)' }} onClick={() => noAsk(f)}>🙅 Refuser</button>
+                      </div>
+                    </div>))}
+                </div>
+              </div>);
+          })()}
           {/* V10.56 — « Empreintes à régulariser » retiré : la régularisation PayZen est automatique (facturation web, V10.55) */}
           {overduePdp.length > 0 && (
             <div className="alert-red" style={{display:'flex',flexDirection:'column',gap:8}}>
@@ -22027,7 +22152,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       fontSize: 14,
       color: 'var(--ink-soft)'
     }
-  }, "Pas encore arrivé à l'entrepôt ? Ouvre les retours et touche ", React.createElement("b", null, "« 🚫 Pas encore arrivé à PDP »"), " : ça débloque pour aujourd'hui."), pdpBoard.blocking > 0 && session && (session.isMaster || session._masterView) && React.createElement("button", {
+  }, "Déposés par le chauffeur à l'entrepôt : choisis la destination de chaque produit, ou ", React.createElement("b", null, "« ❓ Pas trouvé à l'entrepôt »"), ". La livraison DOM peut quand même être clôturée seule."), pdpBoard.blocking > 0 && session && (session.isMaster || session._masterView) && React.createElement("button", {
     className: "btn-secondary",
     style: {
       fontSize: 16,
@@ -29038,10 +29163,18 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function kbPickupLabel(name) { const p = String(name || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : '(client)'; }
     function kbPickupFrom(f) {
       return { orderId: String(f.orderId || f.id || ''), site: f.site || '', consumer_name: kbPickupLabel(f.consumer_name), storedCasier: String(f.storedCasier || ''),
-        distribDate: f.distribDate || f.day || '', items: (f.items || []).slice(0, 60).map(it => ({ produit: String(it.produit || ''), qty: it.qty || 1, dlc: it.dlc || '' })) };
+        distribDate: f.distribDate || f.day || '', items: (f.items || []).slice(0, 60).map(it => ({ produit: String(it.produit || ''), qty: it.qty || 1, dlc: it.dlc || '' })),
+        readyBy: String(f.pdpReadyBy || '').slice(0, 60) };
     }
     async function kbPickupWrite(f) { const id = String(f.orderId || f.id || ''); if (id) { try { await storage.setDoc('pdp_pickups', id, kbPickupFrom(f)); } catch (e) { console.warn('pdp_pickups', e); } } }
     const KB_FU_TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
+    // V11.43 — étapes chauffeur d'une commande en retour PDP (copie pdp_pickups ⇄ followups)
+    const kbPdpReady = (f) => !f.pdpReadyAsk || !!f.pdpReadyAt;
+    function kbPdpSteps(p) {
+      return { pdpRecoveredAt: p.pdpRecoveredAt || '', pdpRecoveredBy: p.pdpRecoveredBy || '', pdpVerifiedAt: p.pdpVerifiedAt || '', pdpVerifiedBy: p.pdpVerifiedBy || '',
+        pdpDepositedAt: p.pdpDepositedAt || '', pdpDepositedBy: p.pdpDepositedBy || '', pdpCheck: p.pdpCheck || {} };
+    }
+    const kbPdpStepSig = (p) => { const x = kbPdpSteps(p || {}); return [x.pdpRecoveredAt, x.pdpVerifiedAt, x.pdpDepositedAt, JSON.stringify(Object.keys(x.pdpCheck).sort().map(k => k + ':' + x.pdpCheck[k]))].join('~'); };
     const kbIsToday = (iso) => !!iso && String(iso).slice(0, 10) === todayKey();
 
     function useKbPdpBoard() {
@@ -29062,19 +29195,19 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const syncSig = React.useRef('');
       React.useEffect(() => {
         if (drv || !fus || !picks) return;
-        const act = fus.filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length);
+        const act = fus.filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length && kbPdpReady(f)); // V11.43
         const pk = {}; picks.forEach(p => { pk[p.id] = p; });
         const ids = new Set(act.map(f => String(f.orderId || f.id)));
         const toCreate = act.filter(f => !pk[String(f.orderId || f.id)]);
         const toDelete = picks.filter(p => !ids.has(p.id));
-        const toCopy = act.filter(f => { const p = pk[String(f.orderId || f.id)]; return p && (p.pdpRecoveredAt || '') !== (f.pdpRecoveredAt || ''); });
-        const sig = [toCreate.map(f => f.orderId).join(','), toDelete.map(p => p.id).join(','), toCopy.map(f => f.orderId + (pk[String(f.orderId || f.id)].pdpRecoveredAt || '')).join(',')].join('|');
+        const toCopy = act.filter(f => { const p = pk[String(f.orderId || f.id)]; return p && kbPdpStepSig(p) !== kbPdpStepSig(f); });
+        const sig = [toCreate.map(f => f.orderId).join(','), toDelete.map(p => p.id).join(','), toCopy.map(f => f.orderId + kbPdpStepSig(pk[String(f.orderId || f.id)])).join(',')].join('|');
         if (sig === '||' || sig === syncSig.current) return;
         syncSig.current = sig;
         (async () => {
           for (const f of toCreate) await kbPickupWrite(f);
           for (const p of toDelete) { try { await storage.deleteDoc('pdp_pickups', p.id); } catch (e) {} }
-          for (const f of toCopy) { const p = pk[String(f.orderId || f.id)]; try { await storage.setDoc('followups', f.id || f.orderId, { pdpRecoveredAt: p.pdpRecoveredAt || '', pdpRecoveredBy: p.pdpRecoveredBy || '' }); } catch (e) {} }
+          for (const f of toCopy) { const p = pk[String(f.orderId || f.id)]; try { await storage.setDoc('followups', f.id || f.orderId, kbPdpSteps(p)); } catch (e) {} }
         })();
       }, [drv, fus, picks]);
       return React.useMemo(() => {
@@ -29086,16 +29219,24 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const orders = drv
           ? (picks || []).filter(p => Array.isArray(p.items) && p.items.length).map(p => ({ ...p, id: p.id, orderId: p.orderId || p.id, forceReturnPdp: true }))
           : (fus || []).filter(f => !KB_FU_TERMINAL.includes(f.status) && f.forceReturnPdp && Array.isArray(f.items) && f.items.length)
-              .map(f => { const p = pkm[String(f.orderId || f.id)]; return p ? { ...f, pdpRecoveredAt: p.pdpRecoveredAt || '', pdpRecoveredBy: p.pdpRecoveredBy || '' } : f; });
-        // À récupérer (chauffeur)
+              .filter(f => kbPdpReady(f)) // V11.43 — pas encore mis dans la cagette par la boutique → invisible du circuit
+              .map(f => { const p = pkm[String(f.orderId || f.id)]; return p ? { ...f, ...kbPdpSteps(p) } : f; });
+        // V11.43 — circuit : à récupérer (boutique) → pris (photo) → vérifié → déposé à PDP → traité
         const recoverManual = (manual || []).filter(r => r.status === 'pending' || r.status === 'missing');
         const recoverOrders = orders.filter(f => !f.pdpRecoveredAt);
         const recoveredTodayManual = (manual || []).filter(r => r.status === 'recovered' && kbIsToday(r.recoveredAt));
         const recoveredTodayOrders = orders.filter(f => f.pdpRecoveredAt && kbIsToday(f.pdpRecoveredAt));
-        // À traiter (entrepôt)
-        const treatManual = (manual || []).filter(r => r.status === 'recovered');
+        const pickedManual = (manual || []).filter(r => r.status === 'recovered');                // dans le camion, à vérifier
+        const pickedOrders = orders.filter(f => f.pdpRecoveredAt && !f.pdpVerifiedAt);
+        const verifiedManual = (manual || []).filter(r => r.status === 'verified');               // vérifié, à déposer
+        const verifiedOrders = orders.filter(f => f.pdpVerifiedAt && !f.pdpDepositedAt);
+        const notFoundManual = (manual || []).filter(r => r.status === 'notfound');
+        const driverTodo = recoverManual.length + recoverOrders.length + pickedManual.length + pickedOrders.length + verifiedManual.length + verifiedOrders.length;
+        // À traiter (entrepôt) = DÉPOSÉ à PDP par le chauffeur
+        const treatManual = (manual || []).filter(r => r.status === 'deposited');
         const treatLines = [];
-        orders.filter(f => f.pdpRecoveredAt).forEach(f => f.items.forEach((it, idx) => { const id = lineId(f, it, idx); if (!tm[id]) treatLines.push({ f, it, idx, id }); }));
+        orders.filter(f => f.pdpDepositedAt).forEach(f => f.items.forEach((it, idx) => { const id = lineId(f, it, idx); if (!tm[id] && (f.pdpCheck || {})[String(idx)] !== false) treatLines.push({ f, it, idx, id }); }));
+        const lastDeposit = [...treatManual.map(r => ({ at: r.depositedAt || '', by: r.depositedBy || '' })), ...treatLines.map(L => ({ at: L.f.pdpDepositedAt || '', by: L.f.pdpDepositedBy || '' }))].sort((a, b) => String(b.at).localeCompare(String(a.at)))[0] || null;
         const toTreat = treatManual.length + treatLines.length;
         // Traités aujourd'hui (pour le mail)
         const treatedToday = [
@@ -29109,8 +29250,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const notYet = (id) => tm['_notyet_' + id] || null;
         const nyToday = (id) => { const d = notYet(id); return !!(d && Array.isArray(d.days) && d.days.includes(today)); };
         const unlock = tm['_unlock_' + today] || null;
-        const blocking = unlock ? 0 : treatManual.filter(r => !nyToday(r.id)).length + treatLines.filter(L => !nyToday(L.id)).length;
-        return { ready, tm, lineId, orders, manualAll: manual || [], recoverManual, recoverOrders, recoveredTodayManual, recoveredTodayOrders, treatManual, treatLines, toTreat, toRecover: recoverManual.length + recoverOrders.length, treatedToday, valid, notYet, nyToday, unlock, blocking };
+        const blocking = unlock ? 0 : treatManual.length + treatLines.length; // V11.43 — déposé = forcément arrivé : plus de « pas encore arrivé »
+        return { ready, tm, lineId, orders, manualAll: manual || [], recoverManual, recoverOrders, recoveredTodayManual, recoveredTodayOrders, pickedManual, pickedOrders, verifiedManual, verifiedOrders, notFoundManual, driverTodo, lastDeposit,
+          treatManual, treatLines, toTreat, toRecover: recoverManual.length + recoverOrders.length, treatedToday, valid, notYet, nyToday, unlock, blocking };
       }, [manual, fus, treats, picks, drv]);
     }
 
@@ -29119,9 +29261,32 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       pribon:  { icon: '🚚', label: 'Zone ROB (navette)', color: '#6e4a9c' },
       partage: { icon: '🤝', label: 'Cagette partage équipe', color: '#c62828' },
       jete:    { icon: '🗑️', label: 'Jeté', color: '#455a64' },
+      lost:    { icon: '❓', label: 'Pas trouvé à l\'entrepôt', color: '#b71c1c' }, // V11.43 — jamais proposé comme destination (bouton dédié + mail)
     };
+    const KB_DEST_PICK = ['rayon', 'pribon', 'partage', 'jete'];
+    // V11.43 — déposé par le chauffeur mais introuvable à l'entrepôt → mail rr@ + hg@ (qui a déposé, qui a cherché)
+    async function kbPdpLostMail(info, by) {
+      const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
+        + `<div style="background:#b71c1c;color:#fff;border-radius:12px;padding:16px 18px"><div style="font-size:24px;font-weight:900">❓ Retour PDP introuvable à l'entrepôt</div><div style="font-size:16px">déposé par le chauffeur, pas trouvé par la prépa</div></div>`
+        + `<div style="border:4px solid #b71c1c;border-radius:12px;padding:16px 18px;margin-top:12px">`
+        + `<div style="font-size:28px;font-weight:900">${kbEsc(kbProdName(info.produit || '(produit)'))}${(info.qty || 1) > 1 ? ` <span style="color:#b71c1c">×${info.qty}</span>` : ''}</div>`
+        + `<div style="font-size:18px;margin-top:8px">Boutique : <b>${kbEsc(info.site || '?')}</b>${info.client ? ' · ' + kbEsc(info.client) : ''}</div>`
+        + `<div style="font-size:18px;margin-top:4px">🚚 Déposé par : <b>${kbEsc(info.depositedBy || '?')}</b>${info.depositedAt ? ' le ' + kbEsc(new Date(info.depositedAt).toLocaleString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })) : ''}</div>`
+        + `<div style="font-size:18px;margin-top:4px">📦 Pas trouvé par : <b>${kbEsc(by || '?')}</b></div></div>`
+        + `<p style="color:#999;font-size:12px;margin-top:14px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
+      try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: `❓ Retour PDP introuvable · ${info.produit || ''} (${info.site || ''}) · déposé par ${info.depositedBy || '?'} · pas trouvé par ${by}`, htmlBody: html,
+        body: `${info.depositedBy || '?'} a déposé ${info.produit} x${info.qty || 1} (${info.site}) mais ${by} ne l'a pas trouvé à l'entrepôt.` }); return !!(r && r.ok); } catch (e) { return false; }
+    }
+    // V11.43 — feuille « À remettre dans le stock » (produits remis en rayon), jointe au mail de validation
+    function kbPdpRestockXlsx(day, rows) {
+      if (!window.XLSX) return null;
+      const data = rows.map(r => ({ 'Produit': kbProdName(r.produit || ''), 'Producteur': r.producteur || '', 'Quantité à remettre': r.qty || 1, 'DLC': r.dlc ? formatDateShort(r.dlc) : '', 'Boutique': r.site || '', 'Client': r.client || '', 'Traité par': r.by || '' }));
+      const ws = XLSX.utils.json_to_sheet(data); ws['!cols'] = [{ wch: 38 }, { wch: 24 }, { wch: 18 }, { wch: 10 }, { wch: 10 }, { wch: 20 }, { wch: 16 }];
+      const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'A remettre en stock');
+      return { dataB64: XLSX.write(wb, { type: 'base64', bookType: 'xlsx' }), mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: `A_remettre_en_stock_${day}.xlsx` };
+    }
     function kbPdpRecapHtml(day, rows, by) {
-      const groups = ['rayon', 'pribon', 'partage', 'jete'].map(k => [k, rows.filter(r => r.destination === k)]).filter(([, a]) => a.length);
+      const groups = ['rayon', 'pribon', 'partage', 'jete', 'lost'].map(k => [k, rows.filter(r => r.destination === k)]).filter(([, a]) => a.length);
       const box = (k, n) => { const u = KB_DEST_UI[k]; return `<td style="padding:5px"><div style="background:${u.color}14;border-left:8px solid ${u.color};border-radius:12px;padding:10px 12px"><div style="font-size:13px;color:#555">${u.icon} ${u.label}</div><div style="font-size:32px;font-weight:900;color:${u.color};line-height:1.1">${n}</div></div></td>`; };
       const sec = ([k, a]) => { const u = KB_DEST_UI[k]; return `<div style="margin-top:14px;font-size:18px;font-weight:900;color:${u.color}">${u.icon} ${u.label}</div><table role="presentation" width="100%" style="border-collapse:collapse;border-left:6px solid ${u.color}">`
         + a.map(r => `<tr><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:16px"><b>${kbEsc(kbProdName(r.produit || ''))}</b> <span style="color:#888;font-size:13px">· ${kbEsc(r.site || '')}${r.client ? ' · ' + kbEsc(r.client) : ''}</span></td><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:16px;text-align:right;white-space:nowrap"><b style="font-size:19px">×${r.qty}</b>${r.dlc ? ` <span style="color:#555">· DLC ${kbEsc(formatDateShort(r.dlc))}</span>` : ''}${r.navetteDate ? ` <span style="color:${u.color}">· navette ${kbEsc(formatDateShort(r.navetteDate))}</span>` : ''}</td></tr>`).join('') + `</table>`; };
@@ -29332,11 +29497,34 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           const nav = dest === 'pribon' ? (routeReturn(it.dlc).navette || kbFirstNavetteBeforeDLC(it.dlc || addDays(todayKey(), 8), new Date())) : null;
           await storage.setDoc('pdp_treatments', id, { id, orderId: f.orderId, site: f.site, client: f.consumer_name || '', produit: it.produit, producteur: it.producteur, qty: it.qty || 1, dlc: it.dlc || '', destination: dest, navetteDate: nav ? nav.date : '', treatedBy: session.name, treatedAt: now() });
           await writeLoss(id, it.produit, it.producteur, it.qty || 1, dest, it.dlc, nav, `Commande non récupérée — ${f.consumer_name || ''} (${f.site})`);
-          const left = f.items.filter((x, k) => { const lid = B.lineId(f, x, k); return lid !== id && !B.tm[lid]; }).length;
+          const left = f.items.filter((x, k) => { const lid = B.lineId(f, x, k); return lid !== id && !B.tm[lid] && (f.pdpCheck || {})[String(k)] !== false; }).length;
           if (!left) await storage.setDoc('followups', f.id || f.orderId, { status: 'returned', autoClosed: true, updatedAt: now() });
           muCelebrate(it.qty || 1);
         } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
       };
+      const lostManual = async (r) => {
+        if (!confirm(`« ${r.produit || r.productLabel} » introuvable à l'entrepôt ?\nUn mail part à Raimbaud et Henry.`)) return;
+        setBusy(true);
+        try {
+          await storage.setDoc('pdp_returns', r.id, { status: 'treated', destination: 'lost', navetteDate: '', treatedBy: session.name, treatedAt: now() });
+          const ok = await kbPdpLostMail({ produit: r.produit || r.productLabel, qty: r.qty || 1, site: r.site, client: r.clientName || '', depositedBy: r.depositedBy || r.recoveredBy, depositedAt: r.depositedAt }, session.name);
+          showToast(ok ? '❓ Noté · mail envoyé à Raimbaud et Henry' : '❓ Noté · ⚠️ mail non parti');
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const lostLine = async (L) => {
+        if (!confirm(`« ${L.it.produit} » introuvable à l'entrepôt ?\nUn mail part à Raimbaud et Henry.`)) return;
+        setBusy(true);
+        try {
+          const { f, it, id } = L;
+          await storage.setDoc('pdp_treatments', id, { id, orderId: f.orderId, site: f.site, client: f.consumer_name || '', produit: it.produit, producteur: it.producteur, qty: it.qty || 1, dlc: it.dlc || '', destination: 'lost', navetteDate: '', treatedBy: session.name, treatedAt: now() });
+          const left = f.items.filter((x, k) => { const lid = B.lineId(f, x, k); return lid !== id && !B.tm[lid] && (f.pdpCheck || {})[String(k)] !== false; }).length;
+          if (!left) await storage.setDoc('followups', f.id || f.orderId, { status: 'returned', autoClosed: true, updatedAt: now() });
+          const ok = await kbPdpLostMail({ produit: it.produit, qty: it.qty || 1, site: f.site, client: f.consumer_name || '', depositedBy: f.pdpDepositedBy, depositedAt: f.pdpDepositedAt }, session.name);
+          showToast(ok ? '❓ Noté · mail envoyé à Raimbaud et Henry' : '❓ Noté · ⚠️ mail non parti');
+        } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const LostBtn = ({ on }) => <button className="btn-secondary" disabled={busy} onClick={on} style={{ width: '100%', marginTop: 10, fontSize: 16, padding: '12px', fontWeight: 700, color: '#b71c1c', borderColor: '#b71c1c' }}>❓ Pas trouvé à l'entrepôt</button>;
+      const photosAll = useKbPdpPhotos();
       const notYetMark = async (id, info) => {
         setBusy(true);
         try { const r = await kbPdpNotYet(B, id, info, session.name); showToast(r.days >= 2 ? (r.mailed ? `⏳ Noté (${r.days}ᵉ fois) · mail envoyé à Raimbaud et Henry` : `⏳ Noté (${r.days}ᵉ fois) · ⚠️ mail non parti`) : '⏳ Noté : pas encore arrivé · il reviendra demain'); }
@@ -29361,13 +29549,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         showToast('Supprimé');
       };
       const valider = async () => {
-        const pend = B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length; // V9.92
+        const pend = B.treatManual.length + B.treatLines.length; // V11.43
         if (pend) { showToast(`Encore ${pend} retour(s) à traiter`); return; }
         if (!B.treatedToday.length) { showToast("Rien de traité aujourd'hui"); return; }
         setBusy(true);
         try {
           const day = todayKey();
-          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: `↩️ Retours PDP traités ${formatDateShort(day)} · ${B.treatedToday.length} produit(s)`, htmlBody: kbPdpRecapHtml(day, B.treatedToday, session.name), body: B.treatedToday.map(x => `- ${x.produit} (${x.site}) x${x.qty} → ${KB_DEST_UI[x.destination] ? KB_DEST_UI[x.destination].label : x.destination}${x.dlc ? ' · DLC ' + formatDateShort(x.dlc) : ''}`).join('\n') });
+          const restock = B.treatedToday.filter(x => x.destination === 'rayon');
+          const att = restock.length ? kbPdpRestockXlsx(day, restock) : null; // V11.43 — ancien site : feuille à reporter sur la feuille de stock (nouveau site : PDV plus tard)
+          const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: `↩️ Retours PDP traités ${formatDateShort(day)} · ${B.treatedToday.length} produit(s)${restock.length ? ` · 🛒 ${restock.reduce((t, x) => t + (x.qty || 1), 0)} à remettre en stock` : ''}`, ...(att ? { attachment: att } : {}), htmlBody: kbPdpRecapHtml(day, B.treatedToday, session.name) + (att ? `<div style="font-family:Arial;max-width:600px;margin-top:10px;background:#2e7d32;color:#fff;border-radius:12px;padding:14px 18px;font-size:18px;font-weight:900">📎 Feuille « À remettre dans le stock » jointe (${restock.length} ligne(s))<div style="font-size:14px;font-weight:400">Ancien site : à reporter sur la feuille de stock. Nouveau site : remise en vente via PDV (à venir).</div></div>` : ''), body: B.treatedToday.map(x => `- ${x.produit} (${x.site}) x${x.qty} → ${KB_DEST_UI[x.destination] ? KB_DEST_UI[x.destination].label : x.destination}${x.dlc ? ' · DLC ' + formatDateShort(x.dlc) : ''}`).join('\n') });
           const ok = !!(r && r.ok);
           await storage.setDoc('pdp_treatments', '_valid_' + day, { id: '_valid_' + day, by: session.name, at: now(), count: B.treatedToday.length, mailOk: ok, mailErr: ok ? '' : String((r && r.error) || '') });
           if (ok) kbCelebrate({ title: 'Retours PDP validés 🎉', sub: 'Récap envoyé à Raimbaud et Henry' }); else showToast('⚠️ Mail non envoyé : ' + ((r && r.error) || 'erreur'));
@@ -29456,7 +29646,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             </button>
             <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{route.reason}</div>
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {Object.keys(KB_DEST_UI).filter(k => k !== reco).map(k => <button key={k} disabled={busy} className="btn-secondary" style={{ flex: '1 1 40%', fontSize: 14, padding: '10px 8px' }} onClick={() => onPick(k)}>{KB_DEST_UI[k].icon} {KB_DEST_UI[k].label}</button>)}
+              {KB_DEST_PICK.filter(k => k !== reco).map(k => <button key={k} disabled={busy} className="btn-secondary" style={{ flex: '1 1 40%', fontSize: 14, padding: '10px 8px' }} onClick={() => onPick(k)}>{KB_DEST_UI[k].icon} {KB_DEST_UI[k].label}</button>)}
             </div>
           </div>
         );
@@ -29493,10 +29683,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const manAll = (B.manualAll || []).filter(r => r.status !== 'treated' || kbIsToday(r.treatedAt));
         const lines = [];
         (B.orders || []).forEach(f => (f.items || []).forEach((it, idx) => { const id = B.lineId(f, it, idx); const t = B.tm[id]; if (!t || kbIsToday(t.treatedAt)) lines.push({ f, it, idx, id, t }); }));
-        const stLbl = (r) => r.status === 'treated' ? ['✅ traité', '#2e7d32'] : r.status === 'recovered' ? ['📦 récupéré', '#1565c0'] : r.status === 'missing' ? ['❓ introuvable', '#c62828'] : ['🚚 à récupérer', '#e65100'];
+        const stLbl = (r) => r.status === 'treated' ? (r.destination === 'lost' ? ['❓ pas trouvé à PDP', '#b71c1c'] : ['✅ traité', '#2e7d32']) : r.status === 'deposited' ? ['🏭 déposé à PDP · à traiter', '#1565c0'] : r.status === 'verified' ? ['🔍 vérifié · dans le camion', '#00838f'] : r.status === 'notfound' ? ['❓ pas trouvé par le chauffeur', '#c62828'] : r.status === 'recovered' ? ['🚚 pris · à vérifier', '#1565c0'] : r.status === 'missing' ? ['❓ introuvable', '#c62828'] : ['📍 à récupérer en boutique', '#e65100'];
         const destRow = (key, dlc, onPick) => mDest === key ? (
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
-            {Object.keys(KB_DEST_UI).map(k => <button key={k} disabled={busy} onClick={async () => { await onPick(k); setMDest(null); }} style={{ flex: '1 1 45%', minHeight: 48, fontSize: 15, fontWeight: 700, borderRadius: 10, border: 'none', background: KB_DEST_UI[k].color, color: '#fff', cursor: 'pointer' }}>{KB_DEST_UI[k].icon} {KB_DEST_UI[k].label}{routeReturn(dlc).dest === k ? ' ★' : ''}</button>)}
+            {KB_DEST_PICK.map(k => <button key={k} disabled={busy} onClick={async () => { await onPick(k); setMDest(null); }} style={{ flex: '1 1 45%', minHeight: 48, fontSize: 15, fontWeight: 700, borderRadius: 10, border: 'none', background: KB_DEST_UI[k].color, color: '#fff', cursor: 'pointer' }}>{KB_DEST_UI[k].icon} {KB_DEST_UI[k].label}{routeReturn(dlc).dest === k ? ' ★' : ''}</button>)}
             <button className="btn-ghost" onClick={() => setMDest(null)} style={{ fontSize: 13 }}>Fermer</button>
           </div>) : null;
         const btn = (txt, on, col) => <button disabled={busy} onClick={on} style={{ minHeight: 40, fontSize: 14, fontWeight: 700, padding: '6px 10px', borderRadius: 10, border: '2px solid ' + (col || 'var(--line)'), background: '#fff', color: col || 'var(--ink)', cursor: 'pointer' }}>{txt}</button>;
@@ -29518,6 +29708,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                     {r.status !== 'treated' && r.kind !== 'rolls' && btn('🎯 Choisir la destination', () => setMDest(r.id), 'var(--master)')}
                     {r.status === 'recovered' && r.kind === 'rolls' && btn('✓ Rolls reçus à PDP', () => treatRolls(r), '#6d4c41')}
                     {(r.status === 'pending' || r.status === 'missing') && btn('✓ Marquer récupéré', () => masterRecovered(r), '#1565c0')}
+                    {['recovered', 'verified', 'notfound'].includes(r.status) && btn('🏭 Marquer déposé à PDP', async () => { await storage.setDoc('pdp_returns', r.id, { status: 'deposited', depositedBy: session.name + ' (master)', depositedAt: now() }); showToast('🏭 Déposé'); }, '#2e7d32')}
+                    {r.status === 'notfound' && btn('↩️ Remettre à récupérer', async () => { await storage.setDoc('pdp_returns', r.id, { status: 'pending', recoveredBy: '', recoveredAt: '', verifiedBy: '', verifiedAt: '' }); showToast('↩️ À récupérer de nouveau'); }, '#e65100')}
                     {r.status === 'treated' && btn('↩️ Annuler le traitement', () => masterUndo(r), '#ef6c00')}
                     {r.kind !== 'rolls' && btn('✏️ Corriger le produit', () => setFix({ r, mode: 'edit' }), '#4a148c')}
                     {btn('🚫 Retirer du suivi', () => setFix({ r, mode: 'rm' }), 'var(--danger)')}
@@ -29549,7 +29741,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP · à traiter</h1>
           {!B.ready && <p>Chargement…</p>}
           {masterPanel()}
-          {B.ready && (B.treatManual.filter(r => !B.nyToday(r.id)).length + B.treatLines.filter(L => !B.nyToday(L.id)).length) === 0 && (
+          {B.ready && (B.treatManual.length + B.treatLines.length) === 0 && (
             <div className="card" style={{ textAlign: 'center', padding: '22px 14px', border: '3px solid #2e7d32', background: '#e8f5e9' }}>
               <div style={{ fontSize: 46 }}>{B.treatedToday.length ? '🎉' : '👍'}</div>
               <div style={{ fontSize: 22, fontWeight: 700, color: '#1b5e20' }}>{B.treatedToday.length ? 'Tout est traité' : 'Rien à traiter'}</div>
@@ -29565,16 +29757,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 <div style={{ fontSize: 23, fontWeight: 700 }}>{r.produit || r.productLabel}{(r.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{r.qty}</span> : ''}</div>
                 <span style={{ background: kbSiteColor(r.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700, height: 'fit-content' }}>{r.site}</span>
               </div>
-              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>{r.kind === 'rolls' ? 'Rolls vides de la distrib' : <>{r.producteur ? r.producteur + ' · ' : ''}{r.dlc ? <>DLC <b>{formatDateShort(r.dlc)}</b></> : 'DLC non renseignée'}</>}{r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}</div>
+              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>{r.kind === 'rolls' ? 'Rolls vides de la distrib' : <>{r.producteur ? r.producteur + ' · ' : ''}{r.dlc ? <>DLC <b>{formatDateShort(r.dlc)}</b></> : 'DLC non renseignée'}</>}{r.depositedBy ? ' · 🏭 déposé par ' + r.depositedBy + (r.depositedAt ? ' à ' + kbHhmm(r.depositedAt) : '') : r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''}</div>
               {r.kind !== 'rolls' && <KbPdpRetOrigin r={r} />}
+              <KbPdpPhotoStrip photos={kbPdpPhotosFor(photosAll, r.site, r.recoveredAt)} />
               {isMaster && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
                 {r.kind !== 'rolls' && <button className="btn-secondary" style={{ fontSize: 14, color: '#4a148c', borderColor: '#4a148c' }} onClick={() => setFix({ r, mode: 'edit' })}>✏️ Corriger le produit</button>}
                 <button className="btn-secondary" style={{ fontSize: 14, color: 'var(--danger)', borderColor: 'var(--danger)' }} onClick={() => setFix({ r, mode: 'rm' })}>🚫 Retirer du suivi</button>
               </div>}
-              {!B.nyToday(r.id) && (r.kind === 'rolls'
+              {r.kind === 'rolls'
                 ? <button disabled={busy} onClick={() => treatRolls(r)} style={{ width: '100%', minHeight: 64, marginTop: 10, fontSize: 20, fontWeight: 800, borderRadius: 14, border: 'none', background: '#6d4c41', color: '#fff' }}>✓ Rolls reçus à PDP</button>
-                : <DestButtons dlc={r.dlc} onPick={(d) => treatManual(r, d)} />)}
-              <NotYetBar id={r.id} info={{ produit: r.produit || r.productLabel, site: r.site, qty: r.qty || 1, recoveredBy: r.recoveredBy, recoveredAt: r.recoveredAt }} />
+                : <DestButtons dlc={r.dlc} onPick={(d) => treatManual(r, d)} />}
+              <LostBtn on={() => lostManual(r)} />
             </div>
           ))}
           {B.treatLines.map(L => (
@@ -29583,9 +29776,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 <div style={{ fontSize: 23, fontWeight: 700 }}>{L.it.produit}{(L.it.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{L.it.qty}</span> : ''}</div>
                 <span style={{ background: kbSiteColor(L.f.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700, height: 'fit-content' }}>{L.f.site}</span>
               </div>
-              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>📦 Commande non récupérée de {L.f.consumer_name || '(client)'}{L.it.dlc ? <> · DLC <b>{formatDateShort(L.it.dlc)}</b></> : ''}</div>
-              {!B.nyToday(L.id) && <DestButtons dlc={L.it.dlc} onPick={(d) => treatLine(L, d)} />}
-              <NotYetBar id={L.id} info={{ produit: L.it.produit, site: L.f.site, qty: L.it.qty || 1, recoveredBy: L.f.pdpRecoveredBy, recoveredAt: L.f.pdpRecoveredAt }} />
+              <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>📦 Commande non récupérée de {L.f.consumer_name || '(client)'}{L.it.dlc ? <> · DLC <b>{formatDateShort(L.it.dlc)}</b></> : ''}{L.f.pdpDepositedBy ? ' · 🏭 déposé par ' + L.f.pdpDepositedBy : ''}</div>
+              {L.idx === 0 || !B.treatLines.some(x => x.f === L.f && x.idx < L.idx) ? <KbPdpPhotoStrip photos={kbPdpPhotosFor(photosAll, L.f.site, L.f.pdpRecoveredAt)} /> : null}
+              <DestButtons dlc={L.it.dlc} onPick={(d) => treatLine(L, d)} />
+              <LostBtn on={() => lostLine(L)} />
             </div>
           ))}
           {B.treatedToday.length > 0 && (
@@ -33448,7 +33642,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div style={{ fontSize: 16, marginTop: 4, opacity: .92, textTransform: 'capitalize' }}>{formatDateFR()} · tournée Rungis 🚚</div>
           </div>
           <Tile ic="📦" title="À livrer aux boutiques" sub="À prendre à PDP : palettes validées + rolls Kelbongoo" n={enl.raw === undefined ? null : livTodo} color="#1565c0" onClick={() => setView('livraison')} />
-          <Tile ic="↩️" title="À ramener à PDP" sub="Les cagettes « Retour PDP » de chaque boutique" n={B.ready ? B.toRecover : null} color="#e65100" onClick={() => setView('retours')} />
+          <Tile ic="↩️" title="Retours PDP" sub="📷 Photo en boutique · 🔍 vérifier · 🏭 déposer à PDP" n={B.ready ? B.driverTodo : null} color="#e65100" onClick={() => setView('retours')} />
           <Tile ic="🟫" title="Retour palettes EPAL" sub="Compter les palettes vides récupérées en boutique" n={E.raw === undefined ? null : E.dueTotal} color="#5d4037" onClick={() => setView('epal')} />
           {SAP.S && SAP.S.n1 && <Tile ic="🎄" title="Sapins à récupérer" sub="Chez Cruard (MIN de Rungis) → magasins · réception signée" n={kbSapTodo(SAP.S)} color="#c62828" onClick={() => setView('sapins')} />}
           <div style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'center', padding: '4px 10px' }}>Touche une grande carte. Tout ce que tu coches est enregistré tout de suite.</div>
@@ -33456,158 +33650,203 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       );
     }
 
-    // ───────── Chauffeur : ↩️ produits à ramener à PDP (par boutique, produit par produit) ─────────
+    // ───────── Chauffeur : ↩️ RETOURS PDP — V11.43 : 📷 photos au lieu → 🔍 vérification (photos en haut) → 🏭 dépôt entrepôt ─────────
+    //   pdp_returns : pending → recovered (pris au lieu) → verified | notfound → deposited → treated (prépa)
+    //   pdp_pickups (commande non récupérée) : pdpRecoveredAt → pdpVerifiedAt + pdpCheck{idx:bool} → pdpDepositedAt
+    //   pdp_photos/{id} : { site, by, at, day, img } (JPEG ≤ 260 Ko) — lues par le chauffeur, la prépa et le master
+    function kbImgPdp(file) {
+      return new Promise((ok, ko) => {
+        const rd = new FileReader();
+        rd.onerror = () => ko(new Error('photo illisible'));
+        rd.onload = () => { const im = new Image(); im.onerror = () => ko(new Error('photo illisible')); im.onload = () => {
+          let max = 1100, q = 0.7, out = '';
+          for (let k = 0; k < 7; k++) {
+            const r = Math.min(1, max / Math.max(im.width, im.height)), cv = document.createElement('canvas');
+            cv.width = Math.round(im.width * r); cv.height = Math.round(im.height * r);
+            cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+            out = cv.toDataURL('image/jpeg', q); if (out.length < 260000) break; max = Math.round(max * 0.8); q = Math.max(0.45, q - 0.07);
+          }
+          ok(out);
+        }; im.src = rd.result; };
+        rd.readAsDataURL(file);
+      });
+    }
+    function useKbPdpPhotos() {
+      const [all, setAll] = React.useState([]);
+      React.useEffect(() => storage.subscribe('pdp_photos', a => setAll((a || []).filter(p => p && p.img && p.day >= addDays(todayKey(), -4)).sort((x, y) => String(x.at).localeCompare(String(y.at))))), []);
+      return all;
+    }
+    // photos d'un lieu prises depuis « sinceIso » − 3 h (la tournée en cours)
+    const kbPdpPhotosFor = (photos, site, sinceIso) => { const t0 = sinceIso ? Date.parse(sinceIso) - 3 * 3600000 : Date.now() - 36 * 3600000; return (photos || []).filter(p => p.site === site && Date.parse(p.at) >= t0); };
+    function KbPdpPhotoStrip({ photos, big, onDel }) {
+      const [zoom, setZoom] = React.useState(null);
+      if (!photos || !photos.length) return null;
+      const h = big ? 150 : 74;
+      return (
+        <>
+          <div style={{ display: 'flex', gap: 8, overflowX: 'auto', padding: '4px 0' }}>
+            {photos.map(p => (
+              <div key={p.id} style={{ position: 'relative', flex: '0 0 auto' }}>
+                <img src={p.img} alt="photo retour" onClick={() => setZoom(p)} style={{ height: h, borderRadius: 12, border: '3px solid #fff', boxShadow: '0 1px 4px rgba(0,0,0,.25)', cursor: 'zoom-in', display: 'block' }} />
+                <span style={{ position: 'absolute', left: 4, bottom: 4, background: 'rgba(0,0,0,.6)', color: '#fff', fontSize: 11, borderRadius: 6, padding: '1px 5px' }}>{kbHhmm(p.at)}</span>
+                {onDel && <button type="button" onClick={() => onDel(p)} style={{ position: 'absolute', right: 2, top: 2, width: 28, height: 28, borderRadius: 14, border: 'none', background: '#c62828', color: '#fff', fontWeight: 900 }}>×</button>}
+              </div>))}
+          </div>
+          {zoom && <div onClick={() => setZoom(null)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.92)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 10 }}>
+            <img src={zoom.img} alt="photo" style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: 10 }} />
+            <div style={{ position: 'absolute', top: 14, right: 18, color: '#fff', fontSize: 34, fontWeight: 900 }}>×</div>
+          </div>}
+        </>);
+    }
     function RungisRetoursView({ session, B }) {
       const showToast = React.useContext(ToastContext);
-      const [itemsDoc, setItemsDoc] = React.useState({});
+      const photos = useKbPdpPhotos();
       const [busy, setBusy] = React.useState(false);
-      const [openOrder, setOpenOrder] = React.useState({});
+      const [step, setStep] = React.useState('lieux'); // lieux | verif
+      const [chk, setChk] = React.useState({}); // clé → true (trouvé) | false (pas trouvé)
       const drv = kbIsPdpDriver();
-      React.useEffect(() => storage.subscribe('pdp_pick_items', a => { const m = {}; (a || []).forEach(d => { m[d.id] = d.items || {}; }); setItemsDoc(m); }), []);
       const now = () => new Date().toISOString();
-      const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (récupéré par quelqu\'un d\'autre ?)' : 'Erreur : ' + ((e && e.message) || e));
-      const setOrder = async (f, on) => {
+      const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (règles Firestore V11.43 à publier ?)' : 'Erreur : ' + ((e && e.message) || e));
+      const pickupSet = async (f, val) => {
         const pid = String(f.orderId || f.id);
-        const val = on ? { pdpRecoveredAt: now(), pdpRecoveredBy: session.name } : { pdpRecoveredAt: '', pdpRecoveredBy: '' };
         if (!drv) await kbPickupWrite(f);
         await storage.setDoc('pdp_pickups', pid, val);
         if (!drv) await storage.setDoc('followups', f.id || f.orderId, val);
       };
-      const itemOn = (f, k) => { const m = itemsDoc[String(f.orderId || f.id)] || {}; return !!(m[k] && m[k].at); };
-      const toggleManual = async (r) => {
+      const group = (man, ord) => { const g = {}; man.forEach(r => (g[r.site || '?'] = g[r.site || '?'] || []).push({ k: 'm', r, key: 'm_' + r.id })); ord.forEach(f => (g[f.site || '?'] = g[f.site || '?'] || []).push({ k: 'o', f, key: 'o_' + (f.orderId || f.id) })); return g; };
+      const toTake = B.ready ? group(B.recoverManual, B.recoverOrders) : {};
+      const toCheck = B.ready ? group(B.pickedManual, B.pickedOrders) : {};
+      const nTake = Object.values(toTake).reduce((a, l) => a + l.length, 0);
+      const nCheck = Object.values(toCheck).reduce((a, l) => a + l.length, 0);
+      const nDepo = B.ready ? B.verifiedManual.length + B.verifiedOrders.length : 0;
+      const nDepoItems = B.ready ? B.verifiedManual.reduce((a, r) => a + (r.qty || 1), 0) + B.verifiedOrders.reduce((a, f) => a + (f.items || []).filter((_, i) => (f.pdpCheck || {})[String(i)] !== false).length, 0) : 0;
+
+      // ── 📷 photo au lieu ──
+      const addPhoto = async (site, files) => {
+        const list = Array.from(files || []).slice(0, 6);
+        if (!list.length) return;
         setBusy(true);
         try {
-          if (r.status === 'recovered') await storage.setDoc('pdp_returns', r.id, { status: 'pending', recoveredBy: '', recoveredAt: '' });
-          else { await storage.setDoc('pdp_returns', r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() }); muCelebrate(r.qty || 1, 'dans le camion'); }
-        } catch (e) { denied(e); } finally { setBusy(false); }
-      };
-      const toggleItem = async (f, k) => {
-        const pid = String(f.orderId || f.id);
-        const on = !itemOn(f, k);
-        setBusy(true);
-        try {
-          await storage.setDoc('pdp_pick_items', pid, { items: { [String(k)]: on ? { by: session.name, at: now() } : null } });
-          const n = (f.items || []).length;
-          const cnt = (f.items || []).filter((_, j) => String(j) === String(k) ? on : itemOn(f, j)).length;
-          if (on && cnt === n && !f.pdpRecoveredAt) { await setOrder(f, true); muCelebrate(n, 'dans le camion'); }
-          else if (!on && f.pdpRecoveredAt) await setOrder(f, false);
-        } catch (e) { if (/permission/i.test(String((e && (e.code || e.message)) || ''))) showToast('Coche « ✓ Toute la cagette » (détail produit pas encore activé)'); else denied(e); } finally { setBusy(false); }
-      };
-      const wholeOrder = async (f) => {
-        const pid = String(f.orderId || f.id);
-        const on = !f.pdpRecoveredAt;
-        setBusy(true);
-        try {
-          const items = {}; (f.items || []).forEach((_, j) => { items[String(j)] = on ? { by: session.name, at: now() } : null; });
-          await setOrder(f, on);
-          try { await storage.setDoc('pdp_pick_items', pid, { items }); } catch (_) {} // détail produit : jamais bloquant
-          if (on) muCelebrate((f.items || []).length, 'dans le camion'); else showToast('↩️ Annulé');
-        } catch (e) { denied(e); } finally { setBusy(false); }
-      };
-      const wholeSite = async (entries) => {
-        setBusy(true);
-        try {
-          for (const x of entries) {
-            if (x.on) continue;
-            if (x.k === 'm') await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
-            else {
-              const items = {}; (x.f.items || []).forEach((_, j) => { items[String(j)] = { by: session.name, at: now() }; });
-              await setOrder(x.f, true);
-              try { await storage.setDoc('pdp_pick_items', String(x.f.orderId || x.f.id), { items }); } catch (_) {}
-            }
+          for (const file of list) {
+            const img = await kbImgPdp(file);
+            const id = `ph_${todayKey()}_${site}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            await storage.setDoc('pdp_photos', id, { id, site, by: session.name, at: now(), day: todayKey(), img }, { replace: true });
           }
-          muCelebrate(entries.length, 'dans le camion');
+          showToast(`📷 ${list.length} photo${list.length > 1 ? 's' : ''} enregistrée${list.length > 1 ? 's' : ''}`);
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      const delPhoto = async (p) => { if (!confirm('Supprimer cette photo ?')) return; try { await storage.deleteDoc('pdp_photos', p.id); } catch (e) { denied(e); } };
+      // ── ✓ pris au lieu ──
+      const takeSite = async (s, list) => {
+        const ph = kbPdpPhotosFor(photos, s, null);
+        if (!ph.length && !confirm(`Aucune photo pour ${s}.\nValider quand même « pris » ?`)) return;
+        setBusy(true);
+        try {
+          for (const x of list) {
+            if (x.k === 'm') await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
+            else await pickupSet(x.f, { pdpRecoveredAt: now(), pdpRecoveredBy: session.name });
+          }
+          muCelebrate(list.length, 'dans le camion');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      // ── 🔍 vérification d'un lieu (photos en haut) ──
+      const itemsOf = (x) => x.k === 'm' ? [{ key: x.key, label: kbProdName(x.r.produit || x.r.productLabel), qty: x.r.qty || 1, sub: [x.r.clientName, x.r.dlc ? 'DLC ' + formatDateShort(x.r.dlc) : ''].filter(Boolean).join(' · ') }]
+        : (x.f.items || []).map((it, i) => ({ key: x.key + '__' + i, label: kbProdName(it.produit || ''), qty: it.qty || 1, sub: '🧺 ' + (x.f.consumer_name || '') + (it.dlc ? ' · DLC ' + formatDateShort(it.dlc) : '') }));
+      const checkSite = async (s, list) => {
+        const keys = list.flatMap(itemsOf).map(i => i.key);
+        if (keys.some(k => chk[k] === undefined)) { showToast('Touche ✓ ou ✗ pour chaque produit'); return; }
+        setBusy(true);
+        try {
+          let nf = 0;
+          for (const x of list) {
+            if (x.k === 'm') { const ok = chk[x.key] !== false; if (!ok) nf++; await storage.setDoc('pdp_returns', x.r.id, { status: ok ? 'verified' : 'notfound', verifiedBy: session.name, verifiedAt: now() }); }
+            else { const c = {}; (x.f.items || []).forEach((_, i) => { c[String(i)] = chk[x.key + '__' + i] !== false; if (!c[String(i)]) nf++; }); await pickupSet(x.f, { pdpVerifiedAt: now(), pdpVerifiedBy: session.name, pdpCheck: c }); }
+          }
+          showToast(nf ? `✓ ${s} vérifié · ${nf} pas trouvé(s) → Henry est prévenu` : `✓ ${s} vérifié, tout est là 👍`);
+          if (!nf) muCelebrate(keys.length, 'vérifiés');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      // ── 🏭 déposé à l'entrepôt ──
+      const deposit = async () => {
+        if (!confirm(`Tu as déposé ${nDepoItems} produit${nDepoItems > 1 ? 's' : ''} à l'entrepôt (PDP) ?\nLa prépa est prévenue et doit les traiter.`)) return;
+        setBusy(true);
+        try {
+          for (const r of B.verifiedManual) await storage.setDoc('pdp_returns', r.id, { status: 'deposited', depositedBy: session.name, depositedAt: now() });
+          for (const f of B.verifiedOrders) await pickupSet(f, { pdpDepositedAt: now(), pdpDepositedBy: session.name });
+          kbCelebrate({ title: 'Déposé à l\'entrepôt 🏭', sub: 'Merci ' + (String(session.name || '').split(' ')[0] || '') + ' ! La prépa prend le relais.' });
         } catch (e) { denied(e); } finally { setBusy(false); }
       };
 
-      const bySite = {};
-      const add = (s, x) => { (bySite[s || '?'] = bySite[s || '?'] || []).push(x); };
-      if (B.ready) {
-        B.recoverManual.forEach(r => add(r.site, { k: 'm', r, on: false }));
-        B.recoveredTodayManual.forEach(r => add(r.site, { k: 'm', r, on: true }));
-        B.recoverOrders.forEach(f => add(f.site, { k: 'o', f, on: false }));
-        B.recoveredTodayOrders.forEach(f => add(f.site, { k: 'o', f, on: true }));
-      }
-      const sitesK = Object.keys(bySite).sort();
-      const total = sitesK.reduce((a, s) => a + bySite[s].length, 0), on = sitesK.reduce((a, s) => a + bySite[s].filter(x => x.on).length, 0);
-      const done = total > 0 && on === total;
-      const was = React.useRef(null);
-      React.useEffect(() => {
-        if (!B.ready) return;
-        if (was.current === false && done) kbCelebrate({ title: 'Tout est récupéré 🎉', sub: 'Direction PDP, merci ' + (String(session.name || '').split(' ')[0] || '') + ' !' });
-        was.current = done;
-      }, [done, B.ready]);
+      const StepChip = ({ n, ic, t, c, on, onClick }) => (
+        <button type="button" onClick={onClick} style={{ flex: '1 1 30%', minHeight: 78, borderRadius: 16, border: '3px solid ' + c, background: on ? c : '#fff', color: on ? '#fff' : c, fontWeight: 800, cursor: 'pointer', padding: '6px 4px' }}>
+          <div style={{ fontSize: 26 }}>{ic} <span style={{ fontSize: 26 }}>{n}</span></div><div style={{ fontSize: 14 }}>{t}</div></button>);
+      const SiteHead = ({ s, right }) => (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: kbSiteColor(s), color: '#fff' }}>
+          <span style={{ fontSize: 28, fontWeight: 700 }}>📍 {s}</span>
+          <span style={{ fontSize: 16, fontWeight: 600, flex: 1, minWidth: 0 }}>{siteLabel(s)}</span>
+          <span style={{ fontSize: 20, fontWeight: 700 }}>{right}</span>
+        </div>);
 
-      const Check = ({ on, big }) => <span style={{ flex: '0 0 auto', width: big ? 52 : 42, height: big ? 52 : 42, borderRadius: 12, border: '3px solid ' + (on ? '#2e7d32' : '#9e9e9e'), background: on ? '#2e7d32' : '#fff', color: '#fff', fontSize: big ? 32 : 26, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{on ? '✓' : ''}</span>;
       return (
         <div className="stack">
           <div>
-            <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Produits à ramener à PDP</h1>
-            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>Dans chaque boutique, prends la cagette <b>« Retour PDP »</b>. Coche ce que tu as dans le camion. À PDP, l'équipe traite.</div>
+            <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP</h1>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>1️⃣ Dans chaque boutique : <b>📷 photo</b> de la cagette « Retour PDP » puis <b>✓ Pris</b>. 2️⃣ Tranquillement : <b>🔍 Vérifier</b>. 3️⃣ À PDP : <b>🏭 Déposé</b>.</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <StepChip n={nTake} ic="📍" t="Boutiques" c="#e65100" on={step === 'lieux'} onClick={() => setStep('lieux')} />
+            <StepChip n={nCheck} ic="🔍" t="Vérifier" c="#1565c0" on={step === 'verif'} onClick={() => setStep('verif')} />
+            <StepChip n={nDepo} ic="🏭" t="Déposer" c="#2e7d32" on={false} onClick={() => { const el = document.getElementById('kb-depot'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }} />
           </div>
           {!B.ready && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
-          {B.ready && !total && <div className="card" style={{ textAlign: 'center', padding: '26px 14px', fontSize: 22, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à ramener aujourd'hui</div>}
-          {total > 0 && (
-            <div style={{ background: 'var(--bg-card)', border: '3px solid ' + (done ? '#2e7d32' : '#e65100'), borderRadius: 16, padding: '12px 14px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 20, fontWeight: 700 }}><span>{on}/{total} récupérés</span><span>{Math.round(on / total * 100)}%</span></div>
-              <div style={{ height: 16, background: 'var(--bg-muted)', borderRadius: 8, marginTop: 8, overflow: 'hidden' }}><div style={{ width: (on / total * 100) + '%', height: '100%', background: '#2e7d32', transition: 'width .4s' }} /></div>
-            </div>
-          )}
-          {sitesK.map(s => {
-            const list = bySite[s];
-            const left = list.filter(x => !x.on).length;
-            return (
+
+          {B.ready && step === 'lieux' && (!nTake
+            ? <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 21, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à prendre en boutique</div>
+            : Object.keys(toTake).sort().map(s => { const list = toTake[s], ph = kbPdpPhotosFor(photos, s, null).filter(p => p.by === session.name || !drv); return (
               <div key={s} style={{ border: '3px solid ' + kbSiteColor(s), borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: kbSiteColor(s), color: '#fff' }}>
-                  <span style={{ fontSize: 28, fontWeight: 700 }}>📍 {s}</span>
-                  <span style={{ fontSize: 16, fontWeight: 600, flex: 1, minWidth: 0 }}>{siteLabel(s)}</span>
-                  <span style={{ fontSize: 22, fontWeight: 700 }}>{left ? left + ' à prendre' : '✓'}</span>
+                <SiteHead s={s} right={list.length + ' à prendre'} />
+                <div className="stack" style={{ gap: 8, padding: 10 }}>
+                  <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Dans la cagette « Retour PDP » :</div>
+                  {list.flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
+                  <KbPdpPhotoStrip photos={ph} onDel={delPhoto} />
+                  <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 64, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', fontSize: 20, fontWeight: 800, cursor: 'pointer', margin: 0 }}>
+                    📷 {ph.length ? 'Encore une photo' : 'Prendre une photo'}
+                    <input type="file" accept="image/*" capture="environment" multiple disabled={busy} style={{ display: 'none' }} onChange={e => { addPhoto(s, e.target.files); e.target.value = ''; }} />
+                  </label>
+                  <button disabled={busy} onClick={() => takeSite(s, list)} style={{ minHeight: 66, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 800, cursor: 'pointer' }}>✓ J'ai pris le retour de {s}</button>
+                </div>
+              </div>); }))}
+
+          {B.ready && step === 'verif' && (!nCheck
+            ? <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 21, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à vérifier</div>
+            : Object.keys(toCheck).sort().map(s => { const list = toCheck[s]; const since = list.map(x => x.k === 'm' ? x.r.recoveredAt : x.f.pdpRecoveredAt).filter(Boolean).sort()[0]; const ph = kbPdpPhotosFor(photos, s, since); const its = list.flatMap(itemsOf); const left = its.filter(i => chk[i.key] === undefined).length; return (
+              <div key={s} style={{ border: '3px solid ' + kbSiteColor(s), borderRadius: 18, background: 'var(--bg-card)' }}>
+                <div style={{ position: 'sticky', top: 0, zIndex: 5, background: 'var(--bg-card)', borderRadius: '15px 15px 0 0', overflow: 'hidden', boxShadow: '0 2px 6px rgba(0,0,0,.12)' }}>
+                  <SiteHead s={s} right={left ? left + ' à cocher' : '✓'} />
+                  <div style={{ padding: '6px 10px' }}>{ph.length ? <KbPdpPhotoStrip photos={ph} big /> : <div style={{ fontSize: 15, color: '#c62828', fontWeight: 700 }}>Pas de photo pour ce lieu</div>}</div>
                 </div>
                 <div className="stack" style={{ gap: 8, padding: 10 }}>
-                  {list.map(x => x.k === 'm' ? (
-                    <button key={x.r.id} disabled={busy} onClick={() => toggleManual(x.r)} style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '12px', border: '3px solid ' + (x.on ? '#2e7d32' : 'var(--line)'), borderRadius: 14, background: x.on ? '#e8f5e9' : '#fff', cursor: 'pointer' }}>
-                      <Check on={x.on} big />
-                      <KbPhoto src={kbPhotoOf(x.r)} />
-                      <span style={{ flex: 1, minWidth: 0 }}>
-                        <span style={{ display: 'block', fontSize: 21, fontWeight: 700 }}>{kbProdName(x.r.produit || x.r.productLabel)}{(x.r.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{x.r.qty}</span> : ''}</span>
-                        <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{x.r.anomalyLabel || 'Retour PDP'}{x.r.dlc ? ' · DLC ' + formatDateShort(x.r.dlc) : ''}{x.r.remark ? ' · « ' + x.r.remark + ' »' : ''}{x.on && x.r.recoveredAt ? ' · ✓ ' + kbHhmm(x.r.recoveredAt) : ''}</span>
-                      </span>
-                    </button>
-                  ) : (() => {
-                    const f = x.f, pid = String(f.orderId || f.id), items = f.items || [];
-                    const nOn = x.on ? items.length : items.filter((_, j) => itemOn(f, j)).length;
-                    const open = openOrder[pid] !== undefined ? openOrder[pid] : !x.on;
-                    return (
-                      <div key={pid} style={{ border: '3px solid ' + (x.on ? '#2e7d32' : '#8d6e63'), borderRadius: 14, background: x.on ? '#e8f5e9' : '#fffaf5' }}>
-                        <div style={{ padding: '10px 12px' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setOpenOrder(o => ({ ...o, [pid]: !open }))}>
-                            <span style={{ fontSize: 34 }}>🧺</span>
-                            <span style={{ flex: 1, minWidth: 0 }}>
-                              <span style={{ display: 'block', fontSize: 20, fontWeight: 700 }}>Cagette entière · {f.consumer_name || '(client)'}</span>
-                              <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{f.storedCasier ? 'Casier ' + f.storedCasier + ' · ' : ''}{nOn}/{items.length} produit(s) cochés · {open ? 'replier ▴' : 'voir le détail ▾'}</span>
-                            </span>
-                          </div>
-                          <button disabled={busy} onClick={() => wholeOrder(f)} style={{ width: '100%', marginTop: 8, minHeight: 54, padding: '6px 12px', borderRadius: 12, border: 'none', fontSize: 17, fontWeight: 700, cursor: 'pointer', background: x.on ? '#9e9e9e' : '#2e7d32', color: '#fff' }}>{x.on ? '↩️ Annuler' : '✓ J\'ai toute la cagette'}</button>
-                        </div>
-                        {open && (
-                          <div className="stack" style={{ gap: 6, padding: '0 10px 10px' }}>
-                            {items.map((it, j) => { const io = x.on || itemOn(f, j); return (
-                              <button key={j} disabled={busy} onClick={() => toggleItem(f, j)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 10px', border: '2px solid ' + (io ? '#2e7d32' : 'var(--line)'), borderRadius: 12, background: io ? '#e8f5e9' : '#fff', cursor: 'pointer' }}>
-                                <Check on={io} />
-                                <KbPhoto src={kbPhotoOf(it)} size={64} />
-                                <span style={{ flex: 1, minWidth: 0, fontSize: 18, fontWeight: 700 }}>{kbProdName(it.produit)}{(it.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{it.qty}</span> : ''}{it.dlc ? <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-soft)' }}> · DLC {formatDateShort(it.dlc)}</span> : ''}</span>
-                              </button>); })}
-                          </div>
-                        )}
+                  {its.map(i => { const v = chk[i.key]; return (
+                    <div key={i.key} style={{ border: '3px solid ' + (v === true ? '#2e7d32' : v === false ? '#c62828' : 'var(--line)'), borderRadius: 14, padding: '10px 12px', background: v === true ? '#e8f5e9' : v === false ? '#fdecea' : '#fff' }}>
+                      <div style={{ fontSize: 20, fontWeight: 800 }}>{i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''}</div>
+                      {i.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{i.sub}</div>}
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                        <button type="button" disabled={busy} onClick={() => setChk(o => ({ ...o, [i.key]: o[i.key] === true ? undefined : true }))} style={{ flex: 1, minHeight: 56, borderRadius: 12, fontSize: 18, fontWeight: 800, border: '3px solid #2e7d32', background: v === true ? '#2e7d32' : '#fff', color: v === true ? '#fff' : '#2e7d32' }}>✓ Trouvé</button>
+                        <button type="button" disabled={busy} onClick={() => setChk(o => ({ ...o, [i.key]: o[i.key] === false ? undefined : false }))} style={{ flex: 1, minHeight: 56, borderRadius: 12, fontSize: 18, fontWeight: 800, border: '3px solid #c62828', background: v === false ? '#c62828' : '#fff', color: v === false ? '#fff' : '#c62828' }}>✗ Pas trouvé</button>
                       </div>
-                    );
-                  })())}
-                  {left > 1 && <button disabled={busy} onClick={() => wholeSite(list)} style={{ minHeight: 56, borderRadius: 14, border: '3px dashed ' + kbSiteColor(s), background: '#fff', fontSize: 17, fontWeight: 700, cursor: 'pointer' }}>✓ J'ai pris tout le retour PDP de {s}</button>}
+                    </div>); })}
+                  <button disabled={busy || left > 0} onClick={() => checkSite(s, list)} style={{ minHeight: 64, borderRadius: 14, border: 'none', background: left ? '#9e9e9e' : '#1565c0', color: '#fff', fontSize: 20, fontWeight: 800, cursor: 'pointer' }}>{left ? `Encore ${left} produit${left > 1 ? 's' : ''} à cocher` : `✅ Valider ${s}`}</button>
                 </div>
-              </div>
-            );
-          })}
-          {done && <div style={{ textAlign: 'center', fontSize: 24, fontWeight: 700, color: '#2e7d32', padding: 12 }}>🎉 Tout est dans le camion, direction PDP !</div>}
+              </div>); }))}
+
+          {B.ready && B.notFoundManual.length > 0 && <div style={{ background: '#fdecea', border: '2px solid #c62828', borderRadius: 12, padding: '10px 12px', fontSize: 15, fontWeight: 700, color: '#b71c1c' }}>❓ {B.notFoundManual.length} produit(s) pas trouvé(s) · Henry est prévenu par mail</div>}
+
+          <div id="kb-depot" style={{ border: '4px solid ' + (nDepo ? '#2e7d32' : 'var(--line)'), borderRadius: 18, padding: 14, background: nDepo ? '#e8f5e9' : 'var(--bg-card)', textAlign: 'center' }}>
+            <div style={{ fontSize: 46 }}>🏭</div>
+            <div style={{ fontSize: 22, fontWeight: 800 }}>{nDepo ? `${nDepoItems} produit${nDepoItems > 1 ? 's' : ''} vérifié${nDepoItems > 1 ? 's' : ''} dans le camion` : 'Rien à déposer pour l\'instant'}</div>
+            {nCheck > 0 && <div style={{ fontSize: 15, color: '#e65100', fontWeight: 700, marginTop: 4 }}>D'abord 🔍 vérifier les {nCheck} retour(s) pris.</div>}
+            <button disabled={busy || !nDepo} onClick={deposit} style={{ width: '100%', marginTop: 10, minHeight: 72, borderRadius: 16, border: 'none', background: nDepo ? '#2e7d32' : '#bdbdbd', color: '#fff', fontSize: 23, fontWeight: 900, cursor: nDepo ? 'pointer' : 'default' }}>🏭 Déposé à l'entrepôt</button>
+          </div>
         </div>
       );
     }
@@ -35762,6 +36001,97 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       if (!board.total) return null;
       if (m && m.takenBy) return <div style={{ background:'#fff8e1', border:'2px solid #f0b429', borderRadius:12, padding:'10px 12px', fontSize:16, fontWeight:700, color:'#7a4f00' }}>🧹 {board.total} produit{board.total > 1 ? 's' : ''} à retirer · {m.takenBy} s'en occupe depuis {kbHhmm(m.takenAt)}</div>;
       return <div style={{ background:'#fdecea', border:'2px solid #c62828', borderRadius:12, padding:'10px 12px', fontSize:16, fontWeight:700, color:'#b71c1c' }}>⚠️ {board.total} produit{board.total > 1 ? 's' : ''} à retirer · personne ne s'en occupe</div>;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // V11.43 — PRÉPA : popup « 🏭 X a déposé le retour PDP » (comme les DLC) : une personne le prend avec son code perso.
+    //   Pas le temps ? « Plus tard » → à faire avant la clôture (clôture bloquée, sauf DOM).
+    // ════════════════════════════════════════════════════════════════
+    function KbPdpDepositPopup({ session, setTab }) {
+      const showToast = React.useContext(ToastContext);
+      const B = useKbPdpBoard();
+      const dlcB = useDlcBoard();
+      const [code, setCode] = React.useState('');
+      const [err, setErr] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [snooze, setSnooze] = React.useState(() => { try { return sessionStorage.getItem('kb_pdpdep_snooze') || ''; } catch (_) { return ''; } });
+      if (!session || session._masterView || session.role !== 'prep' || kbIsPdpDriver()) return null;
+      if (!B.ready || !(B.treatManual.length + B.treatLines.length)) return null;
+      if (dlcB.ready && dlcB.total && dlcB.ordersLoaded && !(dlcB.morning && dlcB.morning.takenBy)) return null; // la popup DLC passe d'abord
+      const last = B.lastDeposit || { at: '', by: '' };
+      const taken = B.tm['_taken_' + todayKey()] || null;
+      if (taken && String(taken.depositAt || '') >= String(last.at || '')) return null;
+      if (snooze && snooze === String(last.at || '')) return null;
+      const n = B.treatManual.reduce((t, r) => t + (r.qty || 1), 0) + B.treatLines.reduce((t, L) => t + (L.it.qty || 1), 0);
+      const sites = [...new Set([...B.treatManual.map(r => r.site), ...B.treatLines.map(L => L.f.site)].filter(Boolean))].sort();
+      const valider = async () => {
+        const c = String(code).trim();
+        if (!c) { setErr('Tape ton code perso'); return; }
+        setBusy(true); setErr('');
+        try {
+          let name = '';
+          try { const r = await kbCallable('kbgLogin')({ code: c, role: 'prep', site: '' }); name = String((r && r.data && r.data.name) || '').trim(); }
+          catch (e) { setErr('Code non reconnu : ' + kbErrMsg(e)); return; }
+          if (!name) { setErr('Code reconnu mais nom absent du registre Salariés'); return; }
+          await storage.setDoc('pdp_treatments', '_taken_' + todayKey(), { id: '_taken_' + todayKey(), by: name, at: new Date().toISOString(), depositAt: last.at || '', depositBy: last.by || '', count: n });
+          setCode('');
+          showToast(`💪 ${name} s'occupe du retour PDP`);
+          if (setTab) setTab('pdpreturns');
+        } catch (e) { setErr('Erreur : ' + e.message); } finally { setBusy(false); }
+      };
+      const later = () => { try { sessionStorage.setItem('kb_pdpdep_snooze', String(last.at || '')); } catch (_) {} setSnooze(String(last.at || '')); showToast('⏰ OK — à traiter AVANT la clôture de la prépa'); };
+      return (
+        <div className="modal-backdrop" style={{ zIndex: 3000, alignItems: 'center' }}>
+          <div className="modal" style={{ maxWidth: 520, padding: 0, overflow: 'hidden', borderRadius: 18 }}>
+            <div style={{ background: '#1565c0', color: '#fff', padding: '16px 18px' }}>
+              <div style={{ fontSize: 26, fontWeight: 800 }}>🏭 Retour PDP déposé</div>
+              <div style={{ fontSize: 17, fontWeight: 600 }}><b>{last.by || 'Le chauffeur'}</b> a validé le dépôt{last.at ? ' à ' + kbHhmm(last.at) : ''} · à traiter</div>
+            </div>
+            <div style={{ padding: '12px 18px 18px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                <div style={{ fontSize: 56, fontWeight: 900, color: '#1565c0' }}>{n}</div>
+                <div style={{ fontSize: 18, fontWeight: 700 }}>produit{n > 1 ? 's' : ''} à traiter<div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>{sites.map(s => <span key={s} style={{ background: kbSiteColor(s), color: '#fff', borderRadius: 8, padding: '2px 8px', fontSize: 14 }}>{s}</span>)}</div></div>
+              </div>
+              <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 8 }}>Pour chaque produit : ★ destination conseillée (rayon, ROB, partage, jeté) ou ❓ pas trouvé. <b>Impossible de clôturer la prépa sans ça</b> (sauf DOM).</div>
+              <div style={{ marginTop: 14, fontSize: 17, fontWeight: 700 }}>Qui s'en occupe ? Tape ton code perso</div>
+              <input type="password" inputMode="numeric" autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setErr(''); }} onKeyDown={e => { if (e.key === 'Enter') valider(); }} placeholder="••••"
+                style={{ width: '100%', boxSizing: 'border-box', marginTop: 6, fontSize: 28, letterSpacing: 8, textAlign: 'center', padding: '12px', border: '3px solid var(--ink)', borderRadius: 14 }} />
+              {err && <div style={{ color: '#c62828', fontWeight: 700, marginTop: 6 }}>{err}</div>}
+              <button className="btn-primary" disabled={busy} onClick={valider} style={{ width: '100%', minHeight: 62, fontSize: 20, fontWeight: 800, marginTop: 12, background: '#1565c0', borderColor: '#1565c0' }}>{busy ? '⏳…' : '💪 Je m\'en occupe maintenant'}</button>
+              <button className="btn-secondary" disabled={busy} onClick={later} style={{ width: '100%', minHeight: 52, fontSize: 16, fontWeight: 700, marginTop: 8 }}>⏰ Plus tard — avant la clôture</button>
+            </div>
+          </div>
+        </div>);
+    }
+    // V11.43 — « pas trouvé » par le chauffeur (vérification) → mail à hg@ (envoyé par un poste prépa / master ouvert, une seule fois)
+    function KbPdpNotFoundMailer() {
+      const B = useKbPdpBoard();
+      const busy = React.useRef(false);
+      React.useEffect(() => {
+        if (!B.ready || busy.current || kbIsPdpDriver()) return;
+        const man = (B.manualAll || []).filter(r => r.status === 'notfound' && !r.nfMailAt);
+        const ord = (B.orders || []).filter(f => f.pdpVerifiedAt && !f.pdpNfMailAt && Object.values(f.pdpCheck || {}).some(v => v === false));
+        if (!man.length && !ord.length) return;
+        busy.current = true;
+        (async () => {
+          try {
+            const at = new Date().toISOString(), rows = [];
+            for (const r of man) { await storage.setDoc('pdp_returns', r.id, { nfMailAt: at }); rows.push({ site: r.site, produit: r.produit || r.productLabel, qty: r.qty || 1, client: r.clientName || '', by: r.verifiedBy || r.recoveredBy || '' }); }
+            for (const f of ord) { await storage.setDoc('followups', f.id || f.orderId, { pdpNfMailAt: at }); (f.items || []).forEach((it, i) => { if ((f.pdpCheck || {})[String(i)] === false) rows.push({ site: f.site, produit: it.produit, qty: it.qty || 1, client: f.consumer_name || '', by: f.pdpVerifiedBy || '' }); }); }
+            const bySite = {}; rows.forEach(x => (bySite[x.site || '?'] = bySite[x.site || '?'] || []).push(x));
+            for (const s of Object.keys(bySite)) {
+              const L = bySite[s], drv = L[0].by || 'le chauffeur';
+              const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
+                + `<div style="background:#c62828;color:#fff;border-radius:12px;padding:16px 18px"><div style="font-size:24px;font-weight:900">⚠️ Attention : ${kbEsc(s)} a fait un retour PDP</div><div style="font-size:16px">mais <b>${kbEsc(drv)}</b> (chauffeur) n'a pas trouvé ces articles</div></div>`
+                + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:12px;border-left:6px solid #c62828">`
+                + L.map(x => `<tr><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:17px"><b>${kbEsc(kbProdName(x.produit || ''))}</b>${x.client ? ` <span style="color:#888;font-size:13px">· ${kbEsc(x.client)}</span>` : ''}</td><td style="padding:9px 12px;border-bottom:1px solid #eee;font-size:20px;text-align:right"><b>×${x.qty}</b></td></tr>`).join('')
+                + `</table><div style="font-size:15px;margin-top:10px">À voir avec ${kbEsc(s)} (photos dans Master › Récap › Retours).</div><p style="color:#999;font-size:12px;margin-top:14px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
+              try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'hg@probon.fr', subject: `⚠️ Retour PDP pas trouvé · ${s} · ${L.length} article(s) · chauffeur ${drv}`, htmlBody: html, body: `${s} a fait un retour PDP mais ${drv} n'a pas trouvé :\n` + L.map(x => `- ${x.produit} x${x.qty}`).join('\n') }); } catch (_) {}
+            }
+          } finally { busy.current = false; }
+        })();
+      }, [B]);
+      return null;
     }
 
     // ---- Popup obligatoire du matin (Prépa, mar→ven dès 5h) ----
@@ -39529,6 +39859,11 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         });
       }, [followUpsAll, session, currentSite]);
 
+      // V11.43 — retours PDP validés par Henry, à mettre dans la cagette « Retour PDP » (popup bloquante sur le lieu)
+      const pdpReadyTodo = React.useMemo(() => {
+        if (!session || session.isMaster || session.role !== 'distrib') return [];
+        return (followUpsAll || []).filter(f => f.site === currentSite && f.forceReturnPdp && f.pdpReadyAsk && !f.pdpReadyAt && !KB_FU_TERMINAL.includes(f.status) && (f.items || []).length);
+      }, [followUpsAll, session, currentSite]);
       // V9.91 — commandes non récupérées depuis 8 j sur CE lieu, pas encore signalées
       const nonRecup8 = React.useMemo(() => {
         if (!session || session.isMaster || session.role !== 'distrib') return [];
@@ -39592,6 +39927,10 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         if (pendingPush.length > 0) {
           const m = pendingPush[0];
           return <PushOverlay key={m.id} message={m} count={pendingPush.length} team={!(m.target === 'prep' && m.to && m.to.length)} onAck={(initials, reply) => ackPush(m, initials, reply)} />;
+        }
+        if (pdpReadyTodo.length > 0) {
+          const f = pdpReadyTodo[0];
+          return <KbPdpReadyOverlay key={f.orderId || f.id} followup={f} count={pdpReadyTodo.length} session={session} site={currentSite} />;
         }
         if (nonRecup8.length > 0) {
           const f = nonRecup8[0];
@@ -39665,6 +40004,8 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             {overlay}
             <UpdateChecker />
             <DlcMorningPopup session={effSession} setTab={setTab} />
+            <KbPdpDepositPopup session={effSession} setTab={setTab} />
+            <KbPdpNotFoundMailer />
             <DlcCorrectionPopup session={effSession} setTab={setTab} />
             <KbAncienAutoRun by={session.name} />
             <KbSupport session={effSession} tab={tab} site="ENTREPOT" />
@@ -39730,6 +40071,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             <UpdateChecker />
           <KbSupport session={effSession} tab={tab} site={currentSite} />
           {session.isMaster && <KbAncienAutoRun by={session.name} />}
+          {session.isMaster && <KbPdpNotFoundMailer />}
           {effSession.isMaster && <KbMasterSidebar tab={tab} setTab={setTab} session={effSession} onLogout={handleLogout} />}
           <div className="topbar">
             <div className="topbar-title">
