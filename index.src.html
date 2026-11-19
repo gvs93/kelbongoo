@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.55';
+    const APP_VERSION = 'V11.56';
+    // V11.56 — (19/11/2026) MU : un produit n'est « terminé » que si les sachets faits couvrent le besoin (avant : 1 MU validée
+    //   suffisait → « Toutes les MU prévues sont faites » à 95 %). Carte réaffichée avec « ➕ Encore X sachets à faire ».
     // V11.55 — (19/11/2026) Heure de fin estimée : cadence par personne mesurée (≥ 10 min) sinon habituelle (réglages : 80 lignes/h,
     //   80 sachets/h) ; les personnes en MU passent en prépa à la fin de la MU (fin de MU calculée d'abord). Plus d'estimation « depuis 10h ».
     // V11.54 — (19/11/2026) Alerte « Retours PDP non traités » : hg@pribon.org (inexistante) → hg@probon.fr.
@@ -13571,12 +13573,13 @@
       },[myActive&&myActive.id, myActive&&myActive.status, myActive&&myActive.inProgress]);
       const est = muEst(item);
       const name = muName(item);
-      const start=()=>{ const id=muNewId(); storage.setDoc(coll,id,{ product:name, target:est||0, uv:item.uv||'', operator, startedAt:Date.now(), elapsedMs:0, inProgress:0, status:'active' },{replace:true}); };
+      const reste = Math.max(0, (est||0) - (doneCount||0)); // V11.56
+      const start=()=>{ const id=muNewId(); storage.setDoc(coll,id,{ product:name, target:(doneCount>0?reste:est)||0, uv:item.uv||'', operator, startedAt:Date.now(), elapsedMs:0, inProgress:0, status:'active' },{replace:true}); };
       const pause=()=>{ if(!myActive)return; const elapsed=(myActive.elapsedMs||0)+(Date.now()-(myActive.startedAt||Date.now())); const ip=parseInt(inProgress,10)||myActive.inProgress||0; storage.setDoc(coll,myActive.id,{ status:'paused', elapsedMs:elapsed, pausedAt:Date.now(), inProgress:ip }); setPhase('paused'); };
       const resume=()=>{ if(!myActive)return; storage.setDoc(coll,myActive.id,{ status:'active', startedAt:Date.now() }); setPhase('running'); if(myActive.inProgress!=null) setInProgress(String(myActive.inProgress)); };
       const cancel=()=>{ if(!myActive)return; if(!confirm('Annuler cette mise en unité ?'))return; storage.deleteDoc(coll,myActive.id); setPhase('idle'); setInProgress(''); setFinalQty(''); };
       const saveIp=()=>{ if(!myActive)return; const v=parseInt(inProgress,10); if(!isNaN(v)&&v>=0) storage.setDoc(coll,myActive.id,{ inProgress:v }); };
-      const openFinish=()=>{ const ip=parseInt(inProgress,10)||(myActive&&myActive.inProgress)||0; setFinalQty(String(Math.max(ip, est||0))); setPhase('finishing'); };
+      const openFinish=()=>{ const ip=parseInt(inProgress,10)||(myActive&&myActive.inProgress)||0; setFinalQty(String(Math.max(ip, doneCount>0?reste:(est||0)))); setPhase('finishing'); };
       const validate=()=>{ if(!myActive)return; const done=Math.max(0,parseInt(finalQty,10)||0); const finishedAt=Date.now(); const elapsed=(myActive.elapsedMs||0)+(phase!=='paused'?finishedAt-(myActive.startedAt||finishedAt):0); storage.setDoc(coll,myActive.id,{ status:'done', done, finishedAt, durationMs:elapsed, inProgress:done }); muCelebrate(done); setPhase('idle'); setInProgress(''); setFinalQty(''); };
       const ip = (myActive&&myActive.inProgress)||0;
       const pct = est>0 ? Math.min(100, Math.round(((doneCount+ip)/est)*100)) : 0;
@@ -13596,6 +13599,7 @@
             )}
             {doneCount>0 && <span style={{color:'#2e7d32'}}>✅ {doneCount} fait{doneCount>1?'s':''}</span>}
           </div>
+          {doneCount>0 && reste>0 && <div style={{background:'#fff3e0',border:'2px solid #ef6c00',borderRadius:10,padding:'6px 10px',marginBottom:8,fontSize:16,fontWeight:800,color:'#e65100',textAlign:'center'}}>➕ Encore {reste} sachet{reste>1?'s':''} à faire <span style={{fontSize:12,fontWeight:500}}>(commandes en hausse depuis la 1re MU)</span></div>}
           {item._sat>0 && ( // V11.46 · V11.47 — tournée unique, jeudi : info, pas une obligation (l'opérateur choisit)
             <div style={{margin:'-2px 0 8px',display:'flex',flexDirection:'column',gap:4}}>
               <div style={{fontSize:15,fontWeight:800,color:'#ef6c00'}}>🎯 MU prépa du jour : {est||0}</div>
@@ -13632,7 +13636,7 @@
           {phase==='finishing' && (
             <div style={{background:'#fff8f1',borderRadius:10,padding:12}}>
               <div style={{textAlign:'center',fontSize:13,fontWeight:600,color:'#555',marginBottom:4}}>🎉 Combien de sachets au total ?</div>
-              <div style={{fontSize:12,color:'var(--ink-mute)',textAlign:'center',marginBottom:8}}>Estimation : {est||'—'} · en cours : {ip}</div>
+              <div style={{fontSize:12,color:'var(--ink-mute)',textAlign:'center',marginBottom:8}}>{doneCount>0 ? <>Reste à faire : {reste} (déjà {doneCount} faits)</> : <>Estimation : {est||'—'}</>} · en cours : {ip}</div>
               <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:14}}>
                 <button className="btn-secondary" style={{width:52,height:52,borderRadius:'50%',fontSize:26,fontWeight:700}} onClick={()=>setFinalQty(s=>String(Math.max(0,(parseInt(s,10)||0)-1)))}>−</button>
                 <input type="number" inputMode="numeric" value={finalQty} onChange={e=>setFinalQty(e.target.value)} onFocus={e=>e.target.select()} style={{width:84,textAlign:'center',fontSize:40,fontWeight:700,border:'none',background:'transparent'}}/>
@@ -14322,12 +14326,19 @@
       const [extraAdded,setExtraAdded]=React.useState({});
       const addExtra=(it)=>setExtraAdded(p=>({ ...p, [muName(it)]:it }));
 
+      // V11.56 — un produit n'est « terminé » que si les sachets faits (somme des MU validées) couvrent le besoin.
+      //   Avant : une seule MU validée suffisait → carte masquée alors qu'il restait des sachets (besoin
+      //   remonté au chargement des commandes réelles, ou MU validée en dessous du besoin).
+      const faitByK = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
+      const muFaitOf = (it)=> faitByK[muKey(muName(it))]||0;
+      const muResteOf = (it)=> Math.max(0, muEst(it) - muFaitOf(it));
+      const muFini = (it)=> muEst(it)>0 && muResteOf(it)<=0;
       const q = search.trim() ? muStrip(search.toLowerCase()) : null;
       const filtered = React.useMemo(()=>{
-        let base = plannedItems.filter(it=>{ const info=byProduct[muName(it)]||{}; if(info.lastDone) return false; return true; });
+        let base = plannedItems.filter(it=>!muFini(it));
         if(muWork.tourAdvance) base = [...base.filter(it=>kbTourKeeps(muName(it))).map(it=>({ ...it, _keep:true })), ...base.filter(it=>!kbTourKeeps(muName(it)))]; // V11.44
         return q ? base.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : base;
-      },[plannedItems,byProduct,q,muWork.tourAdvance]);
+      },[plannedItems,faitByK,q,muWork.tourAdvance]);
       const filteredExtra = React.useMemo(()=>{
         const pool = extraPool.filter(it=>!(muName(it) in extraAdded));
         return q ? pool.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : pool;
@@ -14373,8 +14384,8 @@
 
       const renderCard=(it,idx)=>{ const key=muName(it); const info=byProduct[key]||{doneCount:0,busy:[],mine:null}; return (
         it._keep ? <div key={key+'_'+idx} style={{display:'flex',flexDirection:'column',gap:4}}><div style={{alignSelf:'flex-start',background:'#5e35b1',color:'#fff',fontWeight:800,fontSize:14,borderRadius:8,padding:'2px 10px'}}>🟣 Se garde — à faire en premier</div>
-          <MuCard item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} /></div>
-        : <MuCard key={key+'_'+idx} item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} /> // V11.44
+          <MuCard item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={muFaitOf(it)} busyBy={info.busy} /></div>
+        : <MuCard key={key+'_'+idx} item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={muFaitOf(it)} busyBy={info.busy} /> // V11.44
       ); };
 
       // Récap (master)
@@ -14400,7 +14411,6 @@
 
       const totalEst = plannedItems.reduce((s,it)=>s+muEst(it),0);
       // V11.52 — avancée juste : par produit, plafonnée au besoin du jour ; le surplus = avance pour le lendemain (à part)
-      const faitByK = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
       const prog = React.useMemo(()=>{
         let need=0, done=0, avance=0; const nk={};
         plannedItems.forEach(it=>{ const k=muKey(muName(it)), n=muEst(it); nk[k]=(nk[k]||0)+n; });
@@ -14415,7 +14425,7 @@
         return { brut, stock, fait, pct: brut>0 ? Math.min(100, Math.round((stock+fait)/brut*100)) : 0 };
       },[]);
       const theoSat = muWork.tourAdvance ? theo(reel.rows) : (satOn && reelSat.ready ? theo(reelSat.rows) : null);
-      const nbDone = plannedItems.filter(it=>(byProduct[muName(it)]||{}).lastDone).length;
+      const nbDone = plannedItems.filter(muFini).length;
       const allFinished = plannedItems.length>0 && nbDone===plannedItems.length;
 
       return (
