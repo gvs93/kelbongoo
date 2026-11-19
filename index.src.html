@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.50';
+    const APP_VERSION = 'V11.51';
+    // V11.51 — (19/11/2026) BUG MU : en passant de « Vendredi » à « Samedi », les commandes du vendredi (encore en mémoire)
+    //   étaient écrites comme « MU exacte » du samedi → besoin du samedi faux. Commandes liées à leur jour + nettoyage auto.
     // V11.50 — (19/11/2026) % de MU du jour plafonné PAR PRODUIT au besoin du jour : le surplus (MU avancée pour le lendemain)
     //   n'est plus compté dans le % du jour, il est affiché à part « +N d'avance ».
     // V11.49 — (19/11/2026) Master › Aujourd'hui : rythme prépa / MU (réel vs attendu à cette heure) sous le % de prépa, en compact.
@@ -14041,17 +14043,28 @@
       // V9.59 — commandes exactes : chargement manuel (prépa, 10h) prioritaire ; sinon commandes de la
       // distribution suivante déjà présentes dans l'appli (PrestaShop / export Mongo) chargées après 10h.
       const nextDay = targetDay || muTargetDay(dateKey); // V11.26
-      const [nextOrders, setNextOrders] = React.useState(null);
+      const [nextOrdersSt, setNextOrders] = React.useState(null); // V11.51 — { forDay, d } : jamais les commandes d'un autre jour
+      const nextOrders = nextOrdersSt && nextOrdersSt.forDay === nextDay ? nextOrdersSt.d : null;
+      const nextOrdersLoaded = !!(nextOrdersSt && nextOrdersSt.forDay === nextDay);
       // V9.63 — après 10h (clôture des commandes), les commandes présentes dans l'appli font foi,
       // même si elles ont été chargées avant 10h (on regarde l'HEURE ACTUELLE, plus l'heure de chargement).
       const [after10, setAfter10] = React.useState(()=> Date.now() >= new Date(dateKey+'T10:00:00').getTime());
       React.useEffect(()=>{ if(after10) return; const t=setInterval(()=>{ if(Date.now() >= new Date(dateKey+'T10:00:00').getTime()) setAfter10(true); }, 30000); return ()=>clearInterval(t); },[after10, dateKey]);
       React.useEffect(()=>{
-        const u = storage.subscribe(`day_${nextDay}_orders`, arr=>{ const d=(arr||[]).find(x=>x.id==='data') || null; setNextOrders(d); });
+        setNextOrders(null);
+        const u = storage.subscribe(`day_${nextDay}_orders`, arr=>{ const d=(arr||[]).find(x=>x.id==='data') || null; setNextOrders({ forDay: nextDay, d }); });
         return u;
       },[nextDay]);
+      // V11.51 — « MU exacte » écrite par erreur avec les commandes d'un autre jour (passage Vendredi → Samedi) :
+      //   aucune commande chargée pour la distribution visée → on efface les commandes exactes automatiques.
+      React.useEffect(()=>{
+        if(!nextOrdersLoaded || !snapToday || snapToday.exactSource!=='auto' || snapToday.exactFor!==nextDay) return;
+        if(nextOrders && (nextOrders.orders||[]).length) return;
+        storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: null, exactFor: null, exactSource: null, exactFile: '', exactAt: 0 }).catch(()=>{});
+      },[nextOrdersLoaded, nextOrders, snapToday && snapToday.exactSource, snapToday && snapToday.exactFor, dateKey, nextDay]);
       React.useEffect(()=>{
         if(!ready || !nextOrders || !Object.keys(flIdx).length) return;
+        if(snapToday && snapToday.date && snapToday.date!==dateKey) return; // V11.51 — photo d'une autre journée
         // V9.68 — dès que des commandes sont chargées dans l'appli pour la distribution visée (JSON ancien site
         // du matin, PrestaShop…), la MU devient EXACTE, sans attendre 10h ni le PDF. Le chargement manuel (PDF)
         // ne fait foi que s'il est plus récent que le dernier chargement de commandes.
