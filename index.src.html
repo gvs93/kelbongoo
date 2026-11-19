@@ -795,7 +795,21 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.43';
+    const APP_VERSION = 'V11.44';
+    // V11.44 — (19/11/2026) 🚚 TOURNÉE UNIQUE DU VENDREDI (test) : Master › Livraison & réglages › « 🚚 Tournée unique vendredi »
+    //   (app_config/tournee_unique { on, sites, depart, debut, marge }). Une case à cocher active tout :
+    //   • JEUDI — MU : choix « ➡️ MU du vendredi » / « ⏩ Avancer la MU du samedi » (MU rangée dans la journée MU du vendredi
+    //     mu_<vendredi>, cible samedi → comptée comme déjà faite le vendredi) ; besoin samedi = commandes du samedi en cours lues
+    //     (Master › Tournée unique : JSON Compass de la vente ouverte → mu_<vendredi>._reel.tourLines) + marge MU (70 % par défaut) ;
+    //     repli : moyenne des commandes exactes des 4 derniers samedis + 15 % ; produits qui se gardent (carottes, pommes de terre, oignons, agrumes, pommes,
+    //     poires, courges…) en premier.
+    //   • VENDREDI — Prépa (distribution du samedi) : bandeau « Tournée 14h30 » (avancement des lieux du camion, heure limite,
+    //     état des chargements 7h / 10h), filtre « 🚚 Tournée 14h30 » par défaut tant que ces lieux ne sont pas finis,
+    //     lieux du camion en tête ; bouton « 🚚 Tournée prête → prévenir Rungis » (rolls + dollies de ces lieux seulement,
+    //     mail Rolls Kelbongoo + vue chauffeur + stock contenants) sans attendre la clôture de la prépa ; à la clôture finale,
+    //     ces lieux sont signalés « déjà partis ».
+    //   • 2e chargement des commandes (7h puis 10h) : un casier du JSON déjà pris dans l'appli par un autre client → nouveau n° auto.
+    //   • Commande Rungis du jeudi 4h30 (samedi + marge) : côté serveur (KBG_FL_Auto) — pas dans cette version.
     // V11.43 — (18/11/2026) RETOUR PDP de bout en bout : distrib › Suivi « 🙋 Demander à Henry le retour PDP » (produits choisis) → mail hg@ + carte Master › Récap
     //   (✅ Valider / ✏️ par article / 🙅 Refuser) ; toute validation Henry → POPUP distrib : cocher chaque article mis dans la cagette « Retour PDP »
     //   (ou ❓ introuvable → mail hg@), le chauffeur ne le voit qu'ensuite. Chauffeur : 📷 photos par lieu + « ✓ Pris » → 🔍 Vérifier (photos en haut,
@@ -3515,6 +3529,37 @@
     setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 2500);
     setTimeout(() => { try { kbFlSoLoad(); } catch (e) {} }, 3000); // V11.38
     setTimeout(() => { try { kbDlcRulesLoad(); } catch (e) {} }, 15000);
+    // V11.44 — TOURNÉE UNIQUE DU VENDREDI : une seule tournée camion à 14h30 (prépa du vendredi pour le samedi dès 7h,
+    //   MU du samedi avancée le jeudi). Réglage : app_config/tournee_unique.
+    const KB_TOUR_DEF = { on: false, sites: ['BIC', 'BOR', 'STB', 'TOL', 'ROB'], depart: '14:30', debut: '07:00', marge: 80, margeMu: 70 };
+    let _kbTour = null, _kbTourAt = 0;
+    function kbTourCfg() { const c = { ...KB_TOUR_DEF, ...(_kbTour || {}) }; if (!Array.isArray(c.sites) || !c.sites.length) c.sites = KB_TOUR_DEF.sites.slice(); return c; }
+    async function kbTourLoad(force) {
+      if (!force && _kbTourAt && Date.now() - _kbTourAt < 60000) return kbTourCfg();
+      try { const d = await storage.getDoc('app_config', 'tournee_unique'); _kbTour = d || {}; } catch (_) {}
+      _kbTourAt = Date.now();
+      return kbTourCfg();
+    }
+    function kbDowOf(d) { try { return new Date(d + 'T12:00:00').getDay(); } catch (_) { return -1; } }
+    // distribution servie par la tournée unique = samedi (préparé le vendredi)
+    function kbTourOnFor(cfg, day) { return !!(cfg && cfg.on && day && kbDowOf(day) === 6); }
+    function kbTourHm(t, def) { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? [Number(m[1]), Number(m[2])] : def; }
+    function useKbTour() {
+      const [c, setC] = React.useState(kbTourCfg());
+      React.useEffect(() => {
+        let stop = false;
+        const f = () => kbTourLoad(true).then(x => { if (!stop) setC(x); }).catch(() => {});
+        f();
+        window.addEventListener('kb:tour', f);
+        const iv = setInterval(f, 120000);
+        return () => { stop = true; window.removeEventListener('kb:tour', f); clearInterval(iv); };
+      }, []);
+      return c;
+    }
+    setTimeout(() => { try { kbTourLoad(); } catch (e) {} }, 2000);
+    // produits qui se gardent (MU du samedi faisable dès le jeudi)
+    const KB_TOUR_KEEP = /carotte|pomme de terre|pommes de terre|patate|oignon|echalote|ail\b|orange|citron|clementine|mandarine|pamplemousse|pomelo|kiwi|pomme|poires?\b|courge|potimarron|butternut|betterave|navet|panais|celeri|topinambour|radis noir|chou\b|choux|rutabaga|coing/;
+    function kbTourKeeps(name) { return KB_TOUR_KEEP.test(normalizeText(String(name || ''))); }
     async function kbSameDayOpen(day) {
       await kbSameDayLoad();
       if (!kbIsSameDay(day)) return false;
@@ -13343,14 +13388,16 @@
       out.push('', `TOTAL : ${tr} roll${tr > 1 ? 's' : ''} + ${td} dolly${td > 1 ? 'ies' : ''}`.replace('dollyies', 'dollies'), '', `Prépa clôturée${by ? ' par ' + by : ''}`);
       return out.join('\n');
     }
-    async function kbSendRungis(day, by, list) {
+    async function kbSendRungis(day, by, list, keepList) {
       let r;
       try { r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_RUNGIS_TO, subject: 'Rolls Kelbongoo prêts', body: kbRungisText(day, list, by), htmlBody: kbRungisHtml(day, list, by) }); }
       catch (e) { r = { ok: false, error: e.message }; }
       const log = { at: new Date().toISOString(), by: by || '—', to: KB_RUNGIS_TO, list, ok: !!(r && r.ok), error: (r && r.ok) ? '' : String((r && r.error) || 'inconnue') };
       try { await storage.setDoc(`day_${day}_prep`, 'rungis', log, { replace: true }); } catch (_) {}
       // V10.15 — copie lisible par le chauffeur et l'Espace Rungis (rolls + dollies à charger par lieu)
-      try { await storage.setDoc('rungis_runs', day, { day, list: (list || []).map(x => ({ site: x.site, rolls: x.rolls || 0, dolly: x.dolly || 0 })), by: by || '', at: log.at }, { replace: true }); } catch (_) {}
+      // V11.44 — lieux déjà partis avec la tournée unique gardés dans la vue chauffeur
+      const runL = [...(list || []), ...((keepList || []).filter(k => k && !(list || []).some(x => x.site === k.site)))];
+      try { await storage.setDoc('rungis_runs', day, { day, list: runL.map(x => ({ site: x.site, rolls: x.rolls || 0, dolly: x.dolly || 0 })), by: by || '', at: log.at }, { replace: true }); } catch (_) {}
       return log;
     }
 
@@ -13752,8 +13799,12 @@
     //   « 🧺 Finir la MU du JOUR » (journée MU de la veille, cible = aujourd'hui)
     //   « ➡️ MU du LENDEMAIN »   (journée MU d'aujourd'hui, cible = lendemain) — comme un jour normal.
     //   Choix gardé sur l'appareil pour la journée ; par défaut : jour avant 10h, lendemain après.
-    function muModeGet(t){ try { const v=localStorage.getItem('kb_mu_mode_'+t); if(v==='jour'||v==='lendemain') return v; } catch(e){} return (new Date().getHours()<10) ? 'jour' : 'lendemain'; }
-    function muWorkOf(t, open, mode){
+    function muModeGet(t){ try { const v=localStorage.getItem('kb_mu_mode_'+t); if(v==='jour'||v==='lendemain'||v==='samedi') return v; } catch(e){} return (new Date().getHours()<10) ? 'jour' : 'lendemain'; }
+    // V11.44 — tournée unique : le JEUDI on peut avancer la MU du samedi (journée MU du vendredi, cible samedi)
+    function muWorkOf(t, open, mode, tourThu){
+      if(tourThu && !open) return mode==='samedi'
+        ? { key: muShiftDate(t,1), extra: null, target: muShiftDate(t,2), sameDayOpen: false, tourThu: true, tourAdvance: true, mode }
+        : { key: t, extra: null, target: muShiftDate(t,1), sameDayOpen: false, tourThu: true, tourAdvance: false, mode: 'lendemain' };
       return (open && mode==='jour')
         ? { key: muShiftDate(t,-1), extra: null, target: t, sameDayOpen: true, mode } // V11.26 — mu_<jour> = MU du lendemain : plus ajoutée ici
         : { key: t, extra: null, target: open ? muShiftDate(t,1) : null, sameDayOpen: !!open, mode };
@@ -13769,11 +13820,31 @@
         return ()=>{ stop=true; clearInterval(iv); };
       },[]);
       const setMode = (m)=>{ try { localStorage.setItem('kb_mu_mode_'+todayKey(), m); } catch(e){} setModeSt(m); };
-      const w = React.useMemo(()=>muWorkOf(todayKey(), open, mode), [open, mode]);
+      const tour = useKbTour(); // V11.44
+      const tourThu = !!(tour.on && new Date(t0+'T12:00:00').getDay()===4);
+      const w = React.useMemo(()=>muWorkOf(todayKey(), open, mode, tourThu), [open, mode, tourThu]);
       return { ...w, setMode };
     }
     // V11.26 — bouton de choix (gros) visible seulement le jour « prépa le jour même »
     function MuModeSwitch({ work }){
+      if(work && work.tourThu){ // V11.44 — jeudi, tournée unique
+        const t = todayKey();
+        const b = (m, txt, sub, col)=>(
+          <button onClick={()=>{ if(work.mode!==m) work.setMode(m); }}
+            style={{flex:1,minHeight:72,fontSize:18,fontWeight:800,borderRadius:12,cursor:'pointer',lineHeight:1.2,
+              border: work.mode===m ? '3px solid '+col : '2px solid #ddd', background: work.mode===m ? col : '#fff', color: work.mode===m ? '#fff' : '#555'}}>
+            {txt}<div style={{fontSize:13,fontWeight:600,opacity:.9}}>{sub}</div>
+          </button>);
+        return (
+          <div style={{background:'#ede7f6',border:'2px solid #5e35b1',borderRadius:12,padding:10}}>
+            <div style={{fontSize:15,fontWeight:800,color:'#4527a0',marginBottom:8}}>🚚 Tournée unique de vendredi — tu fais la MU pour :</div>
+            <div style={{display:'flex',gap:8}}>
+              {b('lendemain', '➡️ Vendredi', 'MU du jour, d\'abord', '#2e7d32')}
+              {b('samedi', '⏩ Samedi', 'à avancer après', '#5e35b1')}
+            </div>
+            {work.mode==='samedi' && <div style={{fontSize:13,color:'#4527a0',marginTop:8}}>Besoin du samedi <b>estimé</b> (moyenne des 4 derniers samedis + 15 %). Ce qui est fait aujourd'hui est <b>déjà compté</b> vendredi. Produits qui se gardent en premier 🟣.</div>}
+          </div>);
+      }
       if(!work || !work.sameDayOpen) return null;
       const lbl = (d)=>{ try { return new Date(d+'T12:00:00').toLocaleDateString('fr-FR',{weekday:'long',day:'numeric'}); } catch(e){ return d; } };
       const t = todayKey(), n = muShiftDate(t,1);
@@ -13826,8 +13897,35 @@
       return { stock, source:'calc', fromDate:d, exact: !!muExactOf(snap) };
     }
     // Hook : lignes MU réelle pour la journée (items = liste get-mu-list, entries = map mu_<jour>)
-    function useMuReel(dateKey, items, flRows, entries, targetDay){
+    function useMuReel(dateKey, items, flRows, entries, targetDay, opts){
       const flIdx = React.useMemo(()=>muFlIndex(flRows), [flRows]);
+      // V11.44 — MU du samedi avancée le jeudi : besoin = moyenne des commandes exactes des 4 derniers samedis (+15 %)
+      const tourAdv = !!(opts && opts.tourAdvance);
+      const tourC = useKbTour();
+      const [histEst, setHistEst] = React.useState(null);
+      // V11.44 — commandes du samedi en cours lues (Master › Tournée unique › JSON Compass) × (1 + marge MU)
+      const snap0 = entries ? entries[MU_REEL_DOC] : null;
+      const tourLinesJ = snap0 && snap0.tourLines && snap0.tourFor === targetDay ? snap0.tourLines : '';
+      const liveEst = React.useMemo(()=>{
+        if(!tourAdv || !tourLinesJ || !flIdx || !Object.keys(flIdx).length) return null;
+        let lines=[]; try { lines=JSON.parse(tourLinesJ); } catch(e){ return null; }
+        const r = muExactFromLines(lines, flIdx);
+        const f = 1 + (Number(tourC.margeMu)||0)/100;
+        const map={}; Object.entries(r.exact||{}).forEach(([k,v])=>{ map[k]=Math.ceil((Number(v)||0)*f); });
+        return { map, pct: Number(tourC.margeMu)||0, at: snap0.tourAt||0, n: snap0.tourOrders||0, by: snap0.tourBy||'' };
+      },[tourAdv, tourLinesJ, flIdx, tourC.margeMu]);
+      React.useEffect(()=>{
+        if(!tourAdv){ setHistEst(null); return; }
+        let stop=false;
+        const ds=[1,2,3,4].map(i=>muShiftDate(dateKey,-7*i));
+        Promise.all(ds.map(d=>storage.getDoc('mu_'+d, MU_REEL_DOC).catch(()=>null))).then(snaps=>{
+          const sum={}; let n=0;
+          snaps.forEach(sn=>{ const ex=muExactOf(sn); if(!ex) return; n++; Object.entries(ex).forEach(([k,v])=>{ sum[k]=(sum[k]||0)+(Number(v)||0); }); });
+          const out={}; if(n) Object.entries(sum).forEach(([k,v])=>{ out[k]=Math.ceil(v/n*1.15); });
+          if(!stop) setHistEst({ map: out, n });
+        });
+        return ()=>{ stop=true; };
+      },[tourAdv, dateKey]);
       const [start,setStart] = React.useState(null);
       const ready = items!==null && flRows!==null;
       const snapToday = entries ? entries[MU_REEL_DOC] : null;
@@ -13874,7 +13972,9 @@
           const name = muName(it), k = muKey(name);
           const fl = flIdx[k];
           // Estimation = commandes notées à 6h + 15-20 % (colonne ESTIMATION MU) ; repli : ventes du jour.
-          const estim = (fl && fl.est!=null) ? Math.max(0,Math.round(fl.est))
+          const estim = (tourAdv && liveEst) ? Math.max(0, liveEst.map[k]||0) // V11.44 — commandes du samedi lues + %
+            : (tourAdv && histEst && histEst.n) ? Math.max(0, histEst.map[k]||0) // V11.44 — repli : 4 derniers samedis
+            : (fl && fl.est!=null) ? Math.max(0,Math.round(fl.est))
             : (muEst(it)>0 ? Math.max(0,Math.round(muEst(it))) : ((fl && fl.ventes!=null) ? Math.max(0,Math.round(fl.ventes)) : 0));
           const commandes = exact ? Math.max(0, Math.round(Number(exact[k])||0)) : estim;
           const ov = snapToday && snapToday.overrides ? snapToday.overrides[k] : null;
@@ -13885,12 +13985,13 @@
             aFaire: Math.max(0, commandes - stock), reste: stock + fait - commandes });
         });
         return out;
-      },[items, flIdx, start, snapToday, faitToday]);
+      },[items, flIdx, start, snapToday, faitToday, tourAdv, histEst, liveEst]);
       const byKey = React.useMemo(()=>{ const m={}; rows.forEach(r=>{ m[r.key]=r; }); return m; },[rows]);
       // Photo du jour (stock auto + commandes ESTIMÉES ; les exactes sont dans exactJson) → report du lendemain
       const lastSaved = React.useRef('');
       React.useEffect(()=>{
         if(!start || start.forKey!==dateKey || !ready || start.source==='erreur' || !rows.length) return; // V11.26 — jamais la photo d'une autre journée
+        if(tourAdv && !histEst) return; // V11.44
         const itemsMap = {}; rows.forEach(r=>{ itemsMap[r.key] = { product:r.name, stock:r.auto, commandes:r.estim }; });
         const sig = JSON.stringify(itemsMap);
         if(sig===lastSaved.current) return;
@@ -13909,7 +14010,7 @@
         await storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { startFromSheet: { by: by||'—', at: Date.now() }, overrides: ovs });
       };
       const cancelSheet = async () => { await storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { startFromSheet: null }); };
-      return { rows, byKey, start, ready: !!start, setOverride, cmdInfo, flIdx, nextDay, resetFromSheet, cancelSheet, nextOrdersCount: (nextOrders && nextOrders.orders ? nextOrders.orders.length : 0), after10 };
+      return { rows, byKey, start, ready: !!start, setOverride, cmdInfo: (tourAdv && !exact) ? { exact:false, tourHist: histEst ? histEst.n : null, tourLive: liveEst } : cmdInfo, flIdx, nextDay, resetFromSheet, cancelSheet, nextOrdersCount: (nextOrders && nextOrders.orders ? nextOrders.orders.length : 0), after10 };
     }
     // V9.63 — bandeau MU : distribution visée + source du stock PDP + « Reprendre le stock du Sheet »
     function MuDayStockBar({ reel, operator, onReload }) {
@@ -13947,6 +14048,10 @@
           {info.redirected && Object.keys(info.redirected).length>0 && <div style={{marginTop:4,color:'#8a4b00'}}>ℹ️ Commandes rattachées par le nom à la ligne active (l'ID trouvé était sur une ligne non active) : {Object.entries(info.redirected).map(([k,off])=>`« ${off} » → ${k}`).join(' · ')}.</div>}
         </div>
       );
+      if(info.tourHist!==undefined) return ( // V11.44
+        <div style={{background:'#ede7f6',border:'1px solid #b39ddb',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#4527a0'}}>
+          ⏩ <b>MU du samedi estimée</b> : {info.tourLive ? <>commandes du samedi lues à <b>{muTime(info.tourLive.at)}</b> ({info.tourLive.n} commandes{info.tourLive.by ? ' · '+info.tourLive.by : ''}) <b>+ {info.tourLive.pct} %</b></> : info.tourHist==null ? 'calcul…' : info.tourHist ? `commandes du samedi pas encore lues → moyenne des ${info.tourHist} dernier(s) samedi(s) + 15 %` : 'pas d\'historique de samedi trouvé → estimation du Sheet'}. Elle devient exacte vendredi au chargement des commandes.
+        </div>);
       return (
         <div style={{background:'#fff8e1',border:'1px solid #ffe082',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#8d6e00',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
           <span>⏳ <b>MU estimée</b> (+15-20 % déjà compris). Elle passe en <b>EXACTE</b> toute seule dès que les commandes du jour sont chargées (10h).</span>
@@ -14033,7 +14138,7 @@
       React.useEffect(()=>{ loadList(); },[loadList]);
       useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
       // V9.58 — MU réelle : stock PDP reporté, à faire = commandes − stock
-      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target); // V11.26
+      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target, muWork); // V11.26 · V11.44
 
       const byProduct = React.useMemo(()=>{
         const idx={};
@@ -14090,9 +14195,10 @@
 
       const q = search.trim() ? muStrip(search.toLowerCase()) : null;
       const filtered = React.useMemo(()=>{
-        const base = plannedItems.filter(it=>{ const info=byProduct[muName(it)]||{}; if(info.lastDone) return false; return true; });
+        let base = plannedItems.filter(it=>{ const info=byProduct[muName(it)]||{}; if(info.lastDone) return false; return true; });
+        if(muWork.tourAdvance) base = [...base.filter(it=>kbTourKeeps(muName(it))).map(it=>({ ...it, _keep:true })), ...base.filter(it=>!kbTourKeeps(muName(it)))]; // V11.44
         return q ? base.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : base;
-      },[plannedItems,byProduct,q]);
+      },[plannedItems,byProduct,q,muWork.tourAdvance]);
       const filteredExtra = React.useMemo(()=>{
         const pool = extraPool.filter(it=>!(muName(it) in extraAdded));
         return q ? pool.filter(it=>muStrip(muName(it).toLowerCase()).includes(q)) : pool;
@@ -14137,7 +14243,9 @@
       const totalAPrep = aPreparer.reduce((s,x)=>s+x.qte,0);
 
       const renderCard=(it,idx)=>{ const key=muName(it); const info=byProduct[key]||{doneCount:0,busy:[],mine:null}; return (
-        <MuCard key={key+'_'+idx} item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} />
+        it._keep ? <div key={key+'_'+idx} style={{display:'flex',flexDirection:'column',gap:4}}><div style={{alignSelf:'flex-start',background:'#5e35b1',color:'#fff',fontWeight:800,fontSize:14,borderRadius:8,padding:'2px 10px'}}>🟣 Se garde — à faire en premier</div>
+          <MuCard item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} /></div>
+        : <MuCard key={key+'_'+idx} item={it} operator={operator} dateKey={dateKey} myActive={info.mine} doneCount={info.doneCount} busyBy={info.busy} /> // V11.44
       ); };
 
       // Récap (master)
@@ -14353,7 +14461,7 @@
       },[]);
       React.useEffect(()=>{ load(); },[load]);
       useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
-      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target); // V11.26
+      const reel = useMuReel(dateKey, items, flRows, entries, muWork.target, muWork); // V11.26 · V11.44
 
       const q = search.trim() ? muStrip(search.toLowerCase()) : null;
       const rows = React.useMemo(()=>{
@@ -18328,6 +18436,152 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
     // V9.67 — noms de fromages (repli quand la catégorie du catalogue manque, ex. nouveau site)
     const KB_CHEESE_RX = /\b(fromage|comte|tomme|brie|camembert|chevre|reblochon|roquefort|bleu d|bleu de|emmental|raclette|munster|morbier|cantal|saint[- ]nectaire|st[- ]nectaire|ossau|feta|mozzarella|parmesan|parmigiano|beaufort|abondance|mimolette|gouda|coulommiers|chaource|epoisses|maroilles|pont[- ]l.eveque|langres|salers|laguiole|fourme|crottin|pelardon|picodon|rocamadour|valencay|selles sur cher|sainte[- ]maure|bethmale|tomette|faisselle|fromage blanc|cancoillotte|mont d.or|vacherin|gruyere|ricotta|burrata|halloumi|manchego|pecorino|cheddar)\b/;
+    // V11.44 — bandeau prépa « tournée unique » : lieux du camion, heure limite, chargements 7h / 10h
+    function KbTourBanner({ cfg, day, sites, prog, done, siteProgress, sent, filterOn, onFilter, onSend }) {
+      const [now, setNow] = React.useState(Date.now());
+      const [ld, setLd] = React.useState(null);
+      React.useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
+      React.useEffect(() => storage.subscribe(`day_${day}_orders`, arr => { const d = (arr || []).find(x => x.id === 'data') || null; setLd(d ? { at: d.uploadedAt || d.psLoadedAt || '', n: (d.orders || []).length } : null); }), [day]);
+      const [hh, mm] = kbTourHm(cfg.depart, [14, 30]);
+      const dep = new Date(); dep.setHours(hh, mm, 0, 0);
+      const left = Math.round((dep.getTime() - now) / 60000);
+      const pct = prog.t ? Math.round(prog.d / prog.t * 100) : 0;
+      const late = !done && left < 60;
+      const col = done ? '#2e7d32' : late ? '#c62828' : '#5e35b1';
+      const ldAt = ld && ld.at ? new Date(ld.at) : null;
+      const ld10 = ldAt && (ldAt.getHours() > 10 || (ldAt.getHours() === 10 && ldAt.getMinutes() >= 0)) && ldAt.toDateString() === new Date().toDateString();
+      const fH = d => d ? d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
+      const leftTxt = left > 0 ? `départ dans ${Math.floor(left / 60) ? Math.floor(left / 60) + ' h ' : ''}${String(left % 60).padStart(Math.floor(left / 60) ? 2 : 1, '0')} min` : 'heure de départ passée';
+      return React.createElement("div", { style: { margin: '6px 8px', borderRadius: 16, border: '3px solid ' + col, background: '#fff', overflow: 'hidden' } },
+        React.createElement("div", { style: { background: col, color: '#fff', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+          React.createElement("span", { style: { fontSize: 22, fontWeight: 900 } }, "🚚 TOURNÉE UNIQUE ", String(cfg.depart).replace(':', 'h')),
+          React.createElement("span", { style: { fontSize: 17, fontWeight: 700 } }, sent ? (sent.ok ? `✅ Rungis prévenu à ${formatTimeFR(sent.at)}` : '⚠️ Mail Rungis pas parti — renvoyer') : done ? '✅ lieux du camion prêts' : leftTxt),
+          React.createElement("span", { style: { marginLeft: 'auto', fontSize: 26, fontWeight: 900 } }, pct, "%")),
+        React.createElement("div", { style: { padding: '8px 12px' } },
+          React.createElement("div", { style: { fontSize: 16, fontWeight: 700, marginBottom: 6 } }, done ? "Bravo 🎉 — continue avec les autres lieux." : "D'abord les lieux du camion :"),
+          React.createElement("div", { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, sites.map(x => {
+            const g = siteProgress(x), ok = g.total > 0 && g.done === g.total;
+            return React.createElement("span", { key: x, style: { ...kbSiteVars(x), background: ok ? '#e8f5e9' : kbSiteColor(x), color: ok ? '#2e7d32' : '#fff', border: '2px solid ' + (ok ? '#2e7d32' : kbSiteColor(x)), borderRadius: 10, padding: '4px 10px', fontSize: 17, fontWeight: 900 } },
+              x, " ", ok ? '✓' : `${g.done}/${g.total}`);
+          })),
+          React.createElement("div", { style: { fontSize: 14, color: '#555', marginTop: 6 } },
+            "📥 Commandes : ", ld && ld.n ? `${ld.n} chargées${ldAt ? ' à ' + fH(ldAt) : ''}` : 'pas encore chargées', ld && ld.n && !ld10 ? ' · ⏰ 2e chargement à 10h (nouvelles commandes = nouveaux casiers)' : ''),
+          React.createElement("div", { style: { display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' } },
+            !done && React.createElement("button", { className: "pdj-btn", style: { fontWeight: 800, fontSize: 16, minHeight: 48, border: '3px solid #5e35b1', background: filterOn ? '#5e35b1' : '#fff', color: filterOn ? '#fff' : '#5e35b1' }, onClick: onFilter },
+              filterOn ? '✓ Filtre tournée actif' : '🚚 Voir seulement la tournée'),
+            React.createElement("button", { className: "pdj-btn", style: { fontWeight: 900, fontSize: 17, minHeight: 48, background: done ? '#2e7d32' : '#fff', color: done ? '#fff' : '#2e7d32', border: '3px solid #2e7d32' }, onClick: onSend },
+              sent ? '🚚 Renvoyer à Rungis' : done ? '🚚 Tournée prête → prévenir Rungis' : '🚚 Prévenir Rungis'))));
+    }
+    // V11.44 — jeudi : lire les commandes du SAMEDI en cours (export Compass orders-since-2023, vente pas compilée)
+    //   → mu_<vendredi>._reel.tourLines (lignes produit) ; n'écrit JAMAIS dans day_<samedi>_orders (la prépa n'est pas touchée).
+    function KbTourSatReader({ cfg, session, onPct }) {
+      const showToast = React.useContext(ToastContext);
+      const [busy, setBusy] = React.useState('');
+      const [pct, setPct] = React.useState(cfg.margeMu);
+      React.useEffect(() => { setPct(cfg.margeMu); }, [cfg.margeMu]);
+      const t = todayKey();
+      const dow = new Date(t + 'T12:00:00').getDay();
+      const sat = addDays(t, (6 - dow + 7) % 7 || 7);
+      const fri = addDays(sat, -1);
+      const [snap, setSnap] = React.useState(null);
+      React.useEffect(() => storage.subscribe('mu_' + fri, arr => setSnap((arr || []).find(x => x && x.id === MU_REEL_DOC) || null)), [fri]);
+      const read = async (file) => {
+        if (!file) return;
+        setBusy('Lecture…');
+        try {
+          const prodById = await readCache('products'); const consById = (await readCache('consumers')) || {};
+          if (!prodById) throw new Error('Pas de fichier Produits en mémoire (Master › Chargement)');
+          const text = await file.text();
+          const res = parseOrdersJSON(text, prodById, consById);
+          if (res.dateKey && res.dateKey !== sat) throw new Error(`ce fichier est pour le ${formatDateShort(res.dateKey)}, pas pour samedi ${formatDateShort(sat)}`);
+          const agg = {};
+          muLinesFromOrders(res.orders).forEach(l => { const k = (l.id || '') + '|' + (l.name || ''); if (!agg[k]) agg[k] = { id: l.id || '', name: l.name || '', qty: 0 }; agg[k].qty += Number(l.qty) || 0; });
+          const lines = Object.values(agg).filter(l => l.qty > 0);
+          await storage.setDoc('mu_' + fri, MU_REEL_DOC, { tourLines: JSON.stringify(lines), tourAt: Date.now(), tourBy: (session && session.name) || '—', tourOrders: (res.orders || []).length, tourFor: sat });
+          showToast(`✓ ${(res.orders || []).length} commandes du samedi lues → MU du samedi + ${cfg.margeMu} %`);
+        } catch (e) { showToast('Erreur : ' + (e.message || e)); }
+        finally { setBusy(''); }
+      };
+      return (
+        <div className="card" style={{ padding: 14, border: '2px solid #5e35b1' }}>
+          <strong style={{ fontSize: 16 }}>⏩ Jeudi : besoin MU du samedi {formatDateShort(sat)}</strong>
+          <div style={{ fontSize: 14, marginTop: 4 }}>
+            {snap && snap.tourLines && snap.tourFor === sat
+              ? <span style={{ color: '#2e7d32', fontWeight: 700 }}>✓ {snap.tourOrders} commandes lues à {muTime(snap.tourAt)}{snap.tourBy ? ' par ' + snap.tourBy : ''}</span>
+              : <span style={{ color: '#8a4b00', fontWeight: 700 }}>Pas encore lues → la MU prend la moyenne des 4 derniers samedis + 15 %</span>}
+          </div>
+          <ol style={{ fontSize: 13, margin: '6px 0', paddingLeft: 18, lineHeight: 1.5 }}>
+            <li>Compass › <b>orders-since-2023</b> › filtre sur le <b>globalorder_id du samedi</b> (vente ouverte, pas compilée : normal).</li>
+            <li>Export JSON, puis le choisir ici. Tu peux relire plus tard dans la journée (ça remplace).</li>
+          </ol>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            <input type="file" accept=".json,application/json" disabled={!!busy} onChange={e => { read(e.target.files[0]); e.target.value = ''; }} />
+            <label style={{ fontSize: 14 }}>Marge ajoutée <input type="number" min="0" max="300" value={pct} onChange={e => setPct(e.target.value)} onBlur={() => { if (Number(pct) !== Number(cfg.margeMu)) onPct(Number(pct) || 0); }} style={{ fontSize: 18, padding: 6, width: 80 }} /> %</label>
+            {busy && <b>{busy}</b>}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Sert seulement à la MU du samedi faite le jeudi. La prépa et les commandes du samedi ne sont pas touchées (chargement normal vendredi 7h puis 10h).</div>
+        </div>
+      );
+    }
+    // V11.44 — Master › Livraison & réglages › 🚚 Tournée unique vendredi
+    function KbTourneeUniquePage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [c, setC] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      React.useEffect(() => { kbTourLoad(true).then(x => setC({ ...x })).catch(() => setC(kbTourCfg())); }, []);
+      const save = async (next) => {
+        setBusy(true);
+        try {
+          const v = { on: !!next.on, sites: next.sites, depart: next.depart, debut: next.debut, marge: Number(next.marge) || 0, margeMu: next.margeMu != null && next.margeMu !== '' ? Number(next.margeMu) || 0 : 70, by: (session && session.name) || '—', at: Date.now() };
+          await storage.setDoc('app_config', 'tournee_unique', v, { replace: true });
+          _kbTour = v; _kbTourAt = Date.now(); setC({ ...kbTourCfg() });
+          try { window.dispatchEvent(new CustomEvent('kb:tour')); } catch (_) {}
+          showToast(v.on ? '🚚 Tournée unique ACTIVÉE' : 'Tournée unique désactivée');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+        finally { setBusy(false); }
+      };
+      if (!c) return <div className="card">Chargement…</div>;
+      const cand = ['BIC', 'BOR', 'STB', 'TOL', 'ROB', 'PDC'];
+      const tog = (x) => { const ss = c.sites.includes(x) ? c.sites.filter(y => y !== x) : [...c.sites, x]; save({ ...c, sites: ss.length ? ss : c.sites }); };
+      const big = { fontSize: 16, lineHeight: 1.45 };
+      return (
+        <div className="stack">
+          <h1 style={{ margin: '0 0 4px' }}>🚚 Tournée unique du vendredi</h1>
+          <div className="card" style={{ padding: 16, border: '3px solid ' + (c.on ? '#2e7d32' : '#bbb') }}>
+            <button disabled={busy} onClick={() => save({ ...c, on: !c.on })}
+              style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', padding: '14px 16px', borderRadius: 14, cursor: 'pointer', border: 'none', background: c.on ? '#2e7d32' : '#eceff1', color: c.on ? '#fff' : '#37474f', fontSize: 20, fontWeight: 900, textAlign: 'left' }}>
+              <span style={{ width: 34, height: 34, borderRadius: 8, background: '#fff', color: '#2e7d32', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 26, border: '2px solid ' + (c.on ? '#fff' : '#90a4ae') }}>{c.on ? '✓' : ''}</span>
+              Fin de prépa du vendredi à {String(c.depart).replace(':', 'h')} — une seule tournée
+            </button>
+            {c.by && c.at ? <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Modifié par {c.by} le {new Date(c.at).toLocaleString('fr-FR')}</div> : null}
+          </div>
+          <div className="card" style={{ padding: 14 }}>
+            <strong style={{ fontSize: 16 }}>Ce que ça déclenche</strong>
+            <div style={{ ...big, marginTop: 6 }}>
+              <div>📅 <b>Jeudi · MU</b> : sur l'écran MU, choix « ➡️ Vendredi » / « ⏩ Samedi ». La MU du samedi faite le jeudi est <b>déjà comptée vendredi</b>. Besoin = commandes du samedi lues ci-dessous + {c.margeMu} % (sinon 4 derniers samedis + 15 %), produits qui se gardent en premier.</div>
+              <div style={{ marginTop: 6 }}>🧺 <b>Vendredi · Prépa</b> (dès {String(c.debut).replace(':', 'h')}) : bandeau « Tournée {String(c.depart).replace(':', 'h')} », filtre sur les lieux du camion par défaut, lieux du camion en tête, rappel du 2e chargement à 10h (nouvelles commandes = nouveaux casiers dans les rolls).</div>
+              <div style={{ marginTop: 6 }}>🚚 <b>Vendredi · Rungis</b> : bouton « Tournée prête → prévenir Rungis » : rolls + dollies des lieux du camion, sans attendre la clôture. Le chauffeur les voit tout de suite.</div>
+              <div style={{ marginTop: 6, color: '#8a4b00' }}>⚠️ <b>Commande Rungis du jeudi 4h30</b> (samedi + {c.marge} %) : se fait côté serveur, pas encore branché — à ajouter à la main par Raimbaud tant que ce n'est pas fait.</div>
+            </div>
+          </div>
+          <KbTourSatReader cfg={c} session={session} onPct={(v) => save({ ...c, margeMu: v })} />
+          <div className="card" style={{ padding: 14 }}>
+            <strong style={{ fontSize: 16 }}>Lieux qui partent avec le camion</strong>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+              {cand.map(x => { const on = c.sites.includes(x); return (
+                <button key={x} disabled={busy} onClick={() => tog(x)} style={{ minHeight: 52, minWidth: 92, borderRadius: 12, fontSize: 18, fontWeight: 900, cursor: 'pointer', border: '3px solid ' + kbSiteColor(x), background: on ? kbSiteColor(x) : '#fff', color: on ? '#fff' : kbSiteColor(x) }}>
+                  {on ? '✓ ' : ''}{x}<div style={{ fontSize: 11, fontWeight: 600 }}>{siteLabel(x)}</div>
+                </button>); })}
+            </div>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 12, alignItems: 'flex-end' }}>
+              <label style={{ fontSize: 14 }}>Début prépa<br /><input type="time" value={c.debut} onChange={e => setC({ ...c, debut: e.target.value })} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6 }} /></label>
+              <label style={{ fontSize: 14 }}>Départ camion<br /><input type="time" value={c.depart} onChange={e => setC({ ...c, depart: e.target.value })} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6 }} /></label>
+              <label style={{ fontSize: 14 }}>Marge samedi (Rungis jeudi)<br /><input type="number" min="0" max="200" value={c.marge} onChange={e => setC({ ...c, marge: e.target.value })} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6, width: 90 }} /> %</label>
+            </div>
+          </div>
+        </div>
+      );
+    }
     function PrepaDuJourPage({
   session
 }) {
@@ -18380,6 +18634,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   const [casNum, setCasNum] = React.useState('');
   const [casErr, setCasErr] = React.useState('');
   const [prodSite, setProdSite] = React.useState('');
+  const tourCfg = useKbTour(); // V11.44 — tournée unique du vendredi
+  const [tourRg, setTourRg] = React.useState(null);
+  const [tourBusy, setTourBusy] = React.useState(false);
   const [rg, setRg] = React.useState(null);
   const [rgBusy, setRgBusy] = React.useState(false);
   const [wIdx, setWIdx] = React.useState(() => kbPdjWeightIdx(kbMuCacheGet('fl'), kbMuCacheGet('list')));
@@ -18566,7 +18823,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             closed: !!d.domClosed,
             by: d.domClosedBy || '',
             at: d.domClosedAt || '',
-            dromyOk: !!d.domDromyOk
+            dromyOk: !!d.domDromyOk,
+            tour: d.tourSentAt ? { at: d.tourSentAt, by: d.tourSentBy || '', list: d.tourList || [], ok: d.tourMailOk !== false } : null // V11.44
           };
           return;
         }
@@ -18681,7 +18939,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   const wCounter = (site, n) => storage.setDoc(`day_${day}_prep`, 'counters', {
     [site]: n
   });
-  const sites = React.useMemo(() => [...new Set(rows.map(r => r.site))].sort(), [rows]);
+  const tourOn = kbTourOnFor(tourCfg, day); // V11.44
+  const sites = React.useMemo(() => {
+    const all = [...new Set(rows.map(r => r.site))].sort();
+    if (!tourOn) return all;
+    const ts = tourCfg.sites.filter(x => all.includes(x));
+    return [...ts, ...all.filter(x => !ts.includes(x))]; // V11.44 — lieux du camion en tête
+  }, [rows, tourOn, tourCfg.sites.join(',')]);
+  const tourSites = tourOn ? tourCfg.sites.filter(x => sites.includes(x)) : [];
+  const inProdSite = x => !prodSite || (prodSite === '__tour' ? tourSites.includes(x) : x === prodSite);
+  const prodOne = prodSite && prodSite !== '__tour' ? prodSite : '';
   React.useEffect(() => {
     if (!curSite && sites.length) setCurSite(sites[0]);
   }, [sites]);
@@ -18712,10 +18979,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   React.useEffect(() => {
     if (!day || prep.closed || prep.presence === undefined || !rows.length) return;
     const miss = {};
+    // V11.44 — 2e chargement (tournée unique : 7h puis 10h) : un n° venu du JSON déjà pris par un client dont le casier
+    //   est fixé dans l'appli (cs|) → le nouveau client reçoit le prochain n° libre (jamais deux clients au même n°).
+    const fixed = {};
+    Object.entries(prep.casiers || {}).forEach(([k, a]) => { const [s0, c0] = k.split('||'); (a || []).forEach(n => { const v = String(n).trim(); if (v && v !== '?') { fixed[s0] = fixed[s0] || {}; if (!fixed[s0][v]) fixed[s0][v] = c0; } }); });
+    let nClash = 0;
     rows.forEach(r => {
       if (r.site === 'DOM' || r.cat === 'pain' || r.cat === 'nd' || kbIsSolidaire(r.product)) return;
       const cs = getCasiers(r.site, r.client).map(String).filter(v => v && v !== '?');
-      if (!cs.length) (miss[r.site] = miss[r.site] || new Set()).add(r.client);
+      const clash = !prep.casiers[CK(r.site, r.client)] && cs.some(v => fixed[r.site] && fixed[r.site][v] && fixed[r.site][v] !== r.client);
+      if (!cs.length || clash) { const set = (miss[r.site] = miss[r.site] || new Set()); if (clash && !set.has(r.client)) nClash++; set.add(r.client); }
     });
     const sig = Object.entries(miss).map(([s, set]) => s + ':' + [...set].sort().join(',')).sort().join('|');
     if (!sig || sig === casAutoSig.current) return;
@@ -18734,7 +19007,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         wCas(CK(s, c), [String(n)]);
       });
     });
-    if (cnt) showToast(`🧊 ${cnt} client${cnt > 1 ? 's' : ''} sans casier → n° attribué`);
+    if (cnt) showToast(nClash ? `🧊 ${nClash} casier(s) en double après le nouveau chargement → nouveau n° attribué` : `🧊 ${cnt} client${cnt > 1 ? 's' : ''} sans casier → n° attribué`);
   }, [day, rows, prep]);
   const basket = (s, c) => rows.filter(r => r.site === s && r.client === c).reduce((a, r) => a + r.qty, 0);
   const weighable = t => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
@@ -18814,6 +19087,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     return p.total > 0 && p.done === p.total;
   };
   const sitesOrd = [...sites.filter(x => !siteDone(x)), ...sites.filter(siteDone)];
+  // V11.44 — avancement des lieux de la tournée unique
+  const tourProg = tourSites.reduce((a, x) => { const g = siteProgress(x); a.d += g.done; a.t += g.total; return a; }, { d: 0, t: 0 });
+  const tourDone = tourSites.length > 0 && tourProg.t > 0 && tourProg.d === tourProg.t;
+  const tourAuto = React.useRef('');
+  React.useEffect(() => {
+    if (!tourOn || !tourSites.length || !day) return;
+    if (tourAuto.current === day) return;
+    tourAuto.current = day;
+    if (!tourDone && !prodSite) setProdSite('__tour');
+  }, [tourOn, day, tourSites.length, tourDone]);
+  React.useEffect(() => { if (tourDone && prodSite === '__tour') { setProdSite(''); showToast('🚚 Lieux de la tournée finis → toutes les boutiques'); } }, [tourDone]);
   const curDoneRef = React.useRef(null);
   React.useEffect(() => {
     if (!curSite) return;
@@ -20475,6 +20759,29 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       dolly: {}
     });
   };
+  // V11.44 — 🚚 tournée unique : rolls des lieux du camion envoyés à Rungis AVANT la clôture de la prépa
+  const openTour = () => {
+    const rolls = {}, sel = {};
+    tourSites.forEach(s => { if (rollSites[s]) { rolls[s] = rollSites[s].rolls; sel[s] = true; } });
+    setTourRg({ sel, rolls, dolly: {} });
+  };
+  const sendTour = async () => {
+    if (!tourRg || tourBusy) return;
+    const list = Object.keys(tourRg.sel).filter(s => tourRg.sel[s]).map(s => ({ site: s, rolls: Math.max(0, tourRg.rolls[s] || 0), dolly: Math.max(0, parseInt(tourRg.dolly[s], 10) || 0) }));
+    if (!list.length) { showToast('Coche au moins un lieu'); return; }
+    const notDone = list.filter(x => !siteDone(x.site)).map(x => x.site);
+    if (!confirm((notDone.length ? `⚠️ Pas encore fini : ${notDone.join(', ')}\n\n` : '') + `Prévenir Probon Rungis (départ ${String(tourCfg.depart).replace(':', 'h')}) ?\n\n${list.map(x => `${x.site} : ${x.rolls} roll(s) + ${x.dolly} dolly`).join('\n')}`)) return;
+    setTourBusy(true);
+    try {
+      kbContainersDeliver(day, list);
+      const lg = await kbSendRungis(day, user, list);
+      await storage.setDoc(`day_${day}_prep`, 'meta', { tourSentAt: new Date().toISOString(), tourSentBy: user, tourList: list, tourMailOk: !!lg.ok });
+      showToast(lg.ok ? `🚚 Rungis prévenu : ${list.reduce((a, x) => a + x.rolls, 0)} roll(s) · ${list.reduce((a, x) => a + x.dolly, 0)} dolly` : '⚠️ Mail Rungis non envoyé : ' + lg.error);
+      if (lg.ok) kbCelebrate({ title: 'Tournée prête 🚚', sub: `${list.map(x => x.site).join(' · ')} — départ ${String(tourCfg.depart).replace(':', 'h')}` });
+      setTourRg(null);
+    } catch (e) { showToast('Erreur : ' + e.message); }
+    finally { setTourBusy(false); }
+  };
   const confirmClose = async () => {
     if (!rg || rgBusy) return;
     const list = Object.keys(rg.sel).filter(s => rg.sel[s]).sort().map(s => ({
@@ -20492,7 +20799,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           showToast('Coche au moins un lieu');
           return;
         }
-        const lg = await kbSendRungis(day, user, list);
+        const lg = await kbSendRungis(day, user, list, prep.dom && prep.dom.tour ? prep.dom.tour.list : null);
         try {
           await storage.setDoc(`day_${day}_prep`, 'meta', {
             rungis: list
@@ -20572,7 +20879,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     if (KB_COHABITATION) kbAncienLaunch(day, user).then(ar => showToast(ar && ar.ok ? `🤖 Ancien site : report lancé${ar.result && ar.result.n ? ` (${ar.result.n} produits)` : ''}` : (ar && ar.pending) ? '🤖 Ancien site : report déjà en cours' : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — nouvel essai automatique')).catch(e => showToast('⚠️ Report ancien site : ' + e.message));
     if (rungisList && rungisList.length) {
       try {
-        const lg = await kbSendRungis(day, user, rungisList);
+        const lg = await kbSendRungis(day, user, rungisList, prep.dom && prep.dom.tour ? prep.dom.tour.list : null);
         showToast(lg.ok ? `🚚 Mail Rungis envoyé : ${rungisList.reduce((a, x) => a + x.rolls, 0)} roll(s) · ${rungisList.reduce((a, x) => a + x.dolly, 0)} dolly` : '⚠️ Mail Rungis non envoyé : ' + lg.error);
       } catch (e) {
         showToast('⚠️ Mail Rungis : ' + e.message);
@@ -21065,7 +21372,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       style: {
         marginBottom: 10
       }
-    }, "Coche les lieux, vérifie les rolls et indique les dollies (cagettes vertes à roulettes). Un mail part à fl@, st@ et rr@pribon.org."), ss.map(s => {
+    }, "Coche les lieux, vérifie les rolls et indique les dollies (cagettes vertes à roulettes). Un mail part à fl@, st@ et rr@pribon.org."), prep.dom && prep.dom.tour && React.createElement("div", {
+      style: { background: '#ede7f6', border: '2px solid #5e35b1', borderRadius: 12, padding: '10px 12px', marginBottom: 10, fontSize: 16, color: '#4527a0', fontWeight: 700 }
+    }, "🚚 Déjà partis avec la tournée (", formatTimeFR(prep.dom.tour.at), ") : ", (prep.dom.tour.list || []).map(x => `${x.site} ${x.rolls} roll${x.rolls > 1 ? 's' : ''}`).join(' · '), " — ne les recoche que s'il y a un roll en plus."), ss.map(s => {
       const on = !!rg.sel[s],
         c = kbSiteColor(s);
       return React.createElement("div", {
@@ -21224,7 +21533,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       }, "Aucun résultat pour « ", searchQ, " ».");
     }
   } else if (mode === 'produits') {
-    const rsAll = rows.filter(r => !prodSite || r.site === prodSite);
+    const rsAll = rows.filter(r => inProdSite(r.site)); // V11.44 — « __tour » = lieux de la tournée
     const producers = [...new Set(rsAll.map(r => r.producer || '—'))].sort((a, b) => a.localeCompare(b));
     const pq = muStrip(prodQ.trim().toLowerCase());
     const nCheeseProd = new Set(rsAll.filter(isCheese).map(r => r.producer || '—')).size;
@@ -21519,7 +21828,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       }, "✕")), React.createElement("div", {
         className: "pdj-fbox",
         style: prodSite ? {
-          boxShadow: 'inset 0 0 0 4px ' + kbSiteColor(prodSite),
+          boxShadow: 'inset 0 0 0 4px ' + (prodOne ? kbSiteColor(prodOne) : '#5e35b1'),
           borderRadius: 14
         } : null
       }, React.createElement("select", {
@@ -21528,11 +21837,13 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         onChange: e => {
           const v = e.target.value;
           setProdSite(v);
-          if (v) setCurSite(v);
+          if (v && v !== '__tour') setCurSite(v);
         }
       }, React.createElement("option", {
         value: ""
-      }, "Toutes les boutiques (", sites.length, ")"), sitesOrd.map(x => {
+      }, "Toutes les boutiques (", sites.length, ")"), tourSites.length > 0 && React.createElement("option", {
+        value: "__tour"
+      }, "🚚 Tournée ", String(tourCfg.depart).replace(':', 'h'), " (", tourSites.join(' · '), ")"), sitesOrd.map(x => {
         const pg = siteProgress(x);
         return React.createElement("option", {
           key: x,
@@ -21570,7 +21881,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           className: "pdj-plist"
         }, React.createElement("div", {
           className: "pdj-phead"
-        }, React.createElement("span", null, "Produit", prodSite ? React.createElement(React.Fragment, null, " · ", React.createElement("i", {
+        }, React.createElement("span", null, "Produit", prodSite === '__tour' ? ' · 🚚 tournée ' + String(tourCfg.depart).replace(':', 'h') : prodSite ? React.createElement(React.Fragment, null, " · ", React.createElement("i", {
           className: "pdj-sitepill",
           style: {
             background: kbSiteColor(prodSite)
@@ -21600,7 +21911,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             className: "pdj-pt"
           }, x.po[0].type), weightOf(x.po[0]) && React.createElement("span", {
             className: "pdj-pw"
-          }, "⚖️ ", weightOf(x.po[0])), !prodSite && React.createElement("span", {
+          }, "⚖️ ", weightOf(x.po[0])), !prodOne && React.createElement("span", {
             className: "pdj-psites"
           }, x.ss.map(si => React.createElement("i", {
             key: si,
@@ -21648,7 +21959,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             className: "pdj-badge rp"
           }, "🚫 ", x.rp)), React.createElement("span", {
             className: "pdj-pp"
-          }, x.po[0].producer || '—'), !prodSite && React.createElement("span", {
+          }, x.po[0].producer || '—'), !prodOne && React.createElement("span", {
             className: "pdj-psites"
           }, x.ss.map(si => React.createElement("i", {
             key: si,
@@ -21961,7 +22272,32 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         marginTop: 8
       }
     }, "Un numéro = un seul client par lieu. Casier pas utilisé ? ✕ pour le supprimer : son n° redevient libre.")));
-  })(), rgPopup, replPopup, remPopup, React.createElement("div", {
+  })(), rgPopup, replPopup, remPopup, tourRg && React.createElement(KbSheet, {
+    title: "🚚 Tournée " + String(tourCfg.depart).replace(':', 'h') + " — prévenir Rungis",
+    onClose: () => { if (!tourBusy) setTourRg(null); }
+  }, React.createElement("div", { className: "pdj-rg" }, React.createElement("div", { className: "pdj-hint", style: { marginBottom: 10 } },
+    "Rolls et dollies des lieux du camion. Un mail « Rolls Kelbongoo prêts » part à Rungis, le chauffeur les voit. La prépa des autres lieux continue."),
+    tourSites.map(s => {
+      const on = !!tourRg.sel[s], c = kbSiteColor(s), g = siteProgress(s);
+      const setK = (k, v) => setTourRg(o => ({ ...o, [k]: { ...o[k], [s]: v } }));
+      return React.createElement("div", { key: s, className: "pdj-rgl" + (on ? " on" : ""), style: { '--sc': c, '--ss': c + '1F' } },
+        React.createElement("button", { className: "pdj-rgchk", onClick: () => setK('sel', !on) },
+          React.createElement("span", { className: "box" }, on ? '✓' : ''), React.createElement("span", { className: "code" }, s),
+          React.createElement("span", { className: "nm" }, siteLabel(s), g.done < g.total ? ` · ⚠️ ${g.done}/${g.total}` : ' · ✓')),
+        on && React.createElement("div", { className: "pdj-rgctl" },
+          React.createElement("div", { className: "pdj-rgf" }, React.createElement("span", null, "🛒 Rolls"),
+            React.createElement("button", { onClick: () => setK('rolls', Math.max(0, (tourRg.rolls[s] || 0) - 1)) }, "−"), React.createElement("b", null, tourRg.rolls[s] || 0),
+            React.createElement("button", { onClick: () => setK('rolls', (tourRg.rolls[s] || 0) + 1) }, "+")),
+          React.createElement("div", { className: "pdj-rgf" }, React.createElement("span", null, "🟩 Dollies"),
+            React.createElement("button", { onClick: () => setK('dolly', Math.max(0, (parseInt(tourRg.dolly[s], 10) || 0) - 1)) }, "−"), React.createElement("b", null, parseInt(tourRg.dolly[s], 10) || 0),
+            React.createElement("button", { onClick: () => setK('dolly', (parseInt(tourRg.dolly[s], 10) || 0) + 1) }, "+"))));
+    }),
+    React.createElement("button", { className: "pdj-close", style: { width: '100%', minHeight: 64, fontSize: 20, marginTop: 10 }, disabled: tourBusy, onClick: sendTour },
+      tourBusy ? 'Envoi…' : '🚚 Envoyer à Rungis'))), tourOn && tourSites.length > 0 && !prep.closed && React.createElement(KbTourBanner, {
+    cfg: tourCfg, day: day, sites: tourSites, prog: tourProg, done: tourDone, siteProgress: siteProgress, sent: prep.dom && prep.dom.tour,
+    filterOn: prodSite === '__tour', onFilter: () => { setMode('produits'); setSearchOpen(false); setOpenProd(null); setProdSite(prodSite === '__tour' ? '' : '__tour'); },
+    onSend: openTour
+  }), React.createElement("div", {
     className: "pdj-topbar"
   }, React.createElement("div", {
     className: "pdj-modebar"
@@ -28843,6 +29179,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {sub === 'ancien' && <AncienSitePilotagePage session={session} />}
           {sub === 'factweb' && <KbFacturationWebPage />}
           {sub === 'horaires' && <KbHorairesCommandePage />}
+          {sub === 'tournee' && <KbTourneeUniquePage session={session} />}
           {sub === 'dlcrules' && <KbDlcRulesPage session={session} />}
           {sub === 'rungis' && <><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'invfl' && <div className="stack"><h1 style={{ margin: '0 0 4px' }}>📦 Inventaire &amp; ajout F&amp;L</h1><FlInventorySuiviCard session={session} /><FlRuptureCard session={session} /></div>}
@@ -40322,6 +40659,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         { sub: 'codes', l: 'Codes-barres', ic: '🏷️' },
         { sub: 'lieux', l: 'Lieux & horaires boutiques', ic: '📍' },
         { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
+        { sub: 'tournee', l: 'Tournée unique vendredi', ic: '🚚' },
         { sub: 'dlcrules', l: 'Règles DLC', ic: '📅' },
       ] },
     ];
