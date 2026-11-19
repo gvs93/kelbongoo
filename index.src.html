@@ -795,7 +795,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.46';
+    const APP_VERSION = 'V11.48';
+    // V11.48 — (19/11/2026) Prépa : bandeau « ⏱️ À 11h45, normalement X % de prépa / Y % de MU » (en dessous / dans les temps / en avance)
+    //   + Master › Livraison & réglages › ⏱️ Horaires de prépa (app_config/horaires_prepa) : jour normal 10h-18h (MU 7h-13h),
+    //   jeudi tournée 7h-18h, vendredi tournée 7h-15h (MU 7h-11h) — tout modifiable.
+    // V11.47 — (19/11/2026) MU du jeudi : « 🎯 MU prépa du jour : XX » + encadré violet pointillé « 🟣 MU totale jour + demain : YY (si tu peux) »
+    //   → le total n'est plus présenté comme obligatoire, l'opérateur choisit.
     // V11.46 — (19/11/2026) Tournée unique, jeudi, MU du vendredi : « ⏩ + samedi N · Total à faire » en violet sur chaque carte
     //   (besoin du samedi = commandes lues + % moins le surplus du jeudi, calculé en direct) → pas besoin de passer en mode Samedi.
     // V11.45 — (19/11/2026) Tournée unique : % ajouté aux commandes du samedi lues le jeudi CALCULÉ selon l'heure de lecture
@@ -3598,6 +3603,33 @@
       }
       frac = Math.min(1, Math.max(0.3, frac));
       return { frac, pct: Math.max(0, Math.round((1 / frac - 1) * 100)), n: weeks.length, weeks, src };
+    }
+    // V11.48 — HORAIRES DE PRÉPA (Master › Livraison & réglages › ⏱️ Horaires de prépa · app_config/horaires_prepa)
+    //   → « à cette heure-ci, normalement X % de prépa et Y % de MU » (progression linéaire entre début et fin).
+    const KB_HP_DEF = {
+      normal:      { label: 'Jour normal',                prepDeb: '10:00', prepFin: '18:00', muDeb: '07:00', muFin: '13:00' },
+      tourJeudi:   { label: 'Jeudi (tournée unique)',     prepDeb: '07:00', prepFin: '18:00', muDeb: '07:00', muFin: '18:00' },
+      tourVendredi:{ label: 'Vendredi (tournée unique)',  prepDeb: '07:00', prepFin: '15:00', muDeb: '07:00', muFin: '11:00' }
+    };
+    let _kbHp = null, _kbHpAt = 0;
+    function kbHpCfg() { const c = {}; Object.keys(KB_HP_DEF).forEach(k => { c[k] = { ...KB_HP_DEF[k], ...(((_kbHp || {})[k]) || {}) }; }); return c; }
+    async function kbHpLoad(force) {
+      if (!force && _kbHpAt && Date.now() - _kbHpAt < 60000) return kbHpCfg();
+      try { _kbHp = (await storage.getDoc('app_config', 'horaires_prepa')) || {}; } catch (_) {}
+      _kbHpAt = Date.now(); return kbHpCfg();
+    }
+    // profil du jour de travail (date de prépa) : tournée unique → jeudi / vendredi, sinon normal
+    function kbHpProfile(hp, tour, workDay) {
+      const dow = kbDowOf(workDay);
+      if (tour && tour.on && dow === 4) return { key: 'tourJeudi', ...hp.tourJeudi };
+      if (tour && tour.on && dow === 5) return { key: 'tourVendredi', ...hp.tourVendredi };
+      return { key: 'normal', ...hp.normal };
+    }
+    function kbHpExpected(deb, fin, now) {
+      const [h1, m1] = kbTourHm(deb, [10, 0]), [h2, m2] = kbTourHm(fin, [18, 0]);
+      const d = new Date(now), a = new Date(d), b = new Date(d); a.setHours(h1, m1, 0, 0); b.setHours(h2, m2, 0, 0);
+      if (b <= a) return null;
+      return Math.max(0, Math.min(100, Math.round((d - a) / (b - a) * 100)));
     }
     // produits qui se gardent (MU du samedi faisable dès le jeudi)
     const KB_TOUR_KEEP = /carotte|pomme de terre|pommes de terre|patate|oignon|echalote|ail\b|orange|citron|clementine|mandarine|pamplemousse|pomelo|kiwi|pomme|poires?\b|courge|potimarron|butternut|betterave|navet|panais|celeri|topinambour|radis noir|chou\b|choux|rutabaga|coing/;
@@ -13551,10 +13583,12 @@
             )}
             {doneCount>0 && <span style={{color:'#2e7d32'}}>✅ {doneCount} fait{doneCount>1?'s':''}</span>}
           </div>
-          {item._sat>0 && ( // V11.46 — tournée unique, jeudi : ce qu'il faut en plus pour le samedi
-            <div style={{background:'#5e35b1',color:'#fff',borderRadius:10,padding:'6px 10px',margin:'-2px 0 8px',fontSize:15,fontWeight:800,display:'flex',justifyContent:'space-between',alignItems:'center',gap:6,flexWrap:'wrap'}}>
-              <span>⏩ + samedi {item._sat}</span>
-              <span style={{fontSize:18}}>Total à faire : {(est||0)+item._sat}</span>
+          {item._sat>0 && ( // V11.46 · V11.47 — tournée unique, jeudi : info, pas une obligation (l'opérateur choisit)
+            <div style={{margin:'-2px 0 8px',display:'flex',flexDirection:'column',gap:4}}>
+              <div style={{fontSize:15,fontWeight:800,color:'#ef6c00'}}>🎯 MU prépa du jour : {est||0}</div>
+              <div style={{border:'2px dashed #7e57c2',background:'#f3effa',color:'#4527a0',borderRadius:10,padding:'5px 10px',fontSize:14,fontWeight:700}}>
+                🟣 MU totale jour + demain : <b style={{fontSize:17}}>{(est||0)+item._sat}</b> <span style={{fontWeight:500,fontSize:12}}>(si tu peux)</span>
+              </div>
             </div>)}
           {!myActive && busyBy.length>0 && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>🧑 {busyBy.join(', ')} en cours…</div>}
           {phase==='idle' && <button className="btn-primary" style={{width:'100%',padding:14,fontSize:16,fontWeight:700}} onClick={start}>▶ Je commence !</button>}
@@ -13890,7 +13924,7 @@
               {b('samedi', '⏩ Samedi', 'à avancer après', '#5e35b1')}
             </div>
             {work.mode==='samedi' && <div style={{fontSize:13,color:'#4527a0',marginTop:8}}>Besoin du samedi = commandes déjà passées + % selon l'heure, <b>moins ce qui a été fait en trop pour vendredi</b> (en direct). Ce qui est fait ici est <b>déjà compté</b> vendredi. Produits qui se gardent en premier 🟣.</div>}
-            {work.mode!=='samedi' && <div style={{fontSize:13,color:'#2e7d32',marginTop:8}}>Si tu fais plus que le « à faire » du vendredi, le surplus est <b>déduit automatiquement</b> de la MU du samedi.</div>}
+            {work.mode!=='samedi' && <div style={{fontSize:13,color:'#2e7d32',marginTop:8}}>🎯 = MU pour la prépa du jour (prioritaire). 🟣 = total jour + demain, <b>à toi de voir</b> : tout ce que tu fais en plus est <b>déduit automatiquement</b> du samedi.</div>}
           </div>);
       }
       if(!work || !work.sameDayOpen) return null;
@@ -18507,6 +18541,76 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
     // V9.67 — noms de fromages (repli quand la catégorie du catalogue manque, ex. nouveau site)
     const KB_CHEESE_RX = /\b(fromage|comte|tomme|brie|camembert|chevre|reblochon|roquefort|bleu d|bleu de|emmental|raclette|munster|morbier|cantal|saint[- ]nectaire|st[- ]nectaire|ossau|feta|mozzarella|parmesan|parmigiano|beaufort|abondance|mimolette|gouda|coulommiers|chaource|epoisses|maroilles|pont[- ]l.eveque|langres|salers|laguiole|fourme|crottin|pelardon|picodon|rocamadour|valencay|selles sur cher|sainte[- ]maure|bethmale|tomette|faisselle|fromage blanc|cancoillotte|mont d.or|vacherin|gruyere|ricotta|burrata|halloumi|manchego|pecorino|cheddar)\b/;
+    // V11.48 — « à cette heure-ci, normalement… » : prépa % et MU % comparés aux horaires réglés
+    function KbPaceStrip({ prepPct, tour }) {
+      const [now, setNow] = React.useState(Date.now());
+      const [hp, setHp] = React.useState(kbHpCfg());
+      const [mu, setMu] = React.useState(null);
+      const work = todayKey();
+      React.useEffect(() => { kbHpLoad(true).then(setHp).catch(() => {}); const t = setInterval(() => setNow(Date.now()), 60000); const f = () => kbHpLoad(true).then(setHp); window.addEventListener('kb:hp', f); return () => { clearInterval(t); window.removeEventListener('kb:hp', f); }; }, []);
+      React.useEffect(() => storage.subscribe('mu_' + work, arr => {
+        const list = arr || []; const snap = list.find(x => x && x.id === MU_REEL_DOC);
+        let fait = 0; list.forEach(e => { if (e && e.status === 'done') fait += Number(e.done) || 0; });
+        let need = 0; if (snap && snap.items) Object.values(snap.items).forEach(it => { need += Math.max(0, (Number(it.commandes) || 0) - (Number(it.stock) || 0)); });
+        setMu(need > 0 ? { fait, need, pct: Math.min(100, Math.round(fait / need * 100)) } : null);
+      }), [work]);
+      const pr = kbHpProfile(hp, tour, work);
+      const eP = kbHpExpected(pr.prepDeb, pr.prepFin, now), eM = kbHpExpected(pr.muDeb, pr.muFin, now);
+      if (eP == null && eM == null) return null;
+      const h = new Date(now).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      const tag = (real, exp) => {
+        if (real == null || exp == null) return null;
+        const gap = real - exp;
+        if (gap <= -10) return { c: '#c62828', t: `⚠️ en dessous (${gap} pts)` };
+        if (gap < 0) return { c: '#ef6c00', t: `un peu en dessous (${gap} pts)` };
+        return { c: '#2e7d32', t: gap >= 10 ? `✓ en avance (+${gap} pts)` : '✓ dans les temps' };
+      };
+      const tP = tag(prepPct, eP), tM = tag(mu ? mu.pct : null, eM);
+      const bad = (tP && tP.c === '#c62828') || (tM && tM.c === '#c62828');
+      const part = (lbl, real, exp, tg, sub) => React.createElement("div", { style: { flex: '1 1 220px', minWidth: 200 } },
+        React.createElement("div", { style: { fontSize: 15, fontWeight: 800 } }, lbl, " : ", React.createElement("span", { style: { fontSize: 22 } }, real == null ? '—' : real + ' %'),
+          React.createElement("span", { style: { fontSize: 14, fontWeight: 600, color: '#555' } }, " / normalement ", exp == null ? '—' : exp + ' %')),
+        tg && React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: tg.c } }, tg.t),
+        sub && React.createElement("div", { style: { fontSize: 12, color: '#777' } }, sub));
+      return React.createElement("div", { style: { margin: '6px 8px', borderRadius: 14, border: '2px solid ' + (bad ? '#c62828' : '#cfd8dc'), background: bad ? '#ffebee' : '#fafafa', padding: '8px 12px' } },
+        React.createElement("div", { style: { fontSize: 13, color: '#555', marginBottom: 4 } }, "⏱️ À ", h, " — ", pr.label, " (prépa ", pr.prepDeb.replace(':', 'h'), "-", pr.prepFin.replace(':', 'h'), " · MU ", pr.muDeb.replace(':', 'h'), "-", pr.muFin.replace(':', 'h'), ")"),
+        React.createElement("div", { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
+          part('🧺 Prépa', prepPct, eP, tP, null),
+          part('🥕 MU du jour', mu ? mu.pct : null, eM, tM, mu ? `${mu.fait} / ${mu.need} sachets` : 'MU pas encore ouverte aujourd\'hui')));
+    }
+    // V11.48 — Master › Livraison & réglages › ⏱️ Horaires de prépa
+    function KbHorairesPrepaPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [c, setC] = React.useState(null);
+      React.useEffect(() => { kbHpLoad(true).then(x => setC(JSON.parse(JSON.stringify(x)))); }, []);
+      const save = async (next) => {
+        try {
+          const v = {}; Object.keys(KB_HP_DEF).forEach(k => { v[k] = { prepDeb: next[k].prepDeb, prepFin: next[k].prepFin, muDeb: next[k].muDeb, muFin: next[k].muFin }; });
+          await storage.setDoc('app_config', 'horaires_prepa', { ...v, by: (session && session.name) || '—', at: Date.now() }, { replace: true });
+          _kbHp = v; _kbHpAt = Date.now(); try { window.dispatchEvent(new CustomEvent('kb:hp')); } catch (_) {}
+          showToast('✓ Horaires enregistrés');
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      if (!c) return <div className="card">Chargement…</div>;
+      const set = (k, f, v) => setC(o => ({ ...o, [k]: { ...o[k], [f]: v } }));
+      const inp = (k, f) => <input type="time" value={c[k][f]} onChange={e => set(k, f, e.target.value)} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6 }} />;
+      return (
+        <div className="stack">
+          <h1 style={{ margin: '0 0 4px' }}>⏱️ Horaires de prépa</h1>
+          <div className="card" style={{ padding: 12, fontSize: 14 }}>
+            Sert au bandeau de la prépa : « à cette heure-ci, normalement X % de prépa et Y % de MU ». Le % attendu monte régulièrement entre le début et la fin.
+            Les profils « tournée unique » s'appliquent seulement si la case 🚚 Tournée unique vendredi est cochée.
+          </div>
+          {Object.keys(KB_HP_DEF).map(k => (
+            <div key={k} className="card" style={{ padding: 14 }}>
+              <strong style={{ fontSize: 17 }}>{KB_HP_DEF[k].label}</strong>
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 8 }}>
+                <div style={{ fontSize: 14 }}>🧺 Prépa<br />{inp(k, 'prepDeb')} → {inp(k, 'prepFin')}</div>
+                <div style={{ fontSize: 14 }}>🥕 MU du jour<br />{inp(k, 'muDeb')} → {inp(k, 'muFin')}</div>
+              </div>
+            </div>))}
+        </div>);
+    }
     // V11.44 — bandeau prépa « tournée unique » : lieux du camion, heure limite, chargements 7h / 10h
     function KbTourBanner({ cfg, day, sites, prog, done, siteProgress, sent, filterOn, onFilter, onSend }) {
       const [now, setNow] = React.useState(Date.now());
@@ -22368,7 +22472,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     cfg: tourCfg, day: day, sites: tourSites, prog: tourProg, done: tourDone, siteProgress: siteProgress, sent: prep.dom && prep.dom.tour,
     filterOn: prodSite === '__tour', onFilter: () => { setMode('produits'); setSearchOpen(false); setOpenProd(null); setProdSite(prodSite === '__tour' ? '' : '__tour'); },
     onSend: openTour
-  }), React.createElement("div", {
+  }), !prep.closed && globalProg.t > 0 && React.createElement(KbPaceStrip, { prepPct: globalProg.pct, tour: tourCfg }), React.createElement("div", {
     className: "pdj-topbar"
   }, React.createElement("div", {
     className: "pdj-modebar"
@@ -29251,6 +29355,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {sub === 'factweb' && <KbFacturationWebPage />}
           {sub === 'horaires' && <KbHorairesCommandePage />}
           {sub === 'tournee' && <KbTourneeUniquePage session={session} />}
+          {sub === 'horairesprepa' && <KbHorairesPrepaPage session={session} />}
           {sub === 'dlcrules' && <KbDlcRulesPage session={session} />}
           {sub === 'rungis' && <><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'invfl' && <div className="stack"><h1 style={{ margin: '0 0 4px' }}>📦 Inventaire &amp; ajout F&amp;L</h1><FlInventorySuiviCard session={session} /><FlRuptureCard session={session} /></div>}
@@ -40731,6 +40836,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         { sub: 'lieux', l: 'Lieux & horaires boutiques', ic: '📍' },
         { sub: 'horaires', l: 'Horaires de commande', ic: '🕙' },
         { sub: 'tournee', l: 'Tournée unique vendredi', ic: '🚚' },
+        { sub: 'horairesprepa', l: 'Horaires de prépa', ic: '⏱️' },
         { sub: 'dlcrules', l: 'Règles DLC', ic: '📅' },
       ] },
     ];
