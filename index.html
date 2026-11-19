@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.54) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.55) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.54';
+const APP_VERSION = 'V11.55';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -3971,6 +3971,10 @@ const KB_HP_DEF = {
 };
 let _kbHp = null,
   _kbHpAt = 0;
+const KB_CAD_DEF = {
+  prep: 80,
+  mu: 80
+};
 function kbHpCfg() {
   const c = {};
   Object.keys(KB_HP_DEF).forEach(k => {
@@ -3979,6 +3983,10 @@ function kbHpCfg() {
       ...((_kbHp || {})[k] || {})
     };
   });
+  c.cadence = {
+    ...KB_CAD_DEF,
+    ...((_kbHp || {}).cadence || {})
+  };
   return c;
 }
 async function kbHpLoad(force) {
@@ -35316,53 +35324,73 @@ function KbEtaLine({
 }) {
   const now = Date.now();
   const who = kbEtaWho(pres, now);
+  const hp = kbHpCfg();
+  const cad = hp.cadence || KB_CAD_DEF;
   const hist = React.useRef([]);
   const d = Number(agg && agg.d) || 0,
     t = Number(agg && agg.t) || 0;
+  const muF = P.mu ? P.mu.fait : 0;
   React.useEffect(() => {
     const h = hist.current;
-    if (!h.length || h[h.length - 1].d !== d) h.push({
+    const last = h[h.length - 1];
+    if (!last || last.d !== d || last.mu !== muF) h.push({
       at: Date.now(),
       d,
-      n: who.prep.length
+      mu: muF,
+      np: who.prep.length,
+      nm: who.mu.length
     });
     while (h.length > 2 && h[0].at < Date.now() - 90 * 60000) h.shift();
-  }, [d, who.prep.length]);
-  const [h1, m1] = kbTourHm(P.pr.prepDeb, [10, 0]);
-  const st = new Date();
-  st.setHours(h1, m1, 0, 0);
-  const h = hist.current;
-  let ratePP = null,
-    src = '';
-  if (h.length >= 2 && h[h.length - 1].at - h[0].at >= 10 * 60000) {
-    const dd = h[h.length - 1].d - h[0].d,
-      dt = (h[h.length - 1].at - h[0].at) / 3600000;
-    const nAvg = Math.max(1, h.reduce((a, x) => a + (x.n || 0), 0) / h.length);
-    if (dd > 0) {
-      ratePP = dd / dt / nAvg;
-      src = 'dernière heure';
+  }, [d, muF, who.prep.length, who.mu.length]);
+  const h = hist.current,
+    span = h.length >= 2 ? (h[h.length - 1].at - h[0].at) / 3600000 : 0;
+  const avg = f => Math.max(1, h.reduce((a, x) => a + (x[f] || 0), 0) / Math.max(1, h.length));
+  let rP = Number(cad.prep) || 80,
+    srcP = 'habituelle',
+    rM = Number(cad.mu) || 80,
+    srcM = 'habituelle';
+  if (span >= 10 / 60) {
+    const dd = h[h.length - 1].d - h[0].d;
+    if (dd >= 15) {
+      rP = dd / span / avg('np');
+      srcP = 'mesurée';
+    }
+    const dm = h[h.length - 1].mu - h[0].mu;
+    if (dm >= 15) {
+      rM = dm / span / avg('nm');
+      srcM = 'mesurée';
     }
   }
-  if (ratePP == null && now > st.getTime() + 15 * 60000 && d > 0) {
-    ratePP = d / ((now - st.getTime()) / 3600000) / Math.max(1, who.prep.length);
-    src = 'depuis ' + P.pr.prepDeb.replace(':', 'h');
-  }
   const nP = who.prep.length,
-    rest = Math.max(0, t - d);
-  let etaP = null;
-  if (rest === 0 && t > 0) etaP = 'fini';else if (ratePP && nP) etaP = kbEtaHm(now + rest / (ratePP * nP) * 3600000);
-  const [mh, mm] = kbTourHm(P.pr.muDeb, [7, 0]);
-  const ms = new Date();
-  ms.setHours(mh, mm, 0, 0);
-  let etaM = null;
-  if (P.mu && P.mu.need) {
-    const r = P.mu.need - P.mu.fait;
-    if (r <= 0) etaM = 'finie';else if (P.mu.fait > 0 && now > ms.getTime() + 15 * 60000 && who.mu.length) etaM = kbEtaHm(now + r / (P.mu.fait / ((now - ms.getTime()) / 3600000)) * 3600000);
+    nM = who.mu.length;
+  const restMu = P.mu ? Math.max(0, P.mu.need - P.mu.fait) : 0;
+  let tMu = now;
+  if (restMu > 0) tMu = nM > 0 ? now + restMu / (rM * nM) * 3600000 : null;
+  let restP = Math.max(0, t - d),
+    tP = null;
+  if (restP === 0 && t > 0) tP = now;else {
+    let cur = now;
+    if (tMu && tMu > now && nP > 0) {
+      const doneBefore = rP * nP * (tMu - now) / 3600000;
+      if (doneBefore >= restP) tP = now + restP / (rP * nP) * 3600000;else {
+        restP -= doneBefore;
+        cur = tMu;
+      }
+    } else if (tMu && tMu > now) cur = tMu;
+    if (tP == null) {
+      const team = nP + (tMu ? nM : 0);
+      if (team > 0) tP = cur + restP / (rP * team) * 3600000;
+    }
   }
   const [fh, fm] = kbTourHm(P.pr.prepFin, [18, 0]);
   const fin = new Date();
   fin.setHours(fh, fm, 0, 0);
-  const late = etaP && etaP !== 'fini' && now + rest / ((ratePP || 1) * Math.max(1, nP)) * 3600000 > fin.getTime();
+  const late = tP && tP > fin.getTime();
+  const fmt = x => {
+    if (!x) return null;
+    const s2 = kbEtaHm(x);
+    return new Date(x).toDateString() !== new Date(now).toDateString() ? 'demain ' + s2 : s2;
+  };
   const names = a => a.length ? a.join(', ') : 'personne';
   return React.createElement("div", {
     style: {
@@ -35373,29 +35401,38 @@ function KbEtaLine({
       fontSize: 13,
       lineHeight: 1.45
     }
-  }, "\uD83D\uDD2E Au vu de la cadence actuelle", src ? ` (${src})` : '', ", avec ", React.createElement("b", null, nP, " pr\xE9parateur", nP > 1 ? 's' : ''), " ", React.createElement("span", {
+  }, "\uD83D\uDD2E Avec ", React.createElement("b", null, nP, " en pr\xE9pa"), " ", React.createElement("span", {
     style: {
       opacity: .8
     }
-  }, "(", names(who.prep), ")"), who.mu.length ? React.createElement(React.Fragment, null, " et ", React.createElement("b", null, who.mu.length, " en MU"), " ", React.createElement("span", {
+  }, "(", names(who.prep), ")"), " et ", React.createElement("b", null, nM, " en MU"), " ", React.createElement("span", {
     style: {
       opacity: .8
     }
-  }, "(", names(who.mu), ")")) : null, " :", React.createElement("div", {
+  }, "(", names(who.mu), ")"), nM > 0 && restMu > 0 ? React.createElement("span", {
+    style: {
+      opacity: .8
+    }
+  }, " \u2014 qui passent en pr\xE9pa apr\xE8s la MU") : null, React.createElement("div", {
     style: {
       fontSize: 15,
       marginTop: 2
     }
-  }, "fin de pr\xE9pa estim\xE9e ", React.createElement("b", {
+  }, restMu > 0 ? React.createElement(React.Fragment, null, "fin de MU ", React.createElement("b", null, fmt(tMu) || '—'), " \xB7 ") : P.mu ? React.createElement(React.Fragment, null, "MU finie \u2713 \xB7 ") : null, "fin de pr\xE9pa estim\xE9e ", React.createElement("b", {
     style: {
       fontSize: 18,
       color: late ? '#ff8a80' : '#b9f6ca'
     }
-  }, etaP || (nP ? 'calcul…' : '— (personne sur la prépa)')), etaP && etaP !== 'fini' ? React.createElement("span", {
+  }, tP ? t > 0 && d >= t ? 'finie ✓' : fmt(tP) : '— (personne sur la prépa)'), React.createElement("span", {
     style: {
       opacity: .8
     }
-  }, " (pr\xE9vu ", P.pr.prepFin.replace(':', 'h'), ")") : null, etaM ? React.createElement(React.Fragment, null, " \xB7 fin de MU ", React.createElement("b", null, etaM)) : null));
+  }, " (pr\xE9vu ", P.pr.prepFin.replace(':', 'h'), ")")), React.createElement("div", {
+    style: {
+      fontSize: 11,
+      opacity: .75
+    }
+  }, "Cadence par personne : pr\xE9pa ", Math.round(rP), " lignes/h (", srcP, ") \xB7 MU ", Math.round(rM), " sachets/h (", srcM, ") \u2014 r\xE9glable dans \u23F1\uFE0F Horaires de pr\xE9pa"));
 }
 function KbPaceMini({
   prepPct,
@@ -35556,6 +35593,10 @@ function KbHorairesPrepaPage({
           muFin: next[k].muFin
         };
       });
+      v.cadence = {
+        prep: Number(next.cadence && next.cadence.prep) || KB_CAD_DEF.prep,
+        mu: Number(next.cadence && next.cadence.mu) || KB_CAD_DEF.mu
+      };
       await storage.setDoc('app_config', 'horaires_prepa', {
         ...v,
         by: session && session.name || '—',
@@ -35605,7 +35646,72 @@ function KbHorairesPrepaPage({
       padding: 12,
       fontSize: 14
     }
-  }, "Sert au bandeau de la pr\xE9pa : \xAB \xE0 cette heure-ci, normalement X % de pr\xE9pa et Y % de MU \xBB. Le % attendu monte r\xE9guli\xE8rement entre le d\xE9but et la fin. Les profils \xAB tourn\xE9e unique \xBB s'appliquent seulement si la case \uD83D\uDE9A Tourn\xE9e unique vendredi est coch\xE9e."), Object.keys(KB_HP_DEF).map(k => React.createElement("div", {
+  }, "Sert au bandeau de la pr\xE9pa : \xAB \xE0 cette heure-ci, normalement X % de pr\xE9pa et Y % de MU \xBB. Le % attendu monte r\xE9guli\xE8rement entre le d\xE9but et la fin. Les profils \xAB tourn\xE9e unique \xBB s'appliquent seulement si la case \uD83D\uDE9A Tourn\xE9e unique vendredi est coch\xE9e."), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14
+    }
+  }, React.createElement("strong", {
+    style: {
+      fontSize: 17
+    }
+  }, "\uD83D\uDD2E Cadence habituelle par personne"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "Sert \xE0 l'heure de fin estim\xE9e tant que la cadence du jour n'est pas encore mesur\xE9e (10 min de suivi)."), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 16,
+      flexWrap: 'wrap',
+      marginTop: 8
+    }
+  }, React.createElement("label", {
+    style: {
+      fontSize: 14
+    }
+  }, "\uD83E\uDDFA Pr\xE9pa (lignes / h)", React.createElement("br", null), React.createElement("input", {
+    type: "number",
+    min: "10",
+    max: "400",
+    value: c.cadence.prep,
+    onChange: e => setC(o => ({
+      ...o,
+      cadence: {
+        ...o.cadence,
+        prep: e.target.value
+      }
+    })),
+    onBlur: () => save(c),
+    style: {
+      fontSize: 18,
+      padding: 6,
+      width: 90
+    }
+  })), React.createElement("label", {
+    style: {
+      fontSize: 14
+    }
+  }, "\uD83E\uDD55 MU (sachets / h)", React.createElement("br", null), React.createElement("input", {
+    type: "number",
+    min: "10",
+    max: "400",
+    value: c.cadence.mu,
+    onChange: e => setC(o => ({
+      ...o,
+      cadence: {
+        ...o.cadence,
+        mu: e.target.value
+      }
+    })),
+    onBlur: () => save(c),
+    style: {
+      fontSize: 18,
+      padding: 6,
+      width: 90
+    }
+  })))), Object.keys(KB_HP_DEF).map(k => React.createElement("div", {
     key: k,
     className: "card",
     style: {

@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.54';
+    const APP_VERSION = 'V11.55';
+    // V11.55 — (19/11/2026) Heure de fin estimée : cadence par personne mesurée (≥ 10 min) sinon habituelle (réglages : 80 lignes/h,
+    //   80 sachets/h) ; les personnes en MU passent en prépa à la fin de la MU (fin de MU calculée d'abord). Plus d'estimation « depuis 10h ».
     // V11.54 — (19/11/2026) Alerte « Retours PDP non traités » : hg@pribon.org (inexistante) → hg@probon.fr.
     // V11.53 — (19/11/2026) Master › Aujourd'hui › Rythme : « 🔮 au vu de la cadence actuelle, avec N préparateurs (noms) et M en MU :
     //   fin de prépa estimée HHhMM · fin de MU HHhMM ». Comptés : écran Prépa du jour / écran MU actifs < 3 min (dispatch palette… exclus).
@@ -3622,7 +3624,8 @@
       tourVendredi:{ label: 'Vendredi (tournée unique)',  prepDeb: '07:00', prepFin: '15:00', muDeb: '07:00', muFin: '11:00' }
     };
     let _kbHp = null, _kbHpAt = 0;
-    function kbHpCfg() { const c = {}; Object.keys(KB_HP_DEF).forEach(k => { c[k] = { ...KB_HP_DEF[k], ...(((_kbHp || {})[k]) || {}) }; }); return c; }
+    const KB_CAD_DEF = { prep: 80, mu: 80 }; // V11.55 — cadence habituelle par personne : lignes de prépa / h, sachets de MU / h
+    function kbHpCfg() { const c = {}; Object.keys(KB_HP_DEF).forEach(k => { c[k] = { ...KB_HP_DEF[k], ...(((_kbHp || {})[k]) || {}) }; }); c.cadence = { ...KB_CAD_DEF, ...(((_kbHp || {}).cadence) || {}) }; return c; }
     async function kbHpLoad(force) {
       if (!force && _kbHpAt && Date.now() - _kbHpAt < 60000) return kbHpCfg();
       try { _kbHp = (await storage.getDoc('app_config', 'horaires_prepa')) || {}; } catch (_) {}
@@ -18634,39 +18637,53 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       return { prep, mu };
     }
     const kbEtaHm = (ms) => new Date(ms).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }).replace(':', 'h');
-    // V11.53 — « au vu de la cadence actuelle » : fin de prépa / fin de MU estimées
+    // V11.53 · V11.55 — « au vu de la cadence actuelle » : fin de MU puis fin de prépa estimées.
+    //   Cadence par personne : mesurée sur cette page (≥ 10 min et assez de lignes) sinon cadence habituelle (réglages).
+    //   Les personnes en MU passent en prépa quand la MU est finie → la prépa accélère à ce moment-là.
     function KbEtaLine({ P, agg, pres }) {
       const now = Date.now();
       const who = kbEtaWho(pres, now);
+      const hp = kbHpCfg(); const cad = hp.cadence || KB_CAD_DEF;
       const hist = React.useRef([]);
       const d = Number(agg && agg.d) || 0, t = Number(agg && agg.t) || 0;
-      React.useEffect(() => { const h = hist.current; if (!h.length || h[h.length - 1].d !== d) h.push({ at: Date.now(), d, n: who.prep.length }); while (h.length > 2 && h[0].at < Date.now() - 90 * 60000) h.shift(); }, [d, who.prep.length]);
-      const [h1, m1] = kbTourHm(P.pr.prepDeb, [10, 0]); const st = new Date(); st.setHours(h1, m1, 0, 0);
-      // cadence par préparateur : relevés de cette page (≥ 10 min) sinon moyenne depuis le début de prépa réglé
-      const h = hist.current; let ratePP = null, src = '';
-      if (h.length >= 2 && h[h.length - 1].at - h[0].at >= 10 * 60000) {
-        const dd = h[h.length - 1].d - h[0].d, dt = (h[h.length - 1].at - h[0].at) / 3600000;
-        const nAvg = Math.max(1, h.reduce((a, x) => a + (x.n || 0), 0) / h.length);
-        if (dd > 0) { ratePP = dd / dt / nAvg; src = 'dernière heure'; }
+      const muF = P.mu ? P.mu.fait : 0;
+      React.useEffect(() => { const h = hist.current; const last = h[h.length - 1];
+        if (!last || last.d !== d || last.mu !== muF) h.push({ at: Date.now(), d, mu: muF, np: who.prep.length, nm: who.mu.length });
+        while (h.length > 2 && h[0].at < Date.now() - 90 * 60000) h.shift(); }, [d, muF, who.prep.length, who.mu.length]);
+      const h = hist.current, span = h.length >= 2 ? (h[h.length - 1].at - h[0].at) / 3600000 : 0;
+      const avg = (f) => Math.max(1, h.reduce((a, x) => a + (x[f] || 0), 0) / Math.max(1, h.length));
+      let rP = Number(cad.prep) || 80, srcP = 'habituelle', rM = Number(cad.mu) || 80, srcM = 'habituelle';
+      if (span >= 10 / 60) {
+        const dd = h[h.length - 1].d - h[0].d; if (dd >= 15) { rP = dd / span / avg('np'); srcP = 'mesurée'; }
+        const dm = h[h.length - 1].mu - h[0].mu; if (dm >= 15) { rM = dm / span / avg('nm'); srcM = 'mesurée'; }
       }
-      if (ratePP == null && now > st.getTime() + 15 * 60000 && d > 0) { ratePP = d / ((now - st.getTime()) / 3600000) / Math.max(1, who.prep.length); src = 'depuis ' + P.pr.prepDeb.replace(':', 'h'); }
-      const nP = who.prep.length, rest = Math.max(0, t - d);
-      let etaP = null; if (rest === 0 && t > 0) etaP = 'fini'; else if (ratePP && nP) etaP = kbEtaHm(now + rest / (ratePP * nP) * 3600000);
-      const [mh, mm] = kbTourHm(P.pr.muDeb, [7, 0]); const ms = new Date(); ms.setHours(mh, mm, 0, 0);
-      let etaM = null;
-      if (P.mu && P.mu.need) { const r = P.mu.need - P.mu.fait; if (r <= 0) etaM = 'finie'; else if (P.mu.fait > 0 && now > ms.getTime() + 15 * 60000 && who.mu.length) etaM = kbEtaHm(now + r / (P.mu.fait / ((now - ms.getTime()) / 3600000)) * 3600000); }
+      const nP = who.prep.length, nM = who.mu.length;
+      const restMu = P.mu ? Math.max(0, P.mu.need - P.mu.fait) : 0;
+      // fin de MU
+      let tMu = now; if (restMu > 0) tMu = nM > 0 ? now + restMu / (rM * nM) * 3600000 : null;
+      // fin de prépa : nP jusqu'à la fin de la MU, puis nP + nM
+      let restP = Math.max(0, t - d), tP = null;
+      if (restP === 0 && t > 0) tP = now;
+      else {
+        let cur = now;
+        if (tMu && tMu > now && nP > 0) { const doneBefore = rP * nP * (tMu - now) / 3600000; if (doneBefore >= restP) tP = now + restP / (rP * nP) * 3600000; else { restP -= doneBefore; cur = tMu; } }
+        else if (tMu && tMu > now) cur = tMu;
+        if (tP == null) { const team = nP + (tMu ? nM : 0); if (team > 0) tP = cur + restP / (rP * team) * 3600000; }
+      }
       const [fh, fm] = kbTourHm(P.pr.prepFin, [18, 0]); const fin = new Date(); fin.setHours(fh, fm, 0, 0);
-      const late = etaP && etaP !== 'fini' && (now + rest / ((ratePP || 1) * Math.max(1, nP)) * 3600000) > fin.getTime();
+      const late = tP && tP > fin.getTime();
+      const fmt = (x) => { if (!x) return null; const s2 = kbEtaHm(x); return new Date(x).toDateString() !== new Date(now).toDateString() ? 'demain ' + s2 : s2; };
       const names = (a) => a.length ? a.join(', ') : 'personne';
       return (
         <div style={{ marginTop: 8, background: 'rgba(0,0,0,.18)', borderRadius: 10, padding: '7px 10px', fontSize: 13, lineHeight: 1.45 }}>
-          🔮 Au vu de la cadence actuelle{src ? ` (${src})` : ''}, avec <b>{nP} préparateur{nP > 1 ? 's' : ''}</b> <span style={{ opacity: .8 }}>({names(who.prep)})</span>
-          {who.mu.length ? <> et <b>{who.mu.length} en MU</b> <span style={{ opacity: .8 }}>({names(who.mu)})</span></> : null} :
+          🔮 Avec <b>{nP} en prépa</b> <span style={{ opacity: .8 }}>({names(who.prep)})</span> et <b>{nM} en MU</b> <span style={{ opacity: .8 }}>({names(who.mu)})</span>
+          {nM > 0 && restMu > 0 ? <span style={{ opacity: .8 }}> — qui passent en prépa après la MU</span> : null}
           <div style={{ fontSize: 15, marginTop: 2 }}>
-            fin de prépa estimée <b style={{ fontSize: 18, color: late ? '#ff8a80' : '#b9f6ca' }}>{etaP || (nP ? 'calcul…' : '— (personne sur la prépa)')}</b>
-            {etaP && etaP !== 'fini' ? <span style={{ opacity: .8 }}> (prévu {P.pr.prepFin.replace(':', 'h')})</span> : null}
-            {etaM ? <> · fin de MU <b>{etaM}</b></> : null}
+            {restMu > 0 ? <>fin de MU <b>{fmt(tMu) || '—'}</b> · </> : (P.mu ? <>MU finie ✓ · </> : null)}
+            fin de prépa estimée <b style={{ fontSize: 18, color: late ? '#ff8a80' : '#b9f6ca' }}>{tP ? (t > 0 && d >= t ? 'finie ✓' : fmt(tP)) : '— (personne sur la prépa)'}</b>
+            <span style={{ opacity: .8 }}> (prévu {P.pr.prepFin.replace(':', 'h')})</span>
           </div>
+          <div style={{ fontSize: 11, opacity: .75 }}>Cadence par personne : prépa {Math.round(rP)} lignes/h ({srcP}) · MU {Math.round(rM)} sachets/h ({srcM}) — réglable dans ⏱️ Horaires de prépa</div>
         </div>);
     }
     function KbPaceMini({ prepPct, closed, agg, pres }) {
@@ -18714,6 +18731,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const save = async (next) => {
         try {
           const v = {}; Object.keys(KB_HP_DEF).forEach(k => { v[k] = { prepDeb: next[k].prepDeb, prepFin: next[k].prepFin, muDeb: next[k].muDeb, muFin: next[k].muFin }; });
+          v.cadence = { prep: Number(next.cadence && next.cadence.prep) || KB_CAD_DEF.prep, mu: Number(next.cadence && next.cadence.mu) || KB_CAD_DEF.mu };
           await storage.setDoc('app_config', 'horaires_prepa', { ...v, by: (session && session.name) || '—', at: Date.now() }, { replace: true });
           _kbHp = v; _kbHpAt = Date.now(); try { window.dispatchEvent(new CustomEvent('kb:hp')); } catch (_) {}
           showToast('✓ Horaires enregistrés');
@@ -18728,6 +18746,14 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <div className="card" style={{ padding: 12, fontSize: 14 }}>
             Sert au bandeau de la prépa : « à cette heure-ci, normalement X % de prépa et Y % de MU ». Le % attendu monte régulièrement entre le début et la fin.
             Les profils « tournée unique » s'appliquent seulement si la case 🚚 Tournée unique vendredi est cochée.
+          </div>
+          <div className="card" style={{ padding: 14 }}>
+            <strong style={{ fontSize: 17 }}>🔮 Cadence habituelle par personne</strong>
+            <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Sert à l'heure de fin estimée tant que la cadence du jour n'est pas encore mesurée (10 min de suivi).</div>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 8 }}>
+              <label style={{ fontSize: 14 }}>🧺 Prépa (lignes / h)<br /><input type="number" min="10" max="400" value={c.cadence.prep} onChange={e => setC(o => ({ ...o, cadence: { ...o.cadence, prep: e.target.value } }))} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6, width: 90 }} /></label>
+              <label style={{ fontSize: 14 }}>🥕 MU (sachets / h)<br /><input type="number" min="10" max="400" value={c.cadence.mu} onChange={e => setC(o => ({ ...o, cadence: { ...o.cadence, mu: e.target.value } }))} onBlur={() => save(c)} style={{ fontSize: 18, padding: 6, width: 90 }} /></label>
+            </div>
           </div>
           {Object.keys(KB_HP_DEF).map(k => (
             <div key={k} className="card" style={{ padding: 14 }}>
