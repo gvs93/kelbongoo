@@ -795,7 +795,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.56';
+    const APP_VERSION = 'V11.57';
+    // V11.57 — (19/11/2026) Casiers dès le chargement : n° attribués au chargement du JSON même avant la compilation de 10h
+    //   (nb de casiers selon le volume, capacité apprise sur les JSON compilés) ; rechargement de 10h = mêmes n°, casiers en
+    //   plus ajoutés à la suite si le volume a grossi, n° JSON en double → prochain libre.
     // V11.56 — (19/11/2026) MU : un produit n'est « terminé » que si les sachets faits couvrent le besoin (avant : 1 MU validée
     //   suffisait → « Toutes les MU prévues sont faites » à 95 %). Carte réaffichée avec « ➕ Encore X sachets à faire ».
     // V11.55 — (19/11/2026) Heure de fin estimée : cadence par personne mesurée (≥ 10 min) sinon habituelle (réglages : 80 lignes/h,
@@ -2601,6 +2604,105 @@
       }
       return changed;
     }
+    // ── V11.57 — CASIERS DÈS LE CHARGEMENT (vente pas encore compilée) ──────────────────────────────────
+    //   Avant 10h l'ancien site ne donne aucun n° de bac. L'appli attribue elle-même les casiers dès le chargement
+    //   (Master › Chargement), un ou plusieurs selon le VOLUME de la commande (volume_frais du JSON).
+    //   • Nombre de casiers = ⌈volume / capacité⌉. La capacité d'un casier est APPRISE sur les ventes déjà
+    //     compilées (JSON de 10h : volume + nb de bacs donnés par l'ancien site), mémorisée dans app_config/kb_casier_cap.
+    //   • Clé = lieu + client (comme la prépa) → une commande fusionnée / un 2e chargement garde les MÊMES n°.
+    //   • Rechargement de 10h : les n° déjà fixés dans l'appli gagnent sur ceux du JSON ; si le volume a grossi,
+    //     les casiers en plus sont AJOUTÉS à la suite (le n° de base ne bouge jamais) ; un nouveau client dont le
+    //     n° JSON est déjà pris reçoit le prochain n° libre. Une fois la prépa clôturée, rien n'est touché.
+    //   • Casier modifié à la main en prépa (ajout / retrait) → plus jamais retouché automatiquement.
+    const KB_CAS_CAP_DOC = 'kb_casier_cap';
+    // Règle de départ, calculée sur l'historique Mongo du 19/09 au 19/11/2026 (3 775 commandes compilées, 35 distributions) :
+    //   l'ancien site donne ⌈volume_frais / 170⌉ bacs — 91 % des commandes identiques ; les 8 % restants = casier ajouté
+    //   en prépa (« casier plein », n° hors série), imprévisible au volume. Même règle dans tous les lieux (149 à 175).
+    const KB_CAS_CAP_DEFAULT = { cap: 170, samples: 3775, match: 91, source: 'historique 19/09–19/11/2026' };
+    function kbCasCapLearn(raw, prev) {
+      // Historique (volume, nb de bacs) des ventes compilées, cumulé de chargement en chargement (≤ 3000 couples).
+      // Capacité = valeur qui reproduit le mieux le nb de bacs de l'ancien site (⌈volume / capacité⌉) ;
+      // à égalité, la plus petite (mieux vaut un casier de trop qu'un de moins). Robuste aux commandes atypiques.
+      const fresh = [];
+      (raw || []).forEach(o => {
+        if (!o || o.status === 8 || o.status === 0) return;
+        const k = (o.bacs_frais || []).length, v = Number(o.volume_frais) || 0;
+        if (k && v > 0) fresh.push([Math.round(v * 10) / 10, k]);
+      });
+      if (!fresh.length) return null;
+      const hist = [...((prev && Array.isArray(prev.hist)) ? prev.hist : []).map(x => String(x).split(':').map(Number)).filter(x => x[0] > 0 && x[1] > 0), ...fresh].slice(-3000); // Firestore : pas de tableaux imbriqués → « volume:bacs »
+      const cand = new Set();
+      hist.forEach(([v, k]) => { cand.add(v / k); if (k >= 2) cand.add(v / (k - 1) - 0.01); });
+      let best = null, bestOk = -1;
+      [...cand].filter(c => c > 0).sort((a, b) => a - b).forEach(c => {
+        let ok = 0; hist.forEach(([v, k]) => { if (Math.max(1, Math.ceil(v / c - 1e-9)) === k) ok++; });
+        if (ok > bestOk) { bestOk = ok; best = c; }
+      });
+      return { cap: Math.round(best * 100) / 100, hist: hist.map(([v, k]) => v + ':' + k), samples: hist.length, match: Math.round(bestOk / hist.length * 100), at: new Date().toISOString() };
+    }
+    function kbCasNeed(vol, capDoc) {
+      const cap = Number(capDoc && capDoc.cap) || 0, v = Number(vol) || 0;
+      return cap > 0 && v > 0 ? Math.max(1, Math.ceil(v / cap - 1e-9)) : 1;
+    }
+    async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
+      const res = { assigned: 0, grown: 0, clash: 0, learned: null, cap: null, closed: false };
+      // 1. apprentissage de la capacité sur un JSON compilé (avec bacs)
+      let capDoc = null;
+      try { capDoc = await storage.getDoc('app_config', KB_CAS_CAP_DOC); } catch (_) {}
+      const learned = kbCasCapLearn(raw, capDoc);
+      if (learned) { capDoc = learned; res.learned = learned; try { await storage.setDoc('app_config', KB_CAS_CAP_DOC, learned, { replace: true }); } catch (_) {} }
+      if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT; // V11.57 — règle de l'historique tant que rien n'est appris
+      res.cap = capDoc.cap;
+      // 2. état prépa du jour
+      let prepArr = [];
+      try { prepArr = await storage.getAll(`day_${dayKey}_prep`); } catch (_) {}
+      if ((prepArr || []).some(d => d.id === 'meta' && d.closed)) { res.closed = true; return res; }
+      const fixed = {}; // clé lieu||client → { nums, auto, vol }
+      (prepArr || []).forEach(d => { const id = String(d.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} fixed[k] = { nums: (d.nums || []).map(String), auto: !!d.auto, vol: Number(d.vol) || 0 }; });
+      // 3. clients du jour (mêmes clés que la prépa : lieu + nom), volumes additionnés si plusieurs commandes
+      const cli = {};
+      (orders || []).forEach(o => {
+        const site = String(o.site || '').toUpperCase(); if (!site || site === 'DOM' || o._ps) return;
+        const hasCas = (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
+        if (!hasCas) return;
+        const k = site + '||' + (o.name || '(client)');
+        const c = cli[k] || (cli[k] = { site, client: o.name || '(client)', vol: 0, json: [] });
+        c.vol += Number(o.volumeFrais) || 0;
+        [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => { const v = String(n).trim(); if (v && !c.json.includes(v)) c.json.push(v); });
+      });
+      // 4. n° occupés par lieu (casiers fixés + n° PrestaShop déjà dans la journée)
+      const used = {}; const own = (s, v, k) => { (used[s] = used[s] || {}); if (!used[s][v]) used[s][v] = k; };
+      Object.entries(fixed).forEach(([k, f]) => { const s = k.split('||')[0]; f.nums.forEach(v => own(s, v, k)); });
+      (orders || []).filter(o => o._ps).forEach(o => { const s = String(o.site || '').toUpperCase(); [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => own(s, String(n).trim(), 'PS|' + o.orderId)); });
+      const next = (s) => { const u = used[s] || {}; let n = 0; Object.keys(u).forEach(v => { const x = parseInt(v, 10); if (!isNaN(x) && String(x) === v && x > n) n = x; }); n++; while (u[String(n)]) n++; return String(n); };
+      const writes = [];
+      const keys = Object.keys(cli).sort((a, b) => a.localeCompare(b));
+      // 4a. n° du JSON gardés s'ils sont libres (vente compilée, 1er chargement de 10h)
+      const todo = [];
+      keys.forEach(k => {
+        const c = cli[k]; if (fixed[k]) return;
+        const free = c.json.length && c.json.every(v => !(used[c.site] && used[c.site][v] && used[c.site][v] !== k));
+        if (free) c.json.forEach(v => own(c.site, v, k));
+        else { if (c.json.length) res.clash++; todo.push(k); }
+      });
+      // 4b. casiers déjà attribués par l'appli : on garde, et on ajoute si le volume a grossi
+      keys.forEach(k => {
+        const c = cli[k], f = fixed[k]; if (!f || !f.auto) return;
+        const need = kbCasNeed(c.vol, capDoc);
+        if (need > f.nums.length && c.vol > f.vol) {
+          const nums = [...f.nums]; while (nums.length < need) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
+          writes.push({ k, nums, vol: c.vol }); res.grown++;
+        }
+      });
+      // 4c. clients sans casier → n° à la suite, autant que le volume l'exige
+      todo.forEach(k => {
+        const c = cli[k], need = kbCasNeed(c.vol, capDoc), nums = [];
+        for (let i = 0; i < need; i++) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
+        writes.push({ k, nums, vol: c.vol }); res.assigned++;
+      });
+      for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), { nums: w.nums, auto: true, vol: w.vol }, { replace: true });
+      return res;
+    }
     // Fusionne le JSON kbprepa dans day_<dayKey>_orders. Ajout seulement : les commandes PS déjà
     // présentes gardent leurs casiers ; les commandes Mongo (sans _ps) ne sont jamais touchées.
     async function psMergeDay(dayKey, json, opts) {
@@ -2641,7 +2743,10 @@
       const prodById = (await readCache('products')) || {};
       const fresh = prestaToOrders({ orders: list.filter(po => !known.has(String(po.id_order))) }, { test, prodById, baseOrders: [...base, ...keep], offsetBySite });
       const psFinal = [...keep, ...fresh];
-      const renum = psRenumberCasiers(base, psFinal);
+      // V11.57 — n° déjà attribués par l'appli (casiers fixés au chargement / en prépa) = occupés pour PrestaShop aussi
+      const casFixed = [], psKeys = new Set(psFinal.map(o => String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')));
+      try { (await storage.getAll(`day_${dayKey}_prep`) || []).forEach(d => { const id = String(d.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} if (psKeys.has(k)) return; casFixed.push({ site: k.split('||')[0], casiersFrais: (d.nums || []).map(String), casiersSec: [] }); }); } catch (_) {}
+      const renum = psRenumberCasiers([...base, ...casFixed], psFinal);
       const bySite = {}; psFinal.forEach(o => { bySite[o.site] = (bySite[o.site] || 0) + 1; });
       const unknown = Object.keys(bySite).filter(k => /^PS\d+$/.test(k));
       const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, renum, siteFix, siteFixes, written: false };
@@ -2831,6 +2936,7 @@
           depotPorte: (kbDepotPorte(o) != null ? kbDepotPorte(o) : (cons ? (cons.depotPorte != null ? cons.depotPorte : null) : null)),
           casiersFrais: (o.bacs_frais || []).map(String),
           casiersSec: (o.bacs_sec || []).map(String),
+          volumeFrais: Number(o.volume_frais) || 0, volumeSec: Number(o.volume_sec) || 0, // V11.57 — nb de casiers estimé au chargement
           items,
           pains: items.filter(i => i.cat === 'pain'),
           nds: items.filter(i => i.cat === 'nd'),
@@ -35425,6 +35531,18 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             source: 'v4-json',
             targetDate: dayKey,
           });
+          // V11.57 — casiers attribués tout de suite (même sans n° dans le JSON), mêmes n° au rechargement de 10h
+          try {
+            const rawCas = typeof v4Orders === 'string' ? JSON.parse(v4Orders) : v4Orders;
+            const rc = await kbAssignCasiersOnLoad(dayKey, [...res.orders, ...psKeep], Array.isArray(rawCas) ? rawCas : (rawCas.orders || []));
+            const bits = [];
+            if (rc.assigned) bits.push(`${rc.assigned} client(s) ont reçu leur casier`);
+            if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
+            if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
+            if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+            if (rc.closed) bits.push('prépa déjà clôturée : casiers non touchés');
+            if (bits.length) showToast('🧊 ' + bits.join(' · '));
+          } catch (e) { console.warn('casiers au chargement', e); showToast('⚠️ Casiers non attribués au chargement : ' + e.message); }
 
           // Manquants (removed) → collection du jour, raison à saisir par le préparateur
           for (const m of (res.manquants || [])) {
