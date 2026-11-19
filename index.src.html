@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.49';
+    const APP_VERSION = 'V11.50';
+    // V11.50 — (19/11/2026) % de MU du jour plafonné PAR PRODUIT au besoin du jour : le surplus (MU avancée pour le lendemain)
+    //   n'est plus compté dans le % du jour, il est affiché à part « +N d'avance ».
     // V11.49 — (19/11/2026) Master › Aujourd'hui : rythme prépa / MU (réel vs attendu à cette heure) sous le % de prépa, en compact.
     // V11.48 — (19/11/2026) Prépa : bandeau « ⏱️ À 11h45, normalement X % de prépa / Y % de MU » (en dessous / dans les temps / en avance)
     //   + Master › Livraison & réglages › ⏱️ Horaires de prépa (app_config/horaires_prepa) : jour normal 10h-18h (MU 7h-13h),
@@ -18551,9 +18553,13 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => { kbHpLoad(true).then(setHp).catch(() => {}); const t = setInterval(() => setNow(Date.now()), 60000); const f = () => kbHpLoad(true).then(setHp); window.addEventListener('kb:hp', f); return () => { clearInterval(t); window.removeEventListener('kb:hp', f); }; }, []);
       React.useEffect(() => storage.subscribe('mu_' + work, arr => {
         const list = arr || []; const snap = list.find(x => x && x.id === MU_REEL_DOC);
-        let fait = 0; list.forEach(e => { if (e && e.status === 'done') fait += Number(e.done) || 0; });
-        let need = 0; if (snap && snap.items) Object.values(snap.items).forEach(it => { need += Math.max(0, (Number(it.commandes) || 0) - (Number(it.stock) || 0)); });
-        setMu(need > 0 ? { fait, need, pct: Math.min(100, Math.round(fait / need * 100)) } : null);
+        // V11.50 — par produit, plafonné au besoin du jour : 85 kiwis faits pour 20 à faire = 20 comptés, 65 en avance (samedi)
+        const fb = {}; list.forEach(e => { if (e && e.status === 'done' && e.product) { const k = muKey(e.product); fb[k] = (fb[k] || 0) + (Number(e.done) || 0); } });
+        let need = 0, fait = 0, avance = 0;
+        const nb = {}; if (snap && snap.items) Object.entries(snap.items).forEach(([k, it]) => { nb[k] = Math.max(0, (Number(it.commandes) || 0) - (Number(it.stock) || 0)); });
+        Object.entries(nb).forEach(([k, n]) => { need += n; fait += Math.min(n, fb[k] || 0); });
+        Object.entries(fb).forEach(([k, f]) => { avance += Math.max(0, f - (nb[k] || 0)); });
+        setMu(need > 0 ? { fait, need, avance, pct: Math.min(100, Math.round(fait / need * 100)) } : null);
       }), [work]);
       const pr = kbHpProfile(hp, tour, work);
       const eP = kbHpExpected(pr.prepDeb, pr.prepFin, now), eM = kbHpExpected(pr.muDeb, pr.muFin, now);
@@ -18588,7 +18594,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <div style={{ fontSize: 11, opacity: .8, marginBottom: 6 }}>⏱️ Rythme à {P.h} · {P.pr.label} (prépa {P.pr.prepDeb.replace(':', 'h')}-{P.pr.prepFin.replace(':', 'h')} · MU {P.pr.muDeb.replace(':', 'h')}-{P.pr.muFin.replace(':', 'h')})</div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {chip('🧺', 'prépa', prepPct, P.eP, P.tP)}
-            {chip('🥕', 'MU' + (P.mu ? ` · ${P.mu.fait}/${P.mu.need}` : ''), P.mu ? P.mu.pct : null, P.eM, P.tM)}
+            {chip('🥕', 'MU' + (P.mu ? ` · ${P.mu.fait}/${P.mu.need}${P.mu.avance ? ` · +${P.mu.avance} d'avance` : ''}` : ''), P.mu ? P.mu.pct : null, P.eM, P.tM)}
           </div>
         </div>);
     }
@@ -18605,7 +18611,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         React.createElement("div", { style: { fontSize: 13, color: '#555', marginBottom: 4 } }, "⏱️ À ", h, " — ", pr.label, " (prépa ", pr.prepDeb.replace(':', 'h'), "-", pr.prepFin.replace(':', 'h'), " · MU ", pr.muDeb.replace(':', 'h'), "-", pr.muFin.replace(':', 'h'), ")"),
         React.createElement("div", { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
           part('🧺 Prépa', prepPct, eP, tP, null),
-          part('🥕 MU du jour', mu ? mu.pct : null, eM, tM, mu ? `${mu.fait} / ${mu.need} sachets` : 'MU pas encore ouverte aujourd\'hui')));
+          part('🥕 MU du jour', mu ? mu.pct : null, eM, tM, mu ? `${mu.fait} / ${mu.need} sachets${mu.avance ? ` · +${mu.avance} d'avance (pas comptés ici)` : ''}` : 'MU pas encore ouverte aujourd\'hui')));
     }
     // V11.48 — Master › Livraison & réglages › ⏱️ Horaires de prépa
     function KbHorairesPrepaPage({ session }) {
