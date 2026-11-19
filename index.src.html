@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.45';
+    const APP_VERSION = 'V11.46';
+    // V11.46 — (19/11/2026) Tournée unique, jeudi, MU du vendredi : « ⏩ + samedi N · Total à faire » en violet sur chaque carte
+    //   (besoin du samedi = commandes lues + % moins le surplus du jeudi, calculé en direct) → pas besoin de passer en mode Samedi.
     // V11.45 — (19/11/2026) Tournée unique : % ajouté aux commandes du samedi lues le jeudi CALCULÉ selon l'heure de lecture
     //   (plus de saisie) + surplus de la MU du jeudi déduit EN DIRECT de la MU du samedi. Voir détails V11.44 ci-dessous.
     // V11.44 — (19/11/2026) 🚚 TOURNÉE UNIQUE DU VENDREDI (test) : Master › Livraison & réglages › « 🚚 Tournée unique vendredi »
@@ -13549,6 +13551,11 @@
             )}
             {doneCount>0 && <span style={{color:'#2e7d32'}}>✅ {doneCount} fait{doneCount>1?'s':''}</span>}
           </div>
+          {item._sat>0 && ( // V11.46 — tournée unique, jeudi : ce qu'il faut en plus pour le samedi
+            <div style={{background:'#5e35b1',color:'#fff',borderRadius:10,padding:'6px 10px',margin:'-2px 0 8px',fontSize:15,fontWeight:800,display:'flex',justifyContent:'space-between',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+              <span>⏩ + samedi {item._sat}</span>
+              <span style={{fontSize:18}}>Total à faire : {(est||0)+item._sat}</span>
+            </div>)}
           {!myActive && busyBy.length>0 && <div style={{fontSize:12,color:'var(--ink-mute)',marginBottom:6}}>🧑 {busyBy.join(', ')} en cours…</div>}
           {phase==='idle' && <button className="btn-primary" style={{width:'100%',padding:14,fontSize:16,fontWeight:700}} onClick={start}>▶ Je commence !</button>}
           {phase==='running' && (
@@ -14195,6 +14202,13 @@
       useMuEntries(dateKey, muExtraKey, setEntries); // V11.25
       // V9.58 — MU réelle : stock PDP reporté, à faire = commandes − stock
       const reel = useMuReel(dateKey, items, flRows, entries, muWork.target, muWork); // V11.26 · V11.44
+      // V11.46 — tournée unique, jeudi en mode « Vendredi » : besoin du samedi calculé à côté (même calcul que le mode
+      //   Samedi : commandes lues + %, moins le surplus du jeudi) → « + samedi N · Total à faire » en violet sur chaque carte.
+      const satOn = !!(muWork.tourThu && !muWork.tourAdvance);
+      const satKey = muShiftDate(dateKey,1), satTarget = muShiftDate(dateKey,2);
+      const [satEntries,setSatEntries] = React.useState({});
+      React.useEffect(()=>{ if(!satOn){ setSatEntries({}); return; } return storage.subscribe('mu_'+satKey, arr=>{ const m={}; (arr||[]).forEach(e=>{ if(e && e.id) m[e.id]=e; }); setSatEntries(m); }); },[satOn, satKey]);
+      const reelSat = useMuReel(satKey, satOn ? items : null, satOn ? flRows : null, satEntries, satTarget, satOn ? { tourAdvance:true } : null);
 
       const byProduct = React.useMemo(()=>{
         const idx={};
@@ -14239,8 +14253,9 @@
       const effItems = React.useMemo(()=> (items||[]).map(it=>{
         const r = reel.byKey[muKey(muName(it))];
         if(!r) return it;
-        return { ...it, estimation: r.aFaire, _orig: muEst(it), _reel: { stock:r.stock, commandes:r.commandes } };
-      }), [items, reel.byKey]);
+        const rs = satOn && reelSat.ready ? reelSat.byKey[muKey(muName(it))] : null; // V11.46
+        return { ...it, estimation: r.aFaire, _orig: muEst(it), _reel: { stock:r.stock, commandes:r.commandes }, _sat: rs ? Math.max(0, rs.aFaire||0) : 0 };
+      }), [items, reel.byKey, satOn, reelSat.byKey, reelSat.ready]);
       const hasNeed = (it)=> (it._reel ? it._reel.commandes>0 : muEst(it)>0);
       const plannedAll   = React.useMemo(()=> effItems.filter(hasNeed), [effItems]);
       const plannedItems = React.useMemo(()=> plannedAll.filter(it=>muEst(it)>0), [plannedAll]);
