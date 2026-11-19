@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.56) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.57) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.56';
+const APP_VERSION = 'V11.57';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2617,6 +2617,200 @@ function psRenumberCasiers(base, ps) {
   }
   return changed;
 }
+const KB_CAS_CAP_DOC = 'kb_casier_cap';
+const KB_CAS_CAP_DEFAULT = {
+  cap: 170,
+  samples: 3775,
+  match: 91,
+  source: 'historique 19/09–19/11/2026'
+};
+function kbCasCapLearn(raw, prev) {
+  const fresh = [];
+  (raw || []).forEach(o => {
+    if (!o || o.status === 8 || o.status === 0) return;
+    const k = (o.bacs_frais || []).length,
+      v = Number(o.volume_frais) || 0;
+    if (k && v > 0) fresh.push([Math.round(v * 10) / 10, k]);
+  });
+  if (!fresh.length) return null;
+  const hist = [...(prev && Array.isArray(prev.hist) ? prev.hist : []).map(x => String(x).split(':').map(Number)).filter(x => x[0] > 0 && x[1] > 0), ...fresh].slice(-3000);
+  const cand = new Set();
+  hist.forEach(([v, k]) => {
+    cand.add(v / k);
+    if (k >= 2) cand.add(v / (k - 1) - 0.01);
+  });
+  let best = null,
+    bestOk = -1;
+  [...cand].filter(c => c > 0).sort((a, b) => a - b).forEach(c => {
+    let ok = 0;
+    hist.forEach(([v, k]) => {
+      if (Math.max(1, Math.ceil(v / c - 1e-9)) === k) ok++;
+    });
+    if (ok > bestOk) {
+      bestOk = ok;
+      best = c;
+    }
+  });
+  return {
+    cap: Math.round(best * 100) / 100,
+    hist: hist.map(([v, k]) => v + ':' + k),
+    samples: hist.length,
+    match: Math.round(bestOk / hist.length * 100),
+    at: new Date().toISOString()
+  };
+}
+function kbCasNeed(vol, capDoc) {
+  const cap = Number(capDoc && capDoc.cap) || 0,
+    v = Number(vol) || 0;
+  return cap > 0 && v > 0 ? Math.max(1, Math.ceil(v / cap - 1e-9)) : 1;
+}
+async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
+  const res = {
+    assigned: 0,
+    grown: 0,
+    clash: 0,
+    learned: null,
+    cap: null,
+    closed: false
+  };
+  let capDoc = null;
+  try {
+    capDoc = await storage.getDoc('app_config', KB_CAS_CAP_DOC);
+  } catch (_) {}
+  const learned = kbCasCapLearn(raw, capDoc);
+  if (learned) {
+    capDoc = learned;
+    res.learned = learned;
+    try {
+      await storage.setDoc('app_config', KB_CAS_CAP_DOC, learned, {
+        replace: true
+      });
+    } catch (_) {}
+  }
+  if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT;
+  res.cap = capDoc.cap;
+  let prepArr = [];
+  try {
+    prepArr = await storage.getAll(`day_${dayKey}_prep`);
+  } catch (_) {}
+  if ((prepArr || []).some(d => d.id === 'meta' && d.closed)) {
+    res.closed = true;
+    return res;
+  }
+  const fixed = {};
+  (prepArr || []).forEach(d => {
+    const id = String(d.id || '');
+    if (!id.startsWith('cs|')) return;
+    let k = id.slice(3);
+    try {
+      k = decodeURIComponent(k);
+    } catch (_) {}
+    fixed[k] = {
+      nums: (d.nums || []).map(String),
+      auto: !!d.auto,
+      vol: Number(d.vol) || 0
+    };
+  });
+  const cli = {};
+  (orders || []).forEach(o => {
+    const site = String(o.site || '').toUpperCase();
+    if (!site || site === 'DOM' || o._ps) return;
+    const hasCas = (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
+    if (!hasCas) return;
+    const k = site + '||' + (o.name || '(client)');
+    const c = cli[k] || (cli[k] = {
+      site,
+      client: o.name || '(client)',
+      vol: 0,
+      json: []
+    });
+    c.vol += Number(o.volumeFrais) || 0;
+    [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => {
+      const v = String(n).trim();
+      if (v && !c.json.includes(v)) c.json.push(v);
+    });
+  });
+  const used = {};
+  const own = (s, v, k) => {
+    used[s] = used[s] || {};
+    if (!used[s][v]) used[s][v] = k;
+  };
+  Object.entries(fixed).forEach(([k, f]) => {
+    const s = k.split('||')[0];
+    f.nums.forEach(v => own(s, v, k));
+  });
+  (orders || []).filter(o => o._ps).forEach(o => {
+    const s = String(o.site || '').toUpperCase();
+    [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => own(s, String(n).trim(), 'PS|' + o.orderId));
+  });
+  const next = s => {
+    const u = used[s] || {};
+    let n = 0;
+    Object.keys(u).forEach(v => {
+      const x = parseInt(v, 10);
+      if (!isNaN(x) && String(x) === v && x > n) n = x;
+    });
+    n++;
+    while (u[String(n)]) n++;
+    return String(n);
+  };
+  const writes = [];
+  const keys = Object.keys(cli).sort((a, b) => a.localeCompare(b));
+  const todo = [];
+  keys.forEach(k => {
+    const c = cli[k];
+    if (fixed[k]) return;
+    const free = c.json.length && c.json.every(v => !(used[c.site] && used[c.site][v] && used[c.site][v] !== k));
+    if (free) c.json.forEach(v => own(c.site, v, k));else {
+      if (c.json.length) res.clash++;
+      todo.push(k);
+    }
+  });
+  keys.forEach(k => {
+    const c = cli[k],
+      f = fixed[k];
+    if (!f || !f.auto) return;
+    const need = kbCasNeed(c.vol, capDoc);
+    if (need > f.nums.length && c.vol > f.vol) {
+      const nums = [...f.nums];
+      while (nums.length < need) {
+        const v = next(c.site);
+        own(c.site, v, k);
+        nums.push(v);
+      }
+      writes.push({
+        k,
+        nums,
+        vol: c.vol
+      });
+      res.grown++;
+    }
+  });
+  todo.forEach(k => {
+    const c = cli[k],
+      need = kbCasNeed(c.vol, capDoc),
+      nums = [];
+    for (let i = 0; i < need; i++) {
+      const v = next(c.site);
+      own(c.site, v, k);
+      nums.push(v);
+    }
+    writes.push({
+      k,
+      nums,
+      vol: c.vol
+    });
+    res.assigned++;
+  });
+  for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), {
+    nums: w.nums,
+    auto: true,
+    vol: w.vol
+  }, {
+    replace: true
+  });
+  return res;
+}
 async function psMergeDay(dayKey, json, opts) {
   const test = !!(opts && opts.test);
   const who = opts && opts.who || 'auto';
@@ -2670,7 +2864,25 @@ async function psMergeDay(dayKey, json, opts) {
     offsetBySite
   });
   const psFinal = [...keep, ...fresh];
-  const renum = psRenumberCasiers(base, psFinal);
+  const casFixed = [],
+    psKeys = new Set(psFinal.map(o => String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')));
+  try {
+    ((await storage.getAll(`day_${dayKey}_prep`)) || []).forEach(d => {
+      const id = String(d.id || '');
+      if (!id.startsWith('cs|')) return;
+      let k = id.slice(3);
+      try {
+        k = decodeURIComponent(k);
+      } catch (_) {}
+      if (psKeys.has(k)) return;
+      casFixed.push({
+        site: k.split('||')[0],
+        casiersFrais: (d.nums || []).map(String),
+        casiersSec: []
+      });
+    });
+  } catch (_) {}
+  const renum = psRenumberCasiers([...base, ...casFixed], psFinal);
   const bySite = {};
   psFinal.forEach(o => {
     bySite[o.site] = (bySite[o.site] || 0) + 1;
@@ -2935,6 +3147,8 @@ function parseOrdersJSON(jsonText, prodById, consById, statusKeep) {
       depotPorte: kbDepotPorte(o) != null ? kbDepotPorte(o) : cons ? cons.depotPorte != null ? cons.depotPorte : null : null,
       casiersFrais: (o.bacs_frais || []).map(String),
       casiersSec: (o.bacs_sec || []).map(String),
+      volumeFrais: Number(o.volume_frais) || 0,
+      volumeSec: Number(o.volume_sec) || 0,
       items,
       pains: items.filter(i => i.cat === 'pain'),
       nds: items.filter(i => i.cat === 'nd'),
@@ -72432,6 +72646,20 @@ function AdminPage({
         source: 'v4-json',
         targetDate: dayKey
       });
+      try {
+        const rawCas = typeof v4Orders === 'string' ? JSON.parse(v4Orders) : v4Orders;
+        const rc = await kbAssignCasiersOnLoad(dayKey, [...res.orders, ...psKeep], Array.isArray(rawCas) ? rawCas : rawCas.orders || []);
+        const bits = [];
+        if (rc.assigned) bits.push(`${rc.assigned} client(s) ont reçu leur casier`);
+        if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
+        if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
+        if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+        if (rc.closed) bits.push('prépa déjà clôturée : casiers non touchés');
+        if (bits.length) showToast('🧊 ' + bits.join(' · '));
+      } catch (e) {
+        console.warn('casiers au chargement', e);
+        showToast('⚠️ Casiers non attribués au chargement : ' + e.message);
+      }
       for (const m of res.manquants || []) {
         const id = dispatchNorm(m.producteur + '|' + m.produit) || `m_${m.id}`;
         await storage.setDoc(`day_${dayKey}_manquants`, id, {
