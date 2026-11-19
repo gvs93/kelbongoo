@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.44';
+    const APP_VERSION = 'V11.45';
+    // V11.45 — (19/11/2026) Tournée unique : % ajouté aux commandes du samedi lues le jeudi CALCULÉ selon l'heure de lecture
+    //   (plus de saisie) + surplus de la MU du jeudi déduit EN DIRECT de la MU du samedi. Voir détails V11.44 ci-dessous.
     // V11.44 — (19/11/2026) 🚚 TOURNÉE UNIQUE DU VENDREDI (test) : Master › Livraison & réglages › « 🚚 Tournée unique vendredi »
     //   (app_config/tournee_unique { on, sites, depart, debut, marge }). Une case à cocher active tout :
     //   • JEUDI — MU : choix « ➡️ MU du vendredi » / « ⏩ Avancer la MU du samedi » (MU rangée dans la journée MU du vendredi
@@ -809,6 +811,9 @@
     //     mail Rolls Kelbongoo + vue chauffeur + stock contenants) sans attendre la clôture de la prépa ; à la clôture finale,
     //     ces lieux sont signalés « déjà partis ».
     //   • 2e chargement des commandes (7h puis 10h) : un casier du JSON déjà pris dans l'appli par un autre client → nouveau n° auto.
+    //   • % ajouté aux commandes du samedi lues le jeudi = calculé selon l'heure de lecture (kbTourSatShare : part du F&L du
+    //     samedi déjà commandée à cette heure sur les 6 derniers samedis, ca_history.hoursJ) ; surplus de la MU du jeudi
+    //     déduit EN DIRECT de la MU du samedi (stock de départ du vendredi recalculé en direct).
     //   • Commande Rungis du jeudi 4h30 (samedi + marge) : côté serveur (KBG_FL_Auto) — pas dans cette version.
     // V11.43 — (18/11/2026) RETOUR PDP de bout en bout : distrib › Suivi « 🙋 Demander à Henry le retour PDP » (produits choisis) → mail hg@ + carte Master › Récap
     //   (✅ Valider / ✏️ par article / 🙅 Refuser) ; toute validation Henry → POPUP distrib : cocher chaque article mis dans la cagette « Retour PDP »
@@ -3557,6 +3562,41 @@
       return c;
     }
     setTimeout(() => { try { kbTourLoad(); } catch (e) {} }, 2000);
+    // V11.44 — part du F&L du samedi DÉJÀ commandée à l'instant atMs (vente ouverte jusqu'au vendredi 10h),
+    //   d'après les 6 derniers samedis (ca_history.hoursJ : unités F&L par jour-avant × heure de commande, heure de Paris).
+    //   % à ajouter = 1 / part − 1. Repli sans historique : courbe mesurée en nov. 2026 (jeudi 4h30 56 %, jeudi 17h 72 %, vendredi 7h 92 %).
+    async function kbTourSatShare(satKey, atMs) {
+      const { ymd, hh } = kbParisParts(atMs);
+      const off = Math.round((new Date(satKey + 'T12:00:00') - new Date(ymd + 'T12:00:00')) / 86400000);
+      const h = Number(hh), mn = new Date(atMs).getMinutes();
+      const weeks = [];
+      for (let i = 1; i <= 6; i++) {
+        const d = addDays(satKey, -7 * i);
+        const doc = await storage.getDoc('ca_history', d).catch(() => null);
+        const H = doc ? kbDocJ(doc, 'hoursJ') : null; const all = H && H.all; if (!all) continue;
+        const useFl = Object.values(all).some(v => (Number(v[1]) || 0) > 0), ix = useFl ? 1 : 2;
+        let tot = 0, before = 0;
+        Object.entries(all).forEach(([k, v]) => {
+          const [o, hs] = k.split('|'); const oo = Number(o), hk = Number(hs), q = Number(v[ix]) || 0;
+          tot += q;
+          if (oo > off || (oo === off && hk < h)) before += q;
+          else if (oo === off && hk === h) before += q * mn / 60;
+        });
+        if (tot > 0) weeks.push({ date: d, frac: before / tot });
+      }
+      if (off < 1 || (off === 1 && h >= 10)) return { frac: 1, pct: 0, n: weeks.length, weeks, closed: true };
+      let frac, src;
+      if (weeks.length >= 2) { frac = weeks.reduce((a, w) => a + w.frac, 0) / weeks.length; src = 'hist'; }
+      else {
+        const t = (2 - off) * 24 + h + mn / 60; // heures depuis jeudi 0h
+        const pts = [[-48, 0.35], [4.5, 0.56], [17, 0.72], [31, 0.92], [34, 1]];
+        let a = pts[0], b = pts[pts.length - 1];
+        for (let i = 0; i < pts.length - 1; i++) if (t >= pts[i][0] && t <= pts[i + 1][0]) { a = pts[i]; b = pts[i + 1]; }
+        frac = t <= pts[0][0] ? pts[0][1] : t >= 34 ? 1 : a[1] + (b[1] - a[1]) * (t - a[0]) / ((b[0] - a[0]) || 1); src = 'courbe';
+      }
+      frac = Math.min(1, Math.max(0.3, frac));
+      return { frac, pct: Math.max(0, Math.round((1 / frac - 1) * 100)), n: weeks.length, weeks, src };
+    }
     // produits qui se gardent (MU du samedi faisable dès le jeudi)
     const KB_TOUR_KEEP = /carotte|pomme de terre|pommes de terre|patate|oignon|echalote|ail\b|orange|citron|clementine|mandarine|pamplemousse|pomelo|kiwi|pomme|poires?\b|courge|potimarron|butternut|betterave|navet|panais|celeri|topinambour|radis noir|chou\b|choux|rutabaga|coing/;
     function kbTourKeeps(name) { return KB_TOUR_KEEP.test(normalizeText(String(name || ''))); }
@@ -13842,7 +13882,8 @@
               {b('lendemain', '➡️ Vendredi', 'MU du jour, d\'abord', '#2e7d32')}
               {b('samedi', '⏩ Samedi', 'à avancer après', '#5e35b1')}
             </div>
-            {work.mode==='samedi' && <div style={{fontSize:13,color:'#4527a0',marginTop:8}}>Besoin du samedi <b>estimé</b> (moyenne des 4 derniers samedis + 15 %). Ce qui est fait aujourd'hui est <b>déjà compté</b> vendredi. Produits qui se gardent en premier 🟣.</div>}
+            {work.mode==='samedi' && <div style={{fontSize:13,color:'#4527a0',marginTop:8}}>Besoin du samedi = commandes déjà passées + % selon l'heure, <b>moins ce qui a été fait en trop pour vendredi</b> (en direct). Ce qui est fait ici est <b>déjà compté</b> vendredi. Produits qui se gardent en premier 🟣.</div>}
+            {work.mode!=='samedi' && <div style={{fontSize:13,color:'#2e7d32',marginTop:8}}>Si tu fais plus que le « à faire » du vendredi, le surplus est <b>déduit automatiquement</b> de la MU du samedi.</div>}
           </div>);
       }
       if(!work || !work.sameDayOpen) return null;
@@ -13910,10 +13951,11 @@
         if(!tourAdv || !tourLinesJ || !flIdx || !Object.keys(flIdx).length) return null;
         let lines=[]; try { lines=JSON.parse(tourLinesJ); } catch(e){ return null; }
         const r = muExactFromLines(lines, flIdx);
-        const f = 1 + (Number(tourC.margeMu)||0)/100;
+        const pct = snap0.tourPct!=null ? Number(snap0.tourPct)||0 : (Number(tourC.margeMu)||0);
+        const f = 1 + pct/100;
         const map={}; Object.entries(r.exact||{}).forEach(([k,v])=>{ map[k]=Math.ceil((Number(v)||0)*f); });
-        return { map, pct: Number(tourC.margeMu)||0, at: snap0.tourAt||0, n: snap0.tourOrders||0, by: snap0.tourBy||'' };
-      },[tourAdv, tourLinesJ, flIdx, tourC.margeMu]);
+        return { map, pct, frac: snap0.tourFrac, at: snap0.tourAt||0, n: snap0.tourOrders||0, by: snap0.tourBy||'' };
+      },[tourAdv, tourLinesJ, flIdx, tourC.margeMu, snap0 && snap0.tourPct]);
       React.useEffect(()=>{
         if(!tourAdv){ setHistEst(null); return; }
         let stop=false;
@@ -13926,7 +13968,7 @@
         });
         return ()=>{ stop=true; };
       },[tourAdv, dateKey]);
-      const [start,setStart] = React.useState(null);
+      const [startRaw,setStart] = React.useState(null);
       const ready = items!==null && flRows!==null;
       const snapToday = entries ? entries[MU_REEL_DOC] : null;
       const sheetFlag = snapToday && snapToday.startFromSheet ? String(snapToday.startFromSheet.at||1) : '';
@@ -13937,6 +13979,20 @@
         muComputeStartStock(dateKey, flIdx, snapToday).then(r=>{ if(!stop) setStart({ ...r, forKey: dateKey }); }).catch(()=>{ if(!stop) setStart({stock:{},source:'erreur',fromDate:null, forKey: dateKey}); });
         return ()=>{ stop=true; };
       },[ready, dateKey, flIdx, sheetFlag]);
+      // V11.44 — samedi avancé le jeudi : le stock de départ du vendredi = reste de la MU du jeudi, recalculé EN DIRECT
+      //   (pomme : 10 à faire pour vendredi, 30 faites → les 20 en trop sont déduits tout de suite de la MU du samedi).
+      const prevKey = muShiftDate(dateKey,-1);
+      const [prevLive,setPrevLive] = React.useState(null);
+      React.useEffect(()=>{ if(!tourAdv){ setPrevLive(null); return; } return storage.subscribe('mu_'+prevKey, arr=>setPrevLive(arr||[])); },[tourAdv, prevKey]);
+      const start = React.useMemo(()=>{
+        if(!tourAdv || !startRaw || !prevLive || startRaw.source!=='calc' || startRaw.fromDate!==prevKey) return startRaw;
+        const snap = prevLive.find(x=>x && x.id===MU_REEL_DOC); if(!snap || !snap.items) return startRaw;
+        const fait = muFaitFromEntries(prevLive);
+        const keys = new Set([...Object.keys(snap.items||{}), ...Object.keys(snap.overrides||{}), ...Object.keys(fait), ...Object.keys(muExactOf(snap)||{})]);
+        const stock = {};
+        keys.forEach(k=>{ stock[k] = Math.max(0, Math.round(muStockOfSnap(snap,k) + (fait[k]||0) - muCmdOfSnap(snap,k))); });
+        return { ...startRaw, stock, live: true };
+      },[tourAdv, startRaw, prevLive, prevKey]);
       const faitToday = React.useMemo(()=>muFaitFromEntries(Object.values(entries||{})), [entries]);
       // V9.59 — commandes exactes : chargement manuel (prépa, 10h) prioritaire ; sinon commandes de la
       // distribution suivante déjà présentes dans l'appli (PrestaShop / export Mongo) chargées après 10h.
@@ -14050,7 +14106,7 @@
       );
       if(info.tourHist!==undefined) return ( // V11.44
         <div style={{background:'#ede7f6',border:'1px solid #b39ddb',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#4527a0'}}>
-          ⏩ <b>MU du samedi estimée</b> : {info.tourLive ? <>commandes du samedi lues à <b>{muTime(info.tourLive.at)}</b> ({info.tourLive.n} commandes{info.tourLive.by ? ' · '+info.tourLive.by : ''}) <b>+ {info.tourLive.pct} %</b></> : info.tourHist==null ? 'calcul…' : info.tourHist ? `commandes du samedi pas encore lues → moyenne des ${info.tourHist} dernier(s) samedi(s) + 15 %` : 'pas d\'historique de samedi trouvé → estimation du Sheet'}. Elle devient exacte vendredi au chargement des commandes.
+          ⏩ <b>MU du samedi estimée</b> : {info.tourLive ? <>commandes du samedi lues à <b>{muTime(info.tourLive.at)}</b> ({info.tourLive.n} commandes{info.tourLive.frac!=null ? `, d'habitude ${info.tourLive.frac} % passées à cette heure` : ''}) <b>+ {info.tourLive.pct} %</b>, moins ce qui a été fait en trop pour vendredi</> : info.tourHist==null ? 'calcul…' : info.tourHist ? `commandes du samedi pas encore lues → moyenne des ${info.tourHist} dernier(s) samedi(s) + 15 %` : 'pas d\'historique de samedi trouvé → estimation du Sheet'}. Elle devient exacte vendredi au chargement des commandes.
         </div>);
       return (
         <div style={{background:'#fff8e1',border:'1px solid #ffe082',borderRadius:10,padding:'8px 12px',fontSize:12,color:'#8d6e00',display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,flexWrap:'wrap'}}>
@@ -18477,8 +18533,6 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function KbTourSatReader({ cfg, session, onPct }) {
       const showToast = React.useContext(ToastContext);
       const [busy, setBusy] = React.useState('');
-      const [pct, setPct] = React.useState(cfg.margeMu);
-      React.useEffect(() => { setPct(cfg.margeMu); }, [cfg.margeMu]);
       const t = todayKey();
       const dow = new Date(t + 'T12:00:00').getDay();
       const sat = addDays(t, (6 - dow + 7) % 7 || 7);
@@ -18497,8 +18551,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           const agg = {};
           muLinesFromOrders(res.orders).forEach(l => { const k = (l.id || '') + '|' + (l.name || ''); if (!agg[k]) agg[k] = { id: l.id || '', name: l.name || '', qty: 0 }; agg[k].qty += Number(l.qty) || 0; });
           const lines = Object.values(agg).filter(l => l.qty > 0);
-          await storage.setDoc('mu_' + fri, MU_REEL_DOC, { tourLines: JSON.stringify(lines), tourAt: Date.now(), tourBy: (session && session.name) || '—', tourOrders: (res.orders || []).length, tourFor: sat });
-          showToast(`✓ ${(res.orders || []).length} commandes du samedi lues → MU du samedi + ${cfg.margeMu} %`);
+          const now = Date.now();
+          const pr = await kbTourSatShare(sat, now);
+          await storage.setDoc('mu_' + fri, MU_REEL_DOC, { tourLines: JSON.stringify(lines), tourAt: now, tourBy: (session && session.name) || '—', tourOrders: (res.orders || []).length, tourFor: sat,
+            tourPct: pr.pct, tourFrac: Math.round(pr.frac * 1000) / 10, tourWeeks: pr.n, tourSrc: pr.src || '' });
+          showToast(`✓ ${(res.orders || []).length} commandes du samedi lues · d'habitude ${Math.round(pr.frac * 100)} % passées à cette heure → + ${pr.pct} %`);
         } catch (e) { showToast('Erreur : ' + (e.message || e)); }
         finally { setBusy(''); }
       };
@@ -18507,16 +18564,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <strong style={{ fontSize: 16 }}>⏩ Jeudi : besoin MU du samedi {formatDateShort(sat)}</strong>
           <div style={{ fontSize: 14, marginTop: 4 }}>
             {snap && snap.tourLines && snap.tourFor === sat
-              ? <span style={{ color: '#2e7d32', fontWeight: 700 }}>✓ {snap.tourOrders} commandes lues à {muTime(snap.tourAt)}{snap.tourBy ? ' par ' + snap.tourBy : ''}</span>
+              ? <span style={{ color: '#2e7d32', fontWeight: 700 }}>✓ {snap.tourOrders} commandes lues à {muTime(snap.tourAt)}{snap.tourBy ? ' par ' + snap.tourBy : ''} — à cette heure, d'habitude {snap.tourFrac} % du F&amp;L du samedi est déjà commandé → <span style={{ fontSize: 18 }}>+ {snap.tourPct} %</span> {snap.tourSrc === 'hist' ? `(${snap.tourWeeks} derniers samedis)` : '(courbe de novembre)'}</span>
               : <span style={{ color: '#8a4b00', fontWeight: 700 }}>Pas encore lues → la MU prend la moyenne des 4 derniers samedis + 15 %</span>}
           </div>
           <ol style={{ fontSize: 13, margin: '6px 0', paddingLeft: 18, lineHeight: 1.5 }}>
             <li>Compass › <b>orders-since-2023</b> › filtre sur le <b>globalorder_id du samedi</b> (vente ouverte, pas compilée : normal).</li>
-            <li>Export JSON, puis le choisir ici. Tu peux relire plus tard dans la journée (ça remplace).</li>
+            <li>Export JSON, puis le choisir ici <b>tout de suite</b> : le % est calculé selon l'heure de lecture (plus c'est tard, plus il est petit). Tu peux relire plus tard (ça remplace).</li>
           </ol>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
             <input type="file" accept=".json,application/json" disabled={!!busy} onChange={e => { read(e.target.files[0]); e.target.value = ''; }} />
-            <label style={{ fontSize: 14 }}>Marge ajoutée <input type="number" min="0" max="300" value={pct} onChange={e => setPct(e.target.value)} onBlur={() => { if (Number(pct) !== Number(cfg.margeMu)) onPct(Number(pct) || 0); }} style={{ fontSize: 18, padding: 6, width: 80 }} /> %</label>
             {busy && <b>{busy}</b>}
           </div>
           <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Sert seulement à la MU du samedi faite le jeudi. La prépa et les commandes du samedi ne sont pas touchées (chargement normal vendredi 7h puis 10h).</div>
@@ -18558,7 +18614,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <div className="card" style={{ padding: 14 }}>
             <strong style={{ fontSize: 16 }}>Ce que ça déclenche</strong>
             <div style={{ ...big, marginTop: 6 }}>
-              <div>📅 <b>Jeudi · MU</b> : sur l'écran MU, choix « ➡️ Vendredi » / « ⏩ Samedi ». La MU du samedi faite le jeudi est <b>déjà comptée vendredi</b>. Besoin = commandes du samedi lues ci-dessous + {c.margeMu} % (sinon 4 derniers samedis + 15 %), produits qui se gardent en premier.</div>
+              <div>📅 <b>Jeudi · MU</b> : sur l'écran MU, choix « ➡️ Vendredi » / « ⏩ Samedi ». La MU du samedi faite le jeudi est <b>déjà comptée vendredi</b>. Besoin = commandes du samedi lues ci-dessous + un % calculé selon l'heure de lecture (sinon 4 derniers samedis + 15 %). Ce qui est fait en trop pour vendredi est déduit du samedi, produits qui se gardent en premier.</div>
               <div style={{ marginTop: 6 }}>🧺 <b>Vendredi · Prépa</b> (dès {String(c.debut).replace(':', 'h')}) : bandeau « Tournée {String(c.depart).replace(':', 'h')} », filtre sur les lieux du camion par défaut, lieux du camion en tête, rappel du 2e chargement à 10h (nouvelles commandes = nouveaux casiers dans les rolls).</div>
               <div style={{ marginTop: 6 }}>🚚 <b>Vendredi · Rungis</b> : bouton « Tournée prête → prévenir Rungis » : rolls + dollies des lieux du camion, sans attendre la clôture. Le chauffeur les voit tout de suite.</div>
               <div style={{ marginTop: 6, color: '#8a4b00' }}>⚠️ <b>Commande Rungis du jeudi 4h30</b> (samedi + {c.marge} %) : se fait côté serveur, pas encore branché — à ajouter à la main par Raimbaud tant que ce n'est pas fait.</div>
