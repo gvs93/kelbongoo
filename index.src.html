@@ -795,7 +795,17 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.58';
+    const APP_VERSION = 'V11.61';
+    // V11.61 — (20/11/2026) MU : l'avance de la veille (sachets en trop → stock PDP) est affichée sur un jour normal
+    //   (« 🟣 Avancée réelle X % · N déjà en stock PDP ») ; avant, elle était déduite du « à faire » sans être montrée → MU vue à 0.
+    // V11.60 — (20/11/2026) 🎉 « TA SEMAINE » : la popup prépa du début de semaine devient un bilan positif — feu d'artifice, tuiles
+    //   (lignes préparées, sachets de MU, lignes/h, sachets/h, jours), badges uniquement positifs (record perso, progrès vs SA semaine
+    //   d'avant, zéro erreur), message d'encouragement, total de l'équipe ; qualité en discret (détail repliable + ajustement SAV).
+    //   Jamais de comparaison avec les collègues côté salarié (le comparatif est dans le bilan du mois envoyé au bureau, KBG_Qualite v1.3).
+    // V11.59 — (19/11/2026) 🔀 CASIER TROMPÉ (distrib › Qualité) : un client repart avec le casier / la cagette d'un autre.
+    //   On choisit qui s'est trompé + le n° pris (propriétaire retrouvé seul). Téléphone → popup « appelle-le » avec le texte à dire
+    //   (✅ joint / 📵 pas de réponse → mail) ; pas de téléphone → mail Freshdesk tout de suite. Bandeaux sur les 2 clients dans la liste,
+    //   suivi dans Suivi › 🔀 Casiers trompés (rendu, prévenu, pas revenu, avoir, réglé). forgotten_items kind:'swap' (exclu des oublis).
     // V11.58 — (19/11/2026) 📊 BILAN CA HEBDO selon Raimbaud (cœur KBC partagé avec le mail du lundi, Apps Script KBG_BilanCA) :
     //   décrochage = habitué sans commande depuis 6 semaines (compté une fois) · perdu = 12 semaines · nouveau = < 4 commandes et
     //   1re commande < 3 mois (fichier Consommateurs = historique complet, sinon n/d) · gros points fixes (réglage, défaut BOR BIC DOM STB PDP)
@@ -5719,6 +5729,8 @@
     function kbAlpha(arr) { return [...(arr || [])].sort((a, b) => kbProdName(a.produit || '').localeCompare(kbProdName(b.produit || ''), 'fr', { sensitivity: 'base', numeric: true })); }
 
     function ClientsPage({ session, currentSite, orders, isClosed, dispatch, lastminute }) {
+      const swapsAll = useKbSwaps(currentSite); // V11.59 — casiers trompés du jour
+      const swaps = React.useMemo(() => swapsAll.filter(x => x.day === activeDay()), [swapsAll]);
       const wIdx = useKbWeightIdx(); // V10.75 — ⚖️ fourchette de poids (ND, dernière minute)
       const [statuses, setStatuses] = React.useState([]);
       const [refunds, setRefunds] = React.useState([]);
@@ -6035,6 +6047,7 @@
                               <span className="badge" style={{marginLeft:8,background:'var(--bg-muted)',color:'var(--ink-mute)'}}>hors master</span>
                             )}
                           </div>
+                          <KbSwapBanners swaps={swaps} o={o} />
                           {/* V9.81 — Encadré « À DONNER EN PLUS » : ND (cagette, à la main) + pains, en GROS, quantités bien visibles */}
                           {(pains.length > 0 || ndItems.length > 0) && (
                             <div style={{marginTop:8,border:'3px solid var(--accent-dark)',borderRadius:10,padding:'8px 10px',background:'var(--accent-soft)'}}>
@@ -7391,7 +7404,219 @@
         </div>
       );
     }
+    // ============================================================
+    // V11.59 — 🔀 CASIER TROMPÉ : un client repart avec le casier (cagette) d'un autre.
+    //   Qualité › « 🔀 Casier trompé » : qui s'est trompé → quel casier il a pris (le propriétaire est retrouvé tout seul).
+    //   Téléphone connu → popup « appelle-le » avec le texte à dire (joint / pas de réponse → mail) ; pas de téléphone → mail Freshdesk tout de suite.
+    //   Bandeaux sur les 2 clients dans la liste de distrib ; suivi dans Suivi › 🔀 Casiers trompés.
+    //   Stocké dans forgotten_items (kind:'swap', id swap_…) — même collection que les oublis, filtrée partout.
+    // ============================================================
+    const kbSwapWord = (site) => site === 'DOM' ? 'carton' : (BOUTIQUES || []).includes(site) ? 'casier' : 'cagette';
+    const kbFirstName = (n) => { const p = String(n || '').trim().split(/\s+/); const i = p.findIndex(x => x !== x.toUpperCase()); return i >= 0 ? p.slice(i).join(' ') : p.join(' '); };
+    const kbIsSwap = (f) => f && f.kind === 'swap';
+    const KB_SWAP_ST = { open: { l: 'À régler', c: '#c62828' }, called: { l: 'Prévenu, il revient', c: '#ef6c00' }, mailed: { l: 'Mail envoyé', c: '#ef6c00' }, returned: { l: 'Produits rendus ✓', c: '#2e7d32' }, not_returned: { l: 'Pas revenu', c: '#6a1b9a' }, done: { l: 'Réglé', c: '#2e7d32' } };
+    function kbSwapMailBody(s) {
+      const w = kbSwapWord(s.site), lieu = siteLabel(s.site);
+      return `Bonjour ${kbFirstName(s.takerName)},\n\n`
+        + `Lors de votre passage au point Kelbongoo ${lieu}, vous êtes reparti(e) avec le ${w} n° ${s.takenCasier} au lieu du vôtre${s.takerCasiers && s.takerCasiers.length ? `, le n° ${s.takerCasiers.join(' / ')}` : ''}. Pas d'inquiétude, ça arrive !\n\n`
+        + `Le ${w} n° ${s.takenCasier} contient la commande d'un autre client, qui l'attend. Votre commande à vous est toujours là${s.takerCasiers && s.takerCasiers.length ? `, ${w} n° ${s.takerCasiers.join(' / ')}` : ''}.\n\n`
+        + `Pourriez-vous repasser au point ${lieu} dès que possible, idéalement aujourd'hui pendant la distribution, avec les produits du ${w} n° ${s.takenCasier} ? Nous vous remettrons votre commande en échange.\n\n`
+        + `Si ce n'est pas possible, répondez simplement à ce mail : nous trouverons une solution ensemble.\n\n`
+        + `Merci beaucoup et à très vite,\nL'équipe Kelbongoo`;
+    }
+    function kbSwapCallText(s) {
+      const w = kbSwapWord(s.site);
+      return `« Bonjour, c'est Kelbongoo, point ${siteLabel(s.site)}. En récupérant votre commande, vous avez pris par erreur le ${w} n° ${s.takenCasier}, qui est celui d'un autre client. Votre commande à vous est toujours là${s.takerCasiers && s.takerCasiers.length ? `, ${w} n° ${s.takerCasiers.join(' / ')}` : ''}. Pourriez-vous repasser aujourd'hui avec les produits du ${s.takenCasier} ? On vous donne votre commande en échange. Merci beaucoup ! »`;
+    }
+    async function kbSendSwapMail(s) {
+      if (!s || !s.takerEmail) return { ok: false, error: "pas d'email client" };
+      if (!FRESHDESK_PROXY_URL || FRESHDESK_PROXY_URL.includes('TON_')) return { ok: false, error: 'proxy Freshdesk non configuré' };
+      const subject = `Kelbongoo · petite erreur de ${kbSwapWord(s.site)} à ${siteLabel(s.site)}`;
+      try {
+        const data = await freshdeskPost({ secret: FRESHDESK_SECRET, clients: [{ email: s.takerEmail, name: s.takerName || '', site: s.site, siteName: siteLabel(s.site), subject, body: kbSwapMailBody(s) }] });
+        if (data && data.ok && data.success > 0) {
+          try { await storage.setDoc('client_mail_history', `${s.takerEmail}_${Date.now()}`, { clientEmail: s.takerEmail, clientName: s.takerName || '', type: 'casier_trompe', subject, sentAt: new Date().toISOString(), sentBy: 'casier-trompe', site: s.site }); } catch (e) {}
+          return { ok: true };
+        }
+        return { ok: false, error: (data && (data.error || (data.results && data.results[0] && data.results[0].error))) || 'inconnue' };
+      } catch (e) { return { ok: false, error: e.message }; }
+    }
+    async function kbSwapPatch(s, patch, session) {
+      const n = { ...s, ...patch, updatedBy: (session && session.name) || '', updatedAt: new Date().toISOString() };
+      await storage.setDoc('forgotten_items', s.id, n);
+      return n;
+    }
+    /** Popup « appelle-le » (téléphone connu) — aussi rouvrable depuis le Suivi */
+    function KbSwapCall({ s, session, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const [busy, setBusy] = React.useState(false);
+      const joint = async () => { setBusy(true); await kbSwapPatch(s, { status: 'called', calledAt: new Date().toISOString(), calledBy: session.name }, session); showToast('✓ Noté : il repasse'); setBusy(false); onClose(); };
+      const noAnswer = async () => {
+        setBusy(true);
+        const r = await kbSendSwapMail(s);
+        await kbSwapPatch(s, r.ok ? { status: 'mailed', noAnswerAt: new Date().toISOString(), mailSentAt: new Date().toISOString(), mailSentBy: session.name } : { noAnswerAt: new Date().toISOString() }, session);
+        showToast(r.ok ? '✉️ Pas de réponse → mail envoyé au client' : '⚠️ Mail non envoyé (' + r.error + ') — rappeler plus tard');
+        setBusy(false); onClose();
+      };
+      return (
+        <div className="fs-overlay" style={{ zIndex: 3000 }}>
+          <div className="fs-card fs-block" style={{ borderTop: '8px solid #ef6c00', maxHeight: '92vh', overflowY: 'auto' }}>
+            <div className="fs-icon">📞</div>
+            <h2>Appelle {kbFirstName(s.takerName)} maintenant</h2>
+            <a href={`tel:${s.takerTel}`} style={{ display: 'block', fontSize: 34, fontWeight: 900, color: 'var(--accent-dark)', margin: '6px 0 10px' }}>{s.takerTel}</a>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-mute)', textAlign: 'left' }}>Ce que tu peux dire :</div>
+            <div style={{ fontSize: 16, lineHeight: 1.45, textAlign: 'left', background: '#fff8e1', borderRadius: 12, padding: '10px 12px', marginTop: 4 }}>{kbSwapCallText(s)}</div>
+            <div className="fs-actions" style={{ marginTop: 14, flexDirection: 'column', gap: 8 }}>
+              <button className="btn-primary btn-lg" disabled={busy} onClick={joint}>✅ Joint — il repasse</button>
+              <button className="btn-secondary btn-lg" disabled={busy} onClick={noAnswer}>📵 Pas de réponse → {s.takerEmail ? 'envoyer le mail' : 'noter (pas d\'email)'}</button>
+              <button className="btn-ghost" disabled={busy} onClick={onClose}>Plus tard (reste dans Suivi › Casiers trompés)</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    function KbSwapForm({ orders, session, currentSite, onClose }) {
+      const showToast = React.useContext(ToastContext);
+      const w = kbSwapWord(currentSite);
+      const [q, setQ] = React.useState('');
+      const [taker, setTaker] = React.useState(null);
+      const [cas, setCas] = React.useState('');
+      const [remark, setRemark] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [call, setCall] = React.useState(null);
+      const sit = (orders || []).filter(o => o.site === currentSite);
+      const res = React.useMemo(() => {
+        const s = normalizeText(q); if (!s) return [];
+        return sit.filter(o => normalizeText(displayName(o)).includes(s) || kbCasiersShown(o).includes(q.trim())).slice(0, 8);
+      }, [q, sit.length]);
+      const owner = React.useMemo(() => { const c = String(cas).trim(); if (!c) return null; return sit.find(o => o !== taker && kbCasiersShown(o).includes(c)) || null; }, [cas, taker, sit.length]);
+      const ownCas = taker ? kbCasiersShown(taker) : [];
+      const sameCas = taker && ownCas.includes(String(cas).trim());
+      const ok = taker && String(cas).trim() && !sameCas;
+      const save = async () => {
+        setBusy(true);
+        try {
+          const st = await storage.getAll(`day_${activeDay()}_statuses`).catch(() => []);
+          const passed = (id) => (st || []).some(x => String(x.orderId || x.id) === String(id) && x.passed === true);
+          const id = 'swap_' + Date.now();
+          const s = { id, kind: 'swap', site: currentSite, day: activeDay(),
+            takerOrderId: taker.orderId, takerName: displayName(taker), takerEmail: taker.email || '', takerTel: String(taker.telephone || taker.tel || '').replace(/\s+/g, ''), takerCasiers: ownCas,
+            takenCasier: String(cas).trim(), victimOrderId: owner ? owner.orderId : '', victimName: owner ? displayName(owner) : '', victimEmail: owner ? owner.email || '' : '',
+            victimPassedBefore: owner ? passed(owner.orderId) : false, remark, status: 'open', createdBy: session.name, createdAt: new Date().toISOString() };
+          await storage.setDoc('forgotten_items', id, s);
+          const hasTel = s.takerTel.replace(/\D/g, '').length >= 9;
+          if (hasTel) { setCall(s); setBusy(false); return; }
+          const r = await kbSendSwapMail(s);
+          if (r.ok) await kbSwapPatch(s, { status: 'mailed', mailSentAt: new Date().toISOString(), mailSentBy: session.name }, session);
+          showToast(r.ok ? `✉️ Pas de téléphone : mail envoyé à ${kbFirstName(s.takerName)}` : `⚠️ Pas de téléphone et mail non envoyé (${r.error}) — voir Suivi`);
+          onClose();
+        } catch (e) { showToast('Erreur : ' + (e.message || e)); setBusy(false); }
+      };
+      if (call) return <KbSwapCall s={call} session={session} onClose={onClose} />;
+      const big = { width: '100%', fontSize: 20, padding: 12, borderRadius: 12, border: '2px solid var(--border)' };
+      return (
+        <div className="fs-overlay" style={{ zIndex: 2950 }}>
+          <div className="fs-card" style={{ maxHeight: '92vh', overflowY: 'auto', textAlign: 'left' }}>
+            <h2 style={{ textAlign: 'center' }}>🔀 {w === 'casier' ? 'Casier' : w === 'cagette' ? 'Cagette' : 'Carton'} trompé</h2>
+            <div style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'center' }}>Un client est reparti avec le {w} d'un autre client.</div>
+            <div style={{ fontSize: 15, fontWeight: 800, marginTop: 14 }}>1. Qui s'est trompé ?</div>
+            {taker ? <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'var(--accent-soft)', borderRadius: 12, padding: '10px 12px', marginTop: 6 }}>
+              <div style={{ flex: 1 }}><div style={{ fontSize: 18, fontWeight: 800 }}>{displayName(taker)}</div><div style={{ fontSize: 13 }}>son {w} : <b style={{ fontSize: 18 }}>{ownCas.join(' / ') || '—'}</b>{(taker.telephone || taker.tel) ? ' · 📞' : ' · pas de téléphone'}</div></div>
+              <button className="btn-ghost" onClick={() => { setTaker(null); setQ(''); }}>Changer</button></div>
+              : <><input style={big} value={q} onChange={e => setQ(e.target.value)} placeholder={`Nom ou n° de ${w}`} autoFocus />
+                {res.map(o => <button key={o.orderId} className="btn-secondary" style={{ display: 'block', width: '100%', textAlign: 'left', marginTop: 6, fontSize: 16 }} onClick={() => setTaker(o)}>{displayName(o)} <span style={{ color: 'var(--ink-mute)' }}>· {w} {kbCasiersShown(o).join(' / ') || '—'}</span></button>)}</>}
+            {taker && <>
+              <div style={{ fontSize: 15, fontWeight: 800, marginTop: 14 }}>2. Quel {w} a-t-il pris ?</div>
+              <input style={{ ...big, fontSize: 30, fontWeight: 900, textAlign: 'center', maxWidth: 180, display: 'block', margin: '6px auto 0' }} inputMode="numeric" value={cas} onChange={e => setCas(e.target.value.replace(/[^\dA-Za-z-]/g, '').slice(0, 6))} placeholder="n°" />
+              {sameCas && <div style={{ color: 'var(--danger)', fontWeight: 700, textAlign: 'center' }}>C'est son propre {w}.</div>}
+              {String(cas).trim() && !sameCas && <div style={{ textAlign: 'center', fontSize: 15, marginTop: 6 }}>{owner ? <>= le {w} de <b>{displayName(owner)}</b></> : <span style={{ color: 'var(--ink-mute)' }}>propriétaire non trouvé (pas de commande avec ce n° aujourd'hui)</span>}</div>}
+              <input style={{ ...big, fontSize: 15, marginTop: 12 }} value={remark} onChange={e => setRemark(e.target.value)} placeholder="Remarque (facultatif)" />
+              <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 10 }}>{String(taker.telephone || taker.tel || '').replace(/\D/g, '').length >= 9 ? '📞 Il a un téléphone : tu vas l\'appeler (texte à dire fourni).' : taker.email ? '✉️ Pas de téléphone : un mail lui part tout de suite.' : '⚠️ Ni téléphone ni email : à régler dans Suivi.'}</div>
+            </>}
+            <div className="fs-actions" style={{ marginTop: 14 }}>
+              <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={save}>{busy ? '⏳…' : '✓ Valider'}</button>
+              <button className="btn-ghost" onClick={onClose}>Annuler</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    /** Bandeaux dans la liste de distrib : sur celui qui s'est trompé et sur celui dont le casier a été pris */
+    function KbSwapBanners({ swaps, o }) {
+      const ids = o._subOrderIds || [o.orderId];
+      const mine = (swaps || []).filter(s => s.status !== 'done' && s.status !== 'returned' && (ids.includes(s.takerOrderId) || ids.includes(s.victimOrderId)));
+      if (!mine.length) return null;
+      return mine.map(s => {
+        const w = kbSwapWord(s.site), taker = ids.includes(s.takerOrderId);
+        return (
+          <div key={s.id + (taker ? 't' : 'v')} style={{ marginTop: 8, color: '#fff', fontWeight: 700, fontSize: 15, background: taker ? '#ef6c00' : '#c62828', borderRadius: 8, padding: '8px 10px' }}>
+            <div style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '.03em' }}>🔀 {w} trompé</div>
+            {taker
+              ? <div>A pris le {w} <b style={{ fontSize: 20 }}>{s.takenCasier}</b>{s.victimName ? ` (celui de ${s.victimName})` : ''} au lieu du <b style={{ fontSize: 20 }}>{(s.takerCasiers || []).join(' / ') || '?'}</b>. Quand il revient : reprendre les produits du {s.takenCasier}, lui donner les siens.</div>
+              : <div>Son {w} <b style={{ fontSize: 20 }}>{s.takenCasier}</b> a été pris par erreur par {s.takerName}. Si ce client arrive avant le retour : s'excuser, expliquer, noter dans Suivi › Casiers trompés.</div>}
+          </div>
+        );
+      });
+    }
+    function useKbSwaps(site) {
+      const [all, setAll] = React.useState([]);
+      React.useEffect(() => storage.subscribe('forgotten_items', arr => setAll((arr || []).filter(kbIsSwap))), []);
+      return React.useMemo(() => all.filter(s => !site || s.site === site), [all, site]);
+    }
+    // ----- Suivi › 🔀 Casiers trompés -----
+    function SwapSubPage({ session, currentSite, swaps }) {
+      const showToast = React.useContext(ToastContext);
+      const [filter, setFilter] = React.useState('pending');
+      const [call, setCall] = React.useState(null);
+      const w = kbSwapWord(currentSite);
+      const list = (swaps || []).filter(s => s.site === currentSite && (filter === 'all' || (filter === 'pending' ? !['done', 'returned'].includes(s.status) : ['done', 'returned'].includes(s.status))))
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      const set = async (s, patch, msg) => { await kbSwapPatch(s, patch, session); showToast(msg); };
+      const mail = async (s) => { const r = await kbSendSwapMail(s); if (r.ok) await kbSwapPatch(s, { status: s.status === 'open' ? 'mailed' : s.status, mailSentAt: new Date().toISOString(), mailSentBy: session.name }, session); showToast(r.ok ? '✉️ Mail envoyé' : '⚠️ ' + r.error); };
+      return (
+        <div className="stack">
+          <h1>{w === 'casier' ? 'Casiers' : 'Cagettes'} trompés · {currentSite}</h1>
+          <p style={{ color: 'var(--ink-soft)', fontSize: 13, marginTop: -8 }}>Un client est reparti avec le {w} d'un autre. On le prévient (appel, sinon mail), il rapporte les produits et récupère les siens. Si l'autre client n'a pas eu sa commande : avoir.</p>
+          <div className="filter-row">
+            {[['pending', 'En cours'], ['history', 'Réglés'], ['all', 'Tous']].map(([k, l]) => <div key={k} className={`chip ${filter === k ? 'selected' : ''}`} onClick={() => setFilter(k)}>{l}</div>)}
+          </div>
+          {!list.length ? <div className="empty-state"><div className="icon">🔀</div><p>Aucun {w} trompé {filter === 'pending' ? 'en cours' : ''}.</p></div>
+            : list.map(s => {
+              const st = KB_SWAP_ST[s.status] || KB_SWAP_ST.open;
+              return (
+                <div key={s.id} className="list-item" style={{ flexDirection: 'column', alignItems: 'stretch', borderLeft: '5px solid ' + st.c }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                    <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>{formatDateShort(s.day)} · signalé par {s.createdBy}</div>
+                    <span className="badge" style={{ background: st.c, color: '#fff' }}>{st.l}</span>
+                  </div>
+                  <div style={{ fontSize: 16, marginTop: 4 }}><b>{s.takerName}</b> a pris le {w} <b style={{ fontSize: 20 }}>{s.takenCasier}</b> au lieu du <b style={{ fontSize: 20 }}>{(s.takerCasiers || []).join(' / ') || '?'}</b></div>
+                  {s.victimName && <div style={{ fontSize: 14 }}>{w} de <b>{s.victimName}</b>{s.victimPassedBefore ? ' (déjà passé avant ?)' : ''}{s.victimInformed ? ' · prévenu(e) ✓' : ''}{s.avoirVictim ? ' · 💰 avoir fait' : ''}</div>}
+                  <div className="list-item-sub" style={{ marginTop: 4 }}>
+                    {s.takerTel ? <a href={`tel:${s.takerTel}`} style={{ color: 'var(--accent-dark)', fontWeight: 700 }}>📞 {s.takerTel}</a> : <span>📞 —</span>}
+                    {s.takerEmail && <span style={{ marginLeft: 8 }}>✉️ {s.takerEmail}</span>}
+                  </div>
+                  {s.calledAt && <div className="list-item-sub" style={{ color: '#2e7d32', fontWeight: 600 }}>📞 Joint le {new Date(s.calledAt).toLocaleString('fr-FR')} par {s.calledBy}</div>}
+                  {s.noAnswerAt && <div className="list-item-sub">📵 Pas de réponse le {new Date(s.noAnswerAt).toLocaleString('fr-FR')}</div>}
+                  {s.mailSentAt && <div className="list-item-sub" style={{ color: '#2e7d32', fontWeight: 600 }}>✉️ Mail envoyé le {new Date(s.mailSentAt).toLocaleString('fr-FR')}</div>}
+                  {s.remark && <div style={{ fontSize: 12, fontStyle: 'italic', color: 'var(--ink-soft)' }}>« {s.remark} »</div>}
+                  {!['done', 'returned'].includes(s.status) && <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                    {s.takerTel && <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => setCall(s)}>📞 Appeler</button>}
+                    {s.takerEmail && <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => mail(s)}>✉️ {s.mailSentAt ? 'Renvoyer le mail' : 'Envoyer le mail'}</button>}
+                    <button className="btn-primary" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => set(s, { status: 'returned', returnedAt: new Date().toISOString() }, '✓ Produits rendus, échange fait')}>✅ Revenu, échange fait</button>
+                    {s.victimName && !s.victimInformed && <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => set(s, { victimInformed: true }, '✓ ' + s.victimName + ' prévenu(e)')}>🙋 {kbFirstName(s.victimName)} prévenu(e)</button>}
+                    {s.status !== 'not_returned' && <button className="btn-ghost" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => set(s, { status: 'not_returned' }, 'Noté : pas revenu')}>Pas revenu</button>}
+                    {session.isMaster && <button className={s.avoirVictim ? 'btn-primary' : 'btn-secondary'} style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => set(s, { avoirVictim: !s.avoirVictim }, s.avoirVictim ? 'Avoir retiré' : '💰 Avoir noté')}>💰 Avoir {s.victimName ? kbFirstName(s.victimName) : ''}</button>}
+                    {session.isMaster && <button className="btn-ghost" style={{ padding: '6px 10px', fontSize: 13 }} onClick={() => set(s, { status: 'done' }, '✓ Réglé')}>✓ Réglé</button>}
+                  </div>}
+                </div>
+              );
+            })}
+          {call && <KbSwapCall s={call} session={session} onClose={() => setCall(null)} />}
+        </div>
+      );
+    }
     function QualityPage({ session, currentSite, orders, products, isClosed, consumersByEmail }) {
+      const [showSwap, setShowSwap] = React.useState(false); // V11.59
       const [anomalies, setAnomalies] = React.useState([]);
       const [refunds, setRefunds] = React.useState([]);
       const [showForm, setShowForm] = React.useState(false);
@@ -7445,8 +7670,12 @@
         <div className="stack">
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <h1>Qualité · {currentSite}</h1>
-            <button className="btn-primary" onClick={() => { setEditing(null); setShowForm(true); }}>+ Nouvelle</button>
+            <div style={{display:'flex',gap:6}}>
+              <button className="btn-secondary" onClick={() => setShowSwap(true)}>🔀 {kbSwapWord(currentSite) === 'cagette' ? 'Cagette' : 'Casier'} trompé</button>
+              <button className="btn-primary" onClick={() => { setEditing(null); setShowForm(true); }}>+ Nouvelle</button>
+            </div>
           </div>
+          {showSwap && <KbSwapForm orders={orders} session={session} currentSite={currentSite} onClose={() => setShowSwap(false)} />}
 
           {isClosed && (
             <div className="alert-info">🔒 Journée clôturée</div>
@@ -7671,9 +7900,11 @@
         // On charge les anomalies de toutes les dates récentes
         // Approche : on s'abonne à followups + on lit les collections day_*_anomalies
         // Plus simple : on stocke les oublis dans une collection séparée
-        const unsub = storage.subscribe('forgotten_items', setForgottens);
+        const unsub = storage.subscribe('forgotten_items', (arr) => setForgottens((arr || []).filter(f => !kbIsSwap(f))));
         return unsub;
       }, []);
+      const swaps = useKbSwaps(currentSite); // V11.59
+      const swapsOpen = swaps.filter(x => !['done', 'returned'].includes(x.status)).length;
       const forgottensOpen = forgottens.filter(f =>
         f.site === currentSite && f.status !== 'done' && f.status !== 'returned' && f.status !== 'picked_up' // V10.37 — « traité » = réglé
       );
@@ -7689,8 +7920,12 @@
               📦 Oublis casier
               {alertOublis > 0 && <span className="badge badge-anom" style={{marginLeft:6,padding:'1px 6px',fontSize:10}}>{alertOublis}!</span>}
             </div>
+            <div className={`chip ${subTab==='swaps'?'selected':''}`} onClick={()=>setSubTab('swaps')}>
+              🔀 {kbSwapWord(currentSite) === 'cagette' ? 'Cagettes' : 'Casiers'} trompés
+              {swapsOpen > 0 && <span className="badge badge-anom" style={{marginLeft:6,padding:'1px 6px',fontSize:10}}>{swapsOpen}</span>}
+            </div>
           </div>
-          {subTab === 'non_recup'
+          {subTab === 'swaps' ? <SwapSubPage session={session} currentSite={currentSite} swaps={swaps} /> : subTab === 'non_recup'
             ? <NonRecupSubPage session={session} currentSite={currentSite} consumersByEmail={consumersByEmail} />
             : <OublisSubPage session={session} currentSite={currentSite} forgottens={forgottens} consumersByEmail={consumersByEmail} />}
         </div>
@@ -11280,7 +11515,7 @@
       React.useEffect(() => {
         const u1 = storage.subscribe('consignes', setConsignes);
         const u2 = storage.subscribe('followups', setFollowups);
-        const u3 = storage.subscribe('forgotten_items', setForgottens);
+        const u3 = storage.subscribe('forgotten_items', (arr) => setForgottens((arr || []).filter(f => !kbIsSwap(f))));
         const u4 = storage.subscribe('pdp_returns', setPdpReturns);
         return () => { u1 && u1(); u2 && u2(); u3 && u3(); u4 && u4(); };
       }, []);
@@ -14546,6 +14781,9 @@
         return { brut, stock, fait, pct: brut>0 ? Math.min(100, Math.round((stock+fait)/brut*100)) : 0 };
       },[]);
       const theoSat = muWork.tourAdvance ? theo(reel.rows) : (satOn && reelSat.ready ? theo(reelSat.rows) : null);
+      // V11.61 — jour normal : l'avance faite la veille est dans le STOCK PDP (déjà déduite du « à faire »).
+      //   Elle n'apparaissait nulle part → la MU semblait repartie de 0. On l'affiche comme le samedi théorique.
+      const theoDay = (!theoSat && reel.ready) ? theo(reel.rows) : null;
       const nbDone = plannedItems.filter(muFini).length;
       const allFinished = plannedItems.length>0 && nbDone===plannedItems.length;
 
@@ -14611,6 +14849,19 @@
                   <div style={{fontSize:13,color:'#4527a0'}}>
                     🟣 <b>Samedi · avancée théorique {theoSat.pct} %</b> : {theoSat.stock+theoSat.fait} / {theoSat.brut} sachets
                     <span style={{color:'#666'}}> — {theoSat.stock} en stock après la MU de jeudi (théorique){muWork.tourAdvance ? ` + ${theoSat.fait} faits ici` : ''}</span>
+                  </div>
+                </div>)}
+              {theoDay && theoDay.brut>0 && theoDay.stock>0 && (
+                <div style={{marginTop:10,paddingTop:8,borderTop:'1px dashed #b39ddb'}}>
+                  <div style={{background:'#ede7f6',borderRadius:99,height:14,overflow:'hidden',marginBottom:5,display:'flex'}}>
+                    <div style={{height:'100%',background:'#b39ddb',width:Math.round(theoDay.stock/theoDay.brut*100)+'%'}}/>
+                    <div style={{height:'100%',background:'#5e35b1',width:Math.round(theoDay.fait/theoDay.brut*100)+'%'}}/>
+                  </div>
+                  <div style={{fontSize:15,color:'#4527a0',fontWeight:700}}>
+                    🟣 Avancée réelle {theoDay.pct} % : {theoDay.stock+theoDay.fait} / {theoDay.brut} sachets commandés
+                  </div>
+                  <div style={{fontSize:13,color:'#4527a0'}}>
+                    📦 <b>{theoDay.stock}</b> déjà en stock PDP (MU d'avance d'hier, déjà déduite du « à faire ») + <b>{theoDay.fait}</b> faits aujourd'hui
                   </div>
                 </div>)}
             </div>
@@ -28691,7 +28942,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => {
         const put = (k) => (arr) => setAdm(a => ({ ...a, [k]: arr || [] }));
         const us = [storage.subscribe('consignes', put('consignes')), storage.subscribe('followups', put('followups')),
-          storage.subscribe('forgotten_items', put('oublis')), storage.subscribe('pdp_returns', put('pdp')),
+          storage.subscribe('forgotten_items', (arr) => put('oublis')((arr || []).filter(f => !kbIsSwap(f)))), storage.subscribe('pdp_returns', put('pdp')),
           storage.subscribe(`day_${todayKey()}_anomalies`, put('anom')), storage.subscribe(`day_${todayKey()}_refunds`, put('refunds'))];
         return () => us.forEach(u => { try { u && u(); } catch (_) {} });
       }, []);
@@ -37400,10 +37651,21 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     const kbQwFind = (people, name) => { if (!people || !name) return null; if (people[name]) return [name, people[name]]; const n = normalizeText(name); const k = Object.keys(people).find(x => normalizeText(x) === n); return k ? [k, people[k]] : null; };
     const kbQwRate = (e, l) => l ? (100 * e / l).toFixed(2).replace('.', ',') + ' %' : '—';
     const KB_QW_TYPES = { manque: 'manque', erreur_produit: 'erreur de produit', inversion_casier: 'inversion de casier', en_trop: 'en trop' };
+    // V11.60 — messages d'encouragement (choisis selon la semaine, jamais de reproche)
+    const KB_QW_BRAVO = [
+      'Merci pour ton énergie cette semaine, ça se voit dans chaque casier.',
+      'Grâce à toi, des centaines de clients ont eu leurs produits frais. Respect !',
+      'Belle semaine ! L\'équipe peut compter sur toi.',
+      'Chaque ligne préparée, c\'est un client content. Et tu en as fait beaucoup !',
+      'Ton travail fait tourner Kelbongoo. Merci !',
+      'Tu peux être fier·e de ta semaine. On l\'est !',
+    ];
+    const kbQwNum = (n) => Number(n || 0).toLocaleString('fr-FR', { maximumFractionDigits: 0 });
     function KbQualWeekPopup({ session }) {
       const [st, setSt] = React.useState(null);
       const [ini, setIni] = React.useState('');
       const [busy, setBusy] = React.useState(false);
+      const [showQ, setShowQ] = React.useState(false);
       const name = session && session.name;
       const w1 = addDays(kbMondayOf(todayKey()), -7), w2 = addDays(w1, -7);
       const lsKey = 'kb_qw_ack_' + w1 + '_' + normalizeText(name || '');
@@ -37414,16 +37676,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         (async () => {
           const [d1, d2, ack] = await Promise.all(['qual_week_' + w1, 'qual_week_' + w2, 'qual_ack_' + w1].map(id => storage.getDoc('app_config', id).catch(() => null)));
           if (!alive || !d1) return;
-          const me = kbQwFind(d1.people, name); if (!me || !(me[1].lines > 0)) return;
+          const me = kbQwFind(d1.people, name); if (!me || !(me[1].lines > 0 || me[1].ms > 0)) return;
           if (ack && ack.users && kbQwFind(ack.users, me[0])) { try { localStorage.setItem(lsKey, '1'); } catch (_) {} return; }
-          setSt({ d1, d2, key: me[0], p1: me[1], p2: d2 ? (kbQwFind(d2.people, name) || [])[1] : null });
+          setSt({ d1, d2, key: me[0], p1: me[1], p2: d2 ? (kbQwFind(d2.people, name) || [])[1] : null, msg: KB_QW_BRAVO[Math.floor(Math.random() * KB_QW_BRAVO.length)] });
+          try { if (typeof kbCelebrate === 'function') kbCelebrate({ title: `Bravo ${String(name).trim().split(/\s+/)[0]} !`, sub: 'Ta semaine en chiffres t\'attend 👇', duration: 4500 }); } catch (_) {}
         })();
         return () => { alive = false; };
       }, [name, session && session.role, session && session._masterView, w1]);
       if (!st) return null;
-      const { d1, d2, p1, p2 } = st, T = d1.team || {};
-      const e1 = (p1.errD || 0) + (p1.errS || 0), r1 = p1.lines ? 100 * e1 / p1.lines : 0, rT = T.lines ? 100 * ((T.errD || 0) + (T.errS || 0)) / T.lines : 0;
-      const good = r1 <= rT, col = e1 === 0 ? '#2e7d32' : good ? '#2e7d32' : '#c62828';
+      const { d1, d2, p1, p2 } = st, T = d1.team || {}, rec = p1.rec || {}, pv = p1.prev || null;
+      const e1 = (p1.errD || 0) + (p1.errS || 0);
       const ok = ini.trim().length >= 2;
       const valider = async () => {
         setBusy(true);
@@ -37431,30 +37693,53 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         try { localStorage.setItem(lsKey, '1'); } catch (_) {}
         setBusy(false); setSt(null);
       };
-      const errLine = (x, i) => <div key={i} style={{ fontSize: 14, padding: '4px 0', borderTop: '1px solid var(--line)', textAlign: 'left' }}>
-        <b>{formatDateShort(x.d)}</b> · {x.site} · {x.prod || '—'} — <span style={{ color: '#c62828', fontWeight: 700 }}>{KB_QW_TYPES[x.type] || x.type}</span>{x.src === 'sav' ? ' · 📧 SAV' : ''}</div>;
+      // tuiles : uniquement ce qu'elle / il a fait (rien à 0)
+      const tiles = [
+        p1.lines > 0 && { ic: '🥬', v: kbQwNum(p1.lines), l: 'lignes préparées', c: '#2e7d32', r: rec.lines },
+        p1.ms > 0 && { ic: '⚖️', v: kbQwNum(p1.ms), l: 'sachets de MU', c: '#1565c0', r: rec.ms },
+        p1.prate && { ic: '⚡', v: kbQwNum(p1.prate), l: 'lignes / heure', c: '#ef6c00', r: rec.prate },
+        p1.mrate && { ic: '🚀', v: kbQwNum(p1.mrate), l: 'sachets / heure', c: '#6a1b9a', r: rec.mrate },
+        p1.days > 0 && { ic: '📅', v: p1.days, l: p1.days > 1 ? 'jours' : 'jour', c: '#00838f' },
+      ].filter(Boolean);
+      // badges : seulement du positif (records perso, progrès vs SA semaine d'avant, zéro erreur)
+      const up = (a, b) => a && b && a > b * 1.05 ? Math.round(100 * (a - b) / b) : 0;
+      const badges = [];
+      if (rec.prate) badges.push('🏆 Record perso de vitesse en prépa !');
+      if (rec.mrate) badges.push('🏆 Record perso de vitesse en MU !');
+      if (rec.lines || rec.ms) badges.push('🔥 Ta plus grosse semaine !');
+      if (!rec.prate && pv && up(p1.prate, pv.prate)) badges.push(`💪 +${up(p1.prate, pv.prate)} % de lignes/h par rapport à ta semaine d'avant`);
+      if (!rec.mrate && pv && up(p1.mrate, pv.mrate)) badges.push(`💪 +${up(p1.mrate, pv.mrate)} % de sachets/h par rapport à ta semaine d'avant`);
+      if (p1.lines > 0 && e1 === 0) badges.push('✨ Zéro erreur de prépa : impeccable !');
       const sav2 = p2 ? (p2.errS || 0) : 0;
+      const errLine = (x, i) => <div key={i} style={{ fontSize: 14, padding: '4px 0', borderTop: '1px solid var(--line)', textAlign: 'left' }}>
+        <b>{formatDateShort(x.d)}</b> · {x.site} · {x.prod || '—'} — <span style={{ fontWeight: 700 }}>{KB_QW_TYPES[x.type] || x.type}</span>{x.src === 'sav' ? ' · 📧 SAV' : ''}</div>;
       return (
         <div className="fs-overlay" style={{ zIndex: 2900 }}>
-          <div className="fs-card fs-block" style={{ borderTop: '8px solid ' + col, maxHeight: '92vh', overflowY: 'auto' }}>
-            <div className="fs-icon">{e1 === 0 ? '🎉' : '🎯'}</div>
-            <h2>Bonjour {String(name).split(' ')[0]} · ta semaine du {kbcPer(d1.from, d1.to)}</h2>
-            <div style={{ fontSize: 46, fontWeight: 900, color: col, lineHeight: 1.1 }}>{kbQwRate(e1, p1.lines)}</div>
-            <div style={{ fontSize: 17, fontWeight: 700 }}>d'erreur · {e1} erreur{e1 > 1 ? 's' : ''} sur {p1.lines.toLocaleString('fr-FR')} lignes préparées</div>
-            <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 4 }}>Équipe : {kbQwRate((T.errD || 0) + (T.errS || 0), T.lines)}{e1 === 0 ? ' · zéro erreur, bravo ! 👏' : good ? ' · tu es en dessous de l\'équipe 👍' : ''}</div>
-            {(p1.errs || []).length > 0 && <div style={{ marginTop: 10 }}>{p1.errs.slice(0, 8).map(errLine)}{p1.errs.length > 8 ? <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>+ {p1.errs.length - 8} autre(s)</div> : null}</div>}
-            <div style={{ fontSize: 12.5, color: 'var(--ink-mute)', marginTop: 8 }}>Le SAV peut encore remonter des erreurs de cette semaine (réclamations par mail) : elles seront ajoutées dans l'ajustement de la semaine prochaine.</div>
-            {d2 && p2 && p2.lines > 0 && <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 12, background: sav2 ? '#fff4e5' : '#e8f5e9', textAlign: 'left' }}>
-              <div style={{ fontSize: 15, fontWeight: 800 }}>🔁 Ajustement SAV · semaine du {kbcPer(d2.from, d2.to)}</div>
-              {sav2 ? <div style={{ fontSize: 15, marginTop: 2 }}>+{sav2} erreur{sav2 > 1 ? 's' : ''} remontée{sav2 > 1 ? 's' : ''} par le SAV → taux réel <b style={{ fontSize: 18 }}>{kbQwRate((p2.errD || 0) + sav2, p2.lines)}</b> (au lieu de {kbQwRate(p2.errD || 0, p2.lines)} vu en distrib)</div>
-                : <div style={{ fontSize: 15, marginTop: 2 }}>Aucune erreur remontée par le SAV : ton taux reste <b>{kbQwRate(p2.errD || 0, p2.lines)}</b> ✅</div>}
-              {sav2 > 0 && (p2.errs || []).filter(x => x.src === 'sav').slice(0, 5).map(errLine)}
+          <div className="fs-card fs-block" style={{ borderTop: '8px solid #2e7d32', maxHeight: '92vh', overflowY: 'auto', background: 'linear-gradient(180deg,#f1f8e9 0,#fff 180px)' }}>
+            <div style={{ fontSize: 54, lineHeight: 1 }}>🎉</div>
+            <h2 style={{ margin: '6px 0 0' }}>Bravo {String(name).trim().split(/\s+/)[0]} !</h2>
+            <div style={{ fontSize: 14, color: 'var(--ink-soft)' }}>Ta semaine du {kbcPer(d1.from, d1.to)}</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(130px,1fr))', gap: 8, marginTop: 12 }}>
+              {tiles.map(t => <div key={t.l} style={{ position: 'relative', borderRadius: 14, padding: '10px 8px', background: t.c, color: '#fff', boxShadow: '0 4px 12px rgba(0,0,0,.15)', animation: 'kbPop .5s ease-out' }}>
+                {t.r && <div style={{ position: 'absolute', top: -8, right: -6, background: '#ffd740', color: '#5d4037', borderRadius: 10, padding: '1px 7px', fontSize: 11, fontWeight: 900 }}>🏆 record</div>}
+                <div style={{ fontSize: 22 }}>{t.ic}</div><div style={{ fontSize: 30, fontWeight: 900, lineHeight: 1.05 }}>{t.v}</div><div style={{ fontSize: 13, fontWeight: 600, opacity: .95 }}>{t.l}</div></div>)}
+            </div>
+            {badges.length > 0 && <div style={{ marginTop: 12, display: 'grid', gap: 6 }}>{badges.map(b => <div key={b} style={{ background: '#fff8e1', border: '2px solid #ffd740', borderRadius: 12, padding: '8px 10px', fontSize: 15, fontWeight: 800, color: '#5d4037' }}>{b}</div>)}</div>}
+            <div style={{ fontSize: 17, fontWeight: 700, color: '#1b5e20', marginTop: 12, lineHeight: 1.35 }}>{st.msg}</div>
+            {T.n > 1 && <div style={{ fontSize: 14, marginTop: 8, padding: '8px 10px', borderRadius: 12, background: '#e8f5e9' }}>💚 Ensemble, l'équipe ({T.n} personnes) a préparé <b>{kbQwNum(T.lines)}</b> lignes{T.ms ? <> et <b>{kbQwNum(T.ms)}</b> sachets de MU</> : null} cette semaine.</div>}
+            {p1.lines > 0 && <div style={{ marginTop: 12, textAlign: 'left', padding: '8px 10px', borderRadius: 12, border: '1px solid var(--line)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ fontSize: 15, fontWeight: 800 }}>🎯 Qualité : {e1 === 0 ? 'zéro erreur ✨' : `${e1} erreur${e1 > 1 ? 's' : ''} sur ${kbQwNum(p1.lines)} lignes (${kbQwRate(e1, p1.lines)})`}</div>
+                {e1 > 0 && <button className="btn-ghost" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => setShowQ(v => !v)}>{showQ ? 'masquer' : 'voir'}</button>}
+              </div>
+              {showQ && (p1.errs || []).slice(0, 8).map(errLine)}
+              {e1 > 0 && <div style={{ fontSize: 12.5, color: 'var(--ink-mute)', marginTop: 4 }}>Ça arrive à tout le monde : un coup d'œil au détail aide à ne pas les refaire.</div>}
+              {d2 && p2 && p2.lines > 0 && <div style={{ fontSize: 13.5, marginTop: 6 }}>🔁 Semaine du {kbcPer(d2.from, d2.to)} avec le SAV : {sav2 ? <>+{sav2} erreur{sav2 > 1 ? 's' : ''} remontée{sav2 > 1 ? 's' : ''} par les clients → <b>{kbQwRate((p2.errD || 0) + sav2, p2.lines)}</b> (au lieu de {kbQwRate(p2.errD || 0, p2.lines)})</> : <>aucune réclamation client, <b>{kbQwRate(p2.errD || 0, p2.lines)}</b> confirmé ✅</>}</div>}
             </div>}
             <input value={ini} onChange={e => setIni(e.target.value.toUpperCase().slice(0, 5))} placeholder="Tes initiales" style={{ width: '100%', maxWidth: 200, textAlign: 'center', fontSize: 24, fontWeight: 700, letterSpacing: 3, padding: 12, borderRadius: 12, border: '2px solid var(--border)', marginTop: 14 }} />
             <div className="fs-actions" style={{ marginTop: 12 }}>
-              <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={valider} style={{ opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : ok ? `✓ J'ai vu — ${ini.trim()}` : 'Initiales pour valider'}</button>
+              <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={valider} style={{ opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : ok ? `💚 Merci ! — ${ini.trim()}` : 'Tes initiales pour fermer'}</button>
             </div>
-            <div style={{ fontSize: 11.5, color: 'var(--ink-mute)', marginTop: 6 }}>Pour info seulement. Erreur de prépa = manque, erreur de produit, inversion de casier, en trop (pas les oublis dans le casier ni le poids).</div>
           </div>
         </div>
       );

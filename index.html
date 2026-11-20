@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.58) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.61) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.58';
+const APP_VERSION = 'V11.61';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -7494,6 +7494,8 @@ function ClientsPage({
   dispatch,
   lastminute
 }) {
+  const swapsAll = useKbSwaps(currentSite);
+  const swaps = React.useMemo(() => swapsAll.filter(x => x.day === activeDay()), [swapsAll]);
   const wIdx = useKbWeightIdx();
   const [statuses, setStatuses] = React.useState([]);
   const [refunds, setRefunds] = React.useState([]);
@@ -8065,7 +8067,10 @@ function ClientsPage({
         background: 'var(--bg-muted)',
         color: 'var(--ink-mute)'
       }
-    }, "hors master")), (pains.length > 0 || ndItems.length > 0) && React.createElement("div", {
+    }, "hors master")), React.createElement(KbSwapBanners, {
+      swaps: swaps,
+      o: o
+    }), (pains.length > 0 || ndItems.length > 0) && React.createElement("div", {
       style: {
         marginTop: 8,
         border: '3px solid var(--accent-dark)',
@@ -10361,6 +10366,675 @@ function DispatchModal({
     className: "badge badge-info"
   }, "total ", p.total) : null))))))));
 }
+const kbSwapWord = site => site === 'DOM' ? 'carton' : (BOUTIQUES || []).includes(site) ? 'casier' : 'cagette';
+const kbFirstName = n => {
+  const p = String(n || '').trim().split(/\s+/);
+  const i = p.findIndex(x => x !== x.toUpperCase());
+  return i >= 0 ? p.slice(i).join(' ') : p.join(' ');
+};
+const kbIsSwap = f => f && f.kind === 'swap';
+const KB_SWAP_ST = {
+  open: {
+    l: 'À régler',
+    c: '#c62828'
+  },
+  called: {
+    l: 'Prévenu, il revient',
+    c: '#ef6c00'
+  },
+  mailed: {
+    l: 'Mail envoyé',
+    c: '#ef6c00'
+  },
+  returned: {
+    l: 'Produits rendus ✓',
+    c: '#2e7d32'
+  },
+  not_returned: {
+    l: 'Pas revenu',
+    c: '#6a1b9a'
+  },
+  done: {
+    l: 'Réglé',
+    c: '#2e7d32'
+  }
+};
+function kbSwapMailBody(s) {
+  const w = kbSwapWord(s.site),
+    lieu = siteLabel(s.site);
+  return `Bonjour ${kbFirstName(s.takerName)},\n\n` + `Lors de votre passage au point Kelbongoo ${lieu}, vous êtes reparti(e) avec le ${w} n° ${s.takenCasier} au lieu du vôtre${s.takerCasiers && s.takerCasiers.length ? `, le n° ${s.takerCasiers.join(' / ')}` : ''}. Pas d'inquiétude, ça arrive !\n\n` + `Le ${w} n° ${s.takenCasier} contient la commande d'un autre client, qui l'attend. Votre commande à vous est toujours là${s.takerCasiers && s.takerCasiers.length ? `, ${w} n° ${s.takerCasiers.join(' / ')}` : ''}.\n\n` + `Pourriez-vous repasser au point ${lieu} dès que possible, idéalement aujourd'hui pendant la distribution, avec les produits du ${w} n° ${s.takenCasier} ? Nous vous remettrons votre commande en échange.\n\n` + `Si ce n'est pas possible, répondez simplement à ce mail : nous trouverons une solution ensemble.\n\n` + `Merci beaucoup et à très vite,\nL'équipe Kelbongoo`;
+}
+function kbSwapCallText(s) {
+  const w = kbSwapWord(s.site);
+  return `« Bonjour, c'est Kelbongoo, point ${siteLabel(s.site)}. En récupérant votre commande, vous avez pris par erreur le ${w} n° ${s.takenCasier}, qui est celui d'un autre client. Votre commande à vous est toujours là${s.takerCasiers && s.takerCasiers.length ? `, ${w} n° ${s.takerCasiers.join(' / ')}` : ''}. Pourriez-vous repasser aujourd'hui avec les produits du ${s.takenCasier} ? On vous donne votre commande en échange. Merci beaucoup ! »`;
+}
+async function kbSendSwapMail(s) {
+  if (!s || !s.takerEmail) return {
+    ok: false,
+    error: "pas d'email client"
+  };
+  if (!FRESHDESK_PROXY_URL || FRESHDESK_PROXY_URL.includes('TON_')) return {
+    ok: false,
+    error: 'proxy Freshdesk non configuré'
+  };
+  const subject = `Kelbongoo · petite erreur de ${kbSwapWord(s.site)} à ${siteLabel(s.site)}`;
+  try {
+    const data = await freshdeskPost({
+      secret: FRESHDESK_SECRET,
+      clients: [{
+        email: s.takerEmail,
+        name: s.takerName || '',
+        site: s.site,
+        siteName: siteLabel(s.site),
+        subject,
+        body: kbSwapMailBody(s)
+      }]
+    });
+    if (data && data.ok && data.success > 0) {
+      try {
+        await storage.setDoc('client_mail_history', `${s.takerEmail}_${Date.now()}`, {
+          clientEmail: s.takerEmail,
+          clientName: s.takerName || '',
+          type: 'casier_trompe',
+          subject,
+          sentAt: new Date().toISOString(),
+          sentBy: 'casier-trompe',
+          site: s.site
+        });
+      } catch (e) {}
+      return {
+        ok: true
+      };
+    }
+    return {
+      ok: false,
+      error: data && (data.error || data.results && data.results[0] && data.results[0].error) || 'inconnue'
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.message
+    };
+  }
+}
+async function kbSwapPatch(s, patch, session) {
+  const n = {
+    ...s,
+    ...patch,
+    updatedBy: session && session.name || '',
+    updatedAt: new Date().toISOString()
+  };
+  await storage.setDoc('forgotten_items', s.id, n);
+  return n;
+}
+function KbSwapCall({
+  s,
+  session,
+  onClose
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [busy, setBusy] = React.useState(false);
+  const joint = async () => {
+    setBusy(true);
+    await kbSwapPatch(s, {
+      status: 'called',
+      calledAt: new Date().toISOString(),
+      calledBy: session.name
+    }, session);
+    showToast('✓ Noté : il repasse');
+    setBusy(false);
+    onClose();
+  };
+  const noAnswer = async () => {
+    setBusy(true);
+    const r = await kbSendSwapMail(s);
+    await kbSwapPatch(s, r.ok ? {
+      status: 'mailed',
+      noAnswerAt: new Date().toISOString(),
+      mailSentAt: new Date().toISOString(),
+      mailSentBy: session.name
+    } : {
+      noAnswerAt: new Date().toISOString()
+    }, session);
+    showToast(r.ok ? '✉️ Pas de réponse → mail envoyé au client' : '⚠️ Mail non envoyé (' + r.error + ') — rappeler plus tard');
+    setBusy(false);
+    onClose();
+  };
+  return React.createElement("div", {
+    className: "fs-overlay",
+    style: {
+      zIndex: 3000
+    }
+  }, React.createElement("div", {
+    className: "fs-card fs-block",
+    style: {
+      borderTop: '8px solid #ef6c00',
+      maxHeight: '92vh',
+      overflowY: 'auto'
+    }
+  }, React.createElement("div", {
+    className: "fs-icon"
+  }, "\uD83D\uDCDE"), React.createElement("h2", null, "Appelle ", kbFirstName(s.takerName), " maintenant"), React.createElement("a", {
+    href: `tel:${s.takerTel}`,
+    style: {
+      display: 'block',
+      fontSize: 34,
+      fontWeight: 900,
+      color: 'var(--accent-dark)',
+      margin: '6px 0 10px'
+    }
+  }, s.takerTel), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      color: 'var(--ink-mute)',
+      textAlign: 'left'
+    }
+  }, "Ce que tu peux dire :"), React.createElement("div", {
+    style: {
+      fontSize: 16,
+      lineHeight: 1.45,
+      textAlign: 'left',
+      background: '#fff8e1',
+      borderRadius: 12,
+      padding: '10px 12px',
+      marginTop: 4
+    }
+  }, kbSwapCallText(s)), React.createElement("div", {
+    className: "fs-actions",
+    style: {
+      marginTop: 14,
+      flexDirection: 'column',
+      gap: 8
+    }
+  }, React.createElement("button", {
+    className: "btn-primary btn-lg",
+    disabled: busy,
+    onClick: joint
+  }, "\u2705 Joint \u2014 il repasse"), React.createElement("button", {
+    className: "btn-secondary btn-lg",
+    disabled: busy,
+    onClick: noAnswer
+  }, "\uD83D\uDCF5 Pas de r\xE9ponse \u2192 ", s.takerEmail ? 'envoyer le mail' : 'noter (pas d\'email)'), React.createElement("button", {
+    className: "btn-ghost",
+    disabled: busy,
+    onClick: onClose
+  }, "Plus tard (reste dans Suivi \u203A Casiers tromp\xE9s)"))));
+}
+function KbSwapForm({
+  orders,
+  session,
+  currentSite,
+  onClose
+}) {
+  const showToast = React.useContext(ToastContext);
+  const w = kbSwapWord(currentSite);
+  const [q, setQ] = React.useState('');
+  const [taker, setTaker] = React.useState(null);
+  const [cas, setCas] = React.useState('');
+  const [remark, setRemark] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [call, setCall] = React.useState(null);
+  const sit = (orders || []).filter(o => o.site === currentSite);
+  const res = React.useMemo(() => {
+    const s = normalizeText(q);
+    if (!s) return [];
+    return sit.filter(o => normalizeText(displayName(o)).includes(s) || kbCasiersShown(o).includes(q.trim())).slice(0, 8);
+  }, [q, sit.length]);
+  const owner = React.useMemo(() => {
+    const c = String(cas).trim();
+    if (!c) return null;
+    return sit.find(o => o !== taker && kbCasiersShown(o).includes(c)) || null;
+  }, [cas, taker, sit.length]);
+  const ownCas = taker ? kbCasiersShown(taker) : [];
+  const sameCas = taker && ownCas.includes(String(cas).trim());
+  const ok = taker && String(cas).trim() && !sameCas;
+  const save = async () => {
+    setBusy(true);
+    try {
+      const st = await storage.getAll(`day_${activeDay()}_statuses`).catch(() => []);
+      const passed = id => (st || []).some(x => String(x.orderId || x.id) === String(id) && x.passed === true);
+      const id = 'swap_' + Date.now();
+      const s = {
+        id,
+        kind: 'swap',
+        site: currentSite,
+        day: activeDay(),
+        takerOrderId: taker.orderId,
+        takerName: displayName(taker),
+        takerEmail: taker.email || '',
+        takerTel: String(taker.telephone || taker.tel || '').replace(/\s+/g, ''),
+        takerCasiers: ownCas,
+        takenCasier: String(cas).trim(),
+        victimOrderId: owner ? owner.orderId : '',
+        victimName: owner ? displayName(owner) : '',
+        victimEmail: owner ? owner.email || '' : '',
+        victimPassedBefore: owner ? passed(owner.orderId) : false,
+        remark,
+        status: 'open',
+        createdBy: session.name,
+        createdAt: new Date().toISOString()
+      };
+      await storage.setDoc('forgotten_items', id, s);
+      const hasTel = s.takerTel.replace(/\D/g, '').length >= 9;
+      if (hasTel) {
+        setCall(s);
+        setBusy(false);
+        return;
+      }
+      const r = await kbSendSwapMail(s);
+      if (r.ok) await kbSwapPatch(s, {
+        status: 'mailed',
+        mailSentAt: new Date().toISOString(),
+        mailSentBy: session.name
+      }, session);
+      showToast(r.ok ? `✉️ Pas de téléphone : mail envoyé à ${kbFirstName(s.takerName)}` : `⚠️ Pas de téléphone et mail non envoyé (${r.error}) — voir Suivi`);
+      onClose();
+    } catch (e) {
+      showToast('Erreur : ' + (e.message || e));
+      setBusy(false);
+    }
+  };
+  if (call) return React.createElement(KbSwapCall, {
+    s: call,
+    session: session,
+    onClose: onClose
+  });
+  const big = {
+    width: '100%',
+    fontSize: 20,
+    padding: 12,
+    borderRadius: 12,
+    border: '2px solid var(--border)'
+  };
+  return React.createElement("div", {
+    className: "fs-overlay",
+    style: {
+      zIndex: 2950
+    }
+  }, React.createElement("div", {
+    className: "fs-card",
+    style: {
+      maxHeight: '92vh',
+      overflowY: 'auto',
+      textAlign: 'left'
+    }
+  }, React.createElement("h2", {
+    style: {
+      textAlign: 'center'
+    }
+  }, "\uD83D\uDD00 ", w === 'casier' ? 'Casier' : w === 'cagette' ? 'Cagette' : 'Carton', " tromp\xE9"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)',
+      textAlign: 'center'
+    }
+  }, "Un client est reparti avec le ", w, " d'un autre client."), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      marginTop: 14
+    }
+  }, "1. Qui s'est tromp\xE9 ?"), taker ? React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      background: 'var(--accent-soft)',
+      borderRadius: 12,
+      padding: '10px 12px',
+      marginTop: 6
+    }
+  }, React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 800
+    }
+  }, displayName(taker)), React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, "son ", w, " : ", React.createElement("b", {
+    style: {
+      fontSize: 18
+    }
+  }, ownCas.join(' / ') || '—'), taker.telephone || taker.tel ? ' · 📞' : ' · pas de téléphone')), React.createElement("button", {
+    className: "btn-ghost",
+    onClick: () => {
+      setTaker(null);
+      setQ('');
+    }
+  }, "Changer")) : React.createElement(React.Fragment, null, React.createElement("input", {
+    style: big,
+    value: q,
+    onChange: e => setQ(e.target.value),
+    placeholder: `Nom ou n° de ${w}`,
+    autoFocus: true
+  }), res.map(o => React.createElement("button", {
+    key: o.orderId,
+    className: "btn-secondary",
+    style: {
+      display: 'block',
+      width: '100%',
+      textAlign: 'left',
+      marginTop: 6,
+      fontSize: 16
+    },
+    onClick: () => setTaker(o)
+  }, displayName(o), " ", React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "\xB7 ", w, " ", kbCasiersShown(o).join(' / ') || '—')))), taker && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      marginTop: 14
+    }
+  }, "2. Quel ", w, " a-t-il pris ?"), React.createElement("input", {
+    style: {
+      ...big,
+      fontSize: 30,
+      fontWeight: 900,
+      textAlign: 'center',
+      maxWidth: 180,
+      display: 'block',
+      margin: '6px auto 0'
+    },
+    inputMode: "numeric",
+    value: cas,
+    onChange: e => setCas(e.target.value.replace(/[^\dA-Za-z-]/g, '').slice(0, 6)),
+    placeholder: "n\xB0"
+  }), sameCas && React.createElement("div", {
+    style: {
+      color: 'var(--danger)',
+      fontWeight: 700,
+      textAlign: 'center'
+    }
+  }, "C'est son propre ", w, "."), String(cas).trim() && !sameCas && React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      fontSize: 15,
+      marginTop: 6
+    }
+  }, owner ? React.createElement(React.Fragment, null, "= le ", w, " de ", React.createElement("b", null, displayName(owner))) : React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "propri\xE9taire non trouv\xE9 (pas de commande avec ce n\xB0 aujourd'hui)")), React.createElement("input", {
+    style: {
+      ...big,
+      fontSize: 15,
+      marginTop: 12
+    },
+    value: remark,
+    onChange: e => setRemark(e.target.value),
+    placeholder: "Remarque (facultatif)"
+  }), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      marginTop: 10
+    }
+  }, String(taker.telephone || taker.tel || '').replace(/\D/g, '').length >= 9 ? '📞 Il a un téléphone : tu vas l\'appeler (texte à dire fourni).' : taker.email ? '✉️ Pas de téléphone : un mail lui part tout de suite.' : '⚠️ Ni téléphone ni email : à régler dans Suivi.')), React.createElement("div", {
+    className: "fs-actions",
+    style: {
+      marginTop: 14
+    }
+  }, React.createElement("button", {
+    className: "btn-primary btn-lg",
+    disabled: !ok || busy,
+    onClick: save
+  }, busy ? '⏳…' : '✓ Valider'), React.createElement("button", {
+    className: "btn-ghost",
+    onClick: onClose
+  }, "Annuler"))));
+}
+function KbSwapBanners({
+  swaps,
+  o
+}) {
+  const ids = o._subOrderIds || [o.orderId];
+  const mine = (swaps || []).filter(s => s.status !== 'done' && s.status !== 'returned' && (ids.includes(s.takerOrderId) || ids.includes(s.victimOrderId)));
+  if (!mine.length) return null;
+  return mine.map(s => {
+    const w = kbSwapWord(s.site),
+      taker = ids.includes(s.takerOrderId);
+    return React.createElement("div", {
+      key: s.id + (taker ? 't' : 'v'),
+      style: {
+        marginTop: 8,
+        color: '#fff',
+        fontWeight: 700,
+        fontSize: 15,
+        background: taker ? '#ef6c00' : '#c62828',
+        borderRadius: 8,
+        padding: '8px 10px'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        textTransform: 'uppercase',
+        letterSpacing: '.03em'
+      }
+    }, "\uD83D\uDD00 ", w, " tromp\xE9"), taker ? React.createElement("div", null, "A pris le ", w, " ", React.createElement("b", {
+      style: {
+        fontSize: 20
+      }
+    }, s.takenCasier), s.victimName ? ` (celui de ${s.victimName})` : '', " au lieu du ", React.createElement("b", {
+      style: {
+        fontSize: 20
+      }
+    }, (s.takerCasiers || []).join(' / ') || '?'), ". Quand il revient : reprendre les produits du ", s.takenCasier, ", lui donner les siens.") : React.createElement("div", null, "Son ", w, " ", React.createElement("b", {
+      style: {
+        fontSize: 20
+      }
+    }, s.takenCasier), " a \xE9t\xE9 pris par erreur par ", s.takerName, ". Si ce client arrive avant le retour : s'excuser, expliquer, noter dans Suivi \u203A Casiers tromp\xE9s."));
+  });
+}
+function useKbSwaps(site) {
+  const [all, setAll] = React.useState([]);
+  React.useEffect(() => storage.subscribe('forgotten_items', arr => setAll((arr || []).filter(kbIsSwap))), []);
+  return React.useMemo(() => all.filter(s => !site || s.site === site), [all, site]);
+}
+function SwapSubPage({
+  session,
+  currentSite,
+  swaps
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [filter, setFilter] = React.useState('pending');
+  const [call, setCall] = React.useState(null);
+  const w = kbSwapWord(currentSite);
+  const list = (swaps || []).filter(s => s.site === currentSite && (filter === 'all' || (filter === 'pending' ? !['done', 'returned'].includes(s.status) : ['done', 'returned'].includes(s.status)))).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const set = async (s, patch, msg) => {
+    await kbSwapPatch(s, patch, session);
+    showToast(msg);
+  };
+  const mail = async s => {
+    const r = await kbSendSwapMail(s);
+    if (r.ok) await kbSwapPatch(s, {
+      status: s.status === 'open' ? 'mailed' : s.status,
+      mailSentAt: new Date().toISOString(),
+      mailSentBy: session.name
+    }, session);
+    showToast(r.ok ? '✉️ Mail envoyé' : '⚠️ ' + r.error);
+  };
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", null, w === 'casier' ? 'Casiers' : 'Cagettes', " tromp\xE9s \xB7 ", currentSite), React.createElement("p", {
+    style: {
+      color: 'var(--ink-soft)',
+      fontSize: 13,
+      marginTop: -8
+    }
+  }, "Un client est reparti avec le ", w, " d'un autre. On le pr\xE9vient (appel, sinon mail), il rapporte les produits et r\xE9cup\xE8re les siens. Si l'autre client n'a pas eu sa commande : avoir."), React.createElement("div", {
+    className: "filter-row"
+  }, [['pending', 'En cours'], ['history', 'Réglés'], ['all', 'Tous']].map(([k, l]) => React.createElement("div", {
+    key: k,
+    className: `chip ${filter === k ? 'selected' : ''}`,
+    onClick: () => setFilter(k)
+  }, l))), !list.length ? React.createElement("div", {
+    className: "empty-state"
+  }, React.createElement("div", {
+    className: "icon"
+  }, "\uD83D\uDD00"), React.createElement("p", null, "Aucun ", w, " tromp\xE9 ", filter === 'pending' ? 'en cours' : '', ".")) : list.map(s => {
+    const st = KB_SWAP_ST[s.status] || KB_SWAP_ST.open;
+    return React.createElement("div", {
+      key: s.id,
+      className: "list-item",
+      style: {
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        borderLeft: '5px solid ' + st.c
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        gap: 8
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: 'var(--ink-mute)'
+      }
+    }, formatDateShort(s.day), " \xB7 signal\xE9 par ", s.createdBy), React.createElement("span", {
+      className: "badge",
+      style: {
+        background: st.c,
+        color: '#fff'
+      }
+    }, st.l)), React.createElement("div", {
+      style: {
+        fontSize: 16,
+        marginTop: 4
+      }
+    }, React.createElement("b", null, s.takerName), " a pris le ", w, " ", React.createElement("b", {
+      style: {
+        fontSize: 20
+      }
+    }, s.takenCasier), " au lieu du ", React.createElement("b", {
+      style: {
+        fontSize: 20
+      }
+    }, (s.takerCasiers || []).join(' / ') || '?')), s.victimName && React.createElement("div", {
+      style: {
+        fontSize: 14
+      }
+    }, w, " de ", React.createElement("b", null, s.victimName), s.victimPassedBefore ? ' (déjà passé avant ?)' : '', s.victimInformed ? ' · prévenu(e) ✓' : '', s.avoirVictim ? ' · 💰 avoir fait' : ''), React.createElement("div", {
+      className: "list-item-sub",
+      style: {
+        marginTop: 4
+      }
+    }, s.takerTel ? React.createElement("a", {
+      href: `tel:${s.takerTel}`,
+      style: {
+        color: 'var(--accent-dark)',
+        fontWeight: 700
+      }
+    }, "\uD83D\uDCDE ", s.takerTel) : React.createElement("span", null, "\uD83D\uDCDE \u2014"), s.takerEmail && React.createElement("span", {
+      style: {
+        marginLeft: 8
+      }
+    }, "\u2709\uFE0F ", s.takerEmail)), s.calledAt && React.createElement("div", {
+      className: "list-item-sub",
+      style: {
+        color: '#2e7d32',
+        fontWeight: 600
+      }
+    }, "\uD83D\uDCDE Joint le ", new Date(s.calledAt).toLocaleString('fr-FR'), " par ", s.calledBy), s.noAnswerAt && React.createElement("div", {
+      className: "list-item-sub"
+    }, "\uD83D\uDCF5 Pas de r\xE9ponse le ", new Date(s.noAnswerAt).toLocaleString('fr-FR')), s.mailSentAt && React.createElement("div", {
+      className: "list-item-sub",
+      style: {
+        color: '#2e7d32',
+        fontWeight: 600
+      }
+    }, "\u2709\uFE0F Mail envoy\xE9 le ", new Date(s.mailSentAt).toLocaleString('fr-FR')), s.remark && React.createElement("div", {
+      style: {
+        fontSize: 12,
+        fontStyle: 'italic',
+        color: 'var(--ink-soft)'
+      }
+    }, "\xAB ", s.remark, " \xBB"), !['done', 'returned'].includes(s.status) && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        marginTop: 8,
+        flexWrap: 'wrap'
+      }
+    }, s.takerTel && React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => setCall(s)
+    }, "\uD83D\uDCDE Appeler"), s.takerEmail && React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => mail(s)
+    }, "\u2709\uFE0F ", s.mailSentAt ? 'Renvoyer le mail' : 'Envoyer le mail'), React.createElement("button", {
+      className: "btn-primary",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => set(s, {
+        status: 'returned',
+        returnedAt: new Date().toISOString()
+      }, '✓ Produits rendus, échange fait')
+    }, "\u2705 Revenu, \xE9change fait"), s.victimName && !s.victimInformed && React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => set(s, {
+        victimInformed: true
+      }, '✓ ' + s.victimName + ' prévenu(e)')
+    }, "\uD83D\uDE4B ", kbFirstName(s.victimName), " pr\xE9venu(e)"), s.status !== 'not_returned' && React.createElement("button", {
+      className: "btn-ghost",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => set(s, {
+        status: 'not_returned'
+      }, 'Noté : pas revenu')
+    }, "Pas revenu"), session.isMaster && React.createElement("button", {
+      className: s.avoirVictim ? 'btn-primary' : 'btn-secondary',
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => set(s, {
+        avoirVictim: !s.avoirVictim
+      }, s.avoirVictim ? 'Avoir retiré' : '💰 Avoir noté')
+    }, "\uD83D\uDCB0 Avoir ", s.victimName ? kbFirstName(s.victimName) : ''), session.isMaster && React.createElement("button", {
+      className: "btn-ghost",
+      style: {
+        padding: '6px 10px',
+        fontSize: 13
+      },
+      onClick: () => set(s, {
+        status: 'done'
+      }, '✓ Réglé')
+    }, "\u2713 R\xE9gl\xE9")));
+  }), call && React.createElement(KbSwapCall, {
+    s: call,
+    session: session,
+    onClose: () => setCall(null)
+  }));
+}
 function QualityPage({
   session,
   currentSite,
@@ -10369,6 +11043,7 @@ function QualityPage({
   isClosed,
   consumersByEmail
 }) {
+  const [showSwap, setShowSwap] = React.useState(false);
   const [anomalies, setAnomalies] = React.useState([]);
   const [refunds, setRefunds] = React.useState([]);
   const [showForm, setShowForm] = React.useState(false);
@@ -10440,13 +11115,26 @@ function QualityPage({
       justifyContent: 'space-between',
       alignItems: 'center'
     }
-  }, React.createElement("h1", null, "Qualit\xE9 \xB7 ", currentSite), React.createElement("button", {
+  }, React.createElement("h1", null, "Qualit\xE9 \xB7 ", currentSite), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setShowSwap(true)
+  }, "\uD83D\uDD00 ", kbSwapWord(currentSite) === 'cagette' ? 'Cagette' : 'Casier', " tromp\xE9"), React.createElement("button", {
     className: "btn-primary",
     onClick: () => {
       setEditing(null);
       setShowForm(true);
     }
-  }, "+ Nouvelle")), isClosed && React.createElement("div", {
+  }, "+ Nouvelle"))), showSwap && React.createElement(KbSwapForm, {
+    orders: orders,
+    session: session,
+    currentSite: currentSite,
+    onClose: () => setShowSwap(false)
+  }), isClosed && React.createElement("div", {
     className: "alert-info"
   }, "\uD83D\uDD12 Journ\xE9e cl\xF4tur\xE9e"), React.createElement(KbRollsReturnCard, {
     session: session,
@@ -10857,9 +11545,11 @@ function FollowUpPage({
   const [subTab, setSubTab] = React.useState('non_recup');
   const [forgottens, setForgottens] = React.useState([]);
   React.useEffect(() => {
-    const unsub = storage.subscribe('forgotten_items', setForgottens);
+    const unsub = storage.subscribe('forgotten_items', arr => setForgottens((arr || []).filter(f => !kbIsSwap(f))));
     return unsub;
   }, []);
+  const swaps = useKbSwaps(currentSite);
+  const swapsOpen = swaps.filter(x => !['done', 'returned'].includes(x.status)).length;
   const forgottensOpen = forgottens.filter(f => f.site === currentSite && f.status !== 'done' && f.status !== 'returned' && f.status !== 'picked_up');
   const alertOublis = forgottensOpen.filter(f => daysSince(f.day || f.createdAt) >= 3).length;
   return React.createElement("div", {
@@ -10882,7 +11572,21 @@ function FollowUpPage({
       padding: '1px 6px',
       fontSize: 10
     }
-  }, alertOublis, "!"))), subTab === 'non_recup' ? React.createElement(NonRecupSubPage, {
+  }, alertOublis, "!")), React.createElement("div", {
+    className: `chip ${subTab === 'swaps' ? 'selected' : ''}`,
+    onClick: () => setSubTab('swaps')
+  }, "\uD83D\uDD00 ", kbSwapWord(currentSite) === 'cagette' ? 'Cagettes' : 'Casiers', " tromp\xE9s", swapsOpen > 0 && React.createElement("span", {
+    className: "badge badge-anom",
+    style: {
+      marginLeft: 6,
+      padding: '1px 6px',
+      fontSize: 10
+    }
+  }, swapsOpen))), subTab === 'swaps' ? React.createElement(SwapSubPage, {
+    session: session,
+    currentSite: currentSite,
+    swaps: swaps
+  }) : subTab === 'non_recup' ? React.createElement(NonRecupSubPage, {
     session: session,
     currentSite: currentSite,
     consumersByEmail: consumersByEmail
@@ -18103,7 +18807,7 @@ function MasterRecapPage({
   React.useEffect(() => {
     const u1 = storage.subscribe('consignes', setConsignes);
     const u2 = storage.subscribe('followups', setFollowups);
-    const u3 = storage.subscribe('forgotten_items', setForgottens);
+    const u3 = storage.subscribe('forgotten_items', arr => setForgottens((arr || []).filter(f => !kbIsSwap(f))));
     const u4 = storage.subscribe('pdp_returns', setPdpReturns);
     return () => {
       u1 && u1();
@@ -25638,6 +26342,7 @@ function MuDuJourPage({
     };
   }, []);
   const theoSat = muWork.tourAdvance ? theo(reel.rows) : satOn && reelSat.ready ? theo(reelSat.rows) : null;
+  const theoDay = !theoSat && reel.ready ? theo(reel.rows) : null;
   const nbDone = plannedItems.filter(muFini).length;
   const allFinished = plannedItems.length > 0 && nbDone === plannedItems.length;
   return React.createElement("div", {
@@ -25848,7 +26553,45 @@ function MuDuJourPage({
     style: {
       color: '#666'
     }
-  }, " \u2014 ", theoSat.stock, " en stock apr\xE8s la MU de jeudi (th\xE9orique)", muWork.tourAdvance ? ` + ${theoSat.fait} faits ici` : '')))), items === null && !busy.list && React.createElement("div", {
+  }, " \u2014 ", theoSat.stock, " en stock apr\xE8s la MU de jeudi (th\xE9orique)", muWork.tourAdvance ? ` + ${theoSat.fait} faits ici` : ''))), theoDay && theoDay.brut > 0 && theoDay.stock > 0 && React.createElement("div", {
+    style: {
+      marginTop: 10,
+      paddingTop: 8,
+      borderTop: '1px dashed #b39ddb'
+    }
+  }, React.createElement("div", {
+    style: {
+      background: '#ede7f6',
+      borderRadius: 99,
+      height: 14,
+      overflow: 'hidden',
+      marginBottom: 5,
+      display: 'flex'
+    }
+  }, React.createElement("div", {
+    style: {
+      height: '100%',
+      background: '#b39ddb',
+      width: Math.round(theoDay.stock / theoDay.brut * 100) + '%'
+    }
+  }), React.createElement("div", {
+    style: {
+      height: '100%',
+      background: '#5e35b1',
+      width: Math.round(theoDay.fait / theoDay.brut * 100) + '%'
+    }
+  })), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: '#4527a0',
+      fontWeight: 700
+    }
+  }, "\uD83D\uDFE3 Avanc\xE9e r\xE9elle ", theoDay.pct, " % : ", theoDay.stock + theoDay.fait, " / ", theoDay.brut, " sachets command\xE9s"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#4527a0'
+    }
+  }, "\uD83D\uDCE6 ", React.createElement("b", null, theoDay.stock), " d\xE9j\xE0 en stock PDP (MU d'avance d'hier, d\xE9j\xE0 d\xE9duite du \xAB \xE0 faire \xBB) + ", React.createElement("b", null, theoDay.fait), " faits aujourd'hui"))), items === null && !busy.list && React.createElement("div", {
     className: "card"
   }, React.createElement("p", {
     style: {
@@ -53551,7 +54294,7 @@ function KbTodayPage({
       ...a,
       [k]: arr || []
     }));
-    const us = [storage.subscribe('consignes', put('consignes')), storage.subscribe('followups', put('followups')), storage.subscribe('forgotten_items', put('oublis')), storage.subscribe('pdp_returns', put('pdp')), storage.subscribe(`day_${todayKey()}_anomalies`, put('anom')), storage.subscribe(`day_${todayKey()}_refunds`, put('refunds'))];
+    const us = [storage.subscribe('consignes', put('consignes')), storage.subscribe('followups', put('followups')), storage.subscribe('forgotten_items', arr => put('oublis')((arr || []).filter(f => !kbIsSwap(f)))), storage.subscribe('pdp_returns', put('pdp')), storage.subscribe(`day_${todayKey()}_anomalies`, put('anom')), storage.subscribe(`day_${todayKey()}_refunds`, put('refunds'))];
     return () => us.forEach(u => {
       try {
         u && u();
@@ -76552,12 +77295,17 @@ const KB_QW_TYPES = {
   inversion_casier: 'inversion de casier',
   en_trop: 'en trop'
 };
+const KB_QW_BRAVO = ['Merci pour ton énergie cette semaine, ça se voit dans chaque casier.', 'Grâce à toi, des centaines de clients ont eu leurs produits frais. Respect !', 'Belle semaine ! L\'équipe peut compter sur toi.', 'Chaque ligne préparée, c\'est un client content. Et tu en as fait beaucoup !', 'Ton travail fait tourner Kelbongoo. Merci !', 'Tu peux être fier·e de ta semaine. On l\'est !'];
+const kbQwNum = n => Number(n || 0).toLocaleString('fr-FR', {
+  maximumFractionDigits: 0
+});
 function KbQualWeekPopup({
   session
 }) {
   const [st, setSt] = React.useState(null);
   const [ini, setIni] = React.useState('');
   const [busy, setBusy] = React.useState(false);
+  const [showQ, setShowQ] = React.useState(false);
   const name = session && session.name;
   const w1 = addDays(kbMondayOf(todayKey()), -7),
     w2 = addDays(w1, -7);
@@ -76578,7 +77326,7 @@ function KbQualWeekPopup({
       const [d1, d2, ack] = await Promise.all(['qual_week_' + w1, 'qual_week_' + w2, 'qual_ack_' + w1].map(id => storage.getDoc('app_config', id).catch(() => null)));
       if (!alive || !d1) return;
       const me = kbQwFind(d1.people, name);
-      if (!me || !(me[1].lines > 0)) return;
+      if (!me || !(me[1].lines > 0 || me[1].ms > 0)) return;
       if (ack && ack.users && kbQwFind(ack.users, me[0])) {
         try {
           localStorage.setItem(lsKey, '1');
@@ -76590,8 +77338,16 @@ function KbQualWeekPopup({
         d2,
         key: me[0],
         p1: me[1],
-        p2: d2 ? (kbQwFind(d2.people, name) || [])[1] : null
+        p2: d2 ? (kbQwFind(d2.people, name) || [])[1] : null,
+        msg: KB_QW_BRAVO[Math.floor(Math.random() * KB_QW_BRAVO.length)]
       });
+      try {
+        if (typeof kbCelebrate === 'function') kbCelebrate({
+          title: `Bravo ${String(name).trim().split(/\s+/)[0]} !`,
+          sub: 'Ta semaine en chiffres t\'attend 👇',
+          duration: 4500
+        });
+      } catch (_) {}
     })();
     return () => {
       alive = false;
@@ -76604,12 +77360,10 @@ function KbQualWeekPopup({
       p1,
       p2
     } = st,
-    T = d1.team || {};
-  const e1 = (p1.errD || 0) + (p1.errS || 0),
-    r1 = p1.lines ? 100 * e1 / p1.lines : 0,
-    rT = T.lines ? 100 * ((T.errD || 0) + (T.errS || 0)) / T.lines : 0;
-  const good = r1 <= rT,
-    col = e1 === 0 ? '#2e7d32' : good ? '#2e7d32' : '#c62828';
+    T = d1.team || {},
+    rec = p1.rec || {},
+    pv = p1.prev || null;
+  const e1 = (p1.errD || 0) + (p1.errS || 0);
   const ok = ini.trim().length >= 2;
   const valider = async () => {
     setBusy(true);
@@ -76629,6 +77383,45 @@ function KbQualWeekPopup({
     setBusy(false);
     setSt(null);
   };
+  const tiles = [p1.lines > 0 && {
+    ic: '🥬',
+    v: kbQwNum(p1.lines),
+    l: 'lignes préparées',
+    c: '#2e7d32',
+    r: rec.lines
+  }, p1.ms > 0 && {
+    ic: '⚖️',
+    v: kbQwNum(p1.ms),
+    l: 'sachets de MU',
+    c: '#1565c0',
+    r: rec.ms
+  }, p1.prate && {
+    ic: '⚡',
+    v: kbQwNum(p1.prate),
+    l: 'lignes / heure',
+    c: '#ef6c00',
+    r: rec.prate
+  }, p1.mrate && {
+    ic: '🚀',
+    v: kbQwNum(p1.mrate),
+    l: 'sachets / heure',
+    c: '#6a1b9a',
+    r: rec.mrate
+  }, p1.days > 0 && {
+    ic: '📅',
+    v: p1.days,
+    l: p1.days > 1 ? 'jours' : 'jour',
+    c: '#00838f'
+  }].filter(Boolean);
+  const up = (a, b) => a && b && a > b * 1.05 ? Math.round(100 * (a - b) / b) : 0;
+  const badges = [];
+  if (rec.prate) badges.push('🏆 Record perso de vitesse en prépa !');
+  if (rec.mrate) badges.push('🏆 Record perso de vitesse en MU !');
+  if (rec.lines || rec.ms) badges.push('🔥 Ta plus grosse semaine !');
+  if (!rec.prate && pv && up(p1.prate, pv.prate)) badges.push(`💪 +${up(p1.prate, pv.prate)} % de lignes/h par rapport à ta semaine d'avant`);
+  if (!rec.mrate && pv && up(p1.mrate, pv.mrate)) badges.push(`💪 +${up(p1.mrate, pv.mrate)} % de sachets/h par rapport à ta semaine d'avant`);
+  if (p1.lines > 0 && e1 === 0) badges.push('✨ Zéro erreur de prépa : impeccable !');
+  const sav2 = p2 ? p2.errS || 0 : 0;
   const errLine = (x, i) => React.createElement("div", {
     key: i,
     style: {
@@ -76639,11 +77432,9 @@ function KbQualWeekPopup({
     }
   }, React.createElement("b", null, formatDateShort(x.d)), " \xB7 ", x.site, " \xB7 ", x.prod || '—', " \u2014 ", React.createElement("span", {
     style: {
-      color: '#c62828',
       fontWeight: 700
     }
   }, KB_QW_TYPES[x.type] || x.type), x.src === 'sav' ? ' · 📧 SAV' : '');
-  const sav2 = p2 ? p2.errS || 0 : 0;
   return React.createElement("div", {
     className: "fs-overlay",
     style: {
@@ -76652,73 +77443,142 @@ function KbQualWeekPopup({
   }, React.createElement("div", {
     className: "fs-card fs-block",
     style: {
-      borderTop: '8px solid ' + col,
+      borderTop: '8px solid #2e7d32',
       maxHeight: '92vh',
-      overflowY: 'auto'
+      overflowY: 'auto',
+      background: 'linear-gradient(180deg,#f1f8e9 0,#fff 180px)'
     }
   }, React.createElement("div", {
-    className: "fs-icon"
-  }, e1 === 0 ? '🎉' : '🎯'), React.createElement("h2", null, "Bonjour ", String(name).split(' ')[0], " \xB7 ta semaine du ", kbcPer(d1.from, d1.to)), React.createElement("div", {
     style: {
-      fontSize: 46,
+      fontSize: 54,
+      lineHeight: 1
+    }
+  }, "\uD83C\uDF89"), React.createElement("h2", {
+    style: {
+      margin: '6px 0 0'
+    }
+  }, "Bravo ", String(name).trim().split(/\s+/)[0], " !"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)'
+    }
+  }, "Ta semaine du ", kbcPer(d1.from, d1.to)), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(130px,1fr))',
+      gap: 8,
+      marginTop: 12
+    }
+  }, tiles.map(t => React.createElement("div", {
+    key: t.l,
+    style: {
+      position: 'relative',
+      borderRadius: 14,
+      padding: '10px 8px',
+      background: t.c,
+      color: '#fff',
+      boxShadow: '0 4px 12px rgba(0,0,0,.15)',
+      animation: 'kbPop .5s ease-out'
+    }
+  }, t.r && React.createElement("div", {
+    style: {
+      position: 'absolute',
+      top: -8,
+      right: -6,
+      background: '#ffd740',
+      color: '#5d4037',
+      borderRadius: 10,
+      padding: '1px 7px',
+      fontSize: 11,
+      fontWeight: 900
+    }
+  }, "\uD83C\uDFC6 record"), React.createElement("div", {
+    style: {
+      fontSize: 22
+    }
+  }, t.ic), React.createElement("div", {
+    style: {
+      fontSize: 30,
       fontWeight: 900,
-      color: col,
-      lineHeight: 1.1
+      lineHeight: 1.05
     }
-  }, kbQwRate(e1, p1.lines)), React.createElement("div", {
-    style: {
-      fontSize: 17,
-      fontWeight: 700
-    }
-  }, "d'erreur \xB7 ", e1, " erreur", e1 > 1 ? 's' : '', " sur ", p1.lines.toLocaleString('fr-FR'), " lignes pr\xE9par\xE9es"), React.createElement("div", {
-    style: {
-      fontSize: 15,
-      color: 'var(--ink-soft)',
-      marginTop: 4
-    }
-  }, "\xC9quipe : ", kbQwRate((T.errD || 0) + (T.errS || 0), T.lines), e1 === 0 ? ' · zéro erreur, bravo ! 👏' : good ? ' · tu es en dessous de l\'équipe 👍' : ''), (p1.errs || []).length > 0 && React.createElement("div", {
-    style: {
-      marginTop: 10
-    }
-  }, p1.errs.slice(0, 8).map(errLine), p1.errs.length > 8 ? React.createElement("div", {
+  }, t.v), React.createElement("div", {
     style: {
       fontSize: 13,
-      color: 'var(--ink-mute)'
+      fontWeight: 600,
+      opacity: .95
     }
-  }, "+ ", p1.errs.length - 8, " autre(s)") : null), React.createElement("div", {
-    style: {
-      fontSize: 12.5,
-      color: 'var(--ink-mute)',
-      marginTop: 8
-    }
-  }, "Le SAV peut encore remonter des erreurs de cette semaine (r\xE9clamations par mail) : elles seront ajout\xE9es dans l'ajustement de la semaine prochaine."), d2 && p2 && p2.lines > 0 && React.createElement("div", {
+  }, t.l)))), badges.length > 0 && React.createElement("div", {
     style: {
       marginTop: 12,
-      padding: '10px 12px',
+      display: 'grid',
+      gap: 6
+    }
+  }, badges.map(b => React.createElement("div", {
+    key: b,
+    style: {
+      background: '#fff8e1',
+      border: '2px solid #ffd740',
       borderRadius: 12,
-      background: sav2 ? '#fff4e5' : '#e8f5e9',
-      textAlign: 'left'
+      padding: '8px 10px',
+      fontSize: 15,
+      fontWeight: 800,
+      color: '#5d4037'
+    }
+  }, b))), React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      color: '#1b5e20',
+      marginTop: 12,
+      lineHeight: 1.35
+    }
+  }, st.msg), T.n > 1 && React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 8,
+      padding: '8px 10px',
+      borderRadius: 12,
+      background: '#e8f5e9'
+    }
+  }, "\uD83D\uDC9A Ensemble, l'\xE9quipe (", T.n, " personnes) a pr\xE9par\xE9 ", React.createElement("b", null, kbQwNum(T.lines)), " lignes", T.ms ? React.createElement(React.Fragment, null, " et ", React.createElement("b", null, kbQwNum(T.ms)), " sachets de MU") : null, " cette semaine."), p1.lines > 0 && React.createElement("div", {
+    style: {
+      marginTop: 12,
+      textAlign: 'left',
+      padding: '8px 10px',
+      borderRadius: 12,
+      border: '1px solid var(--line)'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
     }
   }, React.createElement("div", {
     style: {
       fontSize: 15,
       fontWeight: 800
     }
-  }, "\uD83D\uDD01 Ajustement SAV \xB7 semaine du ", kbcPer(d2.from, d2.to)), sav2 ? React.createElement("div", {
+  }, "\uD83C\uDFAF Qualit\xE9 : ", e1 === 0 ? 'zéro erreur ✨' : `${e1} erreur${e1 > 1 ? 's' : ''} sur ${kbQwNum(p1.lines)} lignes (${kbQwRate(e1, p1.lines)})`), e1 > 0 && React.createElement("button", {
+    className: "btn-ghost",
     style: {
-      fontSize: 15,
-      marginTop: 2
-    }
-  }, "+", sav2, " erreur", sav2 > 1 ? 's' : '', " remont\xE9e", sav2 > 1 ? 's' : '', " par le SAV \u2192 taux r\xE9el ", React.createElement("b", {
+      marginLeft: 'auto',
+      fontSize: 12
+    },
+    onClick: () => setShowQ(v => !v)
+  }, showQ ? 'masquer' : 'voir')), showQ && (p1.errs || []).slice(0, 8).map(errLine), e1 > 0 && React.createElement("div", {
     style: {
-      fontSize: 18
+      fontSize: 12.5,
+      color: 'var(--ink-mute)',
+      marginTop: 4
     }
-  }, kbQwRate((p2.errD || 0) + sav2, p2.lines)), " (au lieu de ", kbQwRate(p2.errD || 0, p2.lines), " vu en distrib)") : React.createElement("div", {
+  }, "\xC7a arrive \xE0 tout le monde : un coup d'\u0153il au d\xE9tail aide \xE0 ne pas les refaire."), d2 && p2 && p2.lines > 0 && React.createElement("div", {
     style: {
-      fontSize: 15,
-      marginTop: 2
+      fontSize: 13.5,
+      marginTop: 6
     }
-  }, "Aucune erreur remont\xE9e par le SAV : ton taux reste ", React.createElement("b", null, kbQwRate(p2.errD || 0, p2.lines)), " \u2705"), sav2 > 0 && (p2.errs || []).filter(x => x.src === 'sav').slice(0, 5).map(errLine)), React.createElement("input", {
+  }, "\uD83D\uDD01 Semaine du ", kbcPer(d2.from, d2.to), " avec le SAV : ", sav2 ? React.createElement(React.Fragment, null, "+", sav2, " erreur", sav2 > 1 ? 's' : '', " remont\xE9e", sav2 > 1 ? 's' : '', " par les clients \u2192 ", React.createElement("b", null, kbQwRate((p2.errD || 0) + sav2, p2.lines)), " (au lieu de ", kbQwRate(p2.errD || 0, p2.lines), ")") : React.createElement(React.Fragment, null, "aucune r\xE9clamation client, ", React.createElement("b", null, kbQwRate(p2.errD || 0, p2.lines)), " confirm\xE9 \u2705"))), React.createElement("input", {
     value: ini,
     onChange: e => setIni(e.target.value.toUpperCase().slice(0, 5)),
     placeholder: "Tes initiales",
@@ -76746,13 +77606,7 @@ function KbQualWeekPopup({
     style: {
       opacity: ok ? 1 : .5
     }
-  }, busy ? '⏳…' : ok ? `✓ J'ai vu — ${ini.trim()}` : 'Initiales pour valider')), React.createElement("div", {
-    style: {
-      fontSize: 11.5,
-      color: 'var(--ink-mute)',
-      marginTop: 6
-    }
-  }, "Pour info seulement. Erreur de pr\xE9pa = manque, erreur de produit, inversion de casier, en trop (pas les oublis dans le casier ni le poids).")));
+  }, busy ? '⏳…' : ok ? `💚 Merci ! — ${ini.trim()}` : 'Tes initiales pour fermer'))));
 }
 function DlcMorningPopup({
   session,
