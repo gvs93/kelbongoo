@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.67) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.68) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.67';
+const APP_VERSION = 'V11.68';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -5756,6 +5756,390 @@ async function kbSendNonRecupMail(f, kind, extra) {
     };
   }
 }
+const KB_CRATE_MAX = 10;
+const kbCrateLabel = (site, no) => `${String(site || '').toUpperCase()} RETOUR PDP n°${String(no).padStart(2, '0')}`;
+const kbCrateNewId = (site, no) => `cr_${String(site || 'X').replace(/[^A-Za-z0-9]/g, '')}_${no}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+const kbRetUnits = r => Math.max(1, Number(r && r.qty) || 1);
+const kbIsCrateRet = r => !!r && r.kind !== 'rolls' && String(r.site || '').toUpperCase() !== 'PDP';
+const kbOrderCrate = f => f ? f.pdpCrate && f.pdpCrate.id ? f.pdpCrate : f.crateId ? {
+  id: f.crateId,
+  no: f.crateNo,
+  label: f.crateLabel
+} : null : null;
+function kbCrateUsedNos(manual, picks, site) {
+  const S = String(site || '').toUpperCase(),
+    used = new Set();
+  (manual || []).forEach(r => {
+    if (r && r.crateId && String(r.site || '').toUpperCase() === S && r.status !== 'treated') used.add(Number(r.crateNo) || 0);
+  });
+  (picks || []).forEach(p => {
+    const c = kbOrderCrate(p);
+    if (c && String(p.site || '').toUpperCase() === S) used.add(Number(c.no) || 0);
+  });
+  used.delete(0);
+  return used;
+}
+function kbCrateNextNo(manual, picks, site) {
+  const u = kbCrateUsedNos(manual, picks, site);
+  return u.size ? Math.max(...u) + 1 : 1;
+}
+function kbCrateGroups(manual, site) {
+  const S = site ? String(site).toUpperCase() : null,
+    g = {};
+  (manual || []).forEach(r => {
+    if (!r || !r.crateId || r.status === 'treated') return;
+    if (S && String(r.site || '').toUpperCase() !== S) return;
+    const c = g[r.crateId] || (g[r.crateId] = {
+      id: r.crateId,
+      no: Number(r.crateNo) || 0,
+      label: r.crateLabel || kbCrateLabel(r.site, r.crateNo),
+      site: r.site,
+      day: r.crateDay || '',
+      items: [],
+      units: 0,
+      closed: false
+    });
+    c.items.push(r);
+    c.units += kbRetUnits(r);
+    if (r.crateClosedAt) c.closed = true;
+    if (r.crateDay && (!c.day || r.crateDay < c.day)) c.day = r.crateDay;
+  });
+  return Object.values(g).map(c => ({
+    ...c,
+    ready: c.closed || c.units >= KB_CRATE_MAX || c.day && c.day < todayKey(),
+    allPending: c.items.every(i => i.status === 'pending' || i.status === 'missing')
+  })).sort((a, b) => a.no - b.no);
+}
+function useKbCrateData() {
+  const [manual, setManual] = React.useState(null);
+  const [picks, setPicks] = React.useState(null);
+  React.useEffect(() => {
+    const u1 = storage.subscribe('pdp_returns', a => setManual(a || []));
+    const u2 = storage.subscribe('pdp_pickups', a => setPicks(a || []));
+    return () => {
+      u1 && u1();
+      u2 && u2();
+    };
+  }, []);
+  return {
+    manual,
+    picks,
+    ready: !!(manual && picks)
+  };
+}
+async function kbCrateClose(crate, by) {
+  const at = new Date().toISOString();
+  for (const r of crate.items) {
+    try {
+      await storage.setDoc('pdp_returns', r.id, {
+        crateClosedAt: at,
+        crateClosedBy: by
+      });
+    } catch (_) {}
+  }
+}
+function KbCrateTag({
+  label,
+  sub,
+  color
+}) {
+  return React.createElement("div", {
+    style: {
+      border: '4px dashed ' + (color || '#e65100'),
+      borderRadius: 14,
+      padding: '10px 12px',
+      background: '#fff8e1',
+      textAlign: 'center',
+      margin: '10px 0'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      color: 'var(--ink-soft)'
+    }
+  }, "\u270D\uFE0F \xC9cris en GROS sur la cagette :"), React.createElement("div", {
+    style: {
+      fontSize: 28,
+      fontWeight: 900,
+      letterSpacing: 1,
+      color: color || '#e65100',
+      lineHeight: 1.15,
+      marginTop: 4
+    }
+  }, label), sub && React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 800,
+      marginTop: 4
+    }
+  }, sub));
+}
+function KbPdpCrateGate({
+  session,
+  site
+}) {
+  const showToast = React.useContext(ToastContext);
+  const D = useKbCrateData();
+  const [busy, setBusy] = React.useState(false);
+  const [newFor, setNewFor] = React.useState(null);
+  const S = String(site || '').toUpperCase();
+  const active = !!(session && !session.isMaster && !session._masterView && session.role === 'distrib' && S && S !== 'PDP');
+  const todo = React.useMemo(() => !active || !D.ready ? [] : D.manual.filter(r => kbIsCrateRet(r) && String(r.site || '').toUpperCase() === S && r.status === 'pending' && !r.crateId).sort((a, b) => String(a.createdAt || a.day || '').localeCompare(String(b.createdAt || b.day || ''))), [active, D.manual, D.ready, S]);
+  const groups = React.useMemo(() => !active || !D.ready ? [] : kbCrateGroups(D.manual, S), [active, D.manual, D.ready, S]);
+  const open = groups.filter(c => !c.ready && c.allPending);
+  if (!active || !D.ready) return null;
+  const who = session.name;
+  const put = async (r, crate) => {
+    setBusy(true);
+    try {
+      const now = new Date().toISOString(),
+        q = kbRetUnits(r);
+      const room = KB_CRATE_MAX - (crate.units || 0);
+      if (q > room && room > 0 && q > KB_CRATE_MAX) {
+        const restId = `${r.id}~${Date.now().toString(36)}`;
+        const {
+          id: _i,
+          crateId: _c,
+          crateNo: _n,
+          crateLabel: _l,
+          ...base
+        } = r;
+        await storage.setDoc('pdp_returns', restId, {
+          ...base,
+          id: restId,
+          qty: q - room,
+          splitFrom: r.id,
+          createdAt: now
+        });
+        await storage.setDoc('pdp_returns', r.id, {
+          qty: room
+        });
+        r = {
+          ...r,
+          qty: room
+        };
+      }
+      const patch = {
+        crateId: crate.id,
+        crateNo: crate.no,
+        crateLabel: crate.label,
+        crateDay: todayKey(),
+        crateBy: who,
+        crateAt: now
+      };
+      await storage.setDoc('pdp_returns', r.id, patch);
+      const units = (crate.units || 0) + kbRetUnits(r);
+      if (units >= KB_CRATE_MAX) {
+        const g = kbCrateGroups([...D.manual.filter(x => x.id !== r.id), {
+          ...r,
+          ...patch
+        }], S).find(c => c.id === crate.id);
+        if (g) await kbCrateClose(g, who + ' (pleine)');
+        kbCelebrate({
+          title: `Cagette n°${String(crate.no).padStart(2, '0')} pleine 👍`,
+          sub: `${KB_CRATE_MAX}/${KB_CRATE_MAX} · fermée, prête pour le chauffeur`
+        });
+      } else showToast(`📦 Dans la cagette n°${String(crate.no).padStart(2, '0')} · ${units}/${KB_CRATE_MAX}`);
+      setNewFor(null);
+    } catch (e) {
+      alert('Erreur : ' + (e && e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const closeCrate = async c => {
+    if (!confirm(`Fermer la cagette ${c.label} (${c.units} article${c.units > 1 ? 's' : ''}) ?\nElle part au chauffeur, plus rien ne pourra y être ajouté.`)) return;
+    setBusy(true);
+    try {
+      await kbCrateClose(c, who);
+      showToast('✅ ' + c.label + ' fermée → chauffeur');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const bar = open.length > 0 && React.createElement("div", {
+    style: {
+      margin: '6px 10px',
+      border: '3px solid #e65100',
+      borderRadius: 14,
+      background: '#fff3e0',
+      padding: '8px 10px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      color: '#bf360c'
+    }
+  }, "\uD83D\uDCE6 Cagette", open.length > 1 ? 's' : '', " Retour PDP ouverte", open.length > 1 ? 's' : ''), open.map(c => React.createElement("div", {
+    key: c.id,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      marginTop: 6,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("span", {
+    style: {
+      flex: 1,
+      minWidth: 160,
+      fontSize: 17,
+      fontWeight: 900
+    }
+  }, c.label, " ", React.createElement("span", {
+    style: {
+      color: c.units >= 8 ? '#c62828' : '#2e7d32'
+    }
+  }, "\xB7 ", c.units, "/", KB_CRATE_MAX)), React.createElement("button", {
+    type: "button",
+    disabled: busy,
+    onClick: () => closeCrate(c),
+    style: {
+      minHeight: 44,
+      padding: '4px 12px',
+      borderRadius: 10,
+      border: '2px solid #2e7d32',
+      background: '#fff',
+      color: '#2e7d32',
+      fontSize: 15,
+      fontWeight: 800
+    }
+  }, "\u2705 Fermer \u2192 chauffeur"))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-soft)',
+      marginTop: 4
+    }
+  }, "Ferm\xE9e toute seule \xE0 ", KB_CRATE_MAX, " articles, et en fin de journ\xE9e."));
+  if (!todo.length) return bar || null;
+  const r = todo[0],
+    q = kbRetUnits(r);
+  const fits = open.filter(c => c.units + q <= KB_CRATE_MAX);
+  const nextNo = kbCrateNextNo(D.manual, D.picks, S);
+  const nw = newFor || null;
+  return React.createElement(React.Fragment, null, bar, React.createElement("div", {
+    className: "fs-overlay"
+  }, React.createElement("div", {
+    className: "fs-card fs-block",
+    style: {
+      borderTop: '8px solid #e65100',
+      maxHeight: '92vh',
+      overflowY: 'auto'
+    }
+  }, React.createElement("div", {
+    className: "fs-icon"
+  }, "\uD83D\uDCE6"), React.createElement("h2", null, "Retour PDP : dans quelle cagette ?"), React.createElement("div", {
+    style: {
+      border: '3px solid var(--line)',
+      borderRadius: 14,
+      padding: '10px 12px',
+      margin: '8px 0',
+      textAlign: 'left'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 23,
+      fontWeight: 900
+    }
+  }, kbProdName(r.produit || r.productLabel || ''), q > 1 ? React.createElement("span", {
+    style: {
+      color: '#c62828'
+    }
+  }, " \xD7", q) : ''), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)'
+    }
+  }, [r.clientName, r.reason || r.anomalyLabel || r.remark, r.dlc ? 'DLC ' + formatDateShort(r.dlc) : ''].filter(Boolean).join(' · '))), !nw && React.createElement(React.Fragment, null, fits.map(c => React.createElement("button", {
+    key: c.id,
+    type: "button",
+    disabled: busy,
+    onClick: () => put(r, c),
+    style: {
+      width: '100%',
+      minHeight: 70,
+      marginTop: 8,
+      borderRadius: 14,
+      border: 'none',
+      background: '#2e7d32',
+      color: '#fff',
+      fontSize: 20,
+      fontWeight: 900,
+      cursor: 'pointer'
+    }
+  }, "\u2713 Mis dans la ", c.label.replace(S + ' RETOUR PDP ', 'cagette '), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700
+    }
+  }, c.units, " \u2192 ", c.units + q, "/", KB_CRATE_MAX, " articles"))), open.length > 0 && !fits.length && React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: '#c62828',
+      marginTop: 8
+    }
+  }, "Pas assez de place dans la cagette ouverte (max ", KB_CRATE_MAX, " articles)."), React.createElement("button", {
+    type: "button",
+    disabled: busy,
+    onClick: () => setNewFor({
+      no: nextNo,
+      label: kbCrateLabel(S, nextNo)
+    }),
+    style: {
+      width: '100%',
+      minHeight: 62,
+      marginTop: 10,
+      borderRadius: 14,
+      border: '3px solid #e65100',
+      background: '#fff',
+      color: '#e65100',
+      fontSize: 19,
+      fontWeight: 900,
+      cursor: 'pointer'
+    }
+  }, "\uD83C\uDD95 Nouvelle cagette n\xB0", String(nextNo).padStart(2, '0'))), nw && React.createElement(React.Fragment, null, React.createElement(KbCrateTag, {
+    label: nw.label
+  }), React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 700
+    }
+  }, "Puis mets le produit dedans."), React.createElement("button", {
+    type: "button",
+    disabled: busy,
+    onClick: () => put(r, {
+      id: kbCrateNewId(S, nw.no),
+      no: nw.no,
+      label: nw.label,
+      units: 0
+    }),
+    style: {
+      width: '100%',
+      minHeight: 66,
+      marginTop: 10,
+      borderRadius: 14,
+      border: 'none',
+      background: '#2e7d32',
+      color: '#fff',
+      fontSize: 20,
+      fontWeight: 900
+    }
+  }, busy ? '⏳…' : '✓ C\'est écrit, le produit est dedans'), React.createElement("button", {
+    type: "button",
+    disabled: busy,
+    onClick: () => setNewFor(null),
+    className: "btn-ghost",
+    style: {
+      marginTop: 6
+    }
+  }, "\u2190 Retour")), todo.length > 1 && React.createElement("div", {
+    className: "fs-count"
+  }, todo.length - 1, " autre(s) produit(s) \xE0 ranger"))));
+}
+const KB_CRATE_MISS_REASONS = ['Introuvable en boutique', 'Déjà donné au client', 'Abîmé / jeté', 'Mis en partage', 'Autre'];
 function KbPdpReadyOverlay({
   followup,
   count,
@@ -5764,24 +6148,52 @@ function KbPdpReadyOverlay({
 }) {
   const f = followup;
   const items = f.items || [];
-  const [st, setSt] = React.useState({});
+  const D = useKbCrateData();
+  const [mode, setMode] = React.useState('ask');
+  const [have, setHave] = React.useState({});
+  const [why, setWhy] = React.useState({});
+  const [whyTxt, setWhyTxt] = React.useState({});
   const [ini, setIni] = React.useState('');
   const [busy, setBusy] = React.useState(false);
-  const done = items.length > 0 && items.every((_, i) => st[i]);
-  const ok = done && ini.trim().length >= 2;
-  const save = async () => {
+  const qOf = it => Math.max(1, Number(it.qty) || 1);
+  const total = items.reduce((t, it) => t + qOf(it), 0);
+  const hv = i => have[i] == null ? qOf(items[i]) : have[i];
+  const S = String(site || f.site || '').toUpperCase();
+  const existing = kbOrderCrate(f);
+  const no = existing ? existing.no : D.ready ? kbCrateNextNo(D.manual, D.picks, S) : null;
+  const label = existing ? existing.label : no ? kbCrateLabel(S, no) : '…';
+  const missIdx = items.map((_, i) => i).filter(i => hv(i) < qOf(items[i]));
+  const reasonsOk = missIdx.every(i => why[i] && (why[i] !== 'Autre' || String(whyTxt[i] || '').trim().length >= 3));
+  const present = items.reduce((t, it, i) => t + hv(i), 0);
+  const ok = !!no && ini.trim().length >= 2 && (mode === 'ask' || reasonsOk);
+  const save = async allThere => {
     setBusy(true);
     try {
       const now = new Date().toISOString(),
         who = `${session.name} (${ini.trim().toUpperCase()})`;
-      const keep = items.filter((_, i) => st[i] === 'ok');
-      const lost = items.filter((_, i) => st[i] === 'ko').map(it => ({
-        id: it.id || '',
-        produit: it.produit,
-        producteur: it.producteur || '',
-        qty: Number(it.qty) || 1,
-        reason: 'Introuvable en boutique (' + who + ')'
-      }));
+      const keep = [],
+        lost = [];
+      items.forEach((it, i) => {
+        const h = allThere ? qOf(it) : hv(i),
+          m = qOf(it) - h;
+        if (h > 0) keep.push({
+          ...it,
+          qty: h
+        });
+        if (m > 0) lost.push({
+          id: it.id || '',
+          produit: it.produit,
+          producteur: it.producteur || '',
+          qty: m,
+          reason: (why[i] === 'Autre' ? 'Autre : ' + String(whyTxt[i] || '').trim() : why[i]) + ' (' + who + ')'
+        });
+      });
+      const crate = existing || {
+        id: kbCrateNewId(S, no),
+        no,
+        label
+      };
+      const nKeep = keep.reduce((t, it) => t + qOf(it), 0);
       const patch = {
         items: keep,
         pdpNotReturned: [...(f.pdpNotReturned || []), ...lost],
@@ -5789,7 +6201,16 @@ function KbPdpReadyOverlay({
         pdpReadyBy: who,
         updatedBy: session.name,
         updatedAt: now,
-        ...(keep.length ? {} : {
+        ...(keep.length ? {
+          pdpCrate: {
+            ...crate,
+            client: f.consumer_name || '',
+            distribDate: f.distribDate || f.day || '',
+            units: nKeep,
+            by: who,
+            at: now
+          }
+        } : {
           forceReturnPdp: false,
           status: 'resolved',
           resolvedBy: who,
@@ -5806,15 +6227,15 @@ function KbPdpReadyOverlay({
           await stockPost({
             secret: FRESHDESK_SECRET,
             action: 'send_mail',
-            to: 'hg@probon.fr',
-            subject: `⚠️ Retour PDP · ${site} n'a pas trouvé ${lost.length} article(s) · ${f.consumer_name || 'client'}`,
-            body: `${who} (${site}) n'a pas trouvé dans la commande de ${f.consumer_name || ''} :\n` + lost.map(x => `- ${x.produit} x${x.qty}`).join('\n')
+            to: PDP_ALERT_EMAILS.join(', '),
+            subject: `⚠️ Retour PDP · ${S} · ${f.consumer_name || 'client'} · ${lost.reduce((t, x) => t + x.qty, 0)} article(s) pas dans la cagette`,
+            body: `${who} (${S}) — commande de ${f.consumer_name || ''} du ${formatDateShort(f.distribDate || f.day || '')}, cagette ${crate.label} :\n${nKeep}/${total} article(s) mis dans la cagette.\nPas présent :\n` + lost.map(x => `- ${x.produit} x${x.qty} — ${x.reason}`).join('\n')
           });
         } catch (_) {}
       }
       if (keep.length) kbCelebrate({
-        title: 'Dans la cagette Retour PDP 👍',
-        sub: `${keep.length} article(s) · le chauffeur passera les prendre`
+        title: `${crate.label} prête 👍`,
+        sub: `${nKeep} article(s) · ${f.consumer_name || ''} · le chauffeur passera la prendre`
       });
     } catch (e) {
       alert('Erreur : ' + e.message);
@@ -5822,30 +6243,10 @@ function KbPdpReadyOverlay({
       setBusy(false);
     }
   };
-  const Btn = ({
-    i,
-    v,
-    c,
-    t
-  }) => React.createElement("button", {
-    type: "button",
-    disabled: busy,
-    onClick: () => setSt(o => ({
-      ...o,
-      [i]: o[i] === v ? undefined : v
-    })),
-    style: {
-      minHeight: 52,
-      padding: '6px 12px',
-      borderRadius: 12,
-      fontSize: 16,
-      fontWeight: 800,
-      border: '3px solid ' + c,
-      background: st[i] === v ? c : '#fff',
-      color: st[i] === v ? '#fff' : c,
-      cursor: 'pointer'
-    }
-  }, t);
+  const step = (i, d) => setHave(o => ({
+    ...o,
+    [i]: Math.max(0, Math.min(qOf(items[i]), hv(i) + d))
+  }));
   return React.createElement("div", {
     className: "fs-overlay"
   }, React.createElement("div", {
@@ -5859,71 +6260,46 @@ function KbPdpReadyOverlay({
     className: "fs-icon"
   }, "\u21A9\uFE0F"), React.createElement("h2", null, "Retour PDP valid\xE9 par ", String(f.forceReturnPdpBy || 'Henry').split(' ')[0]), React.createElement("div", {
     style: {
-      fontSize: 26,
-      fontWeight: 900,
-      margin: '4px 0'
-    }
-  }, f.consumer_name || 'Client'), React.createElement("div", {
-    style: {
       fontSize: 16,
       color: 'var(--ink-soft)'
     }
-  }, "Commande du ", formatDateShort(f.distribDate || f.day || ''), f.storedCasier ? React.createElement(React.Fragment, null, " \xB7 casier ", React.createElement("b", {
+  }, "Commande enti\xE8re d'un client : ", React.createElement("b", null, "sa propre cagette"), f.storedCasier ? React.createElement(React.Fragment, null, " \xB7 rang\xE9e casier ", React.createElement("b", {
     style: {
       fontSize: 20
     }
-  }, f.storedCasier)) : ''), React.createElement("div", {
-    style: {
-      margin: '12px 0',
-      padding: '12px',
-      borderRadius: 12,
-      background: '#e3f2fd',
-      fontSize: 17,
-      fontWeight: 700,
-      color: '#0d47a1'
-    }
-  }, "Mets chaque article dans la cagette ", React.createElement("b", null, "\xAB Retour PDP \xBB"), " du lieu, puis coche-le \u2713."), React.createElement("div", {
+  }, f.storedCasier)) : ''), React.createElement(KbCrateTag, {
+    label: label,
+    sub: `${f.consumer_name || 'Client'} · distrib du ${formatDateShort(f.distribDate || f.day || '')}`,
+    color: "#1565c0"
+  }), React.createElement("div", {
     style: {
       display: 'flex',
       flexDirection: 'column',
-      gap: 8,
-      textAlign: 'left'
+      gap: 4,
+      textAlign: 'left',
+      fontSize: 17
     }
   }, items.map((it, i) => React.createElement("div", {
     key: i,
     style: {
-      border: '3px solid ' + (st[i] === 'ok' ? '#2e7d32' : st[i] === 'ko' ? '#c62828' : 'var(--line)'),
-      borderRadius: 14,
-      padding: '10px 12px',
-      background: st[i] === 'ok' ? '#e8f5e9' : st[i] === 'ko' ? '#fdecea' : '#fff'
+      fontWeight: 700
     }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 20,
-      fontWeight: 800
-    }
-  }, kbProdName(it.produit || ''), (Number(it.qty) || 1) > 1 ? React.createElement("span", {
+  }, "\u2022 ", kbProdName(it.produit || ''), qOf(it) > 1 ? React.createElement("span", {
     style: {
       color: '#c62828'
     }
-  }, " \xD7", it.qty) : ''), React.createElement("div", {
+  }, " \xD7", qOf(it)) : ''))), mode === 'ask' && React.createElement(React.Fragment, null, React.createElement("div", {
     style: {
-      display: 'flex',
-      gap: 8,
-      marginTop: 8,
-      flexWrap: 'wrap'
+      fontSize: 24,
+      fontWeight: 900,
+      marginTop: 14
     }
-  }, React.createElement(Btn, {
-    i: i,
-    v: "ok",
-    c: "#2e7d32",
-    t: "\u2713 Dans la cagette"
-  }), React.createElement(Btn, {
-    i: i,
-    v: "ko",
-    c: "#c62828",
-    t: "\u2753 Introuvable"
-  }))))), React.createElement("input", {
+  }, "Il y a bien ", React.createElement("span", {
+    style: {
+      color: '#1565c0',
+      fontSize: 34
+    }
+  }, total), " article", total > 1 ? 's' : '', " dans la cagette ?"), React.createElement("input", {
     value: ini,
     onChange: e => setIni(e.target.value.toUpperCase().slice(0, 5)),
     placeholder: "Tes initiales",
@@ -5933,7 +6309,7 @@ function KbPdpReadyOverlay({
       textAlign: 'center',
       fontSize: 24,
       fontWeight: 700,
-      marginTop: 14
+      marginTop: 10
     }
   }), React.createElement("div", {
     className: "fs-actions",
@@ -5943,13 +6319,172 @@ function KbPdpReadyOverlay({
   }, React.createElement("button", {
     className: "btn-primary btn-lg",
     disabled: !ok || busy,
-    onClick: save,
+    onClick: () => save(true),
+    style: {
+      background: '#2e7d32',
+      borderColor: '#2e7d32',
+      opacity: ok ? 1 : .5
+    }
+  }, busy ? '⏳…' : `✅ Oui, ${total} article${total > 1 ? 's' : ''}`), React.createElement("button", {
+    className: "btn-secondary",
+    disabled: busy,
+    onClick: () => setMode('diff'),
+    style: {
+      color: '#c62828',
+      borderColor: '#c62828',
+      minHeight: 56,
+      fontSize: 18,
+      fontWeight: 800
+    }
+  }, "\u270F\uFE0F Non, il en manque"))), mode === 'diff' && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      margin: '12px 0',
+      padding: '10px 12px',
+      borderRadius: 12,
+      background: '#fdecea',
+      fontSize: 16,
+      fontWeight: 700,
+      color: '#b71c1c'
+    }
+  }, "Mets la quantit\xE9 vraiment dans la cagette. Pour ce qui manque : dis pourquoi."), React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8,
+      textAlign: 'left'
+    }
+  }, items.map((it, i) => {
+    const miss = hv(i) < qOf(it);
+    return React.createElement("div", {
+      key: i,
+      style: {
+        border: '3px solid ' + (miss ? '#c62828' : '#2e7d32'),
+        borderRadius: 14,
+        padding: '10px 12px',
+        background: miss ? '#fdecea' : '#e8f5e9'
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8
+      }
+    }, React.createElement("div", {
+      style: {
+        flex: 1,
+        fontSize: 19,
+        fontWeight: 800
+      }
+    }, kbProdName(it.produit || '')), React.createElement("button", {
+      type: "button",
+      disabled: busy,
+      onClick: () => step(i, -1),
+      style: {
+        width: 50,
+        height: 50,
+        borderRadius: 12,
+        fontSize: 26,
+        fontWeight: 800,
+        border: '2px solid #c62828',
+        background: '#fff'
+      }
+    }, "\u2212"), React.createElement("b", {
+      style: {
+        fontSize: 24,
+        minWidth: 54,
+        textAlign: 'center'
+      }
+    }, hv(i), "/", qOf(it)), React.createElement("button", {
+      type: "button",
+      disabled: busy || !miss,
+      onClick: () => step(i, 1),
+      style: {
+        width: 50,
+        height: 50,
+        borderRadius: 12,
+        fontSize: 26,
+        fontWeight: 800,
+        border: '2px solid #2e7d32',
+        background: '#fff'
+      }
+    }, "+")), miss && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap',
+        marginTop: 8
+      }
+    }, KB_CRATE_MISS_REASONS.map(x => React.createElement("button", {
+      key: x,
+      type: "button",
+      disabled: busy,
+      onClick: () => setWhy(o => ({
+        ...o,
+        [i]: x
+      })),
+      style: {
+        minHeight: 44,
+        padding: '4px 10px',
+        borderRadius: 10,
+        fontSize: 14,
+        fontWeight: 800,
+        border: '2px solid #c62828',
+        background: why[i] === x ? '#c62828' : '#fff',
+        color: why[i] === x ? '#fff' : '#c62828'
+      }
+    }, x)), why[i] === 'Autre' && React.createElement("input", {
+      value: whyTxt[i] || '',
+      onChange: e => setWhyTxt(o => ({
+        ...o,
+        [i]: e.target.value.slice(0, 120)
+      })),
+      placeholder: "Pourquoi ?",
+      style: {
+        width: '100%',
+        fontSize: 17
+      }
+    })));
+  })), React.createElement("div", {
+    style: {
+      fontSize: 20,
+      fontWeight: 900,
+      marginTop: 10
+    }
+  }, "Dans la cagette : ", present, "/", total), React.createElement("input", {
+    value: ini,
+    onChange: e => setIni(e.target.value.toUpperCase().slice(0, 5)),
+    placeholder: "Tes initiales",
+    style: {
+      width: '100%',
+      maxWidth: 200,
+      textAlign: 'center',
+      fontSize: 24,
+      fontWeight: 700,
+      marginTop: 10
+    }
+  }), React.createElement("div", {
+    className: "fs-actions",
+    style: {
+      marginTop: 12
+    }
+  }, React.createElement("button", {
+    className: "btn-primary btn-lg",
+    disabled: !ok || busy,
+    onClick: () => save(false),
     style: {
       background: '#1565c0',
       borderColor: '#1565c0',
       opacity: ok ? 1 : .5
     }
-  }, busy ? '⏳…' : done ? '✅ Valider' : `Coche les ${items.length} article(s)`)), count > 1 && React.createElement("div", {
+  }, busy ? '⏳…' : !reasonsOk ? 'Dis pourquoi il en manque' : '✅ Valider la cagette'), React.createElement("button", {
+    className: "btn-ghost",
+    disabled: busy,
+    onClick: () => {
+      setMode('ask');
+      setHave({});
+      setWhy({});
+    }
+  }, "\u2190 Retour"))), count > 1 && React.createElement("div", {
     className: "fs-count"
   }, count - 1, " autre(s) retour(s) PDP \xE0 pr\xE9parer")));
 }
@@ -59992,7 +60527,13 @@ function kbPickupFrom(f) {
       qty: it.qty || 1,
       dlc: it.dlc || ''
     })),
-    readyBy: String(f.pdpReadyBy || '').slice(0, 60)
+    readyBy: String(f.pdpReadyBy || '').slice(0, 60),
+    ...(f.pdpCrate && f.pdpCrate.id ? {
+      crateId: f.pdpCrate.id,
+      crateNo: f.pdpCrate.no,
+      crateLabel: f.pdpCrate.label,
+      crateUnits: f.pdpCrate.units || 0
+    } : {})
   };
 }
 async function kbPickupWrite(f) {
@@ -61984,102 +62525,136 @@ function PdpReturnsPage({
     },
     disabled: busy,
     onClick: valider
-  }, "Renvoyer le r\xE9cap"))), B.treatManual.map(r => React.createElement("div", {
-    key: r.id,
+  }, "Renvoyer le r\xE9cap"))), (() => {
+    const sorted = [...B.treatManual].sort((a, b) => String(a.site || '').localeCompare(String(b.site || '')) || (Number(a.crateNo) || 999) - (Number(b.crateNo) || 999) || String(a.crateId || '').localeCompare(String(b.crateId || '')));
+    return sorted.map((r, k) => React.createElement(React.Fragment, {
+      key: r.id
+    }, r.crateId && (k === 0 || sorted[k - 1].crateId !== r.crateId) && React.createElement(KbCrateHead, {
+      crate: {
+        id: r.crateId,
+        label: r.crateLabel || kbCrateLabel(r.site, r.crateNo),
+        site: r.site
+      },
+      items: sorted.filter(x => x.crateId === r.crateId).map(x => ({
+        produit: x.produit || x.productLabel,
+        qty: kbRetUnits(x)
+      })),
+      photos: photosAll
+    }), React.createElement("div", {
+      style: {
+        border: '3px solid #1565c0',
+        borderRadius: 16,
+        padding: 14,
+        background: 'var(--bg-card)',
+        ...(r.crateId ? {
+          marginLeft: 10
+        } : {})
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        gap: 8
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 23,
+        fontWeight: 700
+      }
+    }, r.produit || r.productLabel, (r.qty || 1) > 1 ? React.createElement("span", {
+      style: {
+        color: '#c62828'
+      }
+    }, " \xD7", r.qty) : ''), React.createElement("span", {
+      style: {
+        background: kbSiteColor(r.site),
+        color: '#fff',
+        borderRadius: 8,
+        padding: '3px 10px',
+        fontWeight: 700,
+        height: 'fit-content'
+      }
+    }, r.site)), React.createElement("div", {
+      style: {
+        fontSize: 15,
+        color: 'var(--ink-soft)'
+      }
+    }, r.kind === 'rolls' ? 'Contenants vides : ' + kbContLabel(kbContOf(r)) : React.createElement(React.Fragment, null, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée'), r.depositedBy ? ' · 🏭 déposé par ' + r.depositedBy + (r.depositedAt ? ' à ' + kbHhmm(r.depositedAt) : '') : r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
+      r: r
+    }), React.createElement(KbPdpPhotoStrip, {
+      photos: kbPdpPhotosFor(photosAll, r.site, r.recoveredAt)
+    }), isMaster && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        flexWrap: 'wrap',
+        marginTop: 6
+      }
+    }, r.kind !== 'rolls' && React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        fontSize: 14,
+        color: '#4a148c',
+        borderColor: '#4a148c'
+      },
+      onClick: () => setFix({
+        r,
+        mode: 'edit'
+      })
+    }, "\u270F\uFE0F Corriger le produit"), React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        fontSize: 14,
+        color: 'var(--danger)',
+        borderColor: 'var(--danger)'
+      },
+      onClick: () => setFix({
+        r,
+        mode: 'rm'
+      })
+    }, "\uD83D\uDEAB Retirer du suivi")), r.kind === 'rolls' ? React.createElement("button", {
+      disabled: busy,
+      onClick: () => treatRolls(r),
+      style: {
+        width: '100%',
+        minHeight: 64,
+        marginTop: 10,
+        fontSize: 20,
+        fontWeight: 800,
+        borderRadius: 14,
+        border: 'none',
+        background: '#6d4c41',
+        color: '#fff'
+      }
+    }, "\u2713 Re\xE7us \xE0 PDP (", kbContLabel(kbContOf(r)), ")") : React.createElement(DestButtons, {
+      dlc: r.dlc,
+      onPick: d => treatManual(r, d)
+    }), React.createElement(LostBtn, {
+      on: () => lostManual(r)
+    }))));
+  })(), B.treatLines.map((L, k) => React.createElement(React.Fragment, {
+    key: L.id
+  }, kbOrderCrate(L.f) && (k === 0 || B.treatLines[k - 1].f !== L.f) && React.createElement(KbCrateHead, {
+    crate: {
+      ...kbOrderCrate(L.f),
+      site: L.f.site
+    },
+    client: L.f.consumer_name,
+    distribDate: L.f.distribDate || L.f.day,
+    items: (L.f.items || []).map(it => ({
+      produit: it.produit,
+      qty: Math.max(1, Number(it.qty) || 1)
+    })),
+    photos: photosAll
+  }), React.createElement("div", {
     style: {
       border: '3px solid #1565c0',
       borderRadius: 16,
       padding: 14,
-      background: 'var(--bg-card)'
-    }
-  }, React.createElement("div", {
-    style: {
-      display: 'flex',
-      justifyContent: 'space-between',
-      gap: 8
-    }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 23,
-      fontWeight: 700
-    }
-  }, r.produit || r.productLabel, (r.qty || 1) > 1 ? React.createElement("span", {
-    style: {
-      color: '#c62828'
-    }
-  }, " \xD7", r.qty) : ''), React.createElement("span", {
-    style: {
-      background: kbSiteColor(r.site),
-      color: '#fff',
-      borderRadius: 8,
-      padding: '3px 10px',
-      fontWeight: 700,
-      height: 'fit-content'
-    }
-  }, r.site)), React.createElement("div", {
-    style: {
-      fontSize: 15,
-      color: 'var(--ink-soft)'
-    }
-  }, r.kind === 'rolls' ? 'Contenants vides : ' + kbContLabel(kbContOf(r)) : React.createElement(React.Fragment, null, r.producteur ? r.producteur + ' · ' : '', r.dlc ? React.createElement(React.Fragment, null, "DLC ", React.createElement("b", null, formatDateShort(r.dlc))) : 'DLC non renseignée'), r.depositedBy ? ' · 🏭 déposé par ' + r.depositedBy + (r.depositedAt ? ' à ' + kbHhmm(r.depositedAt) : '') : r.recoveredBy ? ' · récupéré par ' + r.recoveredBy : ''), r.kind !== 'rolls' && React.createElement(KbPdpRetOrigin, {
-    r: r
-  }), React.createElement(KbPdpPhotoStrip, {
-    photos: kbPdpPhotosFor(photosAll, r.site, r.recoveredAt)
-  }), isMaster && React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 6,
-      flexWrap: 'wrap',
-      marginTop: 6
-    }
-  }, r.kind !== 'rolls' && React.createElement("button", {
-    className: "btn-secondary",
-    style: {
-      fontSize: 14,
-      color: '#4a148c',
-      borderColor: '#4a148c'
-    },
-    onClick: () => setFix({
-      r,
-      mode: 'edit'
-    })
-  }, "\u270F\uFE0F Corriger le produit"), React.createElement("button", {
-    className: "btn-secondary",
-    style: {
-      fontSize: 14,
-      color: 'var(--danger)',
-      borderColor: 'var(--danger)'
-    },
-    onClick: () => setFix({
-      r,
-      mode: 'rm'
-    })
-  }, "\uD83D\uDEAB Retirer du suivi")), r.kind === 'rolls' ? React.createElement("button", {
-    disabled: busy,
-    onClick: () => treatRolls(r),
-    style: {
-      width: '100%',
-      minHeight: 64,
-      marginTop: 10,
-      fontSize: 20,
-      fontWeight: 800,
-      borderRadius: 14,
-      border: 'none',
-      background: '#6d4c41',
-      color: '#fff'
-    }
-  }, "\u2713 Re\xE7us \xE0 PDP (", kbContLabel(kbContOf(r)), ")") : React.createElement(DestButtons, {
-    dlc: r.dlc,
-    onPick: d => treatManual(r, d)
-  }), React.createElement(LostBtn, {
-    on: () => lostManual(r)
-  }))), B.treatLines.map(L => React.createElement("div", {
-    key: L.id,
-    style: {
-      border: '3px solid #1565c0',
-      borderRadius: 16,
-      padding: 14,
-      background: 'var(--bg-card)'
+      background: 'var(--bg-card)',
+      ...(kbOrderCrate(L.f) ? {
+        marginLeft: 10
+      } : {})
     }
   }, React.createElement("div", {
     style: {
@@ -62117,7 +62692,7 @@ function PdpReturnsPage({
     onPick: d => treatLine(L, d)
   }), React.createElement(LostBtn, {
     on: () => lostLine(L)
-  }))), B.treatedToday.length > 0 && React.createElement("details", {
+  })))), B.treatedToday.length > 0 && React.createElement("details", {
     className: "card",
     style: {
       padding: '12px 14px'
@@ -72296,6 +72871,151 @@ function RungisRetoursView({
   const [take, setTake] = React.useState({});
   const [allChecked, setAllChecked] = React.useState(false);
   const drv = kbIsPdpDriver();
+  const [cnt, setCnt] = React.useState({});
+  const [pic, setPic] = React.useState({});
+  const isCr = x => !!(x.k === 'm' && x.r.crateId || x.k === 'o' && kbOrderCrate(x.f));
+  const cratesOf = list => {
+    const g = {};
+    list.filter(isCr).forEach(x => {
+      if (x.k === 'm') {
+        const r = x.r,
+          c = g[r.crateId] || (g[r.crateId] = {
+            id: r.crateId,
+            no: Number(r.crateNo) || 0,
+            label: r.crateLabel || kbCrateLabel(r.site, r.crateNo),
+            xs: [],
+            expected: 0,
+            closed: false,
+            day: r.crateDay || '',
+            client: ''
+          });
+        c.xs.push(x);
+        c.expected += kbRetUnits(r);
+        if (r.crateClosedAt) c.closed = true;
+      } else {
+        const f = x.f,
+          k = kbOrderCrate(f);
+        g[k.id] = {
+          id: k.id,
+          no: Number(k.no) || 0,
+          label: k.label || kbCrateLabel(f.site, k.no),
+          xs: [x],
+          expected: (f.items || []).reduce((t, it) => t + Math.max(1, Number(it.qty) || 1), 0),
+          closed: true,
+          day: '',
+          client: f.consumer_name || '',
+          distribDate: f.distribDate || f.day || ''
+        };
+      }
+    });
+    return Object.values(g).map(c => ({
+      ...c,
+      ready: c.closed || c.expected >= KB_CRATE_MAX || c.day && c.day < todayKey()
+    })).sort((a, b) => a.no - b.no);
+  };
+  const pickCratePhoto = async (c, files) => {
+    const f0 = files && files[0];
+    if (!f0) return;
+    setBusy(true);
+    try {
+      const img = await kbImgPdp(f0);
+      setPic(o => ({
+        ...o,
+        [c.id]: img
+      }));
+    } catch (e) {
+      showToast('Photo illisible, recommence');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const takeCrate = async (s, c) => {
+    const n = cnt[c.id],
+      img = pic[c.id];
+    if (n == null || !img) return;
+    if (!c.ready && !confirm(`${c.label} n'a pas encore été fermée par la boutique.\nLa prendre quand même ?`)) return;
+    setBusy(true);
+    try {
+      const at = now(),
+        pid = `ph_${todayKey()}_${s}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      let countOk = true;
+      try {
+        await storage.setDoc('pdp_photos', pid, {
+          id: pid,
+          site: s,
+          by: session.name,
+          at,
+          day: todayKey(),
+          img,
+          crate: c.id,
+          crateLabel: c.label,
+          count: Number(n) || 0,
+          expected: c.expected
+        }, {
+          replace: true
+        });
+      } catch (e) {
+        countOk = false;
+        await storage.setDoc('pdp_photos', pid, {
+          id: pid,
+          site: s,
+          by: session.name,
+          at,
+          day: todayKey(),
+          img
+        }, {
+          replace: true
+        });
+      }
+      for (const x of c.xs) {
+        if (x.k === 'm') {
+          await storage.setDoc('pdp_returns', x.r.id, {
+            status: 'recovered',
+            recoveredBy: session.name,
+            recoveredAt: at
+          });
+          await storage.setDoc('pdp_returns', x.r.id, {
+            status: 'verified',
+            verifiedBy: session.name,
+            verifiedAt: now()
+          });
+        } else {
+          await pickupSet(x.f, {
+            pdpRecoveredAt: at,
+            pdpRecoveredBy: session.name
+          });
+          const ck = {};
+          (x.f.items || []).forEach((_, i) => {
+            ck[String(i)] = true;
+          });
+          await pickupSet(x.f, {
+            pdpVerifiedAt: now(),
+            pdpVerifiedBy: session.name,
+            pdpCheck: ck
+          });
+        }
+      }
+      setCnt(o => {
+        const k = {
+          ...o
+        };
+        delete k[c.id];
+        return k;
+      });
+      setPic(o => {
+        const k = {
+          ...o
+        };
+        delete k[c.id];
+        return k;
+      });
+      if (!countOk) showToast('⚠️ Cagette prise, mais comptage non enregistré (règles V11.68 à publier) — préviens Henry');else if (Number(n) < c.expected) showToast(`✓ ${c.label} prise · ${n}/${c.expected} → Raimbaud est prévenu, l'entrepôt vérifiera le détail`);else muCelebrate(Number(n) || c.expected, 'article(s) dans le camion');
+    } catch (e) {
+      denied(e);
+    } finally {
+      setBusy(false);
+    }
+  };
   const now = () => new Date().toISOString();
   const denied = e => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (règles Firestore V11.43 à publier ?)' : 'Erreur : ' + (e && e.message || e));
   const pickupSet = async (f, val) => {
@@ -72597,7 +73317,7 @@ function RungisRetoursView({
       color: 'var(--ink-soft)',
       marginTop: 4
     }
-  }, "1\uFE0F\u20E3 Dans chaque boutique : ", React.createElement("b", null, "\uD83D\uDCF7 photo"), " de la cagette \xAB Retour PDP \xBB puis ", React.createElement("b", null, "\u2713 Pris"), ". 2\uFE0F\u20E3 Tranquillement : ", React.createElement("b", null, "\uD83D\uDD0D V\xE9rifier"), " (tout est trouv\xE9 par d\xE9faut). 3\uFE0F\u20E3 Une fois arriv\xE9 \xE0 PDP et d\xE9pos\xE9 : ", React.createElement("b", null, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t"), ".")), React.createElement("div", {
+  }, "1\uFE0F\u20E3 Dans chaque boutique, pour chaque cagette num\xE9rot\xE9e : ", React.createElement("b", null, "compte les articles"), " + ", React.createElement("b", null, "\uD83D\uDCF7 photo"), " puis ", React.createElement("b", null, "\u2713 Cagette prise"), ". 2\uFE0F\u20E3 Tranquillement : ", React.createElement("b", null, "\uD83D\uDD0D V\xE9rifier"), " (tout est trouv\xE9 par d\xE9faut). 3\uFE0F\u20E3 Une fois arriv\xE9 \xE0 PDP et d\xE9pos\xE9 : ", React.createElement("b", null, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t"), ".")), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 8
@@ -72656,19 +73376,238 @@ function RungisRetoursView({
       }
     }, React.createElement(SiteHead, {
       s: s,
-      right: list.length + ' à prendre'
+      right: (() => {
+        const nc = cratesOf(list).length,
+          ng = list.filter(x => !isCr(x)).length;
+        return [nc ? nc + ' cagette' + (nc > 1 ? 's' : '') : '', ng ? ng + ' autre' + (ng > 1 ? 's' : '') : ''].filter(Boolean).join(' + ') + ' à prendre';
+      })()
     }), React.createElement("div", {
       className: "stack",
       style: {
         gap: 8,
         padding: 10
       }
-    }, React.createElement("div", {
+    }, cratesOf(list).map(c => {
+      const n = cnt[c.id],
+        img = pic[c.id],
+        can = n != null && !!img;
+      return React.createElement("div", {
+        key: c.id,
+        style: {
+          border: '4px solid ' + (c.ready ? '#e65100' : '#bdbdbd'),
+          borderRadius: 16,
+          padding: '10px 12px',
+          background: c.ready ? '#fff8e1' : '#f5f5f5'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 24,
+          fontWeight: 900,
+          lineHeight: 1.15
+        }
+      }, "\uD83D\uDCE6 ", c.label), c.client && React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 800,
+          color: '#1565c0'
+        }
+      }, "\uD83D\uDC64 ", c.client, " \xB7 distrib du ", formatDateShort(c.distribDate)), !c.ready && React.createElement("div", {
+        style: {
+          fontSize: 15,
+          fontWeight: 800,
+          color: '#757575'
+        }
+      }, "\uD83D\uDD13 Pas encore ferm\xE9e par la boutique"), React.createElement("div", {
+        style: {
+          fontSize: 20,
+          fontWeight: 800,
+          marginTop: 4
+        }
+      }, "Pr\xE9vu : ", React.createElement("span", {
+        style: {
+          fontSize: 28,
+          color: '#e65100'
+        }
+      }, c.expected), " article", c.expected > 1 ? 's' : ''), React.createElement("details", {
+        style: {
+          fontSize: 15,
+          marginTop: 2
+        }
+      }, React.createElement("summary", {
+        style: {
+          cursor: 'pointer',
+          color: 'var(--ink-soft)'
+        }
+      }, "Voir le contenu"), c.xs.flatMap(itemsOf).map(i => React.createElement("div", {
+        key: i.key
+      }, "\u2022 ", i.label, i.qty > 1 ? ' ×' + i.qty : ''))), React.createElement("div", {
+        style: {
+          fontSize: 17,
+          fontWeight: 800,
+          marginTop: 8
+        }
+      }, "Combien d'articles tu vois ?"), React.createElement("div", {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          marginTop: 4
+        }
+      }, React.createElement("button", {
+        type: "button",
+        disabled: busy,
+        onClick: () => setCnt(o => ({
+          ...o,
+          [c.id]: Math.max(0, (o[c.id] == null ? c.expected : o[c.id]) - 1)
+        })),
+        style: {
+          width: 60,
+          height: 60,
+          borderRadius: 12,
+          fontSize: 30,
+          fontWeight: 800,
+          border: '2px solid #c62828',
+          background: '#fff'
+        }
+      }, "\u2212"), React.createElement("b", {
+        style: {
+          flex: 1,
+          textAlign: 'center',
+          fontSize: 36,
+          color: n == null ? '#bdbdbd' : n < c.expected ? '#c62828' : '#2e7d32'
+        }
+      }, n == null ? '?' : n), React.createElement("button", {
+        type: "button",
+        disabled: busy,
+        onClick: () => setCnt(o => ({
+          ...o,
+          [c.id]: (o[c.id] == null ? c.expected - 1 : o[c.id]) + 1
+        })),
+        style: {
+          width: 60,
+          height: 60,
+          borderRadius: 12,
+          fontSize: 30,
+          fontWeight: 800,
+          border: '2px solid #2e7d32',
+          background: '#fff'
+        }
+      }, "+")), n == null && React.createElement("button", {
+        type: "button",
+        disabled: busy,
+        onClick: () => setCnt(o => ({
+          ...o,
+          [c.id]: c.expected
+        })),
+        style: {
+          width: '100%',
+          minHeight: 50,
+          marginTop: 6,
+          borderRadius: 12,
+          border: '2px solid #2e7d32',
+          background: '#e8f5e9',
+          color: '#1b5e20',
+          fontSize: 17,
+          fontWeight: 800
+        }
+      }, "\u2713 J'en vois bien ", c.expected), n != null && n < c.expected && React.createElement("div", {
+        style: {
+          fontSize: 15,
+          fontWeight: 800,
+          color: '#c62828',
+          marginTop: 4
+        }
+      }, "Il en manque ", c.expected - n, " \u2192 Raimbaud sera pr\xE9venu, l'entrep\xF4t v\xE9rifie le d\xE9tail."), img ? React.createElement("div", {
+        style: {
+          position: 'relative',
+          marginTop: 8
+        }
+      }, React.createElement("img", {
+        src: img,
+        alt: "cagette",
+        style: {
+          width: '100%',
+          maxHeight: 220,
+          objectFit: 'cover',
+          borderRadius: 12
+        }
+      }), React.createElement("button", {
+        type: "button",
+        onClick: () => setPic(o => {
+          const k = {
+            ...o
+          };
+          delete k[c.id];
+          return k;
+        }),
+        style: {
+          position: 'absolute',
+          right: 6,
+          top: 6,
+          width: 36,
+          height: 36,
+          borderRadius: 18,
+          border: 'none',
+          background: '#c62828',
+          color: '#fff',
+          fontWeight: 900
+        }
+      }, "\xD7")) : React.createElement("label", {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 10,
+          minHeight: 62,
+          marginTop: 8,
+          borderRadius: 14,
+          border: '3px dashed #1565c0',
+          background: '#e3f2fd',
+          color: '#0d47a1',
+          fontSize: 19,
+          fontWeight: 800,
+          cursor: 'pointer'
+        }
+      }, "\uD83D\uDCF7 Photo de la cagette (obligatoire)", React.createElement("input", {
+        type: "file",
+        accept: "image/*",
+        capture: "environment",
+        disabled: busy,
+        style: {
+          display: 'none'
+        },
+        onChange: e => {
+          pickCratePhoto(c, e.target.files);
+          e.target.value = '';
+        }
+      })), React.createElement("button", {
+        disabled: busy || !can,
+        onClick: () => takeCrate(s, c),
+        style: {
+          width: '100%',
+          minHeight: 64,
+          marginTop: 8,
+          borderRadius: 14,
+          border: 'none',
+          background: can ? '#2e7d32' : '#bdbdbd',
+          color: '#fff',
+          fontSize: 20,
+          fontWeight: 900,
+          cursor: can ? 'pointer' : 'default'
+        }
+      }, busy ? '⏳…' : can ? `✓ Cagette prise (${n} article${n > 1 ? 's' : ''})` : n == null ? 'Compte les articles' : '📷 Prends la photo'));
+    }), list.some(x => !isCr(x)) && React.createElement(React.Fragment, null, cratesOf(list).length > 0 && React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 800,
+        marginTop: 4
+      }
+    }, "Autres retours (sans n\xB0 de cagette) :"), React.createElement("div", {
       style: {
         fontSize: 15,
         color: 'var(--ink-soft)'
       }
-    }, "Dans la cagette \xAB Retour PDP \xBB :"), list.filter(x => !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => React.createElement("div", {
+    }, "Dans la cagette \xAB Retour PDP \xBB :"), list.filter(x => !isCr(x) && !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => React.createElement("div", {
       key: i.key,
       style: {
         fontSize: 18,
@@ -72821,7 +73760,7 @@ function RungisRetoursView({
       }
     })), React.createElement("button", {
       disabled: busy,
-      onClick: () => takeSite(s, list),
+      onClick: () => takeSite(s, list.filter(x => !isCr(x))),
       style: {
         minHeight: 66,
         borderRadius: 14,
@@ -72832,7 +73771,7 @@ function RungisRetoursView({
         fontWeight: 800,
         cursor: 'pointer'
       }
-    }, "\u2713 J'ai pris le retour de ", s)));
+    }, "\u2713 J'ai pris le retour de ", s))));
   })), B.ready && step === 'verif' && (!nCheck ? React.createElement("div", {
     className: "card",
     style: {
@@ -78794,6 +79733,126 @@ function KbPdpDepositPopup({
       marginTop: 8
     }
   }, "\u23F0 Plus tard \u2014 avant la cl\xF4ture"))));
+}
+function KbCrateHead({
+  crate,
+  items,
+  photos,
+  client,
+  distribDate
+}) {
+  const ph = (photos || []).filter(p => p.crate === crate.id);
+  const last = ph[ph.length - 1] || null;
+  const exp = (items || []).reduce((t, x) => t + (Number(x.qty) || 1), 0);
+  const expected = last && last.expected != null ? Number(last.expected) : exp;
+  const short = last && Number(last.count) < expected;
+  return React.createElement("div", {
+    style: {
+      border: '4px solid ' + (short ? '#c62828' : '#e65100'),
+      borderRadius: 16,
+      padding: '10px 12px',
+      background: short ? '#fdecea' : '#fff3e0',
+      marginTop: 6
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 24,
+      fontWeight: 900,
+      flex: 1,
+      lineHeight: 1.15
+    }
+  }, "\uD83D\uDCE6 ", crate.label), crate.site && React.createElement("span", {
+    style: {
+      background: kbSiteColor(crate.site),
+      color: '#fff',
+      borderRadius: 8,
+      padding: '3px 10px',
+      fontWeight: 700
+    }
+  }, crate.site)), client && React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 800,
+      color: '#1565c0'
+    }
+  }, "\uD83D\uDC64 ", client, distribDate ? ' · distrib du ' + formatDateShort(distribDate) : ''), React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 800,
+      marginTop: 2
+    }
+  }, "Pr\xE9vu ", expected, " article", expected > 1 ? 's' : '', last ? React.createElement(React.Fragment, null, " \xB7 chauffeur ", React.createElement("b", {
+    style: {
+      color: short ? '#c62828' : '#2e7d32',
+      fontSize: 22
+    }
+  }, last.count), " vu", Number(last.count) > 1 ? 's' : '', " (", last.by, ")") : ''), short && React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 900,
+      color: '#c62828'
+    }
+  }, "\u26A0\uFE0F Il en manque ", expected - Number(last.count), " : v\xE9rifie produit par produit (\u2753 pas trouv\xE9 si absent)"), React.createElement(KbPdpPhotoStrip, {
+    photos: ph
+  }));
+}
+function KbPdpCrateShortMailer() {
+  const B = useKbPdpBoard();
+  const photos = useKbPdpPhotos();
+  const busy = React.useRef(false);
+  React.useEffect(() => {
+    if (!B.ready || busy.current || kbIsPdpDriver()) return;
+    const todo = (photos || []).filter(p => p.crate && Number(p.count) < Number(p.expected) && !B.tm['_cratemail_' + p.id]);
+    if (!todo.length) return;
+    busy.current = true;
+    (async () => {
+      try {
+        for (const p of todo) {
+          const at = new Date().toISOString();
+          await storage.setDoc('pdp_treatments', '_cratemail_' + p.id, {
+            id: '_cratemail_' + p.id,
+            crate: p.crate,
+            at
+          });
+          const man = (B.manualAll || []).filter(r => r.crateId === p.crate);
+          const ord = (B.orders || []).find(f => {
+            const c = kbOrderCrate(f);
+            return c && c.id === p.crate;
+          });
+          const rows = man.length ? man.map(r => ({
+            produit: r.produit || r.productLabel,
+            qty: kbRetUnits(r),
+            client: r.clientName || ''
+          })) : ord ? (ord.items || []).map(it => ({
+            produit: it.produit,
+            qty: Math.max(1, Number(it.qty) || 1),
+            client: ord.consumer_name || ''
+          })) : [];
+          const miss = Number(p.expected) - Number(p.count);
+          const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">` + `<div style="background:#e65100;color:#fff;border-radius:12px;padding:16px 18px"><div style="font-size:24px;font-weight:900">⚠️ ${kbEsc(p.crateLabel || '')}</div><div style="font-size:18px">${kbEsc(p.by || 'Le chauffeur')} a compté <b>${Number(p.count)}</b> article(s) au lieu de <b>${Number(p.expected)}</b> · il en manque <b>${miss}</b></div></div>` + (ord ? `<div style="font-size:16px;margin-top:10px">Commande entière de <b>${kbEsc(ord.consumer_name || '')}</b> · distrib du ${kbEsc(formatDateShort(ord.distribDate || ord.day || ''))}</div>` : '') + `<div style="font-size:16px;font-weight:900;margin-top:12px">Normalement dans la cagette :</div>` + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:6px;border-left:6px solid #e65100">` + rows.map(x => `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:17px"><b>${kbEsc(kbProdName(x.produit || ''))}</b>${x.client ? ` <span style="color:#888;font-size:13px">· ${kbEsc(x.client)}</span>` : ''}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:19px;text-align:right"><b>×${x.qty}</b></td></tr>`).join('') + `</table><div style="font-size:15px;margin-top:10px">Les préparateurs vérifient le détail à l'entrepôt (Prépa › Retours PDP). Photo de la cagette dans l'appli.</div><p style="color:#999;font-size:12px;margin-top:14px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
+          try {
+            await stockPost({
+              secret: FRESHDESK_SECRET,
+              action: 'send_mail',
+              to: PDP_ALERT_EMAILS[0],
+              subject: `⚠️ ${p.crateLabel || 'Cagette retour PDP'} · ${p.count}/${p.expected} articles · il en manque ${miss}`,
+              htmlBody: html,
+              body: `${p.crateLabel} : ${p.by} a compté ${p.count} au lieu de ${p.expected}.\nNormalement :\n` + rows.map(x => `- ${x.produit} x${x.qty}`).join('\n')
+            });
+          } catch (_) {}
+        }
+      } finally {
+        busy.current = false;
+      }
+    })();
+  }, [B, photos]);
+  return null;
 }
 function KbPdpNotFoundMailer() {
   const B = useKbPdpBoard();
@@ -89731,7 +90790,7 @@ function App() {
     }), React.createElement(KbPdpDepositPopup, {
       session: effSession,
       setTab: setTab
-    }), React.createElement(KbPdpNotFoundMailer, null), React.createElement(DlcCorrectionPopup, {
+    }), React.createElement(KbPdpNotFoundMailer, null), React.createElement(KbPdpCrateShortMailer, null), React.createElement(DlcCorrectionPopup, {
       session: effSession,
       setTab: setTab
     }), React.createElement(KbAncienAutoRun, {
@@ -89889,13 +90948,16 @@ function App() {
   }
   return React.createElement("div", {
     className: 'app-shell' + (effSession.isMaster ? ' kb-wide' : '')
-  }, overlay, React.createElement(UpdateChecker, null), React.createElement(KbSupport, {
+  }, overlay, React.createElement(UpdateChecker, null), effSession.role === 'distrib' && !session.isMaster && React.createElement(KbPdpCrateGate, {
+    session: effSession,
+    site: currentSite
+  }), React.createElement(KbSupport, {
     session: effSession,
     tab: tab,
     site: currentSite
   }), session.isMaster && React.createElement(KbAncienAutoRun, {
     by: session.name
-  }), session.isMaster && React.createElement(KbPdpNotFoundMailer, null), effSession.isMaster && React.createElement(KbMasterSidebar, {
+  }), session.isMaster && React.createElement(KbPdpNotFoundMailer, null), session.isMaster && React.createElement(KbPdpCrateShortMailer, null), effSession.isMaster && React.createElement(KbMasterSidebar, {
     tab: tab,
     setTab: setTab,
     session: effSession,
