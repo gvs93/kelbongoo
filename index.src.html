@@ -795,7 +795,15 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.64';
+    const APP_VERSION = 'V11.65';
+    // V11.65 — (20/11/2026) ① 💬 CHAT ÉQUIPE : Master › 💬 › « 👋 Équipe » : choisir une personne connectée (prépa, distrib, chauffeur),
+    //   « 💬 Discussion » (popup qui ouvre le chat, elle répond) ou « ✅ À valider » (popup à valider avec ses initiales, sans réponse).
+    //   Côté équipe, le chat n'apparaît que sur demande du Master ; sinon 💬 = Support technique. (support_msgs kind:'team', présence + uid)
+    //   ② Historique › Prépa : « ⏱️ Horaires de la journée — réel vs estimé » (début/fin MU et prépa d'après l'appli, clôture,
+    //   1re et dernière estimation, écart) ; estimations gardées toutes les 10 min (kb_presence/~eta_<jour>) quand le Master › Aujourd'hui est ouvert.
+    //   ③ Prépa : ≥ 90 % et 5 min sans geste → popup humoristique ; 100 % et pas clôturée 5 min après → « faut clôturer ! ».
+    //   ④ Distrib : 📒 CARNET DE BORD remplace Suivi / Consigne / Infos : Non récupérés · Oublis & erreurs client ·
+    //   Retours rolls-dollies-cagettes + consignes (sortis de Qualité) · Commande pain (date au choix, Bichat : + pain Pribon) · Infos du jour.
     // V11.64 — (20/11/2026) 📦 CARTONS DOM DÈS LE CHARGEMENT (comme les casiers V11.57) : chargement de 7h (vente pas encore
     //   compilée) → chaque client livré à domicile reçoit tout de suite son / ses n° de carton, nombre estimé d'après le VOLUME
     //   de la commande. Capacité d'un carton apprise À PART (app_config/kb_carton_cap) sur les livraisons DOM déjà compilées
@@ -7753,8 +7761,7 @@
           {isClosed && (
             <div className="alert-info">🔒 Journée clôturée</div>
           )}
-          {/* V11.08 — rolls vides à faire récupérer par le chauffeur (retour PDP) */}
-          <KbRollsReturnCard session={session} site={currentSite} />
+          {/* V11.65 — rolls / dollies / cagettes : déplacés dans 📒 Carnet de bord › Retours */}
 
           {hideAfterClose ? (
             <div className="empty-state">
@@ -8005,6 +8012,128 @@
       );
     }
 
+    // ============================================================
+    // V11.65 — 📒 CARNET DE BORD (distrib) : un seul menu, interactif, qui remplace Suivi / Consigne / Infos.
+    //   📞 Non récupérés · 🧺 Oublis & casiers trompés · 🔁 Retours rolls / dollies / cagettes + consignes ·
+    //   🥖 Commande pain (date au choix ; à Bichat : pain Kelbongoo + pain Pribon Bichat) · 📋 Infos du jour.
+    // ============================================================
+    function KbPainSuivi({ currentSite }) {
+      const [day, setDay] = React.useState(() => { try { return activeDay(); } catch (_) { return todayKey(); } });
+      const [kbg, setKbg] = React.useState(null);
+      const [pri, setPri] = React.useState(null);
+      const [next, setNext] = React.useState([]);
+      const [err, setErr] = React.useState('');
+      const [showCli, setShowCli] = React.useState(false);
+      const isBic = currentSite === 'BIC';
+      React.useEffect(() => {
+        let stop = false; setKbg(null); setPri(null); setErr('');
+        (async () => {
+          try {
+            const od = await storage.getDoc(`day_${day}_orders`, 'data').catch(() => null);
+            const tot = {}, cli = [];
+            ((od && od.orders) || []).filter(o => String(o.site || '').toUpperCase() === currentSite && !o._test).forEach(o => {
+              const ps = (o.items || []).filter(it => it.cat === 'pain');
+              if (!ps.length) return;
+              cli.push({ name: o.name || o.consumer_name || '(client)', items: ps });
+              ps.forEach(it => { const n = kbProdName(it.produit || it.name || ''); tot[n] = (tot[n] || 0) + (parseInt(it.qty, 10) || 1); });
+            });
+            if (!stop) setKbg({ loaded: !!od, tot: Object.entries(tot).sort((a, b) => a[0].localeCompare(b[0], 'fr')), cli: cli.sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr')) });
+          } catch (e) { if (!stop) setErr(e.message || String(e)); }
+          if (isBic) {
+            try {
+              const d = await storage.getDoc('pain_pribon', `${day}_PRIBIC`);
+              if (!stop) setPri(d || { lines: [] });
+              const up = [];
+              for (let i = 1; i <= 10; i++) { const d2 = addDays(day, i); try { const x = await storage.getDoc('pain_pribon', `${d2}_PRIBIC`); if (x && (x.lines || []).some(l => l.qty > 0)) up.push({ day: d2, nb: x.nb || x.lines.reduce((t, l) => t + (l.qty || 0), 0) }); } catch (_) {} }
+              if (!stop) setNext(up);
+            } catch (e) { if (!stop) { setPri({ err: e.message || String(e) }); } }
+          }
+        })();
+        return () => { stop = true; };
+      }, [day, currentSite]);
+      const box = (bg, bd) => ({ background: bg, border: '2px solid ' + bd, borderRadius: 14, padding: '12px 14px' });
+      const nbK = kbg ? kbg.tot.reduce((t, x) => t + x[1], 0) : 0;
+      const priLines = pri && !pri.err ? (pri.lines || []).filter(l => l.qty > 0) : [];
+      return (
+        <div className="stack">
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button className="btn-secondary" style={{ width: 'auto' }} onClick={() => setDay(addDays(day, -1))}>◀︎</button>
+            <input type="date" value={day} onChange={e => e.target.value && setDay(e.target.value)} style={{ width: 'auto', fontSize: 17, fontWeight: 700, padding: '8px 10px' }} />
+            <button className="btn-secondary" style={{ width: 'auto' }} onClick={() => setDay(addDays(day, 1))}>▶︎</button>
+            {day !== activeDay() && <button className="btn-ghost" style={{ width: 'auto' }} onClick={() => setDay(activeDay())}>↩ Aujourd'hui</button>}
+          </div>
+          <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Pains pour la distribution du <b>{formatDateShort(day)}</b></div>
+          <div style={box('#fff8e1', '#f9a825')}>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 6 }}>🥖 Pain Kelbongoo · {currentSite} {kbg && nbK > 0 ? <span style={{ fontSize: 22, color: '#e65100' }}>· {nbK}</span> : null}</div>
+            {err && <div style={{ color: 'var(--danger)' }}>{err}</div>}
+            {!kbg ? <div style={{ color: 'var(--ink-mute)' }}>Chargement…</div>
+              : !kbg.loaded ? <div style={{ color: 'var(--ink-mute)' }}>Commandes de ce jour pas encore chargées.</div>
+              : !kbg.tot.length ? <div style={{ color: 'var(--ink-mute)' }}>Aucun pain commandé ce jour-là.</div>
+              : <>{kbg.tot.map(([n, q]) => <div key={n} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0', borderBottom: '1px solid #f3e0b0' }}><KbQty q={q} big /><span style={{ fontSize: 17, fontWeight: 600 }}>{n}</span></div>)}
+                  <button className="btn-ghost" style={{ marginTop: 6 }} onClick={() => setShowCli(v => !v)}>{showCli ? '▲ Masquer' : '▼ Voir'} par client ({kbg.cli.length})</button>
+                  {showCli && kbg.cli.map((c, i) => <div key={i} style={{ fontSize: 15, padding: '4px 0' }}><b>{c.name}</b> : {c.items.map(it => (parseInt(it.qty, 10) || 1) + '× ' + kbProdName(it.produit || it.name || '')).join(', ')}</div>)}</>}
+          </div>
+          {isBic && <div style={box('#e8f5e9', '#2e7d32')}>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 6 }}>🏪 Pain Pribon Bichat {priLines.length ? <span style={{ fontSize: 22, color: '#1b5e20' }}>· {priLines.reduce((t, l) => t + (l.qty || 0), 0)}</span> : null}</div>
+            {!pri ? <div style={{ color: 'var(--ink-mute)' }}>Chargement…</div>
+              : pri.err ? <div style={{ color: 'var(--danger)', fontSize: 14 }}>Lecture impossible : {pri.err}{/permission/i.test(pri.err) ? ' (droit de lecture « pain_pribon » à ouvrir pour la distrib)' : ''}</div>
+              : !priLines.length ? <div style={{ color: 'var(--ink-mute)' }}>Pas de commande Pribon pour ce jour.</div>
+              : priLines.map((l, i) => <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0', borderBottom: '1px solid #c8e6c9' }}><KbQty q={l.qty} big /><span style={{ fontSize: 17, fontWeight: 600 }}>{kbProdName(l.name || l.key || '')}</span></div>)}
+            {pri && pri.by && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Commandé par {pri.by}{pri.at ? ' · ' + new Date(pri.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''}</div>}
+            {next.length > 0 && <div style={{ marginTop: 10 }}><div style={{ fontSize: 14, fontWeight: 700 }}>📅 Commandes Pribon déjà passées pour les jours suivants :</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>{next.map(n => <button key={n.day} className="btn-secondary" style={{ width: 'auto' }} onClick={() => setDay(n.day)}>{formatDateShort(n.day)} · {n.nb} pain(s)</button>)}</div></div>}
+          </div>}
+        </div>);
+    }
+    const KB_CARNET = [
+      { k: 'nonrecup', ic: '📞', t: 'Non récupérés', d: 'Commandes pas venues chercher : relances, retour PDP' },
+      { k: 'oublis', ic: '🧺', t: 'Casiers oubliés & erreurs client', d: 'Produits oubliés dans un casier · casier / cagette pris par erreur' },
+      { k: 'retours', ic: '🔁', t: 'Retours rolls · dollies · cagettes & consignes', d: 'Ce que le chauffeur doit reprendre · consignes rendues' },
+      { k: 'pain', ic: '🥖', t: 'Commande pain', d: 'Les pains du jour (ou d\'une autre date)' },
+      { k: 'infos', ic: '📋', t: 'Infos du jour', d: 'Messages et consignes de la journée' },
+    ];
+    function KbCarnetPage({ session, currentSite, orders, isClosed, consumersByEmail }) {
+      const [sec, setSec] = React.useState(() => { try { return sessionStorage.getItem('kb_carnet_sec') || ''; } catch (_) { return ''; } });
+      const go = (k) => { setSec(k); try { sessionStorage.setItem('kb_carnet_sec', k); } catch (_) {} window.scrollTo({ top: 0 }); };
+      const [fu, setFu] = React.useState([]);
+      const [forg, setForg] = React.useState([]);
+      const [oubTab, setOubTab] = React.useState('oublis');
+      React.useEffect(() => storage.subscribe('followups', a => setFu(a || [])), []);
+      React.useEffect(() => storage.subscribe('forgotten_items', a => setForg((a || []).filter(f => !kbIsSwap(f)))), []);
+      const swaps = useKbSwaps(currentSite);
+      const TERMINAL = ['resolved', 'picked_up', 'credited', 'returned'];
+      const nNr = fu.filter(f => f.site === currentSite && !TERMINAL.includes(f.status)).length;
+      const nOub = forg.filter(f => f.site === currentSite && !['done', 'returned', 'picked_up'].includes(f.status)).length + swaps.filter(x => !['done', 'returned'].includes(x.status)).length;
+      const badge = { nonrecup: nNr, oublis: nOub };
+      const cur = KB_CARNET.find(x => x.k === sec);
+      if (cur) return (
+        <div className="stack">
+          <button className="btn-secondary" style={{ alignSelf: 'flex-start', width: 'auto', fontSize: 16, fontWeight: 700 }} onClick={() => go('')}>← Carnet de bord</button>
+          <h1 style={{ margin: '2px 0' }}>{cur.ic} {cur.t} · {currentSite}</h1>
+          {sec === 'nonrecup' && <NonRecupSubPage session={session} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
+          {sec === 'oublis' && <>
+            <div className="filter-row" style={{ marginBottom: 0 }}>
+              <div className={`chip ${oubTab === 'oublis' ? 'selected' : ''}`} onClick={() => setOubTab('oublis')}>📦 Oublis casier</div>
+              <div className={`chip ${oubTab === 'swaps' ? 'selected' : ''}`} onClick={() => setOubTab('swaps')}>🔀 {kbSwapWord(currentSite) === 'cagette' ? 'Cagettes' : 'Casiers'} trompés</div>
+            </div>
+            {oubTab === 'swaps' ? <SwapSubPage session={session} currentSite={currentSite} swaps={swaps} /> : <OublisSubPage session={session} currentSite={currentSite} forgottens={forg} consumersByEmail={consumersByEmail} />}
+          </>}
+          {sec === 'retours' && <><KbRollsReturnCard session={session} site={currentSite} /><ConsignesPage session={session} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} /></>}
+          {sec === 'pain' && <KbPainSuivi currentSite={currentSite} />}
+          {sec === 'infos' && <InfosPage session={session} currentSite={currentSite} />}
+        </div>);
+      return (
+        <div className="stack">
+          <h1 style={{ margin: '2px 0' }}>📒 Carnet de bord · {currentSite}</h1>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 10 }}>
+            {KB_CARNET.map(x => <button key={x.k} onClick={() => go(x.k)} style={{ position: 'relative', textAlign: 'left', cursor: 'pointer', background: '#fff', border: '2px solid ' + (badge[x.k] ? '#ef6c00' : 'var(--line,#ddd)'), borderRadius: 16, padding: '14px 14px', minHeight: 96, display: 'flex', gap: 12, alignItems: 'center', boxShadow: '0 2px 8px rgba(0,0,0,.05)' }}>
+              <span style={{ fontSize: 40, lineHeight: 1 }}>{x.ic}</span>
+              <span style={{ flex: 1 }}><span style={{ display: 'block', fontSize: 18, fontWeight: 800, color: 'var(--ink)' }}>{x.t}</span><span style={{ display: 'block', fontSize: 13, color: 'var(--ink-soft)', marginTop: 2 }}>{x.d}</span></span>
+              {badge[x.k] > 0 && <span style={{ minWidth: 34, height: 34, borderRadius: 17, background: '#ef6c00', color: '#fff', fontSize: 18, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 8px' }}>{badge[x.k]}</span>}
+            </button>)}
+          </div>
+        </div>);
+    }
     // V9.59j — Feuille à mettre dans le casier d'une commande non récupérée (A4 paysage, nom en très gros)
     function generateNonRecupSheetPDF(f, info) {
       const { jsPDF } = window.jspdf;
@@ -19142,6 +19271,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       }
       const [fh, fm] = kbTourHm(P.pr.prepFin, [18, 0]); const fin = new Date(); fin.setHours(fh, fm, 0, 0);
       const late = tP && tP > fin.getTime();
+      // V11.65 — estimations gardées (toutes les 10 min) pour les comparer au réel dans Historique › Prépa
+      const etaSlot = Math.floor(now / 600000), etaDay = agg && agg.day;
+      React.useEffect(() => {
+        if (!etaDay || !(t > 0) || d >= t || (!tP && !(restMu > 0 && tMu))) return;
+        storage.setDoc(KB_PRES, '~eta_' + etaDay, { day: etaDay, ['e' + etaSlot]: { at: Date.now(), mu: restMu > 0 && tMu ? Math.round(tMu) : 0, prep: tP ? Math.round(tP) : 0, np: nP, nm: nM, pct: Math.round(100 * d / t) } }).catch(() => {});
+      }, [etaDay, etaSlot]);
       const fmt = (x) => { if (!x) return null; const s2 = kbEtaHm(x); return new Date(x).toDateString() !== new Date(now).toDateString() ? 'demain ' + s2 : s2; };
       const names = (a) => a.length ? a.join(', ') : 'personne';
       return (
@@ -19380,6 +19515,50 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           </div>
         </div>
       );
+    }
+    // V11.65 — fin de prépa : à 90 % et plus, 5 min sans toucher l'écran → popup pour relancer ;
+    //   à 100 % et toujours pas clôturée 5 min après → popup « faut clôturer ». Revient toutes les 5 min.
+    const KB_NUDGE_IDLE = [
+      { e: '😴', t: 'Ohé ! Tout le monde dort ?', s: 'Plus que quelques produits et c\'est plié. Les clients comptent sur vous !' },
+      { e: '🐌', t: 'L\'escargot a pris la tête…', s: 'À 90 %, c\'est le sprint final, pas la pause café.' },
+      { e: '🏃', t: 'Dernière ligne droite !', s: 'Personne n\'a touché l\'appli depuis 5 min. On termine et on file ?' },
+      { e: '🧺', t: 'Les casiers se sentent seuls…', s: 'Il reste quelques produits à poser. Courage, c\'est presque fini !' },
+    ];
+    const KB_NUDGE_CLOSE = [
+      { e: '🏁', t: 'C\'est fini… mais pas clôturé !', s: '100 % depuis 5 min : faut clôturer la prépa, sinon les mails clients et Rungis ne partent pas.' },
+      { e: '🔒', t: 'Il manque juste un clic !', s: 'Tout est préparé. Clôture la prépa pour lancer les mails et l\'ancien site.' },
+      { e: '🎉', t: 'Bravo… et maintenant on clôture !', s: 'La fête commence après le bouton « Clôturer la prépa ».' },
+    ];
+    function KbPrepNudge({ pct, t, closed }) {
+      const last = React.useRef(Date.now());
+      const at100 = React.useRef(0);
+      const [now, setNow] = React.useState(Date.now());
+      const [snooze, setSnooze] = React.useState(0);
+      const [pick] = React.useState(() => Math.random());
+      React.useEffect(() => {
+        const hit = () => { last.current = Date.now(); };
+        const evs = ['pointerdown', 'keydown', 'touchstart', 'wheel'];
+        evs.forEach(ev => window.addEventListener(ev, hit, { passive: true }));
+        const iv = setInterval(() => setNow(Date.now()), 15000);
+        return () => { evs.forEach(ev => window.removeEventListener(ev, hit)); clearInterval(iv); };
+      }, []);
+      if (t > 0 && pct >= 100) { if (!at100.current) at100.current = Date.now(); } else at100.current = 0;
+      if (closed || !(t > 0) || now < snooze) return null;
+      const FIVE = 5 * 60000;
+      let kind = null;
+      if (pct >= 100 && at100.current && now - at100.current >= FIVE) kind = 'close';
+      else if (pct >= 90 && pct < 100 && now - last.current >= FIVE) kind = 'idle';
+      if (!kind) return null;
+      const L = kind === 'close' ? KB_NUDGE_CLOSE : KB_NUDGE_IDLE, m = L[Math.floor(pick * L.length) % L.length];
+      const ok = () => { last.current = Date.now(); setSnooze(Date.now() + FIVE); };
+      const col = kind === 'close' ? '#2e7d32' : '#ef6c00';
+      return React.createElement('div', { style: { position: 'fixed', inset: 0, zIndex: 3900, background: 'rgba(0,0,0,.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 } },
+        React.createElement('div', { style: { background: '#fff', borderRadius: 22, maxWidth: 440, width: '100%', textAlign: 'center', padding: '22px 18px', borderTop: '12px solid ' + col, boxShadow: '0 14px 44px rgba(0,0,0,.35)' } },
+          React.createElement('div', { style: { fontSize: 72, lineHeight: 1 } }, m.e),
+          React.createElement('div', { style: { fontSize: 26, fontWeight: 900, margin: '10px 0 6px', color: col } }, m.t),
+          React.createElement('div', { style: { fontSize: 18, lineHeight: 1.4, marginBottom: 6 } }, m.s),
+          React.createElement('div', { style: { fontSize: 44, fontWeight: 900, color: col, margin: '6px 0 14px' } }, pct + ' %'),
+          React.createElement('button', { className: 'btn-primary btn-block', onClick: ok, style: { minHeight: 62, fontSize: 21, fontWeight: 800 } }, kind === 'close' ? '🔒 OK, je clôture !' : '💪 On y retourne !')));
     }
     function PrepaDuJourPage({
   session
@@ -22999,7 +23178,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   const nr = curSite ? rows.filter(r => r.site === curSite && (prep.status[K(r)] === 'rupture' || prep.status[K(r)] === 'partiel')).length : 0;
   return React.createElement("div", {
     className: "pdj-wrap" + (mode === 'produits' && openProd ? ' focus' : '')
-  }, React.createElement(PdjStyle, null), casPick && (() => {
+  }, React.createElement(PdjStyle, null), React.createElement(KbPrepNudge, { pct: globalProg.pct, t: globalProg.t, closed: !!prep.closed }), casPick && (() => {
     const {
       site,
       client
@@ -30716,7 +30895,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const st = __kbPres[id] || (__kbPres[id] = { data: {}, timer: null, last: 0 });
         Object.assign(st.data, patch || {});
         const flush = () => { st.timer = null; st.last = Date.now();
-          storage.setDoc(KB_PRES, id, { name: session.name, role: kbPresRole(session), at: Date.now(), day: todayKey(), ...st.data }).catch(() => {}); };
+          storage.setDoc(KB_PRES, id, { name: session.name, role: kbPresRole(session), uid: kbSupUid(), site: session.site || st.data.site || '', at: Date.now(), day: todayKey(), ...st.data }).catch(() => {}); };
         const wait = (minGap == null ? 8000 : minGap) - (Date.now() - st.last);
         if (wait <= 0) flush(); else if (!st.timer) st.timer = setTimeout(flush, wait);
       } catch (e) {}
@@ -39090,6 +39269,37 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       ['', 'Toutes les actions'], ['pose', '✅ Posé'], ['partiel', '🟠 Partiel'], ['rupture', '❌ Rupture'], ['compteur', '🔢 Compteur'],
       ['casier', '🧺 Casiers'], ['remise', '💸 Remises'], ['lm', '🟣 Dernière minute'], ['nd', '🥬 ND'], ['annul', '↩️ Annulations'], ['cloture', '🔒 Clôture'],
     ];
+    // V11.65 — Horaires de la journée : réel (calculé d'après l'utilisation de l'appli) vs estimations faites pendant la journée.
+    function KbDayTimeline({ ps, meta, eta }) {
+      const hm = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }).replace(':', 'h') : '—';
+      const ppl = (ps && ps.people) || [];
+      const pick = (arr, f) => { const v = arr.filter(Boolean); return v.length ? f(...v) : 0; };
+      const prepDeb = pick(ppl.filter(p => p.lines > 0).map(p => p.first), Math.min), prepFin = pick(ppl.filter(p => p.lines > 0).map(p => p.last), Math.max);
+      const muDeb = pick(ppl.map(p => p.muFirst), Math.min), muFin = pick(ppl.map(p => p.muLast), Math.max);
+      const clo = meta && meta.closed ? (kbTsMs(meta.closedAt) || Number(meta.closedAt) || kbTsMs(meta._ts) || 0) : 0;
+      const ests = Object.keys(eta || {}).filter(k => /^e\d+$/.test(k)).map(k => eta[k]).filter(e => e && e.at).sort((a, b) => a.at - b.at);
+      const firstMu = ests.find(e => e.mu), lastMu = [...ests].reverse().find(e => e.mu && (!muFin || e.at <= muFin));
+      const firstP = ests.find(e => e.prep), lastP = [...ests].reverse().find(e => e.prep && (!prepFin || e.at <= prepFin));
+      const gap = (real, est) => { if (!real || !est) return null; const m = Math.round((real - est) / 60000); if (Math.abs(m) <= 5) return <span style={{ color: '#2e7d32', fontWeight: 700 }}>✓ pile</span>;
+        return <span style={{ color: m > 0 ? '#c62828' : '#2e7d32', fontWeight: 700 }}>{m > 0 ? '+' : '−'}{Math.abs(m) >= 60 ? Math.floor(Math.abs(m) / 60) + 'h' + String(Math.abs(m) % 60).padStart(2, '0') : Math.abs(m) + ' min'}</span>; };
+      const cell = { padding: '6px 8px', borderBottom: '1px solid var(--line)', fontSize: 14 };
+      const estTxt = (e, f) => e ? <>{hm(e[f])} <span style={{ color: 'var(--ink-mute)', fontSize: 12 }}>(estimé à {hm(e.at)}{e.pct != null ? ', ' + e.pct + ' %' : ''})</span></> : <span style={{ color: 'var(--ink-mute)' }}>—</span>;
+      return (
+        <div className="card">
+          <h3 style={{ fontSize: 16, margin: '0 0 4px' }}>⏱️ Horaires de la journée — réel vs estimé</h3>
+          <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 8 }}>Réel = 1er et dernier geste enregistrés dans l'appli. Estimé = « 🔮 au vu de la cadence » du Master › Aujourd'hui (gardé toutes les 10 min quand le Master est ouvert).</div>
+          <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr style={{ textAlign: 'left', fontSize: 12, color: 'var(--ink-mute)' }}><th style={cell}></th><th style={cell}>Début réel</th><th style={cell}>Fin réelle</th><th style={cell}>1re estimation</th><th style={cell}>Dernière estimation</th><th style={cell}>Écart réel / 1re</th></tr></thead>
+            <tbody>
+              <tr><td style={{ ...cell, fontWeight: 700 }}>⚖️ MU</td><td style={cell}>{hm(muDeb)}</td><td style={{ ...cell, fontWeight: 700 }}>{hm(muFin)}</td><td style={cell}>{estTxt(firstMu, 'mu')}</td><td style={cell}>{estTxt(lastMu, 'mu')}</td><td style={cell}>{gap(muFin, firstMu && firstMu.mu) || '—'}</td></tr>
+              <tr><td style={{ ...cell, fontWeight: 700 }}>🧺 Prépa</td><td style={cell}>{hm(prepDeb)}</td><td style={{ ...cell, fontWeight: 700 }}>{hm(prepFin)} <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>dernier geste</span></td><td style={cell}>{estTxt(firstP, 'prep')}</td><td style={cell}>{estTxt(lastP, 'prep')}</td><td style={cell}>{gap(prepFin, firstP && firstP.prep) || '—'}</td></tr>
+              <tr><td style={{ ...cell, fontWeight: 700 }}>🔒 Clôture</td><td style={cell}></td><td style={{ ...cell, fontWeight: 700 }}>{clo ? hm(clo) : 'pas clôturée'}{meta && meta.closedBy ? <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}> · {meta.closedBy}</span> : null}</td><td style={cell} colSpan={2}>{clo && prepFin ? <span style={{ fontSize: 13 }}>{Math.max(0, Math.round((clo - prepFin) / 60000))} min entre le dernier geste et la clôture</span> : null}</td><td style={cell}>{gap(clo, firstP && firstP.prep) || '—'}</td></tr>
+            </tbody></table></div>
+          {ests.length > 2 && <details style={{ marginTop: 6 }}><summary style={{ cursor: 'pointer', fontSize: 13, fontWeight: 700 }}>Toutes les estimations ({ests.length})</summary>
+            <div style={{ fontSize: 13, columns: '2 260px' }}>{ests.map((e, i) => <div key={i}>{hm(e.at)} · {e.pct != null ? e.pct + ' % · ' : ''}MU {e.mu ? hm(e.mu) : 'finie'} · prépa {hm(e.prep)} <span style={{ color: 'var(--ink-mute)' }}>({e.np} prépa, {e.nm} MU)</span></div>)}</div></details>}
+          {!ests.length && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Pas d'estimation gardée pour ce jour (enregistrées à partir de la V11.65, quand le Master › Aujourd'hui est ouvert pendant la prépa).</div>}
+        </div>);
+    }
     function PrepHistoryView() {
       const [day, setDay] = React.useState(() => { try { return activeDay(); } catch (e) { return todayKey(); } });
       const [data, setData] = React.useState(null);
@@ -39101,10 +39311,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const load = React.useCallback(async () => {
         setData(null); setErr('');
         try {
-          const [od, prepArr, logArr] = await Promise.all([
+          const [od, prepArr, logArr, etaDoc] = await Promise.all([
             storage.getDoc(`day_${day}_orders`, 'data').catch(() => null),
             storage.getAll(`day_${day}_prep`).catch(() => []),
             storage.getAll(`day_${day}_preplog`).catch(() => []),
+            storage.getDoc(KB_PRES, '~eta_' + day).catch(() => null),
           ]);
           const orderBy = {};
           for (const o of ((od && od.orders) || [])) orderBy[String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')] = o;
@@ -39116,7 +39327,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           const raw = { orders: (od && od.orders) || [], prepArr: prepArr || [], logArr: logArr || [] }; // V10.34
           let ps = null;
           if (raw.orders.length) { const muArr = await storage.getAll('mu_' + addDays(day, -1)).catch(() => []); ps = kbPsCompute(day, raw.orders, raw.prepArr, raw.logArr, muArr); const ca = await storage.getDoc('ca_history', day).catch(() => null); ps.caReel = ca && ca.totals && ca.totals.reel ? ca.totals.reel : 0; kbPsRefFeed(ps); } // V10.35 — MU incluse
-          setData({ etat, journal, nOrders: ((od && od.orders) || []).length, raw, ps });
+          const metaDoc = (prepArr || []).find(d => d.id === 'meta') || null;
+          setData({ etat, journal, nOrders: ((od && od.orders) || []).length, raw, ps, eta: etaDoc, meta: metaDoc });
         } catch (e) { setErr(e.message || String(e)); setData({ etat: [], journal: [], nOrders: 0, raw: null, ps: null }); }
       }, [day]);
       React.useEffect(() => { load(); }, [load]);
@@ -39176,6 +39388,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             )}
           </div>
 
+          {data && data.ps && (data.ps.team.lines > 0 || data.ps.team.muDone > 0) && <KbDayTimeline ps={data.ps} meta={data.meta} eta={data.eta} />}
           {data && data.ps && (data.ps.team.lines > 0 || data.ps.team.muDone > 0) && <KbPrepTeamCard s={data.ps} title="👥 Équipe — % de chacun ce jour-là" />}
 
           <div className="card" style={{ position: 'sticky', top: 0, zIndex: 5 }}>
@@ -40902,7 +41115,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
     const kbFabStyle = (bottom) => ({ position: 'fixed', right: 12, bottom, zIndex: 900, width: 46, height: 46, borderRadius: 23, border: '1px solid var(--line,#ddd)', background: '#fff', boxShadow: '0 3px 12px rgba(0,0,0,.18)', fontSize: 22, lineHeight: '44px', textAlign: 'center', cursor: 'pointer', padding: 0, opacity: .92 });
     const KbBadge = ({ n }) => n > 0 ? <span style={{ position: 'absolute', top: -4, right: -4, minWidth: 20, height: 20, borderRadius: 10, background: '#e53935', color: '#fff', fontSize: 12, fontWeight: 700, lineHeight: '20px', padding: '0 5px' }}>{n}</span> : null;
     function KbThread({ m, me }) {
-      const items = [{ by: 'user', from: m.from, text: m.text, at: m.at, img: m.img }, ...(m.thread || [])];
+      const items = [...(m.text || m.img ? [{ by: 'user', from: m.from, text: m.text, at: m.at, img: m.img }] : []), ...(m.thread || [])];
       return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           {items.map((t, i) => { const mine = me === 'master' ? t.by === 'master' : t.by !== 'master'; return (
@@ -40913,6 +41126,41 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             </div>); })}
         </div>
       );
+    }
+    // V11.65 — demande du Master à une personne précise : popup plein écran.
+    //   mode 'ack' = à valider avec ses initiales (pas de réponse) ; mode 'chat' = la personne répond dans le chat.
+    function KbTeamPopup({ m, session }) {
+      const showToast = React.useContext(ToastContext);
+      const [ini, setIni] = React.useState('');
+      const [txt, setTxt] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const lastM = [...(m.thread || [])].reverse().find(t => t.by === 'master') || {};
+      const save = async (patch) => { setBusy(true); try { await storage.setDoc('support_msgs', m.id, patch); } catch (e) { showToast('Erreur : ' + e.message); } finally { setBusy(false); } };
+      const now = () => Date.now();
+      const valider = () => { const i = ini.trim().toUpperCase(); if (i.length < 2) { showToast('Tes initiales (2 lettres min.)'); return; }
+        save({ thread: [...(m.thread || []), { by: 'user', from: session.name, text: '✅ Validé — ' + i, ack: i, at: now() }], userReadAt: now(), status: 'done' }); };
+      const repondre = () => { const t = txt.trim(); if (!t) { showToast('Écris ta réponse'); return; }
+        save({ thread: [...(m.thread || []), { by: 'user', from: session.name, text: t.slice(0, 2000), at: now() }], userReadAt: now(), status: 'new' }); };
+      const ack = m.mode === 'ack';
+      return (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 4000, background: 'rgba(0,0,0,.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 14 }}>
+          <div style={{ background: '#fff', borderRadius: 18, width: '100%', maxWidth: 460, maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 12px 40px rgba(0,0,0,.35)', borderTop: '10px solid ' + (ack ? '#2e7d32' : '#ef6c00') }}>
+            <div style={{ padding: '14px 16px' }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: ack ? '#2e7d32' : '#ef6c00' }}>{ack ? '📣 À VALIDER' : '💬 MESSAGE'} · de {lastM.from || 'le Master'} · {kbHm(lastM.at)}</div>
+              {ack ? <div style={{ fontSize: 22, fontWeight: 800, lineHeight: 1.35, margin: '12px 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{lastM.text}</div>
+                : <div style={{ margin: '12px 0' }}><KbThread m={m} me="user" /></div>}
+              {ack ? (<>
+                <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>Tes initiales</div>
+                <input value={ini} onChange={e => setIni(e.target.value.slice(0, 4))} placeholder="ex. MS" autoFocus style={{ width: '100%', boxSizing: 'border-box', fontSize: 26, fontWeight: 800, textAlign: 'center', textTransform: 'uppercase', padding: 10, borderRadius: 12, border: '3px solid #2e7d32', marginBottom: 10 }} />
+                <button className="btn-primary btn-block" disabled={busy} onClick={valider} style={{ minHeight: 58, fontSize: 20, fontWeight: 800 }}>✅ Lu et validé</button>
+              </>) : (<>
+                <textarea value={txt} onChange={e => setTxt(e.target.value)} rows={3} autoFocus placeholder="Ta réponse…" style={{ width: '100%', boxSizing: 'border-box', fontSize: 17, padding: 10, borderRadius: 12, border: '3px solid #ef6c00', marginBottom: 10 }} />
+                <button className="btn-primary btn-block" disabled={busy} onClick={repondre} style={{ minHeight: 56, fontSize: 19, fontWeight: 800 }}>➤ Répondre</button>
+                <button className="btn-ghost btn-block" disabled={busy} onClick={() => save({ userReadAt: now() })} style={{ marginTop: 6, fontSize: 15 }}>Plus tard (le chat reste dans 💬)</button>
+              </>)}
+            </div>
+          </div>
+        </div>);
     }
     // ---------- côté équipe (prépa, distrib, chauffeur…) ----------
     function KbSupportUser({ session, tab, site, bottom }) {
@@ -40927,7 +41175,13 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       const [reply, setReply] = React.useState({});
       const online = useKbMastersOnline();
       const uid = kbSupUid();
-      React.useEffect(() => { if (!uid) return; return storage.subscribeWhere('support_msgs', 'fromUid', '==', uid, (arr) => setMine((arr || []).sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 10))); }, [uid]);
+      const [allMine, setAllMine] = React.useState([]);
+      React.useEffect(() => { if (!uid) return; return storage.subscribeWhere('support_msgs', 'fromUid', '==', uid, (arr) => setAllMine((arr || []).sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 30))); }, [uid]);
+      // V11.65 — demandes du Master (chat équipe) à part du support technique
+      React.useEffect(() => { setMine(allMine.filter(m => m.kind !== 'team').slice(0, 10)); }, [allMine]);
+      const teamMsgs = allMine.filter(m => m.kind === 'team' && (Date.now() - (m.at || 0)) < 3 * 864e5);
+      const teamOpen = teamMsgs.filter(m => m.mode !== 'ack' && m.status !== 'done');
+      const teamPending = teamMsgs.find(m => m.status !== 'done' && (m.thread || []).some(t => t.by === 'master' && (t.at || 0) > (m.userReadAt || 0)));
       const unread = mine.filter(m => (m.thread || []).some(t => t.by === 'master' && (t.at || 0) > (m.userReadAt || 0))).length;
       React.useEffect(() => { if (open && unread) mine.forEach(m => { if ((m.thread || []).some(t => t.by === 'master' && (t.at || 0) > (m.userReadAt || 0))) storage.setDoc('support_msgs', m.id, { userReadAt: Date.now() }).catch(() => {}); }); }, [open, unread]);
       const pickImg = async (f) => { if (!f) return; try { setImg(await kbImgSmall(f)); } catch (e) { showToast(e.message); } };
@@ -40941,8 +41195,14 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       const answer = async (m) => { const t = String(reply[m.id] || '').trim(); if (!t) return; try { await storage.setDoc('support_msgs', m.id, { thread: [...(m.thread || []), { by: 'user', from: session.name, text: t, at: Date.now() }], userReadAt: Date.now(), status: 'new' }); setReply(r => ({ ...r, [m.id]: '' })); } catch (e) { showToast('Erreur : ' + e.message); } };
       return (
         <React.Fragment>
-          <button aria-label="Support appli" title="Un souci, une idée ? Écris à Henry" onClick={() => { setOpen(true); setSent(null); }} style={kbFabStyle(bottom)}>💬<KbBadge n={unread} /></button>
-          {open && <KbSheet title="💬 Un souci, une idée sur l'appli ?" onClose={() => setOpen(false)}>
+          <button aria-label="Support appli" title="Un souci, une idée ? Écris à Henry" onClick={() => { setOpen(true); setSent(null); }} style={kbFabStyle(bottom)}>💬<KbBadge n={unread + (teamPending ? 1 : 0)} /></button>
+          {teamPending && !open && <KbTeamPopup m={teamPending} session={session} />}
+          {open && <KbSheet title={teamOpen.length ? '💬 Chat avec le Master · Support technique' : '🛟 Support technique — un souci, une idée ?'} onClose={() => setOpen(false)}>
+            {teamOpen.map(m => <div key={m.id} style={{ border: '3px solid #ef6c00', background: '#fff8f0', borderRadius: 14, padding: 10, marginBottom: 14 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 6 }}>👋 Discussion avec {((m.thread || [])[0] || {}).from || 'le Master'}</div>
+              <KbThread m={m} me="user" />
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}><input value={reply[m.id] || ''} onChange={e => setReply(r => ({ ...r, [m.id]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') answer(m); }} placeholder="Répondre…" style={{ flex: 1, fontSize: 16, padding: '10px 12px', borderRadius: 12, border: '2px solid #ef6c00' }} /><button className="btn-primary" style={{ width: 'auto' }} onClick={() => answer(m)}>➤</button></div>
+            </div>)}
             <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginBottom: 8 }}>{online.length ? <b style={{ color: '#2e7d32' }}>🟢 {online.map(n => String(n).split(' ')[0]).join(', ')} en ligne : réponse ici même. </b> : null}Henry reçoit aussi un mail dans tous les cas.</div>
             {sent && <div style={{ background: '#e8f5e9', border: '2px solid #2e7d32', borderRadius: 12, padding: '10px 12px', marginBottom: 10, fontWeight: 700, color: '#1b5e20' }}>✅ Envoyé, merci ! {sent.mailed ? 'Henry a reçu un mail.' : ''}</div>}
             <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>1. Le thème</div>
@@ -40979,6 +41239,9 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       const [reply, setReply] = React.useState({});
       const [msg, setMsg] = React.useState('');
       const [pop, setPop] = React.useState(null);
+      const [pres, setPres] = React.useState([]); // V11.65 — chat équipe : personnes en ligne
+      const [tTo, setTTo] = React.useState(null); const [tMode, setTMode] = React.useState('chat'); const [tMsg, setTMsg] = React.useState('');
+      React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
       const [seenChat, setSeenChat] = React.useState(() => { try { return Number(localStorage.getItem('kb_chat_seen') || 0); } catch (_) { return 0; } });
       const mount = React.useRef(Date.now());
       const online = useKbMastersOnline();
@@ -40988,7 +41251,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         const L = (arr || []).sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, 80);
         setSup(prev => {
           const last = L.find(m => m.status === 'new' && Math.max(m.at || 0, ...((m.thread || []).map(t => t.at || 0))) > mount.current && !prev.some(p => p.id === m.id && (p.thread || []).length === (m.thread || []).length && p.status === m.status));
-          if (last) { const lt = (last.thread || []).slice(-1)[0]; setPop({ kind: 'sup', id: last.id, from: lt ? lt.from : last.from, text: lt ? lt.text : last.text, theme: last.theme }); }
+          if (last) { const lt = (last.thread || []).slice(-1)[0]; setPop({ kind: last.kind === 'team' ? 'team' : 'sup', id: last.id, from: lt ? lt.from : last.from, text: lt ? lt.text : last.text, theme: last.theme }); }
           return L;
         });
       }), []);
@@ -40997,7 +41260,20 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         const L = (arr || []).filter(m => (m.at || 0) > t0).sort((a, b) => (a.at || 0) - (b.at || 0)).slice(-120);
         setChat(prev => { const n = L[L.length - 1]; if (n && n.at > mount.current && n.from !== session.name && (!prev.length || prev[prev.length - 1].id !== n.id)) setPop({ kind: 'chat', from: n.from, text: n.text }); return L; });
       }), []);
-      const nNew = sup.filter(m => m.status === 'new').length;
+      const supOnly = sup.filter(m => m.kind !== 'team'), team = sup.filter(m => m.kind === 'team');
+      const nNew = supOnly.filter(m => m.status === 'new').length, nTeam = team.filter(m => m.status === 'new').length;
+      const tNow = Date.now();
+      const staffOn = pres.filter(p => p && p.name && p.uid && !String(p.id || '').startsWith('~') && p.role !== 'master' && tNow - (p.at || 0) < 5 * 60000)
+        .sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr'));
+      const sendTeam = async () => {
+        const t = tMsg.trim(); if (!tTo) { showToast('Choisis la personne'); return; } if (!t) { showToast('Écris le message'); return; }
+        const now = Date.now(), id = 'team_' + now + '_' + Math.random().toString(36).slice(2, 6);
+        try {
+          await storage.setDoc('support_msgs', id, { kind: 'team', mode: tMode, from: tTo.name, fromUid: tTo.uid, role: tTo.role || '', site: tTo.site || '', tab: '', theme: 'team', text: '', img: '',
+            at: now, status: 'open', thread: [{ by: 'master', from: session.name, text: t.slice(0, 2000), at: now }], userReadAt: 0, ver: APP_VERSION }, { replace: true });
+          setTMsg(''); showToast(tMode === 'ack' ? '📣 Envoyé à valider à ' + tTo.name : '💬 Envoyé à ' + tTo.name);
+        } catch (e) { showToast('Erreur : ' + e.message); }
+      };
       const nChat = chat.filter(m => (m.at || 0) > seenChat && m.from !== session.name).length;
       React.useEffect(() => { if (open && pane === 'chat' && nChat) { const t = Date.now(); setSeenChat(t); try { localStorage.setItem('kb_chat_seen', String(t)); } catch (_) {} } }, [open, pane, nChat]);
       const answer = async (m, done) => {
@@ -41010,23 +41286,52 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       const openPane = (p) => { setPane(p); setOpen(true); setPop(null); };
       return (
         <React.Fragment>
-          <button aria-label="Support et chat master" title="Support équipe · Chat master" onClick={() => open ? setOpen(false) : openPane(nNew || !nChat ? 'sup' : 'chat')} style={kbFabStyle(bottom)}>💬<KbBadge n={nNew + nChat} /></button>
-          {pop && !open && <div onClick={() => openPane(pop.kind)} style={{ position: 'fixed', right: 12, bottom: bottom + 56, zIndex: 901, width: 300, maxWidth: 'calc(100vw - 24px)', background: '#fff', borderRadius: 14, boxShadow: '0 8px 26px rgba(0,0,0,.22)', borderLeft: '6px solid ' + (pop.kind === 'sup' ? '#1565c0' : '#2e7d32'), padding: '10px 12px', cursor: 'pointer' }}>
-            <div style={{ display: 'flex', alignItems: 'center' }}><b style={{ flex: 1, fontSize: 14 }}>{pop.kind === 'sup' ? kbSupTheme(pop.theme).ic + ' ' + pop.from : '👥 ' + pop.from}</b><button onClick={e => { e.stopPropagation(); setPop(null); }} style={{ border: 0, background: 'none', fontSize: 18, cursor: 'pointer' }}>×</button></div>
+          <button aria-label="Support et chat master" title="Support technique · Chat équipe · Chat master" onClick={() => open ? setOpen(false) : openPane(nTeam ? 'team' : nNew || !nChat ? 'sup' : 'chat')} style={kbFabStyle(bottom)}>💬<KbBadge n={nNew + nChat + nTeam} /></button>
+          {pop && !open && <div onClick={() => openPane(pop.kind)} style={{ position: 'fixed', right: 12, bottom: bottom + 56, zIndex: 901, width: 300, maxWidth: 'calc(100vw - 24px)', background: '#fff', borderRadius: 14, boxShadow: '0 8px 26px rgba(0,0,0,.22)', borderLeft: '6px solid ' + (pop.kind === 'sup' ? '#1565c0' : pop.kind === 'team' ? '#ef6c00' : '#2e7d32'), padding: '10px 12px', cursor: 'pointer' }}>
+            <div style={{ display: 'flex', alignItems: 'center' }}><b style={{ flex: 1, fontSize: 14 }}>{pop.kind === 'sup' ? kbSupTheme(pop.theme).ic + ' ' + pop.from : (pop.kind === 'team' ? '👋 ' : '👥 ') + pop.from}</b><button onClick={e => { e.stopPropagation(); setPop(null); }} style={{ border: 0, background: 'none', fontSize: 18, cursor: 'pointer' }}>×</button></div>
             <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical' }}>{pop.text}</div>
             <div style={{ fontSize: 12, color: '#1565c0', fontWeight: 700, marginTop: 4 }}>Répondre →</div>
           </div>}
           {open && <div style={{ position: 'fixed', right: 0, top: 0, bottom: 0, width: 420, maxWidth: '100vw', zIndex: 3000, background: '#fff', boxShadow: '-6px 0 24px rgba(0,0,0,.18)', display: 'flex', flexDirection: 'column' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 12px', borderBottom: '1px solid var(--line,#ddd)' }}>
-              {[['sup', '🛟 Support équipe', nNew], ['chat', '👥 Chat master', nChat]].map(([k, l, n]) => <button key={k} onClick={() => setPane(k)} className={pane === k ? 'btn-primary' : 'btn-secondary'} style={{ width: 'auto', fontSize: 14, fontWeight: 700, position: 'relative' }}>{l}{n ? ` (${n})` : ''}</button>)}
+              {[['sup', '🛟 Support', nNew], ['team', '👋 Équipe', nTeam], ['chat', '👥 Master', nChat]].map(([k, l, n]) => <button key={k} onClick={() => setPane(k)} className={pane === k ? 'btn-primary' : 'btn-secondary'} style={{ width: 'auto', fontSize: 14, fontWeight: 700, position: 'relative' }}>{l}{n ? ` (${n})` : ''}</button>)}
               <span style={{ flex: 1 }} />
               <button onClick={() => setOpen(false)} style={{ border: 0, background: 'none', fontSize: 26, cursor: 'pointer' }} aria-label="Fermer">×</button>
             </div>
             <div style={{ fontSize: 12, color: 'var(--ink-mute)', padding: '6px 12px' }}>🟢 En ligne dans le Master : {online.length ? online.join(', ') : '—'}</div>
-            {pane === 'sup' ? (
+            {pane === 'team' ? (
               <div style={{ overflowY: 'auto', flex: 1, padding: '6px 12px 20px' }}>
-                {!sup.length && <div style={{ color: 'var(--ink-mute)', padding: 10 }}>Aucun message de l'équipe.</div>}
-                {sup.map(m => { const th = kbSupTheme(m.theme); return (
+                <div style={{ fontSize: 14, fontWeight: 700, margin: '4px 0 6px' }}>1. À qui ? <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--ink-mute)' }}>(personnes connectées à l'appli ces 5 dernières minutes)</span></div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                  {!staffOn.length && <div style={{ color: 'var(--ink-mute)', fontSize: 14 }}>Personne de l'équipe en ligne pour l'instant.</div>}
+                  {staffOn.map(p => { const on = tTo && tTo.uid === p.uid; return <button key={p.id} onClick={() => setTTo(on ? null : p)} style={{ padding: '7px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 14, fontWeight: 700, border: '2px solid ' + (on ? '#ef6c00' : 'var(--line,#ddd)'), background: on ? '#fff3e0' : '#fff' }}>{p.role === 'distrib' ? '🛍️' : p.role === 'pdp' ? '🚚' : '🧺'} {p.name}{p.site ? ' · ' + p.site : ''}</button>; })}
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>2. Quel type ?</div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                  {[['chat', '💬 Discussion', 'popup qui ouvre le chat, la personne répond'], ['ack', '✅ À valider', 'popup à valider avec ses initiales, sans réponse']].map(([k, l, d]) =>
+                    <button key={k} onClick={() => setTMode(k)} title={d} style={{ flex: 1, padding: '8px 6px', borderRadius: 12, cursor: 'pointer', fontSize: 14, fontWeight: 700, border: '2px solid ' + (tMode === k ? 'var(--accent-dark,#2f5326)' : 'var(--line,#ddd)'), background: tMode === k ? 'var(--accent-soft,#eaf1e6)' : '#fff' }}>{l}<div style={{ fontSize: 11, fontWeight: 400, color: 'var(--ink-mute)' }}>{d}</div></button>)}
+                </div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+                  <textarea value={tMsg} onChange={e => setTMsg(e.target.value)} rows={2} placeholder={tTo ? 'Message pour ' + tTo.name + '…' : 'Choisis d\'abord la personne'} style={{ flex: 1, fontSize: 15, padding: '8px 10px', borderRadius: 12, border: '1px solid var(--line,#ddd)' }} />
+                  <button className="btn-primary" style={{ width: 'auto' }} onClick={sendTeam}>➤</button>
+                </div>
+                {!team.length && <div style={{ color: 'var(--ink-mute)', padding: 10 }}>Aucune demande envoyée à l'équipe.</div>}
+                {team.map(m => { const ack = (m.thread || []).find(t => t.ack); return (
+                  <div key={m.id} style={{ border: '2px solid ' + (m.status === 'new' ? '#ef6c00' : 'var(--line,#ddd)'), borderRadius: 12, padding: 10, marginBottom: 10, opacity: m.status === 'done' ? .7 : 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700 }}>{m.mode === 'ack' ? '✅ À valider' : '💬 Discussion'} → {m.from}{m.site ? ' · ' + m.site : ''}</div>
+                    <div style={{ fontSize: 12, color: m.status === 'done' ? '#2e7d32' : 'var(--ink-mute)', fontWeight: 600, marginBottom: 6 }}>{ack ? '✅ validé par ' + ack.ack + ' à ' + kbHm(ack.at) : m.status === 'done' ? '✓ terminé' : m.userReadAt ? '👀 vu à ' + kbHm(m.userReadAt) : '⏳ pas encore vu'}</div>
+                    <KbThread m={m} me="master" />
+                    {m.status !== 'done' && <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                      {m.mode !== 'ack' && <><input value={reply[m.id] || ''} onChange={e => setReply(r => ({ ...r, [m.id]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') answer(m, false); }} placeholder="Répondre…" style={{ flex: 1, fontSize: 15, padding: '8px 10px', borderRadius: 10, border: '1px solid var(--line,#ddd)' }} />
+                      <button className="btn-primary" style={{ width: 'auto' }} onClick={() => answer(m, false)}>➤</button></>}
+                      <button className="btn-secondary" style={{ width: 'auto' }} title="Clore la discussion" onClick={() => answer(m, true)}>✓ Clore</button>
+                    </div>}
+                  </div>); })}
+              </div>
+            ) : pane === 'sup' ? (
+              <div style={{ overflowY: 'auto', flex: 1, padding: '6px 12px 20px' }}>
+                {!supOnly.length && <div style={{ color: 'var(--ink-mute)', padding: 10 }}>Aucun message de l'équipe.</div>}
+                {supOnly.map(m => { const th = kbSupTheme(m.theme); return (
                   <div key={m.id} style={{ border: '2px solid ' + (m.status === 'new' ? '#1565c0' : 'var(--line,#ddd)'), borderRadius: 12, padding: 10, marginBottom: 10, opacity: m.status === 'done' ? .65 : 1 }}>
                     <div style={{ fontSize: 14, fontWeight: 700 }}>{th.ic} {th.l}</div>
                     <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 6 }}>{m.from} · {m.role}{m.site ? ' · ' + m.site : ''}{m.tab ? ' · écran ' + m.tab : ''} · {m.ver || ''}</div>
@@ -41888,7 +42193,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
           {tab === 'clients' && <ClientsPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} dispatch={dispatchData[currentSite] || null} lastminute={lastminute} />}
           {tab === "quality" && <QualityPage session={effSession} currentSite={currentSite} orders={orders} products={products} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
           {tab === 'consignes' && <ConsignesPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} />}
-          {tab === 'followup' && <FollowUpPage session={effSession} currentSite={currentSite} consumersByEmail={consumersByEmail} />}
+          {tab === 'followup' && (effSession.isMaster ? <FollowUpPage session={effSession} currentSite={currentSite} consumersByEmail={consumersByEmail} /> : <KbCarnetPage session={effSession} currentSite={currentSite} orders={orders} isClosed={isClosed} consumersByEmail={consumersByEmail} />)}
           {tab === 'infos' && <InfosPage session={effSession} currentSite={currentSite} />}
           {tab === 'temp' && !effSession.isMaster && BOUTIQUES.includes(currentSite) && <TemperaturePage session={effSession} currentSite={currentSite} />}
           {tab === 'closure' && <ClosurePage session={effSession} currentSite={currentSite} orders={orders} consumersByEmail={consumersByEmail} isClosed={isClosed} onReopen={() => {}} />}
@@ -41924,15 +42229,13 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             )}
             {!effSession.isMaster && (
               <button className={tab==='followup'?'active':''} onClick={()=>setTab('followup')}>
-                <span className="tab-icon">📞</span>Suivi
+                <span className="tab-icon">📒</span>Carnet
               </button>
             )}
             {!effSession.isMaster && (
-              <KbMoreTab tab={tab} setTab={setTab} items={[
-                { k: 'consignes', ic: '🍯', l: 'Consigne' },
-                { k: 'infos', ic: '📋', l: 'Infos' },
-                ...(BOUTIQUES.includes(currentSite) ? [{ k: 'temp', ic: '🌡️', l: 'Température' }] : []),
-              ]} />
+              BOUTIQUES.includes(currentSite) && <button className={tab==='temp'?'active':''} onClick={()=>setTab('temp')}>
+                <span className="tab-icon">🌡️</span>Temp.
+              </button>
             )}
             {!effSession.isMaster && (
               <button className={tab==='closure'?'active':''} onClick={()=>setTab('closure')} style={{background: tab==='closure' ? undefined : '#ffebee'}}>
