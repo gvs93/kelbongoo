@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.65) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.67) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.65';
+const APP_VERSION = 'V11.67';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -16710,6 +16710,10 @@ function kbIsFLProduct(p) {
   const t = normalizeText([p && p.category, p && p.family, p && p.famille, p && p.cat].filter(Boolean).join(' '));
   return /fruit|legume|f&l|\bfl\b/.test(t);
 }
+function kbInvDlcLimit(day) {
+  const x = new Date((day || todayKey()) + 'T12:00:00');
+  return addDays(day || todayKey(), -((x.getDay() + 6) % 7) + 11);
+}
 function InventoryPage({
   session
 }) {
@@ -18173,7 +18177,41 @@ function InventoryPage({
     className: "stat-value"
   }, Object.keys(eanMap).length), React.createElement("div", {
     className: "stat-label"
-  }, "Codes appris"))), React.createElement("div", {
+  }, "Codes appris"))), (() => {
+    const lim = kbInvDlcLimit(invDate);
+    return React.createElement("div", {
+      style: {
+        margin: '4px 0 10px',
+        padding: '14px 16px',
+        borderRadius: 14,
+        background: '#c62828',
+        color: '#fff',
+        textAlign: 'center'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 700,
+        opacity: .95
+      }
+    }, "\u26A0\uFE0F SIGNALER LA DLC des produits qui ont une DLC"), React.createElement("div", {
+      style: {
+        fontSize: 30,
+        fontWeight: 900,
+        lineHeight: 1.15,
+        margin: '4px 0'
+      }
+    }, "JUSQU'AU ", new Date(lim + 'T12:00:00').toLocaleDateString('fr-FR', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'numeric'
+    }).toUpperCase(), " COMPRIS"), React.createElement("div", {
+      style: {
+        fontSize: 14,
+        opacity: .95
+      }
+    }, "Le client doit avoir J+3 : distrib du mercredi ", formatDateShort(addDays(lim, -2)), " \u2192 DLC au moins le ", formatDateShort(addDays(lim, 1)), ". Une DLC le ", formatDateShort(lim), " ou avant = trop courte."));
+  })(), React.createElement("div", {
     className: "filter-row"
   }, React.createElement("div", {
     className: `chip ${!scanMode ? 'selected' : ''}`,
@@ -18712,7 +18750,18 @@ function InventoryPage({
       saved: dlcInputs[p.id] || '',
       onValidate: v => saveDlcFromInventory(p.id, v),
       onClose: () => setDlcExpandedId(null)
-    }));
+    }), hasDlc && dlcInputs[p.id] <= kbInvDlcLimit(invDate) && React.createElement("div", {
+      style: {
+        marginTop: 8,
+        padding: '8px 10px',
+        borderRadius: 10,
+        background: '#c62828',
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: 800,
+        textAlign: 'center'
+      }
+    }, "\u26A0\uFE0F DLC ", formatDateShort(dlcInputs[p.id]), " \u2264 ", formatDateShort(kbInvDlcLimit(invDate)), " : trop courte pour le client"));
   }), invType === 'tournant' && !scopeOk && React.createElement("p", {
     style: {
       fontSize: 13,
@@ -26405,6 +26454,95 @@ function kbMuCacheSet(k, v) {
       at: Date.now(),
       v
     }));
+  } catch (e) {}
+  if (k === 'fl') kbFlWeekRemember(v);
+}
+function kbFlParse(rows) {
+  if (!rows || rows.length < 2) return [];
+  const H = rows[0].map(h => normalizeText(String(h || '')).trim());
+  const col = preds => {
+    for (const p of preds) {
+      const i = H.findIndex(p);
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const iD = col([h => h === 'designation', h => h.includes('designation')]),
+    iP = col([h => h === 'producteur']),
+    iA = col([h => h === 'actif ?', h => h.includes('actif')]),
+    iPx = col([h => h.includes('prix achat')]),
+    iPv = col([h => h.includes('prix vente')]),
+    iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
+    iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]),
+    iMu = col([h => h.startsWith('mu en k')]),
+    iT = col([h => h === 'type']);
+  if (iD < 0) return [];
+  const num = v => {
+    const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.'));
+    return isNaN(n) ? 0 : n;
+  };
+  const out = [],
+    seen = new Set();
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const name = String(row[iD] == null ? '' : row[iD]).trim();
+    if (!name) continue;
+    const active = iA < 0 || /^actif/.test(normalizeText(String(row[iA] || '')).trim());
+    const prod = iP >= 0 ? String(row[iP] || '').trim() : '';
+    const key = prod + '|' + name;
+    if (seen.has(key)) {
+      if (active) {
+        const o = out.find(x => x.key === key);
+        if (o) o.active = true;
+      }
+      continue;
+    }
+    seen.add(key);
+    out.push({
+      key,
+      name,
+      prod,
+      active,
+      uv: iU >= 0 ? String(row[iU] || '').trim() : '',
+      type: iT >= 0 ? String(row[iT] || '').trim() : '',
+      pa: iPx >= 0 ? num(row[iPx]) : 0,
+      pv: iPv >= 0 ? num(row[iPv]) : 0,
+      colisage: iC >= 0 ? num(row[iC]) : 0,
+      mu: iMu >= 0 ? num(row[iMu]) : 0
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+}
+function kbFlWeekId(day) {
+  const d = day || todayKey();
+  const x = new Date(d + 'T12:00:00');
+  return 'fl_week_' + addDays(d, -((x.getDay() + 6) % 7));
+}
+const kbFlWkEnc = k => encodeURIComponent(k).replace(/\./g, '%2E');
+function kbFlWeekLocal() {
+  try {
+    return JSON.parse(localStorage.getItem('kb_' + kbFlWeekId()) || '{}') || {};
+  } catch (e) {
+    return {};
+  }
+}
+function kbFlWeekRemember(rows) {
+  try {
+    const act = kbFlParse(rows).filter(x => x.active).map(x => kbFlWkEnc(x.key));
+    const loc = kbFlWeekLocal();
+    const add = {};
+    act.forEach(k => {
+      if (!loc[k]) add[k] = true;
+    });
+    if (!Object.keys(add).length) return;
+    localStorage.setItem('kb_' + kbFlWeekId(), JSON.stringify({
+      ...loc,
+      ...add
+    }));
+    storage.setDoc('app_config', kbFlWeekId(), {
+      active: add,
+      updatedAt: new Date().toISOString()
+    }).catch(() => {});
   } catch (e) {}
 }
 function kbWithTimeout(p, ms, label) {
@@ -58913,6 +59051,9 @@ function KbPertesRobPage({
   const [archives, setArchives] = React.useState(null);
   const [open, setOpen] = React.useState(null);
   const [what, setWhat] = React.useState('pribon');
+  const [mode, setMode] = React.useState('cal');
+  const [calMonth, setCalMonth] = React.useState(() => todayKey().slice(0, 7));
+  const [calDay, setCalDay] = React.useState(() => todayKey());
   React.useEffect(() => {
     const u1 = storage.subscribe('losses', a => setLosses(a || []));
     const u2 = storage.subscribe('losses_archive', a => setArchives(a || []));
@@ -58961,6 +59102,33 @@ function KbPertesRobPage({
       };
     }).sort((a, b) => b.monday.localeCompare(a.monday));
   }, [losses, archives]);
+  const pad2 = n => String(n).padStart(2, '0');
+  const localKey = iso => {
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  };
+  const byRemoval = React.useMemo(() => {
+    const m = {};
+    const seen = new Set();
+    const add = l => {
+      const day = l.createdAt && localKey(l.createdAt) || l.day || '';
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+      const key = l.id || `${day}|${l.produit}|${l.quantity}|${l.createdAt}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      (m[day] = m[day] || []).push(l);
+    };
+    (losses || []).forEach(add);
+    (archives || []).forEach(a => {
+      let it = [];
+      try {
+        it = JSON.parse(a.losses || '[]');
+      } catch (_) {}
+      it.forEach(add);
+    });
+    return m;
+  }, [losses, archives]);
   if (losses === null || archives === null) return React.createElement("div", {
     className: "card"
   }, React.createElement("p", {
@@ -58972,6 +59140,13 @@ function KbPertesRobPage({
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
   }) + ' €';
+  const keep = l => what === 'pribon' ? l.destination === 'pribon' : what === 'seche' ? l.destination === 'jete' || l.destination === 'partage' : true;
+  const hhmm = iso => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : `${pad2(d.getHours())}h${pad2(d.getMinutes())}`;
+  };
+  const dayItems = d => (byRemoval[d] || []).filter(keep);
+  const daySum = d => dayItems(d).reduce((t, l) => t + (Number(l.totalValue) || 0), 0);
   const val = w => what === 'pribon' ? w.robEur : what === 'seche' ? w.secheEur : w.robEur + w.secheEur;
   const max = Math.max(1, ...weeks.map(val));
   const last4 = weeks.slice(0, 4);
@@ -59045,13 +59220,266 @@ function KbPertesRobPage({
       fontSize: 28,
       fontWeight: 700
     }
-  }, eur(avg4)))), weeks.length === 0 && React.createElement("div", {
+  }, eur(avg4)))), React.createElement("div", {
+    className: "seg",
+    style: {
+      alignSelf: 'flex-start'
+    }
+  }, React.createElement("button", {
+    className: mode === 'cal' ? 'active' : '',
+    onClick: () => setMode('cal')
+  }, "\uD83D\uDCC5 Calendrier"), React.createElement("button", {
+    className: mode === 'sem' ? 'active' : '',
+    onClick: () => setMode('sem')
+  }, "\uD83D\uDCCA Par semaine")), mode === 'cal' && (() => {
+    const [Y, M] = calMonth.split('-').map(Number);
+    const first = `${calMonth}-01`;
+    const nDays = new Date(Y, M, 0).getDate();
+    const lead = (new Date(Y, M - 1, 1).getDay() + 6) % 7;
+    const cells = [];
+    for (let i = 0; i < lead; i++) cells.push(null);
+    for (let d = 1; d <= nDays; d++) cells.push(`${calMonth}-${pad2(d)}`);
+    const shift = k => {
+      const d = new Date(Y, M - 1 + k, 1);
+      setCalMonth(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`);
+    };
+    const monthTot = cells.filter(Boolean).reduce((t, d) => t + daySum(d), 0);
+    const maxDay = Math.max(1, ...cells.filter(Boolean).map(daySum));
+    const today = todayKey();
+    const color = what === 'seche' ? 'var(--danger)' : '#6e4a9c';
+    const items = dayItems(calDay).slice().sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    const DESTL = {
+      pribon: '♻️ ROB',
+      partage: '🤝 Partage équipe',
+      jete: '🗑️ Jeté'
+    };
+    return React.createElement(React.Fragment, null, React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 12
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+        marginBottom: 10
+      }
+    }, React.createElement("button", {
+      className: "btn-secondary",
+      onClick: () => shift(-1),
+      style: {
+        padding: '4px 12px'
+      }
+    }, "\u2039"), React.createElement("div", {
+      style: {
+        textAlign: 'center'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 17,
+        fontWeight: 700,
+        textTransform: 'capitalize'
+      }
+    }, new Date(Y, M - 1, 1).toLocaleDateString('fr-FR', {
+      month: 'long',
+      year: 'numeric'
+    })), React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)'
+      }
+    }, "Total du mois : ", React.createElement("b", {
+      style: {
+        color
+      }
+    }, eur(monthTot)))), React.createElement("button", {
+      className: "btn-secondary",
+      onClick: () => shift(1),
+      style: {
+        padding: '4px 12px'
+      }
+    }, "\u203A")), React.createElement("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(7,1fr)',
+        gap: 4
+      }
+    }, ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(j => React.createElement("div", {
+      key: j,
+      style: {
+        fontSize: 11,
+        fontWeight: 700,
+        color: 'var(--ink-mute)',
+        textAlign: 'center'
+      }
+    }, j)), cells.map((d, i) => {
+      if (!d) return React.createElement("div", {
+        key: 'e' + i
+      });
+      const v = daySum(d);
+      const n = dayItems(d).length;
+      const sel = d === calDay;
+      const a = v > 0 ? 0.12 + 0.5 * (v / maxDay) : 0;
+      return React.createElement("button", {
+        key: d,
+        onClick: () => setCalDay(d),
+        style: {
+          minHeight: 58,
+          borderRadius: 8,
+          cursor: 'pointer',
+          padding: '4px 2px',
+          textAlign: 'center',
+          border: sel ? `2px solid ${color}` : d === today ? '2px solid var(--ink-mute)' : '1px solid var(--line)',
+          background: n ? what === 'seche' ? `rgba(200,40,40,${a})` : `rgba(110,74,156,${a})` : 'transparent'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 13,
+          fontWeight: 700
+        }
+      }, Number(d.slice(8))), n > 0 && React.createElement("div", {
+        style: {
+          fontSize: 11,
+          fontWeight: 700
+        }
+      }, Math.round(v), " \u20AC"), n > 0 && React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: 'var(--ink-mute)'
+        }
+      }, n, " art."));
+    }))), React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 12
+      }
+    }, React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'baseline',
+        gap: 8,
+        flexWrap: 'wrap'
+      }
+    }, React.createElement("h2", {
+      style: {
+        margin: 0,
+        fontSize: 17,
+        textTransform: 'capitalize'
+      }
+    }, "Retir\xE9 le ", new Date(calDay + 'T12:00:00').toLocaleDateString('fr-FR', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long'
+    })), React.createElement("b", {
+      style: {
+        fontSize: 18,
+        color
+      }
+    }, eur(daySum(calDay)))), React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: 'var(--ink-mute)',
+        margin: '2px 0 8px'
+      }
+    }, items.length, " article", items.length > 1 ? 's' : '', " \xB7 tri\xE9 par heure de retrait"), items.length === 0 && React.createElement("p", {
+      style: {
+        fontSize: 13,
+        color: 'var(--ink-mute)',
+        margin: 0
+      }
+    }, "Rien de retir\xE9 ce jour."), items.map((l, i) => {
+      const dlcPast = l.dlc && l.dlc < calDay;
+      return React.createElement("div", {
+        key: l.id || i,
+        style: {
+          display: 'grid',
+          gridTemplateColumns: '52px 1fr auto',
+          gap: 8,
+          alignItems: 'start',
+          padding: '8px 0',
+          borderBottom: '1px solid var(--line)',
+          fontSize: 13
+        }
+      }, React.createElement("div", {
+        style: {
+          fontWeight: 700,
+          fontSize: 14
+        }
+      }, hhmm(l.createdAt) || '—'), React.createElement("div", {
+        style: {
+          minWidth: 0
+        }
+      }, React.createElement("div", null, React.createElement("b", null, kbProdName(l.produit || l.productName || '(produit)')), " \xD7", l.quantity || l.qty || 1, l.producteur ? React.createElement("span", {
+        style: {
+          color: 'var(--ink-mute)'
+        }
+      }, " \xB7 ", l.producteur) : null), React.createElement("div", {
+        style: {
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 6,
+          marginTop: 3,
+          fontSize: 12
+        }
+      }, React.createElement("span", {
+        style: {
+          padding: '1px 7px',
+          borderRadius: 10,
+          fontWeight: 700,
+          background: dlcPast ? '#fde2e2' : '#fff3cd',
+          color: dlcPast ? '#a12020' : '#7a5b00'
+        }
+      }, "DLC ", l.dlc ? formatDateShort(l.dlc) : '?'), React.createElement("span", {
+        style: {
+          padding: '1px 7px',
+          borderRadius: 10,
+          background: 'var(--bg-muted)'
+        }
+      }, "\uD83D\uDC64 ", l.createdBy || '?', l.controlInitials ? ` · contrôle ${l.controlInitials}` : ''), React.createElement("span", {
+        style: {
+          padding: '1px 7px',
+          borderRadius: 10,
+          background: 'var(--bg-muted)'
+        }
+      }, DESTL[l.destination] || l.destination, l.destination === 'pribon' && l.robSentDate ? ` · navette du ${formatDateShort(l.robSentDate)}` : ''), l.site ? React.createElement("span", {
+        style: {
+          padding: '1px 7px',
+          borderRadius: 10,
+          background: 'var(--bg-muted)'
+        }
+      }, "\uD83D\uDCCD ", l.site) : null), l.remark ? React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: 'var(--ink-mute)',
+          marginTop: 3
+        }
+      }, l.remark) : null), React.createElement("div", {
+        style: {
+          textAlign: 'right',
+          whiteSpace: 'nowrap'
+        }
+      }, React.createElement("b", null, eur(l.totalValue)), Number(l.unitPrice) > 0 ? React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: 'var(--ink-mute)'
+        }
+      }, eur(l.unitPrice), " / u") : React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: 'var(--warn)'
+        }
+      }, "prix inconnu")));
+    })));
+  })(), mode === 'sem' && weeks.length === 0 && React.createElement("div", {
     className: "card"
   }, React.createElement("p", {
     style: {
       margin: 0
     }
-  }, "Aucune perte enregistr\xE9e.")), React.createElement("div", {
+  }, "Aucune perte enregistr\xE9e.")), mode === 'sem' && React.createElement("div", {
     className: "card",
     style: {
       padding: '8px 10px'
@@ -59669,19 +60097,20 @@ function useKbPdpBoard() {
         ...kbPdpSteps(p)
       } : f;
     });
-    const recoverManual = (manual || []).filter(r => r.status === 'pending' || r.status === 'missing');
-    const recoverOrders = orders.filter(f => !f.pdpRecoveredAt);
+    const atPdp = x => String(x && x.site || '').toUpperCase() === 'PDP';
+    const recoverManual = (manual || []).filter(r => !atPdp(r) && (r.status === 'pending' || r.status === 'missing'));
+    const recoverOrders = orders.filter(f => !atPdp(f) && !f.pdpRecoveredAt);
     const recoveredTodayManual = (manual || []).filter(r => r.status === 'recovered' && kbIsToday(r.recoveredAt));
     const recoveredTodayOrders = orders.filter(f => f.pdpRecoveredAt && kbIsToday(f.pdpRecoveredAt));
-    const pickedManual = (manual || []).filter(r => r.status === 'recovered');
-    const pickedOrders = orders.filter(f => f.pdpRecoveredAt && !f.pdpVerifiedAt);
-    const verifiedManual = (manual || []).filter(r => r.status === 'verified');
-    const verifiedOrders = orders.filter(f => f.pdpVerifiedAt && !f.pdpDepositedAt);
+    const pickedManual = (manual || []).filter(r => !atPdp(r) && r.status === 'recovered');
+    const pickedOrders = orders.filter(f => !atPdp(f) && f.pdpRecoveredAt && !f.pdpVerifiedAt);
+    const verifiedManual = (manual || []).filter(r => !atPdp(r) && r.status === 'verified');
+    const verifiedOrders = orders.filter(f => !atPdp(f) && f.pdpVerifiedAt && !f.pdpDepositedAt);
     const notFoundManual = (manual || []).filter(r => r.status === 'notfound');
     const driverTodo = recoverManual.length + recoverOrders.length + pickedManual.length + pickedOrders.length + verifiedManual.length + verifiedOrders.length;
-    const treatManual = (manual || []).filter(r => r.status === 'deposited');
+    const treatManual = (manual || []).filter(r => r.status === 'deposited' || atPdp(r) && ['pending', 'missing', 'recovered', 'verified'].includes(r.status));
     const treatLines = [];
-    orders.filter(f => f.pdpDepositedAt).forEach(f => f.items.forEach((it, idx) => {
+    orders.filter(f => f.pdpDepositedAt || atPdp(f)).forEach(f => f.items.forEach((it, idx) => {
       const id = lineId(f, it, idx);
       if (!tm[id] && (f.pdpCheck || {})[String(idx)] !== false) treatLines.push({
         f,
@@ -61960,7 +62389,7 @@ function LossesPage({
       color: '#1565c0',
       fontWeight: 700
     }
-  }, "\uD83E\uDD6C F&L en lot"), React.createElement("button", {
+  }, "\uD83E\uDD6C Saisir le F&L \xE0 envoyer \xE0 Montreuil"), React.createElement("button", {
     className: "btn-primary",
     disabled: !catalogue || catalogue.length === 0,
     onClick: () => {
@@ -62316,9 +62745,14 @@ function LossesPage({
       }
     }, "\xAB ", l.remark, " \xBB"));
   })), showForm && React.createElement(LossForm, {
-    catalogue: catalogue,
+    catalogue: (catalogue || []).filter(p => !kbLossIsFl(p) || editing && editing.productKey === `${p.producteur}|${p.produit}`),
     session: session,
     editing: editing,
+    onFl: () => {
+      setShowForm(false);
+      setEditing(null);
+      setShowFl(true);
+    },
     onClose: () => {
       setShowForm(false);
       setEditing(null);
@@ -62343,6 +62777,20 @@ function FlMontreuilForm({
   const [dest, setDest] = React.useState('pribon');
   const [dlc, setDlc] = React.useState('');
   const [busy, setBusy] = React.useState(false);
+  const [wk, setWk] = React.useState(() => kbFlWeekLocal());
+  const [extra, setExtra] = React.useState([]);
+  React.useEffect(() => {
+    let stop = false;
+    storage.getDoc('app_config', kbFlWeekId()).then(d => {
+      if (!stop && d && d.active) setWk(o => ({
+        ...o,
+        ...d.active
+      }));
+    }).catch(() => {});
+    return () => {
+      stop = true;
+    };
+  }, []);
   React.useEffect(() => {
     let stop = false;
     flPost({
@@ -62363,59 +62811,13 @@ function FlMontreuilForm({
       stop = true;
     };
   }, []);
-  const list = React.useMemo(() => {
-    if (!rows || rows.length < 2) return [];
-    const H = rows[0].map(h => normalizeText(String(h || '')).trim());
-    const col = preds => {
-      for (const p of preds) {
-        const i = H.findIndex(p);
-        if (i >= 0) return i;
-      }
-      return -1;
-    };
-    const iD = col([h => h === 'designation', h => h.includes('designation')]),
-      iP = col([h => h === 'producteur']),
-      iA = col([h => h === 'actif ?', h => h.includes('actif')]),
-      iPx = col([h => h.includes('prix achat')]),
-      iPv = col([h => h.includes('prix vente')]),
-      iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
-      iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]),
-      iMu = col([h => h.startsWith('mu en k')]),
-      iT = col([h => h === 'type']);
-    if (iD < 0) return [];
-    const num = v => {
-      const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.'));
-      return isNaN(n) ? 0 : n;
-    };
-    const out = [],
-      seen = new Set();
-    for (let r = 1; r < rows.length; r++) {
-      const row = rows[r] || [];
-      const name = String(row[iD] == null ? '' : row[iD]).trim();
-      if (!name) continue;
-      if (iA >= 0 && !/^actif/.test(normalizeText(String(row[iA] || '')).trim())) continue;
-      const prod = iP >= 0 ? String(row[iP] || '').trim() : '';
-      const key = prod + '|' + name;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({
-        key,
-        name,
-        prod,
-        uv: iU >= 0 ? String(row[iU] || '').trim() : '',
-        type: iT >= 0 ? String(row[iT] || '').trim() : '',
-        pa: iPx >= 0 ? num(row[iPx]) : 0,
-        pv: iPv >= 0 ? num(row[iPv]) : 0,
-        colisage: iC >= 0 ? num(row[iC]) : 0,
-        mu: iMu >= 0 ? num(row[iMu]) : 0
-      });
-    }
-    return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
-  }, [rows]);
+  const all = React.useMemo(() => kbFlParse(rows), [rows]);
+  const list = React.useMemo(() => all.filter(x => x.active || wk[kbFlWkEnc(x.key)] || extra.includes(x.key)), [all, wk, extra]);
   const qtyRungis = x => (cag[x.key] || 0) * (x.colisage || 0) + (uvq[x.key] || 0) * (x.mu > 0 ? x.mu : 1);
   const unitR = x => /piece|pce|botte|lot/.test(normalizeText(x.type + ' ' + x.uv)) && !(x.mu > 0 && x.mu < 1) ? 'pce' : 'kg';
   const nq = normalizeText(q.trim());
   const shown = nq ? list.filter(x => normalizeText(x.name + ' ' + x.prod).includes(nq)) : list;
+  const others = nq ? all.filter(x => !list.includes(x) && normalizeText(x.name + ' ' + x.prod).includes(nq)).slice(0, 30) : [];
   const picked = list.filter(x => (cag[x.key] || 0) > 0 || (uvq[x.key] || 0) > 0);
   const noCol = picked.filter(x => (cag[x.key] || 0) > 0 && !(x.colisage > 0));
   const totA = picked.reduce((t, x) => t + qtyRungis(x) * x.pa, 0);
@@ -62492,7 +62894,7 @@ function FlMontreuilForm({
     className: "modal"
   }, React.createElement("div", {
     className: "modal-header"
-  }, React.createElement("h2", null, "\uD83E\uDD6C F&L en lot"), React.createElement("button", {
+  }, React.createElement("h2", null, "\uD83E\uDD6C F&L \xE0 envoyer \xE0 Montreuil"), React.createElement("button", {
     className: "modal-close",
     onClick: onClose
   }, "\xD7")), React.createElement("p", {
@@ -62515,11 +62917,17 @@ function FlMontreuilForm({
     style: {
       fontSize: 12
     }
-  }, "\u26A0\uFE0F ", err, rows ? ' — liste du dernier chargement' : ''), React.createElement("input", {
+  }, "\u26A0\uFE0F ", err, rows ? ' — liste du dernier chargement' : ''), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      marginBottom: 6
+    }
+  }, "Liste = F&L actifs cette semaine (m\xEAme s'ils sont pass\xE9s inactifs depuis). Un produit manque ? Cherche-le, puis \u2795 Ajouter."), React.createElement("input", {
     type: "search",
     value: q,
     onChange: e => setQ(e.target.value),
-    placeholder: "\uD83D\uDD0E Chercher un F&L\u2026",
+    placeholder: "\uD83D\uDD0E Chercher un F&L (ex. brocoli)\u2026",
     style: {
       width: '100%',
       fontSize: 17,
@@ -62630,7 +63038,64 @@ function FlMontreuilForm({
       })),
       onClose: () => setOpen(null)
     }));
-  })), React.createElement("div", {
+  }), nq && !shown.length && !others.length && rows != null && React.createElement("div", {
+    style: {
+      padding: 14,
+      fontSize: 15
+    }
+  }, "Aucun F&L \xAB ", q, " \xBB dans le Sheet FL. Essaie un autre mot (ex. \xAB brocoli \xBB)."), others.length > 0 && React.createElement("div", {
+    style: {
+      padding: '8px 10px',
+      background: '#fff8e1',
+      borderTop: '2px solid #f9a825',
+      fontSize: 13,
+      fontWeight: 700,
+      color: '#8d6e00'
+    }
+  }, "Pas dans la liste de la semaine \u2014 touche \u2795 pour l'ajouter :"), others.map(x => React.createElement("div", {
+    key: x.key,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      padding: '8px 10px',
+      borderTop: '1px solid var(--line)',
+      background: '#fffdf5'
+    }
+  }, React.createElement("span", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 16,
+      fontWeight: 600
+    }
+  }, x.name), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, x.prod, x.uv ? ' · ' + x.uv : '', x.active ? '' : ' · inactif')), React.createElement("button", {
+    onClick: () => {
+      setExtra(e => e.includes(x.key) ? e : [...e, x.key]);
+      setOpen(x.key);
+    },
+    style: {
+      minWidth: 92,
+      height: 44,
+      borderRadius: 10,
+      fontSize: 15,
+      fontWeight: 700,
+      border: '2px solid #1565c0',
+      background: '#e3f2fd',
+      color: '#0d47a1',
+      cursor: 'pointer'
+    }
+  }, "\u2795 Ajouter")))), React.createElement("div", {
     className: "field",
     style: {
       marginTop: 10
@@ -62658,11 +63123,25 @@ function FlMontreuilForm({
     onClick: validate
   }, busy ? 'Enregistrement…' : `✅ Valider (${picked.length} produit${picked.length > 1 ? 's' : ''} · ${totA.toFixed(2)} € achat${totV ? ' · ' + totV.toFixed(2) + ' € vente' : ''})`))));
 }
+function kbLossIsFl(p) {
+  if (!p) return false;
+  if (kbIsFLProduct({
+    category: p.category || p.categorie,
+    family: p.famille || p.family,
+    cat: p.rayon
+  })) return true;
+  if (!kbLossIsFl._set || kbLossIsFl._at !== kbMuCacheAt('fl')) {
+    kbLossIsFl._at = kbMuCacheAt('fl');
+    kbLossIsFl._set = new Set(kbFlParse(kbMuCacheGet('fl')).map(x => normalizeText(x.prod + '|' + x.name)));
+  }
+  return kbLossIsFl._set.has(normalizeText(`${p.producteur || ''}|${p.produit || ''}`));
+}
 function LossForm({
   catalogue,
   session,
   editing,
-  onClose
+  onClose,
+  onFl
 }) {
   const showToast = React.useContext(ToastContext);
   const [productKey, setProductKey] = React.useState(editing?.productKey || '');
@@ -62757,9 +63236,35 @@ function LossForm({
   }, React.createElement("h2", null, editing ? 'Modifier perte' : 'Nouvelle perte'), React.createElement("button", {
     className: "modal-close",
     onClick: onClose
-  }, "\xD7")), React.createElement("div", {
+  }, "\xD7")), !editing && onFl && React.createElement("div", {
+    style: {
+      marginBottom: 12,
+      padding: '10px 12px',
+      borderRadius: 12,
+      background: '#e3f2fd',
+      border: '2px solid #1565c0'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      color: '#0d47a1'
+    }
+  }, "\uD83E\uDD6C Fruits & l\xE9gumes : PAS ICI"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      margin: '2px 0 8px'
+    }
+  }, "Le F&L se saisit uniquement avec \xAB Saisir le F&L \xE0 envoyer \xE0 Montreuil \xBB."), React.createElement("button", {
+    className: "btn-primary btn-block",
+    style: {
+      background: '#1565c0',
+      borderColor: '#1565c0'
+    },
+    onClick: onFl
+  }, "\uD83E\uDD6C Saisir le F&L \xE0 envoyer \xE0 Montreuil")), React.createElement("div", {
     className: "field"
-  }, React.createElement("label", null, "Produit (catalogue complet)"), React.createElement(ProductPicker, {
+  }, React.createElement("label", null, "Produit (hors fruits & l\xE9gumes)"), React.createElement(ProductPicker, {
     products: catalogue,
     value: productKey,
     onChange: setProductKey,
@@ -71472,7 +71977,7 @@ function RungisDriverHome({
     });
     return m;
   }, [picks]);
-  const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, from, to, pk]);
+  const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to).filter(l => String(l.site || '').toUpperCase() !== 'PDP' && !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, from, to, pk]);
   const livTodo = lines.filter(l => !l.info && !l.refused && !(pk[l.id] && pk[l.id].status)).length;
   const prenom = String(session.name || '').trim().split(/\s+/)[0] || 'toi';
   React.useEffect(() => {
@@ -71788,6 +72293,8 @@ function RungisRetoursView({
   const [busy, setBusy] = React.useState(false);
   const [step, setStep] = React.useState('lieux');
   const [chk, setChk] = React.useState({});
+  const [take, setTake] = React.useState({});
+  const [allChecked, setAllChecked] = React.useState(false);
   const drv = kbIsPdpDriver();
   const now = () => new Date().toISOString();
   const denied = e => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (règles Firestore V11.43 à publier ?)' : 'Erreur : ' + (e && e.message || e));
@@ -71856,7 +72363,76 @@ function RungisRetoursView({
     if (!ph.length && !confirm(`Aucune photo pour ${s}.\nValider quand même « pris » ?`)) return;
     setBusy(true);
     try {
+      let restMsg = '';
       for (const x of list) {
+        if (x.k === 'm' && x.r.kind === 'rolls') {
+          const ask = kbContOf(x.r),
+            got = {
+              ...ask,
+              ...(take[x.r.id] || {})
+            };
+          const tot = KB_CONT.reduce((a, t) => a + (Number(got[t.k]) || 0), 0);
+          const rest = {};
+          KB_CONT.forEach(t => {
+            rest[t.k] = Math.max(0, (ask[t.k] || 0) - (Number(got[t.k]) || 0));
+          });
+          const nRest = KB_CONT.reduce((a, t) => a + rest[t.k], 0);
+          if (!nRest) {
+            await storage.setDoc('pdp_returns', x.r.id, {
+              status: 'recovered',
+              recoveredBy: session.name,
+              recoveredAt: now()
+            });
+            continue;
+          }
+          if (tot) {
+            const lbl = '🛒 ' + kbContLabel(got);
+            await storage.setDoc('pdp_returns', x.r.id, {
+              status: 'recovered',
+              recoveredBy: session.name,
+              recoveredAt: now(),
+              roll: got.roll,
+              dolly: got.dolly,
+              cagette: got.cagette,
+              qty: tot,
+              produit: lbl,
+              productLabel: lbl,
+              askedInit: ask
+            });
+          }
+          const rlbl = '🛒 ' + kbContLabel(rest);
+          const rid = tot ? `pdpret_rolls_${x.r.site}_${Date.now()}_r` : x.r.id;
+          try {
+            await storage.setDoc('pdp_returns', rid, {
+              ...(tot ? {
+                id: rid,
+                kind: 'rolls',
+                site: x.r.site,
+                productKey: 'ROLLS',
+                producteur: '',
+                clientName: '',
+                dlc: '',
+                pickupDate: x.r.pickupDate || '',
+                day: x.r.day || todayKey(),
+                createdBy: x.r.createdBy || session.name,
+                createdAt: x.r.createdAt || now()
+              } : {}),
+              status: 'pending',
+              roll: rest.roll,
+              dolly: rest.dolly,
+              cagette: rest.cagette,
+              qty: nRest,
+              produit: rlbl,
+              productLabel: rlbl,
+              remark: `Reste à ramener (${session.name} en a pris ${tot ? kbContLabel(got) : 'aucun'})`,
+              updatedAt: now()
+            });
+            restMsg += ` · reste ${kbContLabel(rest)} à ${x.r.site}`;
+          } catch (e) {
+            restMsg += ` · ⚠️ reste ${kbContLabel(rest)} non enregistré, préviens ${x.r.site}`;
+          }
+          continue;
+        }
         if (x.k === 'm') await storage.setDoc('pdp_returns', x.r.id, {
           status: 'recovered',
           recoveredBy: session.name,
@@ -71866,6 +72442,7 @@ function RungisRetoursView({
           pdpRecoveredBy: session.name
         });
       }
+      if (restMsg) showToast('✓ Pris' + restMsg);
       muCelebrate(list.length, 'dans le camion');
     } catch (e) {
       denied(e);
@@ -71886,10 +72463,7 @@ function RungisRetoursView({
   }));
   const checkSite = async (s, list) => {
     const keys = list.flatMap(itemsOf).map(i => i.key);
-    if (keys.some(k => chk[k] === undefined)) {
-      showToast('Touche ✓ ou ✗ pour chaque produit');
-      return;
-    }
+    const last = Object.keys(toCheck).length <= 1;
     setBusy(true);
     try {
       let nf = 0;
@@ -71916,7 +72490,7 @@ function RungisRetoursView({
         }
       }
       showToast(nf ? `✓ ${s} vérifié · ${nf} pas trouvé(s) → Henry est prévenu` : `✓ ${s} vérifié, tout est là 👍`);
-      if (!nf) muCelebrate(keys.length, 'vérifiés');
+      if (last) setAllChecked(true);else if (!nf) muCelebrate(keys.length, 'vérifiés');
     } catch (e) {
       denied(e);
     } finally {
@@ -72023,7 +72597,7 @@ function RungisRetoursView({
       color: 'var(--ink-soft)',
       marginTop: 4
     }
-  }, "1\uFE0F\u20E3 Dans chaque boutique : ", React.createElement("b", null, "\uD83D\uDCF7 photo"), " de la cagette \xAB Retour PDP \xBB puis ", React.createElement("b", null, "\u2713 Pris"), ". 2\uFE0F\u20E3 Tranquillement : ", React.createElement("b", null, "\uD83D\uDD0D V\xE9rifier"), ". 3\uFE0F\u20E3 \xC0 PDP : ", React.createElement("b", null, "\uD83C\uDFED D\xE9pos\xE9"), ".")), React.createElement("div", {
+  }, "1\uFE0F\u20E3 Dans chaque boutique : ", React.createElement("b", null, "\uD83D\uDCF7 photo"), " de la cagette \xAB Retour PDP \xBB puis ", React.createElement("b", null, "\u2713 Pris"), ". 2\uFE0F\u20E3 Tranquillement : ", React.createElement("b", null, "\uD83D\uDD0D V\xE9rifier"), " (tout est trouv\xE9 par d\xE9faut). 3\uFE0F\u20E3 Une fois arriv\xE9 \xE0 PDP et d\xE9pos\xE9 : ", React.createElement("b", null, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t"), ".")), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 8
@@ -72094,7 +72668,7 @@ function RungisRetoursView({
         fontSize: 15,
         color: 'var(--ink-soft)'
       }
-    }, "Dans la cagette \xAB Retour PDP \xBB :"), list.flatMap(itemsOf).map(i => React.createElement("div", {
+    }, "Dans la cagette \xAB Retour PDP \xBB :"), list.filter(x => !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => React.createElement("div", {
       key: i.key,
       style: {
         fontSize: 18,
@@ -72110,7 +72684,110 @@ function RungisRetoursView({
         fontWeight: 500,
         color: 'var(--ink-soft)'
       }
-    }, i.sub))), React.createElement(KbPdpPhotoStrip, {
+    }, i.sub))), list.filter(x => x.k === 'm' && x.r.kind === 'rolls').map(x => {
+      const ask = kbContOf(x.r),
+        got = {
+          ...ask,
+          ...(take[x.r.id] || {})
+        };
+      return React.createElement("div", {
+        key: x.key,
+        style: {
+          border: '3px solid #6d4c41',
+          borderRadius: 14,
+          padding: '10px 12px',
+          background: '#efebe9'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 800
+        }
+      }, "\uD83D\uDED2 Contenants vides demand\xE9s : ", kbContLabel(ask)), React.createElement("div", {
+        style: {
+          fontSize: 14,
+          color: 'var(--ink-soft)',
+          marginBottom: 6
+        }
+      }, "Tu en prends moins ? Mets combien tu en prends vraiment :"), KB_CONT.filter(t => ask[t.k]).map(t => React.createElement("div", {
+        key: t.k,
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+          padding: '4px 0'
+        }
+      }, React.createElement("span", {
+        style: {
+          fontSize: 18,
+          fontWeight: 700
+        }
+      }, t.ic, " ", t.l, " ", React.createElement("span", {
+        style: {
+          fontSize: 13,
+          color: 'var(--ink-soft)'
+        }
+      }, "(demand\xE9 ", ask[t.k], ")")), React.createElement("span", {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6
+        }
+      }, React.createElement("button", {
+        type: "button",
+        disabled: busy,
+        onClick: () => setTake(o => ({
+          ...o,
+          [x.r.id]: {
+            ...got,
+            [t.k]: Math.max(0, got[t.k] - 1)
+          }
+        })),
+        style: {
+          width: 54,
+          height: 54,
+          borderRadius: 12,
+          fontSize: 28,
+          fontWeight: 800,
+          border: '2px solid var(--line)',
+          background: '#fff'
+        }
+      }, "\u2212"), React.createElement("b", {
+        style: {
+          fontSize: 28,
+          minWidth: 36,
+          textAlign: 'center',
+          color: got[t.k] < ask[t.k] ? '#e65100' : 'inherit'
+        }
+      }, got[t.k]), React.createElement("button", {
+        type: "button",
+        disabled: busy || got[t.k] >= ask[t.k],
+        onClick: () => setTake(o => ({
+          ...o,
+          [x.r.id]: {
+            ...got,
+            [t.k]: Math.min(ask[t.k], got[t.k] + 1)
+          }
+        })),
+        style: {
+          width: 54,
+          height: 54,
+          borderRadius: 12,
+          fontSize: 28,
+          fontWeight: 800,
+          border: '2px solid #2e7d32',
+          background: '#e8f5e9'
+        }
+      }, "+")))), KB_CONT.some(t => got[t.k] < ask[t.k]) && React.createElement("div", {
+        style: {
+          fontSize: 14,
+          fontWeight: 700,
+          color: '#e65100',
+          marginTop: 4
+        }
+      }, "Le reste restera \xE0 r\xE9cup\xE9rer la prochaine fois."));
+    }), React.createElement(KbPdpPhotoStrip, {
       photos: ph,
       onDel: delPhoto
     }), React.createElement("label", {
@@ -72170,7 +72847,7 @@ function RungisRetoursView({
     const since = list.map(x => x.k === 'm' ? x.r.recoveredAt : x.f.pdpRecoveredAt).filter(Boolean).sort()[0];
     const ph = kbPdpPhotosFor(photos, s, since);
     const its = list.flatMap(itemsOf);
-    const left = its.filter(i => chk[i.key] === undefined).length;
+    const left = its.filter(i => chk[i.key] === false).length;
     return React.createElement("div", {
       key: s,
       style: {
@@ -72190,7 +72867,7 @@ function RungisRetoursView({
       }
     }, React.createElement(SiteHead, {
       s: s,
-      right: left ? left + ' à cocher' : '✓'
+      right: left ? '✗ ' + left + ' pas trouvé' + (left > 1 ? 's' : '') : '✓ tout trouvé'
     }), React.createElement("div", {
       style: {
         padding: '6px 10px'
@@ -72210,8 +72887,22 @@ function RungisRetoursView({
         gap: 8,
         padding: 10
       }
-    }, its.map(i => {
-      const v = chk[i.key];
+    }, React.createElement("div", {
+      style: {
+        fontSize: 15,
+        color: 'var(--ink-soft)',
+        fontWeight: 600
+      }
+    }, "Tout est compt\xE9 comme ", React.createElement("b", {
+      style: {
+        color: '#2e7d32'
+      }
+    }, "\u2713 trouv\xE9"), ". Touche ", React.createElement("b", {
+      style: {
+        color: '#c62828'
+      }
+    }, "\u2717 Pas trouv\xE9"), " seulement pour ce qui manque."), its.map(i => {
+      const v = chk[i.key] === false ? false : true;
       return React.createElement("div", {
         key: i.key,
         style: {
@@ -72238,32 +72929,26 @@ function RungisRetoursView({
         style: {
           display: 'flex',
           gap: 8,
-          marginTop: 8
+          marginTop: 8,
+          alignItems: 'center'
         }
-      }, React.createElement("button", {
-        type: "button",
-        disabled: busy,
-        onClick: () => setChk(o => ({
-          ...o,
-          [i.key]: o[i.key] === true ? undefined : true
-        })),
+      }, React.createElement("span", {
         style: {
           flex: 1,
-          minHeight: 56,
-          borderRadius: 12,
-          fontSize: 18,
+          fontSize: 17,
           fontWeight: 800,
-          border: '3px solid #2e7d32',
-          background: v === true ? '#2e7d32' : '#fff',
-          color: v === true ? '#fff' : '#2e7d32'
+          color: v ? '#2e7d32' : '#c62828'
         }
-      }, "\u2713 Trouv\xE9"), React.createElement("button", {
+      }, v ? '✓ Trouvé' : '✗ Pas trouvé'), React.createElement("button", {
         type: "button",
         disabled: busy,
-        onClick: () => setChk(o => ({
-          ...o,
-          [i.key]: o[i.key] === false ? undefined : false
-        })),
+        onClick: () => setChk(o => {
+          const n = {
+            ...o
+          };
+          if (n[i.key] === false) delete n[i.key];else n[i.key] = false;
+          return n;
+        }),
         style: {
           flex: 1,
           minHeight: 56,
@@ -72271,24 +72956,24 @@ function RungisRetoursView({
           fontSize: 18,
           fontWeight: 800,
           border: '3px solid #c62828',
-          background: v === false ? '#c62828' : '#fff',
-          color: v === false ? '#fff' : '#c62828'
+          background: v ? '#fff' : '#c62828',
+          color: v ? '#c62828' : '#fff'
         }
-      }, "\u2717 Pas trouv\xE9")));
+      }, v ? '✗ Pas trouvé' : '↩️ Finalement trouvé')));
     }), React.createElement("button", {
-      disabled: busy || left > 0,
+      disabled: busy,
       onClick: () => checkSite(s, list),
       style: {
         minHeight: 64,
         borderRadius: 14,
         border: 'none',
-        background: left ? '#9e9e9e' : '#1565c0',
+        background: '#1565c0',
         color: '#fff',
         fontSize: 20,
         fontWeight: 800,
         cursor: 'pointer'
       }
-    }, left ? `Encore ${left} produit${left > 1 ? 's' : ''} à cocher` : `✅ Valider ${s}`)));
+    }, "\u2705 Valider ", s, left ? ` (${left} pas trouvé${left > 1 ? 's' : ''})` : ' — tout trouvé')));
   })), B.ready && B.notFoundManual.length > 0 && React.createElement("div", {
     style: {
       background: '#fdecea',
@@ -72339,7 +73024,94 @@ function RungisRetoursView({
       fontWeight: 900,
       cursor: nDepo ? 'pointer' : 'default'
     }
-  }, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t")));
+  }, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t"), nDepo > 0 && React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: '#1b5e20',
+      marginTop: 6
+    }
+  }, "\uD83D\uDC49 Touche ce bouton seulement quand tu es \xC0 PDP et que tu as pos\xE9 les produits.")), allChecked && React.createElement("div", {
+    onClick: () => setAllChecked(false),
+    style: {
+      position: 'fixed',
+      inset: 0,
+      zIndex: 9999,
+      background: 'rgba(0,0,0,.6)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 16
+    }
+  }, React.createElement("div", {
+    onClick: e => e.stopPropagation(),
+    style: {
+      background: '#fff',
+      borderRadius: 22,
+      padding: '24px 20px',
+      maxWidth: 440,
+      width: '100%',
+      textAlign: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 64,
+      lineHeight: 1
+    }
+  }, "\uD83C\uDF89"), React.createElement("div", {
+    style: {
+      fontSize: 28,
+      fontWeight: 900,
+      marginTop: 8,
+      color: '#2e7d32'
+    }
+  }, "Bravo, tu as tout v\xE9rifi\xE9 !"), React.createElement("div", {
+    style: {
+      fontSize: 20,
+      fontWeight: 700,
+      marginTop: 12,
+      lineHeight: 1.35
+    }
+  }, "Maintenant, va \xE0 ", React.createElement("b", null, "PDP"), ".", React.createElement("br", null), "Quand tu as ", React.createElement("u", null, "d\xE9pos\xE9"), " les produits \xE0 l'entrep\xF4t, touche :"), React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: '14px 10px',
+      borderRadius: 14,
+      background: '#2e7d32',
+      color: '#fff',
+      fontSize: 22,
+      fontWeight: 900
+    }
+  }, "\uD83C\uDFED D\xE9pos\xE9 \xE0 l'entrep\xF4t"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: 'var(--ink-soft)',
+      marginTop: 8
+    }
+  }, "(le bouton vert en bas de cette page)"), React.createElement("button", {
+    onClick: () => {
+      setAllChecked(false);
+      setStep('lieux');
+      setTimeout(() => {
+        const el = document.getElementById('kb-depot');
+        if (el) el.scrollIntoView({
+          behavior: 'smooth'
+        });
+      }, 50);
+    },
+    style: {
+      width: '100%',
+      marginTop: 16,
+      minHeight: 60,
+      borderRadius: 14,
+      border: 'none',
+      background: '#1565c0',
+      color: '#fff',
+      fontSize: 20,
+      fontWeight: 800,
+      cursor: 'pointer'
+    }
+  }, "OK, compris \uD83D\uDC4D"))));
 }
 function kbEnlMirrorPick(l, doc) {
   try {
@@ -90075,6 +90847,6 @@ if (window.__firebase) boot();else window.addEventListener('firebase-ready', boo
     once: true
   });else arm();
 })();
-</script>
+  </script>
 </body>
 </html>
