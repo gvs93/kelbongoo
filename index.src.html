@@ -795,7 +795,18 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.65';
+    const APP_VERSION = 'V11.67';
+    // V11.67 — Pertes : plus de F&L dans « + Ajouter » (bandeau → « 🥬 Saisir le F&L à envoyer à Montreuil »). Formulaire F&L :
+    //   liste = produits ACTIFS au moins une fois cette semaine (app_config/fl_week_<lundi>, alimenté à chaque lecture du Sheet FL)
+    //   + recherche dans TOUT le Sheet FL (inactifs compris) avec « ➕ Ajouter ».
+    // V11.67 — (20/11/2026) ① Inventaire : gros bandeau « DLC jusqu'au vendredi XX compris » (vendredi de la semaine suivante :
+    //   client J+3, distrib du mercredi suivant) + alerte rouge sur un produit dont la DLC saisie est ≤ cette date.
+    //   ② Chauffeur : PDP = entrepôt → aucun retour ni livraison PDP à faire (les retours de PDP vont directement « à traiter »).
+    //   Rolls / dollies / cagettes : il choisit combien il en prend, le reste reste en demande (pending) pour la fois suivante.
+    //   Vérification : tout est « trouvé » par défaut, un seul bouton ✗ Pas trouvé. Dernier lieu vérifié → popup
+    //   « Bravo, tu as tout vérifié ! Quand tu as déposé à PDP, touche 🏭 Déposé à l'entrepôt ».
+    // V11.66 — Pertes ROB : vue 📅 Calendrier (par jour de RETRAIT) ; clic sur un jour = liste des articles retirés
+    //   avec heure, DLC, qui l'a retiré, destination (+ date de navette ROB), site, remarque.
     // V11.65 — (20/11/2026) ① 💬 CHAT ÉQUIPE : Master › 💬 › « 👋 Équipe » : choisir une personne connectée (prépa, distrib, chauffeur),
     //   « 💬 Discussion » (popup qui ouvre le chat, elle répond) ou « ✅ À valider » (popup à valider avec ses initiales, sans réponse).
     //   Côté équipe, le chat n'apparaît que sur demande du Master ; sinon 💬 = Support technique. (support_msgs kind:'team', présence + uid)
@@ -10374,6 +10385,9 @@
       const t = normalizeText([p && p.category, p && p.family, p && p.famille, p && p.cat].filter(Boolean).join(' '));
       return /fruit|legume|f&l|\bfl\b/.test(t);
     }
+    // V11.67 — DLC limite pour l'inventaire : vendredi de la semaine SUIVANTE (lundi + 11 j), compris.
+    //   ex. inventaire mardi 17/11 → distrib mer. 25/11, client J+3 = 28/11 → DLC ≤ ven. 27/11 = trop courte.
+    function kbInvDlcLimit(day) { const x = new Date((day || todayKey()) + 'T12:00:00'); return addDays(day || todayKey(), -((x.getDay() + 6) % 7) + 11); }
     function InventoryPage({ session }) {
       const showToast = React.useContext(ToastContext);
       const [products, setProducts] = React.useState([]);
@@ -11257,6 +11271,14 @@
             <div className="stat"><div className="stat-value">{Object.keys(eanMap).length}</div><div className="stat-label">Codes appris</div></div>
           </div>
 
+          {/* V11.67 — DLC limite : client = J+3 ; prépa mardi → distrib mercredi de la semaine suivante (+3 = samedi) → DLC ≤ vendredi = trop court */}
+          {(() => { const lim = kbInvDlcLimit(invDate); return (
+            <div style={{margin:'4px 0 10px',padding:'14px 16px',borderRadius:14,background:'#c62828',color:'#fff',textAlign:'center'}}>
+              <div style={{fontSize:16,fontWeight:700,opacity:.95}}>⚠️ SIGNALER LA DLC des produits qui ont une DLC</div>
+              <div style={{fontSize:30,fontWeight:900,lineHeight:1.15,margin:'4px 0'}}>JUSQU'AU {new Date(lim+'T12:00:00').toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'numeric'}).toUpperCase()} COMPRIS</div>
+              <div style={{fontSize:14,opacity:.95}}>Le client doit avoir J+3 : distrib du mercredi {formatDateShort(addDays(lim,-2))} → DLC au moins le {formatDateShort(addDays(lim,1))}. Une DLC le {formatDateShort(lim)} ou avant = trop courte.</div>
+            </div>); })()}
+
           <div className="filter-row">
             <div className={`chip ${!scanMode?'selected':''}`} onClick={()=>setScanMode(false)}>✍️ Saisie manuelle</div>
             <div className={`chip ${scanMode?'selected':''}`} onClick={()=>setScanMode(true)}>📷 Scan caméra</div>
@@ -11393,6 +11415,7 @@
                         style={{flex:1,fontSize:14,padding:'9px 14px',borderRadius:10,border:`1px solid ${hasDlc?'#b45309':'var(--border)'}`,background:'transparent',color: hasDlc ? '#b45309' : 'var(--ink-mute)',cursor:'pointer',fontWeight:700}}>{hasDlc ? `✓ DLC ${dlcInputs[p.id].slice(8,10)}/${dlcInputs[p.id].slice(5,7)}` : '📅 DLC courte'}</button>
                     </div>
                     {dlcOpen && <KbDlcField big saved={dlcInputs[p.id] || ''} onValidate={(v)=>saveDlcFromInventory(p.id, v)} onClose={()=>setDlcExpandedId(null)} />}
+                    {hasDlc && dlcInputs[p.id] <= kbInvDlcLimit(invDate) && <div style={{marginTop:8,padding:'8px 10px',borderRadius:10,background:'#c62828',color:'#fff',fontSize:16,fontWeight:800,textAlign:'center'}}>⚠️ DLC {formatDateShort(dlcInputs[p.id])} ≤ {formatDateShort(kbInvDlcLimit(invDate))} : trop courte pour le client</div>}
                   </div>
                   );
                 })}
@@ -14761,7 +14784,42 @@
     // V9.69 — cache local de la liste MU et du Sheet FL : affichage immédiat, mise à jour en arrière-plan
     function kbMuCacheGet(k){ try{ const o = JSON.parse(localStorage.getItem('kb_mu_cache_'+k)||'null'); return o && Array.isArray(o.v) ? o.v : null; }catch(e){ return null; } }
     function kbMuCacheAt(k){ try{ const o = JSON.parse(localStorage.getItem('kb_mu_cache_'+k)||'null'); return o ? o.at : 0; }catch(e){ return 0; } }
-    function kbMuCacheSet(k, v){ try{ localStorage.setItem('kb_mu_cache_'+k, JSON.stringify({ at: Date.now(), v })); }catch(e){} }
+    function kbMuCacheSet(k, v){ try{ localStorage.setItem('kb_mu_cache_'+k, JSON.stringify({ at: Date.now(), v })); }catch(e){} if (k === 'fl') kbFlWeekRemember(v); }
+    // V11.67 — Sheet FL lu en liste { key, name, prod, active, … } (tous les produits, actifs ou non)
+    function kbFlParse(rows) {
+      if (!rows || rows.length < 2) return [];
+      const H = rows[0].map(h => normalizeText(String(h || '')).trim());
+      const col = (preds) => { for (const p of preds) { const i = H.findIndex(p); if (i >= 0) return i; } return -1; };
+      const iD = col([h => h === 'designation', h => h.includes('designation')]), iP = col([h => h === 'producteur']), iA = col([h => h === 'actif ?', h => h.includes('actif')]),
+            iPx = col([h => h.includes('prix achat')]), iPv = col([h => h.includes('prix vente')]), iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
+            iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]), iMu = col([h => h.startsWith('mu en k')]), iT = col([h => h === 'type']);
+      if (iD < 0) return [];
+      const num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.')); return isNaN(n) ? 0 : n; };
+      const out = [], seen = new Set();
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r] || []; const name = String(row[iD] == null ? '' : row[iD]).trim(); if (!name) continue;
+        const active = iA < 0 || /^actif/.test(normalizeText(String(row[iA] || '')).trim());
+        const prod = iP >= 0 ? String(row[iP] || '').trim() : ''; const key = prod + '|' + name;
+        if (seen.has(key)) { if (active) { const o = out.find(x => x.key === key); if (o) o.active = true; } continue; } seen.add(key);
+        out.push({ key, name, prod, active, uv: iU >= 0 ? String(row[iU] || '').trim() : '', type: iT >= 0 ? String(row[iT] || '').trim() : '',
+          pa: iPx >= 0 ? num(row[iPx]) : 0, pv: iPv >= 0 ? num(row[iPv]) : 0, colisage: iC >= 0 ? num(row[iC]) : 0, mu: iMu >= 0 ? num(row[iMu]) : 0 });
+      }
+      return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+    }
+    // V11.67 — produits F&L vus ACTIFS au moins une fois cette semaine (lundi → dimanche) : app_config/fl_week_<lundi>
+    //   (+ copie locale). Un produit passé inactif en fin de semaine reste proposé pour l'envoi à Montreuil.
+    function kbFlWeekId(day) { const d = day || todayKey(); const x = new Date(d + 'T12:00:00'); return 'fl_week_' + addDays(d, -((x.getDay() + 6) % 7)); }
+    const kbFlWkEnc = (k) => encodeURIComponent(k).replace(/\./g, '%2E');
+    function kbFlWeekLocal() { try { return JSON.parse(localStorage.getItem('kb_' + kbFlWeekId()) || '{}') || {}; } catch (e) { return {}; } }
+    function kbFlWeekRemember(rows) {
+      try {
+        const act = kbFlParse(rows).filter(x => x.active).map(x => kbFlWkEnc(x.key));
+        const loc = kbFlWeekLocal(); const add = {}; act.forEach(k => { if (!loc[k]) add[k] = true; });
+        if (!Object.keys(add).length) return;
+        localStorage.setItem('kb_' + kbFlWeekId(), JSON.stringify({ ...loc, ...add }));
+        storage.setDoc('app_config', kbFlWeekId(), { active: add, updatedAt: new Date().toISOString() }).catch(() => {});
+      } catch (e) {}
+    }
     function kbWithTimeout(p, ms, label){ return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error((label||'Chargement')+' : pas de réponse après '+Math.round(ms/1000)+' s')), ms))]); }
     function MuLoadBar({ busy, onRetry }){
       const on = busy && (busy.list || busy.fl);
@@ -30609,6 +30667,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const [archives, setArchives] = React.useState(null);
       const [open, setOpen] = React.useState(null); // lundi de la semaine ouverte
       const [what, setWhat] = React.useState('pribon'); // pribon | seche | tout
+      const [mode, setMode] = React.useState('cal'); // cal | sem — V11.66
+      const [calMonth, setCalMonth] = React.useState(() => todayKey().slice(0, 7));
+      const [calDay, setCalDay] = React.useState(() => todayKey());
       React.useEffect(() => {
         const u1 = storage.subscribe('losses', a => setLosses(a || []));
         const u2 = storage.subscribe('losses_archive', a => setArchives(a || []));
@@ -30633,8 +30694,28 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             noPrice: rob.filter(l => !(Number(l.unitPrice) > 0)).length };
         }).sort((a, b) => b.monday.localeCompare(a.monday));
       }, [losses, archives]);
+      // V11.66 — calendrier : regroupé par JOUR DE RETRAIT (date/heure de saisie), pas par date de navette.
+      const pad2 = (n) => String(n).padStart(2, '0');
+      const localKey = (iso) => { const d = new Date(iso); if (isNaN(d)) return ''; return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+      const byRemoval = React.useMemo(() => {
+        const m = {}; const seen = new Set();
+        const add = (l) => {
+          const day = (l.createdAt && localKey(l.createdAt)) || l.day || '';
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+          const key = l.id || `${day}|${l.produit}|${l.quantity}|${l.createdAt}`;
+          if (seen.has(key)) return; seen.add(key);
+          (m[day] = m[day] || []).push(l);
+        };
+        (losses || []).forEach(add);
+        (archives || []).forEach(a => { let it = []; try { it = JSON.parse(a.losses || '[]'); } catch (_) {} it.forEach(add); });
+        return m;
+      }, [losses, archives]);
       if (losses === null || archives === null) return <div className="card"><p style={{ margin: 0 }}>Chargement…</p></div>;
       const eur = (v) => (Number(v) || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+      const keep = (l) => what === 'pribon' ? l.destination === 'pribon' : what === 'seche' ? (l.destination === 'jete' || l.destination === 'partage') : true;
+      const hhmm = (iso) => { const d = new Date(iso); return isNaN(d) ? '' : `${pad2(d.getHours())}h${pad2(d.getMinutes())}`; };
+      const dayItems = (d) => (byRemoval[d] || []).filter(keep);
+      const daySum = (d) => dayItems(d).reduce((t, l) => t + (Number(l.totalValue) || 0), 0);
       const val = (w) => what === 'pribon' ? w.robEur : what === 'seche' ? w.secheEur : w.robEur + w.secheEur;
       const max = Math.max(1, ...weeks.map(val));
       const last4 = weeks.slice(0, 4);
@@ -30655,8 +30736,85 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div className="card" style={{ margin: 0 }}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 600 }}>Cette semaine</div><div style={{ fontSize: 28, fontWeight: 700 }}>{eur(val(weeks.find(w => w.monday === thisMonday) || { robEur: 0, secheEur: 0 }))}</div></div>
             <div className="card" style={{ margin: 0 }}><div style={{ fontSize: 12, color: 'var(--ink-mute)', fontWeight: 600 }}>Moyenne 4 dernières semaines</div><div style={{ fontSize: 28, fontWeight: 700 }}>{eur(avg4)}</div></div>
           </div>
-          {weeks.length === 0 && <div className="card"><p style={{ margin: 0 }}>Aucune perte enregistrée.</p></div>}
-          <div className="card" style={{ padding: '8px 10px' }}>
+          <div className="seg" style={{ alignSelf: 'flex-start' }}>
+            <button className={mode === 'cal' ? 'active' : ''} onClick={() => setMode('cal')}>📅 Calendrier</button>
+            <button className={mode === 'sem' ? 'active' : ''} onClick={() => setMode('sem')}>📊 Par semaine</button>
+          </div>
+          {mode === 'cal' && (() => {
+            const [Y, M] = calMonth.split('-').map(Number);
+            const first = `${calMonth}-01`;
+            const nDays = new Date(Y, M, 0).getDate();
+            const lead = (new Date(Y, M - 1, 1).getDay() + 6) % 7;
+            const cells = []; for (let i = 0; i < lead; i++) cells.push(null);
+            for (let d = 1; d <= nDays; d++) cells.push(`${calMonth}-${pad2(d)}`);
+            const shift = (k) => { const d = new Date(Y, M - 1 + k, 1); setCalMonth(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`); };
+            const monthTot = cells.filter(Boolean).reduce((t, d) => t + daySum(d), 0);
+            const maxDay = Math.max(1, ...cells.filter(Boolean).map(daySum));
+            const today = todayKey();
+            const color = what === 'seche' ? 'var(--danger)' : '#6e4a9c';
+            const items = dayItems(calDay).slice().sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+            const DESTL = { pribon: '♻️ ROB', partage: '🤝 Partage équipe', jete: '🗑️ Jeté' };
+            return (
+              <>
+                <div className="card" style={{ padding: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 10 }}>
+                    <button className="btn-secondary" onClick={() => shift(-1)} style={{ padding: '4px 12px' }}>‹</button>
+                    <div style={{ textAlign: 'center' }}>
+                      <div style={{ fontSize: 17, fontWeight: 700, textTransform: 'capitalize' }}>{new Date(Y, M - 1, 1).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}</div>
+                      <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Total du mois : <b style={{ color }}>{eur(monthTot)}</b></div>
+                    </div>
+                    <button className="btn-secondary" onClick={() => shift(1)} style={{ padding: '4px 12px' }}>›</button>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 4 }}>
+                    {['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(j => <div key={j} style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink-mute)', textAlign: 'center' }}>{j}</div>)}
+                    {cells.map((d, i) => {
+                      if (!d) return <div key={'e' + i} />;
+                      const v = daySum(d); const n = dayItems(d).length; const sel = d === calDay;
+                      const a = v > 0 ? 0.12 + 0.5 * (v / maxDay) : 0;
+                      return (
+                        <button key={d} onClick={() => setCalDay(d)} style={{ minHeight: 58, borderRadius: 8, cursor: 'pointer', padding: '4px 2px', textAlign: 'center',
+                          border: sel ? `2px solid ${color}` : d === today ? '2px solid var(--ink-mute)' : '1px solid var(--line)',
+                          background: n ? (what === 'seche' ? `rgba(200,40,40,${a})` : `rgba(110,74,156,${a})`) : 'transparent' }}>
+                          <div style={{ fontSize: 13, fontWeight: 700 }}>{Number(d.slice(8))}</div>
+                          {n > 0 && <div style={{ fontSize: 11, fontWeight: 700 }}>{Math.round(v)} €</div>}
+                          {n > 0 && <div style={{ fontSize: 10, color: 'var(--ink-mute)' }}>{n} art.</div>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="card" style={{ padding: 12 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                    <h2 style={{ margin: 0, fontSize: 17, textTransform: 'capitalize' }}>Retiré le {new Date(calDay + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
+                    <b style={{ fontSize: 18, color }}>{eur(daySum(calDay))}</b>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--ink-mute)', margin: '2px 0 8px' }}>{items.length} article{items.length > 1 ? 's' : ''} · trié par heure de retrait</div>
+                  {items.length === 0 && <p style={{ fontSize: 13, color: 'var(--ink-mute)', margin: 0 }}>Rien de retiré ce jour.</p>}
+                  {items.map((l, i) => {
+                    const dlcPast = l.dlc && l.dlc < calDay;
+                    return (
+                      <div key={l.id || i} style={{ display: 'grid', gridTemplateColumns: '52px 1fr auto', gap: 8, alignItems: 'start', padding: '8px 0', borderBottom: '1px solid var(--line)', fontSize: 13 }}>
+                        <div style={{ fontWeight: 700, fontSize: 14 }}>{hhmm(l.createdAt) || '—'}</div>
+                        <div style={{ minWidth: 0 }}>
+                          <div><b>{kbProdName(l.produit || l.productName || '(produit)')}</b> ×{l.quantity || l.qty || 1}{l.producteur ? <span style={{ color: 'var(--ink-mute)' }}> · {l.producteur}</span> : null}</div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 3, fontSize: 12 }}>
+                            <span style={{ padding: '1px 7px', borderRadius: 10, fontWeight: 700, background: dlcPast ? '#fde2e2' : '#fff3cd', color: dlcPast ? '#a12020' : '#7a5b00' }}>DLC {l.dlc ? formatDateShort(l.dlc) : '?'}</span>
+                            <span style={{ padding: '1px 7px', borderRadius: 10, background: 'var(--bg-muted)' }}>👤 {l.createdBy || '?'}{l.controlInitials ? ` · contrôle ${l.controlInitials}` : ''}</span>
+                            <span style={{ padding: '1px 7px', borderRadius: 10, background: 'var(--bg-muted)' }}>{DESTL[l.destination] || l.destination}{l.destination === 'pribon' && l.robSentDate ? ` · navette du ${formatDateShort(l.robSentDate)}` : ''}</span>
+                            {l.site ? <span style={{ padding: '1px 7px', borderRadius: 10, background: 'var(--bg-muted)' }}>📍 {l.site}</span> : null}
+                          </div>
+                          {l.remark ? <div style={{ fontSize: 11, color: 'var(--ink-mute)', marginTop: 3 }}>{l.remark}</div> : null}
+                        </div>
+                        <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}><b>{eur(l.totalValue)}</b>{Number(l.unitPrice) > 0 ? <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{eur(l.unitPrice)} / u</div> : <div style={{ fontSize: 11, color: 'var(--warn)' }}>prix inconnu</div>}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            );
+          })()}
+          {mode === 'sem' && weeks.length === 0 && <div className="card"><p style={{ margin: 0 }}>Aucune perte enregistrée.</p></div>}
+          {mode === 'sem' && <div className="card" style={{ padding: '8px 10px' }}>
             {weeks.map(w => {
               const v = val(w);
               return (
@@ -30674,7 +30832,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 </button>
               );
             })}
-          </div>
+          </div>}
           {W && (
             <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') setOpen(null); }}>
               <div className="modal" style={{ maxWidth: 680 }}>
@@ -30973,20 +31131,22 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               .filter(f => kbPdpReady(f)) // V11.43 — pas encore mis dans la cagette par la boutique → invisible du circuit
               .map(f => { const p = pkm[String(f.orderId || f.id)]; return p ? { ...f, ...kbPdpSteps(p) } : f; });
         // V11.43 — circuit : à récupérer (boutique) → pris (photo) → vérifié → déposé à PDP → traité
-        const recoverManual = (manual || []).filter(r => r.status === 'pending' || r.status === 'missing');
-        const recoverOrders = orders.filter(f => !f.pdpRecoveredAt);
+        // V11.67 — PDP = l'entrepôt : le chauffeur ne récupère rien à PDP, ces retours passent directement « à traiter »
+        const atPdp = (x) => String((x && x.site) || '').toUpperCase() === 'PDP';
+        const recoverManual = (manual || []).filter(r => !atPdp(r) && (r.status === 'pending' || r.status === 'missing'));
+        const recoverOrders = orders.filter(f => !atPdp(f) && !f.pdpRecoveredAt);
         const recoveredTodayManual = (manual || []).filter(r => r.status === 'recovered' && kbIsToday(r.recoveredAt));
         const recoveredTodayOrders = orders.filter(f => f.pdpRecoveredAt && kbIsToday(f.pdpRecoveredAt));
-        const pickedManual = (manual || []).filter(r => r.status === 'recovered');                // dans le camion, à vérifier
-        const pickedOrders = orders.filter(f => f.pdpRecoveredAt && !f.pdpVerifiedAt);
-        const verifiedManual = (manual || []).filter(r => r.status === 'verified');               // vérifié, à déposer
-        const verifiedOrders = orders.filter(f => f.pdpVerifiedAt && !f.pdpDepositedAt);
+        const pickedManual = (manual || []).filter(r => !atPdp(r) && r.status === 'recovered');                // dans le camion, à vérifier
+        const pickedOrders = orders.filter(f => !atPdp(f) && f.pdpRecoveredAt && !f.pdpVerifiedAt);
+        const verifiedManual = (manual || []).filter(r => !atPdp(r) && r.status === 'verified');               // vérifié, à déposer
+        const verifiedOrders = orders.filter(f => !atPdp(f) && f.pdpVerifiedAt && !f.pdpDepositedAt);
         const notFoundManual = (manual || []).filter(r => r.status === 'notfound');
         const driverTodo = recoverManual.length + recoverOrders.length + pickedManual.length + pickedOrders.length + verifiedManual.length + verifiedOrders.length;
         // À traiter (entrepôt) = DÉPOSÉ à PDP par le chauffeur
-        const treatManual = (manual || []).filter(r => r.status === 'deposited');
+        const treatManual = (manual || []).filter(r => r.status === 'deposited' || (atPdp(r) && ['pending', 'missing', 'recovered', 'verified'].includes(r.status)));
         const treatLines = [];
-        orders.filter(f => f.pdpDepositedAt).forEach(f => f.items.forEach((it, idx) => { const id = lineId(f, it, idx); if (!tm[id] && (f.pdpCheck || {})[String(idx)] !== false) treatLines.push({ f, it, idx, id }); }));
+        orders.filter(f => f.pdpDepositedAt || atPdp(f)).forEach(f => f.items.forEach((it, idx) => { const id = lineId(f, it, idx); if (!tm[id] && (f.pdpCheck || {})[String(idx)] !== false) treatLines.push({ f, it, idx, id }); }));
         const lastDeposit = [...treatManual.map(r => ({ at: r.depositedAt || '', by: r.depositedBy || '' })), ...treatLines.map(L => ({ at: L.f.pdpDepositedAt || '', by: L.f.pdpDepositedBy || '' }))].sort((a, b) => String(b.at).localeCompare(String(a.at)))[0] || null;
         const toTreat = treatManual.length + treatLines.length;
         // Traités aujourd'hui (pour le mail)
@@ -31747,7 +31907,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <h1>Pertes</h1>
             <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-              <button className="btn-secondary" onClick={() => setShowFl(true)} style={{borderColor:'#1565c0',color:'#1565c0',fontWeight:700}}>🥬 F&L en lot</button>
+              <button className="btn-secondary" onClick={() => setShowFl(true)} style={{borderColor:'#1565c0',color:'#1565c0',fontWeight:700}}>🥬 Saisir le F&L à envoyer à Montreuil</button>
               <button className="btn-primary" disabled={!catalogue || catalogue.length === 0} onClick={() => { setEditing(null); setShowForm(true); }}>
                 + Ajouter
               </button>
@@ -31950,9 +32110,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
           {showForm && (
             <LossForm
-              catalogue={catalogue}
+              catalogue={(catalogue || []).filter(p => !kbLossIsFl(p) || (editing && editing.productKey === `${p.producteur}|${p.produit}`))}
               session={session}
               editing={editing}
+              onFl={() => { setShowForm(false); setEditing(null); setShowFl(true); }}
               onClose={() => { setShowForm(false); setEditing(null); }}
             />
           )}
@@ -31978,34 +32139,21 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const [dest, setDest] = React.useState('pribon');
       const [dlc, setDlc] = React.useState('');
       const [busy, setBusy] = React.useState(false);
+      const [wk, setWk] = React.useState(() => kbFlWeekLocal()); // V11.67 — actifs vus cette semaine
+      const [extra, setExtra] = React.useState([]); // V11.67 — produits ajoutés par recherche (inactifs)
+      React.useEffect(() => { let stop = false; storage.getDoc('app_config', kbFlWeekId()).then(d => { if (!stop && d && d.active) setWk(o => ({ ...o, ...d.active })); }).catch(() => {}); return () => { stop = true; }; }, []);
       React.useEffect(() => { let stop = false;
         flPost({ secret: FRESHDESK_SECRET, action: 'fl_read', tab: FL_SHEET_TAB, ts: Date.now() })
           .then(d => { if (stop) return; if (d && d.ok !== false && d.rows) { setRows(d.rows); kbMuCacheSet('fl', d.rows); } else setErr((d && d.error) || 'lecture du Sheet FL impossible'); })
           .catch(e => { if (!stop) setErr(e.message); });
         return () => { stop = true; }; }, []);
-      const list = React.useMemo(() => {
-        if (!rows || rows.length < 2) return [];
-        const H = rows[0].map(h => normalizeText(String(h || '')).trim());
-        const col = (preds) => { for (const p of preds) { const i = H.findIndex(p); if (i >= 0) return i; } return -1; };
-        const iD = col([h => h === 'designation', h => h.includes('designation')]), iP = col([h => h === 'producteur']), iA = col([h => h === 'actif ?', h => h.includes('actif')]),
-              iPx = col([h => h.includes('prix achat')]), iPv = col([h => h.includes('prix vente')]), iU = col([h => h === 'unite de vente', h => h.includes('unite de vente')]),
-              iC = col([h => h === 'col', h => h === 'colisage', h => h.startsWith('colisage')]), iMu = col([h => h.startsWith('mu en k')]), iT = col([h => h === 'type']);
-        if (iD < 0) return [];
-        const num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/\s|€/g, '').replace(',', '.')); return isNaN(n) ? 0 : n; };
-        const out = [], seen = new Set();
-        for (let r = 1; r < rows.length; r++) {
-          const row = rows[r] || []; const name = String(row[iD] == null ? '' : row[iD]).trim(); if (!name) continue;
-          if (iA >= 0 && !/^actif/.test(normalizeText(String(row[iA] || '')).trim())) continue;
-          const prod = iP >= 0 ? String(row[iP] || '').trim() : ''; const key = prod + '|' + name; if (seen.has(key)) continue; seen.add(key);
-          out.push({ key, name, prod, uv: iU >= 0 ? String(row[iU] || '').trim() : '', type: iT >= 0 ? String(row[iT] || '').trim() : '',
-            pa: iPx >= 0 ? num(row[iPx]) : 0, pv: iPv >= 0 ? num(row[iPv]) : 0, colisage: iC >= 0 ? num(row[iC]) : 0, mu: iMu >= 0 ? num(row[iMu]) : 0 });
-        }
-        return out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
-      }, [rows]);
+      const all = React.useMemo(() => kbFlParse(rows), [rows]);
+      const list = React.useMemo(() => all.filter(x => x.active || wk[kbFlWkEnc(x.key)] || extra.includes(x.key)), [all, wk, extra]);
       const qtyRungis = (x) => (cag[x.key] || 0) * (x.colisage || 0) + (uvq[x.key] || 0) * (x.mu > 0 ? x.mu : 1);
       const unitR = (x) => /piece|pce|botte|lot/.test(normalizeText(x.type + ' ' + x.uv)) && !(x.mu > 0 && x.mu < 1) ? 'pce' : 'kg';
       const nq = normalizeText(q.trim());
       const shown = nq ? list.filter(x => normalizeText(x.name + ' ' + x.prod).includes(nq)) : list;
+      const others = nq ? all.filter(x => !list.includes(x) && normalizeText(x.name + ' ' + x.prod).includes(nq)).slice(0, 30) : []; // V11.67 — pas dans la liste de la semaine
       const picked = list.filter(x => (cag[x.key] || 0) > 0 || (uvq[x.key] || 0) > 0);
       const noCol = picked.filter(x => (cag[x.key] || 0) > 0 && !(x.colisage > 0));
       const totA = picked.reduce((t, x) => t + qtyRungis(x) * x.pa, 0);
@@ -32034,11 +32182,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       return (
         <div className="modal-backdrop" onClick={(e) => { if (e.target.className === 'modal-backdrop') onClose(); }}>
           <div className="modal">
-            <div className="modal-header"><h2>🥬 F&L en lot</h2><button className="modal-close" onClick={onClose}>×</button></div>
+            <div className="modal-header"><h2>🥬 F&L à envoyer à Montreuil</h2><button className="modal-close" onClick={onClose}>×</button></div>
             <p style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '0 0 8px' }}>Comme l'inventaire : 🥬 = cagettes (entières + ¼ ⅓ ½ ⅔ ¾), − / + = sachets. Valorisé au prix d'achat du Sheet FL.</p>
             <div className="chip-group" style={{ marginBottom: 8 }}>{DESTS.map(d => <div key={d.id} className={`chip ${dest === d.id ? 'selected' : ''}`} onClick={() => setDest(d.id)}>{d.label}</div>)}</div>
             {err && <div className="alert-warning" style={{ fontSize: 12 }}>⚠️ {err}{rows ? ' — liste du dernier chargement' : ''}</div>}
-            <input type="search" value={q} onChange={e => setQ(e.target.value)} placeholder="🔎 Chercher un F&L…" style={{ width: '100%', fontSize: 17, padding: '12px 14px', borderRadius: 12, border: '2px solid var(--line)', marginBottom: 8 }} />
+            <div style={{ fontSize: 13, color: 'var(--ink-soft)', marginBottom: 6 }}>Liste = F&L actifs cette semaine (même s'ils sont passés inactifs depuis). Un produit manque ? Cherche-le, puis ➕ Ajouter.</div>
+            <input type="search" value={q} onChange={e => setQ(e.target.value)} placeholder="🔎 Chercher un F&L (ex. brocoli)…" style={{ width: '100%', fontSize: 17, padding: '12px 14px', borderRadius: 12, border: '2px solid var(--line)', marginBottom: 8 }} />
             <div style={{ maxHeight: '46vh', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 12 }}>
               {rows == null && <div style={{ padding: 14 }}>Chargement du Sheet FL…</div>}
               {shown.map((x, i) => { const c = cag[x.key] || 0, u = uvq[x.key] || 0, on = c > 0 || u > 0; return (
@@ -32056,6 +32205,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                   </div>
                   {open === x.key && <FractionPad value={c} label="cagettes" onChange={v => setCag(m => ({ ...m, [x.key]: v }))} onClose={() => setOpen(null)} />}
                 </div>); })}
+              {nq && !shown.length && !others.length && rows != null && <div style={{ padding: 14, fontSize: 15 }}>Aucun F&L « {q} » dans le Sheet FL. Essaie un autre mot (ex. « brocoli »).</div>}
+              {others.length > 0 && <div style={{ padding: '8px 10px', background: '#fff8e1', borderTop: '2px solid #f9a825', fontSize: 13, fontWeight: 700, color: '#8d6e00' }}>Pas dans la liste de la semaine — touche ➕ pour l'ajouter :</div>}
+              {others.map(x => (
+                <div key={x.key} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderTop: '1px solid var(--line)', background: '#fffdf5' }}>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: 'block', fontSize: 16, fontWeight: 600 }}>{x.name}</span>
+                    <span style={{ display: 'block', fontSize: 12, color: 'var(--ink-mute)' }}>{x.prod}{x.uv ? ' · ' + x.uv : ''}{x.active ? '' : ' · inactif'}</span>
+                  </span>
+                  <button onClick={() => { setExtra(e => e.includes(x.key) ? e : [...e, x.key]); setOpen(x.key); }} style={{ minWidth: 92, height: 44, borderRadius: 10, fontSize: 15, fontWeight: 700, border: '2px solid #1565c0', background: '#e3f2fd', color: '#0d47a1', cursor: 'pointer' }}>➕ Ajouter</button>
+                </div>))}
             </div>
             <div className="field" style={{ marginTop: 10 }}>
               <label>Raison</label>
@@ -32071,7 +32230,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       );
     }
 
-    function LossForm({ catalogue, session, editing, onClose }) {
+    // V11.67 — le F&L ne se saisit PAS dans « + Ajouter » : uniquement via « 🥬 Saisir le F&L à envoyer à Montreuil »
+    //   (catégorie fruits/légumes du catalogue, ou produit présent dans le Sheet FL).
+    function kbLossIsFl(p) {
+      if (!p) return false;
+      if (kbIsFLProduct({ category: p.category || p.categorie, family: p.famille || p.family, cat: p.rayon })) return true;
+      if (!kbLossIsFl._set || kbLossIsFl._at !== kbMuCacheAt('fl')) { kbLossIsFl._at = kbMuCacheAt('fl'); kbLossIsFl._set = new Set(kbFlParse(kbMuCacheGet('fl')).map(x => normalizeText(x.prod + '|' + x.name))); }
+      return kbLossIsFl._set.has(normalizeText(`${p.producteur || ''}|${p.produit || ''}`));
+    }
+    function LossForm({ catalogue, session, editing, onClose, onFl }) {
       const showToast = React.useContext(ToastContext);
       const [productKey, setProductKey] = React.useState(editing?.productKey || '');
       const [destination, setDestination] = React.useState(editing?.destination || 'jete');
@@ -32144,8 +32311,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               <h2>{editing ? 'Modifier perte' : 'Nouvelle perte'}</h2>
               <button className="modal-close" onClick={onClose}>×</button>
             </div>
+            {!editing && onFl && (
+              <div style={{marginBottom:12,padding:'10px 12px',borderRadius:12,background:'#e3f2fd',border:'2px solid #1565c0'}}>
+                <div style={{fontSize:15,fontWeight:800,color:'#0d47a1'}}>🥬 Fruits &amp; légumes : PAS ICI</div>
+                <div style={{fontSize:13,margin:'2px 0 8px'}}>Le F&amp;L se saisit uniquement avec « Saisir le F&amp;L à envoyer à Montreuil ».</div>
+                <button className="btn-primary btn-block" style={{background:'#1565c0',borderColor:'#1565c0'}} onClick={onFl}>🥬 Saisir le F&amp;L à envoyer à Montreuil</button>
+              </div>
+            )}
             <div className="field">
-              <label>Produit (catalogue complet)</label>
+              <label>Produit (hors fruits &amp; légumes)</label>
               <ProductPicker products={catalogue} value={productKey} onChange={setProductKey} allowFreetext={false} />
             </div>
 
@@ -35416,7 +35590,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
       const from = addDays(todayKey(), -1), to = addDays(todayKey(), 1);
       const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
-      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, from, to, pk]);
+      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, from, to).filter(l => String(l.site || '').toUpperCase() !== 'PDP' && !(pk[l.id] && pk[l.id].status === 'hidden')), [enl.list, runs, from, to, pk]); // V11.67 — PDP = entrepôt
       const livTodo = lines.filter(l => !l.info && !l.refused && !(pk[l.id] && pk[l.id].status)).length;
       const prenom = String(session.name || '').trim().split(/\s+/)[0] || 'toi';
       React.useEffect(() => { try { window.scrollTo({ top: 0 }); } catch (e) {} }, [view]);
@@ -35506,7 +35680,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const photos = useKbPdpPhotos();
       const [busy, setBusy] = React.useState(false);
       const [step, setStep] = React.useState('lieux'); // lieux | verif
-      const [chk, setChk] = React.useState({}); // clé → true (trouvé) | false (pas trouvé)
+      const [chk, setChk] = React.useState({}); // clé → false (pas trouvé) ; V11.67 : par défaut = trouvé
+      const [take, setTake] = React.useState({}); // V11.67 — rolls : { [id]: { roll, dolly, cagette } } réellement pris
+      const [allChecked, setAllChecked] = React.useState(false); // V11.67 — popup « bravo, tout vérifié »
       const drv = kbIsPdpDriver();
       const now = () => new Date().toISOString();
       const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (règles Firestore V11.43 à publier ?)' : 'Erreur : ' + ((e && e.message) || e));
@@ -35545,10 +35721,29 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         if (!ph.length && !confirm(`Aucune photo pour ${s}.\nValider quand même « pris » ?`)) return;
         setBusy(true);
         try {
+          let restMsg = '';
           for (const x of list) {
+            if (x.k === 'm' && x.r.kind === 'rolls') {
+              // V11.67 — le chauffeur peut en prendre MOINS : on garde ce qu'il a pris, le reste repart en demande
+              const ask = kbContOf(x.r), got = { ...ask, ...(take[x.r.id] || {}) };
+              const tot = KB_CONT.reduce((a, t) => a + (Number(got[t.k]) || 0), 0);
+              const rest = {}; KB_CONT.forEach(t => { rest[t.k] = Math.max(0, (ask[t.k] || 0) - (Number(got[t.k]) || 0)); });
+              const nRest = KB_CONT.reduce((a, t) => a + rest[t.k], 0);
+              if (!nRest) { await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() }); continue; }
+              if (tot) { const lbl = '🛒 ' + kbContLabel(got); await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now(), roll: got.roll, dolly: got.dolly, cagette: got.cagette, qty: tot, produit: lbl, productLabel: lbl, askedInit: ask }); }
+              const rlbl = '🛒 ' + kbContLabel(rest);
+              const rid = tot ? `pdpret_rolls_${x.r.site}_${Date.now()}_r` : x.r.id;
+              try {
+                await storage.setDoc('pdp_returns', rid, { ...(tot ? { id: rid, kind: 'rolls', site: x.r.site, productKey: 'ROLLS', producteur: '', clientName: '', dlc: '', pickupDate: x.r.pickupDate || '', day: x.r.day || todayKey(), createdBy: x.r.createdBy || session.name, createdAt: x.r.createdAt || now() } : {}),
+                  status: 'pending', roll: rest.roll, dolly: rest.dolly, cagette: rest.cagette, qty: nRest, produit: rlbl, productLabel: rlbl, remark: `Reste à ramener (${session.name} en a pris ${tot ? kbContLabel(got) : 'aucun'})`, updatedAt: now() });
+                restMsg += ` · reste ${kbContLabel(rest)} à ${x.r.site}`;
+              } catch (e) { restMsg += ` · ⚠️ reste ${kbContLabel(rest)} non enregistré, préviens ${x.r.site}`; }
+              continue;
+            }
             if (x.k === 'm') await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() });
             else await pickupSet(x.f, { pdpRecoveredAt: now(), pdpRecoveredBy: session.name });
           }
+          if (restMsg) showToast('✓ Pris' + restMsg);
           muCelebrate(list.length, 'dans le camion');
         } catch (e) { denied(e); } finally { setBusy(false); }
       };
@@ -35557,7 +35752,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         : (x.f.items || []).map((it, i) => ({ key: x.key + '__' + i, label: kbProdName(it.produit || ''), qty: it.qty || 1, sub: '🧺 ' + (x.f.consumer_name || '') + (it.dlc ? ' · DLC ' + formatDateShort(it.dlc) : '') }));
       const checkSite = async (s, list) => {
         const keys = list.flatMap(itemsOf).map(i => i.key);
-        if (keys.some(k => chk[k] === undefined)) { showToast('Touche ✓ ou ✗ pour chaque produit'); return; }
+        const last = Object.keys(toCheck).length <= 1; // V11.67 — dernier lieu vérifié → popup
         setBusy(true);
         try {
           let nf = 0;
@@ -35566,7 +35761,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             else { const c = {}; (x.f.items || []).forEach((_, i) => { c[String(i)] = chk[x.key + '__' + i] !== false; if (!c[String(i)]) nf++; }); await pickupSet(x.f, { pdpVerifiedAt: now(), pdpVerifiedBy: session.name, pdpCheck: c }); }
           }
           showToast(nf ? `✓ ${s} vérifié · ${nf} pas trouvé(s) → Henry est prévenu` : `✓ ${s} vérifié, tout est là 👍`);
-          if (!nf) muCelebrate(keys.length, 'vérifiés');
+          if (last) setAllChecked(true); else if (!nf) muCelebrate(keys.length, 'vérifiés');
         } catch (e) { denied(e); } finally { setBusy(false); }
       };
       // ── 🏭 déposé à l'entrepôt ──
@@ -35594,7 +35789,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         <div className="stack">
           <div>
             <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP</h1>
-            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>1️⃣ Dans chaque boutique : <b>📷 photo</b> de la cagette « Retour PDP » puis <b>✓ Pris</b>. 2️⃣ Tranquillement : <b>🔍 Vérifier</b>. 3️⃣ À PDP : <b>🏭 Déposé</b>.</div>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>1️⃣ Dans chaque boutique : <b>📷 photo</b> de la cagette « Retour PDP » puis <b>✓ Pris</b>. 2️⃣ Tranquillement : <b>🔍 Vérifier</b> (tout est trouvé par défaut). 3️⃣ Une fois arrivé à PDP et déposé : <b>🏭 Déposé à l'entrepôt</b>.</div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <StepChip n={nTake} ic="📍" t="Boutiques" c="#e65100" on={step === 'lieux'} onClick={() => setStep('lieux')} />
@@ -35610,7 +35805,22 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 <SiteHead s={s} right={list.length + ' à prendre'} />
                 <div className="stack" style={{ gap: 8, padding: 10 }}>
                   <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Dans la cagette « Retour PDP » :</div>
-                  {list.flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
+                  {list.filter(x => !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
+                  {list.filter(x => x.k === 'm' && x.r.kind === 'rolls').map(x => { const ask = kbContOf(x.r), got = { ...ask, ...(take[x.r.id] || {}) }; return (
+                    <div key={x.key} style={{ border: '3px solid #6d4c41', borderRadius: 14, padding: '10px 12px', background: '#efebe9' }}>
+                      <div style={{ fontSize: 18, fontWeight: 800 }}>🛒 Contenants vides demandés : {kbContLabel(ask)}</div>
+                      <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginBottom: 6 }}>Tu en prends moins ? Mets combien tu en prends vraiment :</div>
+                      {KB_CONT.filter(t => ask[t.k]).map(t => (
+                        <div key={t.k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '4px 0' }}>
+                          <span style={{ fontSize: 18, fontWeight: 700 }}>{t.ic} {t.l} <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>(demandé {ask[t.k]})</span></span>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <button type="button" disabled={busy} onClick={() => setTake(o => ({ ...o, [x.r.id]: { ...got, [t.k]: Math.max(0, got[t.k] - 1) } }))} style={{ width: 54, height: 54, borderRadius: 12, fontSize: 28, fontWeight: 800, border: '2px solid var(--line)', background: '#fff' }}>−</button>
+                            <b style={{ fontSize: 28, minWidth: 36, textAlign: 'center', color: got[t.k] < ask[t.k] ? '#e65100' : 'inherit' }}>{got[t.k]}</b>
+                            <button type="button" disabled={busy || got[t.k] >= ask[t.k]} onClick={() => setTake(o => ({ ...o, [x.r.id]: { ...got, [t.k]: Math.min(ask[t.k], got[t.k] + 1) } }))} style={{ width: 54, height: 54, borderRadius: 12, fontSize: 28, fontWeight: 800, border: '2px solid #2e7d32', background: '#e8f5e9' }}>+</button>
+                          </span>
+                        </div>))}
+                      {KB_CONT.some(t => got[t.k] < ask[t.k]) && <div style={{ fontSize: 14, fontWeight: 700, color: '#e65100', marginTop: 4 }}>Le reste restera à récupérer la prochaine fois.</div>}
+                    </div>); })}
                   <KbPdpPhotoStrip photos={ph} onDel={delPhoto} />
                   <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 64, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', fontSize: 20, fontWeight: 800, cursor: 'pointer', margin: 0 }}>
                     📷 {ph.length ? 'Encore une photo' : 'Prendre une photo'}
@@ -35622,23 +35832,24 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
 
           {B.ready && step === 'verif' && (!nCheck
             ? <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 21, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à vérifier</div>
-            : Object.keys(toCheck).sort().map(s => { const list = toCheck[s]; const since = list.map(x => x.k === 'm' ? x.r.recoveredAt : x.f.pdpRecoveredAt).filter(Boolean).sort()[0]; const ph = kbPdpPhotosFor(photos, s, since); const its = list.flatMap(itemsOf); const left = its.filter(i => chk[i.key] === undefined).length; return (
+            : Object.keys(toCheck).sort().map(s => { const list = toCheck[s]; const since = list.map(x => x.k === 'm' ? x.r.recoveredAt : x.f.pdpRecoveredAt).filter(Boolean).sort()[0]; const ph = kbPdpPhotosFor(photos, s, since); const its = list.flatMap(itemsOf); const left = its.filter(i => chk[i.key] === false).length; return (
               <div key={s} style={{ border: '3px solid ' + kbSiteColor(s), borderRadius: 18, background: 'var(--bg-card)' }}>
                 <div style={{ position: 'sticky', top: 0, zIndex: 5, background: 'var(--bg-card)', borderRadius: '15px 15px 0 0', overflow: 'hidden', boxShadow: '0 2px 6px rgba(0,0,0,.12)' }}>
-                  <SiteHead s={s} right={left ? left + ' à cocher' : '✓'} />
+                  <SiteHead s={s} right={left ? '✗ ' + left + ' pas trouvé' + (left > 1 ? 's' : '') : '✓ tout trouvé'} />
                   <div style={{ padding: '6px 10px' }}>{ph.length ? <KbPdpPhotoStrip photos={ph} big /> : <div style={{ fontSize: 15, color: '#c62828', fontWeight: 700 }}>Pas de photo pour ce lieu</div>}</div>
                 </div>
                 <div className="stack" style={{ gap: 8, padding: 10 }}>
-                  {its.map(i => { const v = chk[i.key]; return (
+                  <div style={{ fontSize: 15, color: 'var(--ink-soft)', fontWeight: 600 }}>Tout est compté comme <b style={{ color: '#2e7d32' }}>✓ trouvé</b>. Touche <b style={{ color: '#c62828' }}>✗ Pas trouvé</b> seulement pour ce qui manque.</div>
+                  {its.map(i => { const v = chk[i.key] === false ? false : true; return (
                     <div key={i.key} style={{ border: '3px solid ' + (v === true ? '#2e7d32' : v === false ? '#c62828' : 'var(--line)'), borderRadius: 14, padding: '10px 12px', background: v === true ? '#e8f5e9' : v === false ? '#fdecea' : '#fff' }}>
                       <div style={{ fontSize: 20, fontWeight: 800 }}>{i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''}</div>
                       {i.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{i.sub}</div>}
-                      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                        <button type="button" disabled={busy} onClick={() => setChk(o => ({ ...o, [i.key]: o[i.key] === true ? undefined : true }))} style={{ flex: 1, minHeight: 56, borderRadius: 12, fontSize: 18, fontWeight: 800, border: '3px solid #2e7d32', background: v === true ? '#2e7d32' : '#fff', color: v === true ? '#fff' : '#2e7d32' }}>✓ Trouvé</button>
-                        <button type="button" disabled={busy} onClick={() => setChk(o => ({ ...o, [i.key]: o[i.key] === false ? undefined : false }))} style={{ flex: 1, minHeight: 56, borderRadius: 12, fontSize: 18, fontWeight: 800, border: '3px solid #c62828', background: v === false ? '#c62828' : '#fff', color: v === false ? '#fff' : '#c62828' }}>✗ Pas trouvé</button>
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                        <span style={{ flex: 1, fontSize: 17, fontWeight: 800, color: v ? '#2e7d32' : '#c62828' }}>{v ? '✓ Trouvé' : '✗ Pas trouvé'}</span>
+                        <button type="button" disabled={busy} onClick={() => setChk(o => { const n = { ...o }; if (n[i.key] === false) delete n[i.key]; else n[i.key] = false; return n; })} style={{ flex: 1, minHeight: 56, borderRadius: 12, fontSize: 18, fontWeight: 800, border: '3px solid #c62828', background: v ? '#fff' : '#c62828', color: v ? '#c62828' : '#fff' }}>{v ? '✗ Pas trouvé' : '↩️ Finalement trouvé'}</button>
                       </div>
                     </div>); })}
-                  <button disabled={busy || left > 0} onClick={() => checkSite(s, list)} style={{ minHeight: 64, borderRadius: 14, border: 'none', background: left ? '#9e9e9e' : '#1565c0', color: '#fff', fontSize: 20, fontWeight: 800, cursor: 'pointer' }}>{left ? `Encore ${left} produit${left > 1 ? 's' : ''} à cocher` : `✅ Valider ${s}`}</button>
+                  <button disabled={busy} onClick={() => checkSite(s, list)} style={{ minHeight: 64, borderRadius: 14, border: 'none', background: '#1565c0', color: '#fff', fontSize: 20, fontWeight: 800, cursor: 'pointer' }}>✅ Valider {s}{left ? ` (${left} pas trouvé${left > 1 ? 's' : ''})` : ' — tout trouvé'}</button>
                 </div>
               </div>); }))}
 
@@ -35649,7 +35860,20 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div style={{ fontSize: 22, fontWeight: 800 }}>{nDepo ? `${nDepoItems} produit${nDepoItems > 1 ? 's' : ''} vérifié${nDepoItems > 1 ? 's' : ''} dans le camion` : 'Rien à déposer pour l\'instant'}</div>
             {nCheck > 0 && <div style={{ fontSize: 15, color: '#e65100', fontWeight: 700, marginTop: 4 }}>D'abord 🔍 vérifier les {nCheck} retour(s) pris.</div>}
             <button disabled={busy || !nDepo} onClick={deposit} style={{ width: '100%', marginTop: 10, minHeight: 72, borderRadius: 16, border: 'none', background: nDepo ? '#2e7d32' : '#bdbdbd', color: '#fff', fontSize: 23, fontWeight: 900, cursor: nDepo ? 'pointer' : 'default' }}>🏭 Déposé à l'entrepôt</button>
+            {nDepo > 0 && <div style={{ fontSize: 15, fontWeight: 700, color: '#1b5e20', marginTop: 6 }}>👉 Touche ce bouton seulement quand tu es À PDP et que tu as posé les produits.</div>}
           </div>
+          {allChecked && (
+            <div onClick={() => setAllChecked(false)} style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+              <div onClick={e => e.stopPropagation()} style={{ background: '#fff', borderRadius: 22, padding: '24px 20px', maxWidth: 440, width: '100%', textAlign: 'center' }}>
+                <div style={{ fontSize: 64, lineHeight: 1 }}>🎉</div>
+                <div style={{ fontSize: 28, fontWeight: 900, marginTop: 8, color: '#2e7d32' }}>Bravo, tu as tout vérifié !</div>
+                <div style={{ fontSize: 20, fontWeight: 700, marginTop: 12, lineHeight: 1.35 }}>Maintenant, va à <b>PDP</b>.<br />Quand tu as <u>déposé</u> les produits à l'entrepôt, touche :</div>
+                <div style={{ marginTop: 12, padding: '14px 10px', borderRadius: 14, background: '#2e7d32', color: '#fff', fontSize: 22, fontWeight: 900 }}>🏭 Déposé à l'entrepôt</div>
+                <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 8 }}>(le bouton vert en bas de cette page)</div>
+                <button onClick={() => { setAllChecked(false); setStep('lieux'); setTimeout(() => { const el = document.getElementById('kb-depot'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }, 50); }} style={{ width: '100%', marginTop: 16, minHeight: 60, borderRadius: 14, border: 'none', background: '#1565c0', color: '#fff', fontSize: 20, fontWeight: 800, cursor: 'pointer' }}>OK, compris 👍</button>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
