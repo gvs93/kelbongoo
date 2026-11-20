@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.63) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.64) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -713,7 +713,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.63';
+const APP_VERSION = 'V11.64';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2637,6 +2637,7 @@ function kbCasCapLearn(raw, prev) {
   const fresh = [];
   (raw || []).forEach(o => {
     if (!o || o.status === 8 || o.status === 0) return;
+    if (String(o.locale || '').trim().toUpperCase() === 'DOM') return;
     const k = (o.bacs_frais || []).length,
       v = Number(o.volume_frais) || 0;
     if (k && v > 0) fresh.push([Math.round(v * 10) / 10, k]);
@@ -2668,6 +2669,105 @@ function kbCasCapLearn(raw, prev) {
     at: new Date().toISOString()
   };
 }
+const KB_CART_CAP_DOC = 'kb_carton_cap';
+const KB_CART_CAP_DEFAULT = {
+  cap: 120,
+  mode: 'fs',
+  samples: 0,
+  match: 0,
+  source: 'provisoire (rien appris)'
+};
+function kbCapFit(pairs) {
+  const cand = new Set();
+  pairs.forEach(([v, k]) => {
+    if (v > 0) {
+      cand.add(v / k);
+      if (k >= 2) cand.add(v / (k - 1) - 0.01);
+    }
+  });
+  let best = null,
+    bestOk = -1;
+  [...cand].filter(c => c > 0).sort((a, b) => a - b).forEach(c => {
+    let ok = 0;
+    pairs.forEach(([v, k]) => {
+      if (Math.max(1, Math.ceil(v / c - 1e-9)) === k) ok++;
+    });
+    if (ok > bestOk) {
+      bestOk = ok;
+      best = c;
+    }
+  });
+  return best ? {
+    cap: Math.round(best * 100) / 100,
+    ok: bestOk
+  } : null;
+}
+function kbCartCapLearn(rows, prev) {
+  const fresh = [];
+  (rows || []).forEach(o => {
+    if (!o || o.status === 8 || o.status === 0 || o._ps || o._test) return;
+    if (String(o.locale || o.site || '').trim().toUpperCase() !== 'DOM') return;
+    const nums = [...(o.bacs_frais || o.casiersFrais || []), ...(o.bacs_sec || o.casiersSec || [])].map(x => String(x).trim()).filter(Boolean);
+    const k = new Set(nums).size;
+    const vf = Number(o.volume_frais != null ? o.volume_frais : o.volumeFrais) || 0,
+      vs = Number(o.volume_sec != null ? o.volume_sec : o.volumeSec) || 0;
+    if (k && vf + vs > 0) fresh.push([Math.round(vf * 10) / 10, Math.round(vs * 10) / 10, k]);
+  });
+  if (!fresh.length) return null;
+  const old = (prev && Array.isArray(prev.hist) ? prev.hist : []).map(x => String(x).split(':').map(Number)).filter(x => x.length === 3 && x[2] > 0);
+  const hist = [...old, ...fresh].slice(-1500);
+  const fF = kbCapFit(hist.filter(h => h[0] > 0).map(h => [h[0], h[2]]));
+  const fS = kbCapFit(hist.map(h => [h[0] + h[1], h[2]]));
+  const okF = fF ? fF.ok : -1,
+    okS = fS ? fS.ok : -1;
+  const useS = okS >= okF;
+  const f = useS ? fS : fF;
+  if (!f) return null;
+  return {
+    cap: f.cap,
+    mode: useS ? 'fs' : 'f',
+    hist: hist.map(h => h.join(':')),
+    samples: hist.length,
+    match: Math.round(f.ok / hist.length * 100),
+    at: new Date().toISOString()
+  };
+}
+function kbCartVol(o, capDoc) {
+  const vf = Number(o.volumeFrais) || 0,
+    vs = Number(o.volumeSec) || 0;
+  return capDoc && capDoc.mode === 'f' ? vf : vf + vs;
+}
+async function kbCartCapGet(raw) {
+  let doc = null,
+    learned = null;
+  try {
+    doc = await storage.getDoc('app_config', KB_CART_CAP_DOC);
+  } catch (_) {}
+  learned = kbCartCapLearn(raw, doc);
+  if (!learned && !(doc && doc.cap)) {
+    const days = [];
+    for (let i = -1; i <= 14; i++) days.push(addDays(todayKey(), -i));
+    const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+    const rows = [];
+    docs.forEach(d => (d && d.orders || []).forEach(o => rows.push(o)));
+    learned = kbCartCapLearn(rows, null);
+  }
+  if (learned) {
+    try {
+      await storage.setDoc('app_config', KB_CART_CAP_DOC, learned, {
+        replace: true
+      });
+    } catch (_) {}
+    return {
+      doc: learned,
+      learned
+    };
+  }
+  return {
+    doc: doc && doc.cap ? doc : KB_CART_CAP_DEFAULT,
+    learned: null
+  };
+}
 function kbCasNeed(vol, capDoc) {
   const cap = Number(capDoc && capDoc.cap) || 0,
     v = Number(vol) || 0;
@@ -2680,7 +2780,12 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     clash: 0,
     learned: null,
     cap: null,
-    closed: false
+    closed: false,
+    dom: 0,
+    domCartons: 0,
+    domGrown: 0,
+    cartLearned: null,
+    cartCap: null
   };
   let capDoc = null;
   try {
@@ -2698,6 +2803,14 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   }
   if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT;
   res.cap = capDoc.cap;
+  let cartDoc = KB_CART_CAP_DEFAULT;
+  try {
+    const g = await kbCartCapGet(raw);
+    cartDoc = g.doc;
+    res.cartLearned = g.learned;
+  } catch (_) {}
+  res.cartCap = cartDoc;
+  const capOf = s => s === 'DOM' ? cartDoc : capDoc;
   let prepArr = [];
   try {
     prepArr = await storage.getAll(`day_${dayKey}_prep`);
@@ -2723,8 +2836,8 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   const cli = {};
   (orders || []).forEach(o => {
     const site = String(o.site || '').toUpperCase();
-    if (!site || site === 'DOM' || o._ps) return;
-    const hasCas = (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
+    if (!site || o._ps) return;
+    const hasCas = site === 'DOM' ? (o.items || []).length > 0 : (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
     if (!hasCas) return;
     const k = site + '||' + (o.name || '(client)');
     const c = cli[k] || (cli[k] = {
@@ -2733,7 +2846,7 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
       vol: 0,
       json: []
     });
-    c.vol += Number(o.volumeFrais) || 0;
+    c.vol += site === 'DOM' ? kbCartVol(o, cartDoc) : Number(o.volumeFrais) || 0;
     [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => {
       const v = String(n).trim();
       if (v && !c.json.includes(v)) c.json.push(v);
@@ -2779,7 +2892,7 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     const c = cli[k],
       f = fixed[k];
     if (!f || !f.auto) return;
-    const need = kbCasNeed(c.vol, capDoc);
+    const need = kbCasNeed(c.vol, capOf(c.site));
     if (need > f.nums.length && c.vol > f.vol) {
       const nums = [...f.nums];
       while (nums.length < need) {
@@ -2792,12 +2905,12 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
         nums,
         vol: c.vol
       });
-      res.grown++;
+      if (c.site === 'DOM') res.domGrown++;else res.grown++;
     }
   });
   todo.forEach(k => {
     const c = cli[k],
-      need = kbCasNeed(c.vol, capDoc),
+      need = kbCasNeed(c.vol, capOf(c.site)),
       nums = [];
     for (let i = 0; i < need; i++) {
       const v = next(c.site);
@@ -2809,7 +2922,10 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
       nums,
       vol: c.vol
     });
-    res.assigned++;
+    if (c.site === 'DOM') {
+      res.dom++;
+      res.domCartons += nums.length;
+    } else res.assigned++;
   });
   for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), {
     nums: w.nums,
@@ -74591,6 +74707,9 @@ function AdminPage({
         if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
         if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
         if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+        if (rc.dom) bits.push(`📦 DOM : ${rc.dom} client(s) → ${rc.domCartons} carton(s)`);
+        if (rc.domGrown) bits.push(`📦 DOM : ${rc.domGrown} avec carton(s) en plus`);
+        if (rc.cartLearned) bits.push(`cartons DOM estimés sur ${rc.cartLearned.samples} livraisons compilées (${rc.cartLearned.match} % identiques)`);else if (rc.dom && rc.cartCap && !rc.cartCap.samples) bits.push('cartons DOM : estimation provisoire, s\'affine au chargement de 10h');
         if (rc.closed) bits.push('prépa déjà clôturée : casiers non touchés');
         if (bits.length) showToast('🧊 ' + bits.join(' · '));
       } catch (e) {

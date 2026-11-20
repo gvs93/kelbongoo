@@ -795,7 +795,12 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.63';
+    const APP_VERSION = 'V11.64';
+    // V11.64 — (20/11/2026) 📦 CARTONS DOM DÈS LE CHARGEMENT (comme les casiers V11.57) : chargement de 7h (vente pas encore
+    //   compilée) → chaque client livré à domicile reçoit tout de suite son / ses n° de carton, nombre estimé d'après le VOLUME
+    //   de la commande. Capacité d'un carton apprise À PART (app_config/kb_carton_cap) sur les livraisons DOM déjà compilées
+    //   (JSON de 10h ou jours déjà chargés) — l'ancien site ne remplit pas un carton comme un casier. Rechargement de 10h :
+    //   mêmes n°, cartons en plus ajoutés à la suite si le volume a grossi. Les cartons DOM ne faussent plus la capacité des casiers.
     // V11.63 — (20/11/2026) VENDREDI : le stock MU (MU faite la veille pour avancer) compte comme MU RÉALISÉE — barre principale de
     //   l'écran MU (vert clair = fait hier, orange = aujourd'hui, « dont X faits hier » + rappel « bien compter la veille ») et bandeau
     //   « ⏱️ normalement X % » (prépa + Master) ; « Couvert par le stock PDP » → « ✅ Déjà fait hier (stock MU) ». Jour normal : inchangé (V11.61).
@@ -2653,6 +2658,7 @@
       const fresh = [];
       (raw || []).forEach(o => {
         if (!o || o.status === 8 || o.status === 0) return;
+        if (String(o.locale || '').trim().toUpperCase() === 'DOM') return; // V11.64 — cartons DOM appris à part
         const k = (o.bacs_frais || []).length, v = Number(o.volume_frais) || 0;
         if (k && v > 0) fresh.push([Math.round(v * 10) / 10, k]);
       });
@@ -2667,12 +2673,65 @@
       });
       return { cap: Math.round(best * 100) / 100, hist: hist.map(([v, k]) => v + ':' + k), samples: hist.length, match: Math.round(bestOk / hist.length * 100), at: new Date().toISOString() };
     }
+    // ── V11.64 — CARTONS DOM : même principe, capacité apprise À PART ───────────────────────────────────
+    //   Un carton DOM reçoit TOUTE la commande (frais, sec, pain, ND : pas de ND à domicile). On ne sait pas si l'ancien site
+    //   compte le volume frais seul ou frais + sec → les deux sont essayés, on garde celui qui reproduit le mieux ses cartons.
+    const KB_CART_CAP_DOC = 'kb_carton_cap';
+    const KB_CART_CAP_DEFAULT = { cap: 120, mode: 'fs', samples: 0, match: 0, source: 'provisoire (rien appris)' };
+    function kbCapFit(pairs) {
+      const cand = new Set();
+      pairs.forEach(([v, k]) => { if (v > 0) { cand.add(v / k); if (k >= 2) cand.add(v / (k - 1) - 0.01); } });
+      let best = null, bestOk = -1;
+      [...cand].filter(c => c > 0).sort((a, b) => a - b).forEach(c => {
+        let ok = 0; pairs.forEach(([v, k]) => { if (Math.max(1, Math.ceil(v / c - 1e-9)) === k) ok++; });
+        if (ok > bestOk) { bestOk = ok; best = c; }
+      });
+      return best ? { cap: Math.round(best * 100) / 100, ok: bestOk } : null;
+    }
+    // rows : [{ locale|site, status, bacs_frais|casiersFrais, bacs_sec|casiersSec, volume_frais|volumeFrais, volume_sec|volumeSec }]
+    function kbCartCapLearn(rows, prev) {
+      const fresh = [];
+      (rows || []).forEach(o => {
+        if (!o || o.status === 8 || o.status === 0 || o._ps || o._test) return;
+        if (String(o.locale || o.site || '').trim().toUpperCase() !== 'DOM') return;
+        const nums = [...(o.bacs_frais || o.casiersFrais || []), ...(o.bacs_sec || o.casiersSec || [])].map(x => String(x).trim()).filter(Boolean);
+        const k = new Set(nums).size;
+        const vf = Number(o.volume_frais != null ? o.volume_frais : o.volumeFrais) || 0, vs = Number(o.volume_sec != null ? o.volume_sec : o.volumeSec) || 0;
+        if (k && vf + vs > 0) fresh.push([Math.round(vf * 10) / 10, Math.round(vs * 10) / 10, k]);
+      });
+      if (!fresh.length) return null;
+      const old = ((prev && Array.isArray(prev.hist)) ? prev.hist : []).map(x => String(x).split(':').map(Number)).filter(x => x.length === 3 && x[2] > 0);
+      const hist = [...old, ...fresh].slice(-1500);
+      const fF = kbCapFit(hist.filter(h => h[0] > 0).map(h => [h[0], h[2]]));
+      const fS = kbCapFit(hist.map(h => [h[0] + h[1], h[2]]));
+      const okF = fF ? fF.ok : -1, okS = fS ? fS.ok : -1;
+      const useS = okS >= okF; const f = useS ? fS : fF; if (!f) return null;
+      return { cap: f.cap, mode: useS ? 'fs' : 'f', hist: hist.map(h => h.join(':')), samples: hist.length, match: Math.round(f.ok / hist.length * 100), at: new Date().toISOString() };
+    }
+    function kbCartVol(o, capDoc) {
+      const vf = Number(o.volumeFrais) || 0, vs = Number(o.volumeSec) || 0;
+      return (capDoc && capDoc.mode === 'f') ? vf : vf + vs;
+    }
+    async function kbCartCapGet(raw) {
+      let doc = null, learned = null;
+      try { doc = await storage.getDoc('app_config', KB_CART_CAP_DOC); } catch (_) {}
+      learned = kbCartCapLearn(raw, doc);
+      if (!learned && !(doc && doc.cap)) {
+        // rien encore appris : on apprend sur les livraisons DOM déjà chargées (compilées) des 14 derniers jours
+        const days = []; for (let i = -1; i <= 14; i++) days.push(addDays(todayKey(), -i));
+        const docs = await Promise.all(days.map(d => storage.getDoc(`day_${d}_orders`, 'data').catch(() => null)));
+        const rows = []; docs.forEach(d => ((d && d.orders) || []).forEach(o => rows.push(o)));
+        learned = kbCartCapLearn(rows, null);
+      }
+      if (learned) { try { await storage.setDoc('app_config', KB_CART_CAP_DOC, learned, { replace: true }); } catch (_) {} return { doc: learned, learned }; }
+      return { doc: (doc && doc.cap) ? doc : KB_CART_CAP_DEFAULT, learned: null };
+    }
     function kbCasNeed(vol, capDoc) {
       const cap = Number(capDoc && capDoc.cap) || 0, v = Number(vol) || 0;
       return cap > 0 && v > 0 ? Math.max(1, Math.ceil(v / cap - 1e-9)) : 1;
     }
     async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
-      const res = { assigned: 0, grown: 0, clash: 0, learned: null, cap: null, closed: false };
+      const res = { assigned: 0, grown: 0, clash: 0, learned: null, cap: null, closed: false, dom: 0, domCartons: 0, domGrown: 0, cartLearned: null, cartCap: null };
       // 1. apprentissage de la capacité sur un JSON compilé (avec bacs)
       let capDoc = null;
       try { capDoc = await storage.getDoc('app_config', KB_CAS_CAP_DOC); } catch (_) {}
@@ -2680,6 +2739,11 @@
       if (learned) { capDoc = learned; res.learned = learned; try { await storage.setDoc('app_config', KB_CAS_CAP_DOC, learned, { replace: true }); } catch (_) {} }
       if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT; // V11.57 — règle de l'historique tant que rien n'est appris
       res.cap = capDoc.cap;
+      // V11.64 — capacité d'un carton DOM (apprise à part)
+      let cartDoc = KB_CART_CAP_DEFAULT;
+      try { const g = await kbCartCapGet(raw); cartDoc = g.doc; res.cartLearned = g.learned; } catch (_) {}
+      res.cartCap = cartDoc;
+      const capOf = s => s === 'DOM' ? cartDoc : capDoc;
       // 2. état prépa du jour
       let prepArr = [];
       try { prepArr = await storage.getAll(`day_${dayKey}_prep`); } catch (_) {}
@@ -2689,12 +2753,13 @@
       // 3. clients du jour (mêmes clés que la prépa : lieu + nom), volumes additionnés si plusieurs commandes
       const cli = {};
       (orders || []).forEach(o => {
-        const site = String(o.site || '').toUpperCase(); if (!site || site === 'DOM' || o._ps) return;
-        const hasCas = (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
+        const site = String(o.site || '').toUpperCase(); if (!site || o._ps) return;
+        // V11.64 — DOM : tout va dans le carton (pain, ND compris) → toute commande avec des produits a un carton
+        const hasCas = site === 'DOM' ? (o.items || []).length > 0 : (o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit));
         if (!hasCas) return;
         const k = site + '||' + (o.name || '(client)');
         const c = cli[k] || (cli[k] = { site, client: o.name || '(client)', vol: 0, json: [] });
-        c.vol += Number(o.volumeFrais) || 0;
+        c.vol += site === 'DOM' ? kbCartVol(o, cartDoc) : (Number(o.volumeFrais) || 0);
         [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => { const v = String(n).trim(); if (v && !c.json.includes(v)) c.json.push(v); });
       });
       // 4. n° occupés par lieu (casiers fixés + n° PrestaShop déjà dans la journée)
@@ -2715,17 +2780,17 @@
       // 4b. casiers déjà attribués par l'appli : on garde, et on ajoute si le volume a grossi
       keys.forEach(k => {
         const c = cli[k], f = fixed[k]; if (!f || !f.auto) return;
-        const need = kbCasNeed(c.vol, capDoc);
+        const need = kbCasNeed(c.vol, capOf(c.site));
         if (need > f.nums.length && c.vol > f.vol) {
           const nums = [...f.nums]; while (nums.length < need) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
-          writes.push({ k, nums, vol: c.vol }); res.grown++;
+          writes.push({ k, nums, vol: c.vol }); if (c.site === 'DOM') res.domGrown++; else res.grown++;
         }
       });
       // 4c. clients sans casier → n° à la suite, autant que le volume l'exige
       todo.forEach(k => {
-        const c = cli[k], need = kbCasNeed(c.vol, capDoc), nums = [];
+        const c = cli[k], need = kbCasNeed(c.vol, capOf(c.site)), nums = [];
         for (let i = 0; i < need; i++) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
-        writes.push({ k, nums, vol: c.vol }); res.assigned++;
+        writes.push({ k, nums, vol: c.vol }); if (c.site === 'DOM') { res.dom++; res.domCartons += nums.length; } else res.assigned++;
       });
       for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), { nums: w.nums, auto: true, vol: w.vol }, { replace: true });
       return res;
@@ -36260,6 +36325,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
             if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
             if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+            if (rc.dom) bits.push(`📦 DOM : ${rc.dom} client(s) → ${rc.domCartons} carton(s)`);
+            if (rc.domGrown) bits.push(`📦 DOM : ${rc.domGrown} avec carton(s) en plus`);
+            if (rc.cartLearned) bits.push(`cartons DOM estimés sur ${rc.cartLearned.samples} livraisons compilées (${rc.cartLearned.match} % identiques)`);
+            else if (rc.dom && rc.cartCap && !rc.cartCap.samples) bits.push('cartons DOM : estimation provisoire, s\'affine au chargement de 10h');
             if (rc.closed) bits.push('prépa déjà clôturée : casiers non touchés');
             if (bits.length) showToast('🧊 ' + bits.join(' · '));
           } catch (e) { console.warn('casiers au chargement', e); showToast('⚠️ Casiers non attribués au chargement : ' + e.message); }
