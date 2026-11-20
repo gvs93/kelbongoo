@@ -804,6 +804,7 @@
     //   ③ Prépa : ≥ 90 % et 5 min sans geste → popup humoristique ; 100 % et pas clôturée 5 min après → « faut clôturer ! ».
     //   ④ Distrib : 📒 CARNET DE BORD remplace Suivi / Consigne / Infos : Non récupérés · Oublis & erreurs client ·
     //   Retours rolls-dollies-cagettes + consignes (sortis de Qualité) · Commande pain (date au choix, Bichat : + pain Pribon) · Infos du jour.
+    //   ⑤ Historique › Prépa : « 📦 Que contient ce casier / carton ? » (lieu + n° → client, produits, posé / rupture / partiel / remise).
     // V11.64 — (20/11/2026) 📦 CARTONS DOM DÈS LE CHARGEMENT (comme les casiers V11.57) : chargement de 7h (vente pas encore
     //   compilée) → chaque client livré à domicile reçoit tout de suite son / ses n° de carton, nombre estimé d'après le VOLUME
     //   de la commande. Capacité d'un carton apprise À PART (app_config/kb_carton_cap) sur les livraisons DOM déjà compilées
@@ -39300,6 +39301,61 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {!ests.length && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginTop: 6 }}>Pas d'estimation gardée pour ce jour (enregistrées à partir de la V11.65, quand le Master › Aujourd'hui est ouvert pendant la prépa).</div>}
         </div>);
     }
+    // V11.65 — 📦 « Que contient ce casier / carton ? » : lieu + n° → client(s), produits et statut final de la prépa.
+    function KbCasierContent({ raw }) {
+      const [site, setSite] = React.useState('');
+      const [num, setNum] = React.useState('');
+      const orders = (raw && raw.orders) || [];
+      const sites = React.useMemo(() => [...new Set(orders.map(o => String(o.site || '').toUpperCase()).filter(Boolean))].sort(), [orders]);
+      const idx = React.useMemo(() => {
+        const st = {}, rc = {}, cs = {};
+        ((raw && raw.prepArr) || []).forEach(d => {
+          const id = String(d.id || ''), bar = id.indexOf('|'); if (bar < 0) return;
+          const pfx = id.slice(0, bar); let k = id.slice(bar + 1); try { k = decodeURIComponent(k); } catch (e) {}
+          if (pfx === 'st') st[k] = d; else if (pfx === 'rc') rc[k] = d; else if (pfx === 'cs') cs[k] = (d.nums || []).map(String);
+        });
+        return { st, rc, cs };
+      }, [raw]);
+      const n = String(num).trim().replace(/^0+/, '');
+      const hits = !site || !n ? [] : orders.filter(o => String(o.site || '').toUpperCase() === site).map(o => {
+        const key = site + '||' + (o.name || '(client)');
+        const nums = idx.cs[key] || [...(o.casiersFrais || []), ...(o.casiersSec || [])].map(String);
+        return { o, key, nums };
+      }).filter(h => h.nums.some(x => String(x).replace(/^0+/, '') === n));
+      const word = site === 'DOM' ? 'carton' : (typeof kbSwapWord === 'function' ? kbSwapWord(site) : 'casier');
+      const inp = { fontSize: 16, padding: '8px 10px', borderRadius: 10, border: '1px solid var(--line)' };
+      const stat = (h, it) => {
+        if (it.cat === 'pain') return { t: '🥖 pain (remis à la main, hors ' + word + ')', c: '#8d6e63' };
+        const d = idx.st[h.key + '||' + it.produit], q = Number(it.qty) || 1;
+        if (!d || !d.v) return { t: '⏳ pas encore traité', c: '#9e9e9e' };
+        if (d.v === 'done') return { t: '✅ posé ×' + q, c: '#2e7d32' };
+        if (d.v === 'rupture') return { t: '❌ rupture (rien dans le ' + word + ')', c: '#c62828' };
+        if (d.v === 'partiel') return { t: '🟠 ' + (d.n || 0) + '/' + q + ' posé(s) — ' + Math.max(0, q - (d.n || 0)) + ' manquant(s)', c: '#ef6c00' };
+        return { t: d.v, c: '#555' };
+      };
+      return (
+        <div className="card">
+          <h3 style={{ fontSize: 16, margin: '0 0 6px' }}>📦 Que contient ce casier / carton ?</h3>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <select value={site} onChange={e => setSite(e.target.value)} style={inp}><option value="">Lieu…</option>{sites.map(s => <option key={s} value={s}>{s}</option>)}</select>
+            <input value={num} onChange={e => setNum(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" placeholder="N°" style={{ ...inp, width: 90, fontWeight: 800, fontSize: 20, textAlign: 'center' }} />
+            {site && n && <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{hits.length ? hits.length + ' client(s)' : 'aucun client avec ce n°'}</span>}
+          </div>
+          {hits.map(h => {
+            const items = [...(h.o.items || [])].sort((a, b) => kbProdName(a.produit).localeCompare(kbProdName(b.produit), 'fr'));
+            return (
+              <div key={h.key} style={{ marginTop: 10, border: '2px solid var(--line)', borderRadius: 12, padding: 10 }}>
+                <div style={{ fontSize: 17, fontWeight: 800 }}>{word === 'carton' ? '📦' : '🧺'} {site} {word} {n} · {h.o.name}</div>
+                {h.nums.length > 1 && <div style={{ fontSize: 13, color: '#ef6c00', fontWeight: 700 }}>⚠️ Ce client a {h.nums.length} {word}s : {h.nums.join(', ')} — les produits sont répartis entre eux.</div>}
+                {items.map((it, i) => { const s = stat(h, it), r = idx.rc[h.key + '||' + it.produit]; return (
+                  <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'baseline', padding: '5px 0', borderBottom: '1px solid #eee', fontSize: 15 }}>
+                    <span style={{ flex: 1 }}><b>{Number(it.qty) || 1}×</b> {kbProdName(it.produit)}</span>
+                    <span style={{ color: s.c, fontWeight: 700, fontSize: 14 }}>{s.t}{r && r.pct ? ' · 💸 −' + r.pct + ' %' : ''}</span>
+                  </div>); })}
+              </div>);
+          })}
+        </div>);
+    }
     function PrepHistoryView() {
       const [day, setDay] = React.useState(() => { try { return activeDay(); } catch (e) { return todayKey(); } });
       const [data, setData] = React.useState(null);
@@ -39388,6 +39444,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             )}
           </div>
 
+          {data && data.raw && data.raw.orders.length > 0 && <KbCasierContent raw={data.raw} />}
           {data && data.ps && (data.ps.team.lines > 0 || data.ps.team.muDone > 0) && <KbDayTimeline ps={data.ps} meta={data.meta} eta={data.eta} />}
           {data && data.ps && (data.ps.team.lines > 0 || data.ps.team.muDone > 0) && <KbPrepTeamCard s={data.ps} title="👥 Équipe — % de chacun ce jour-là" />}
 
