@@ -795,7 +795,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.67';
+    const APP_VERSION = 'V11.68';
+    // V11.68 — (20/11/2026) RETOURS PDP PAR CAGETTES NUMÉROTÉES : distrib → popup bloquante « dans quelle cagette ? » pour chaque produit en retour
+    //   (« BOR RETOUR PDP n°03 », max 10 articles, fermée seule à 10 / par la boutique / en fin de journée) ; commande entière d'un client
+    //   (validée par Henry) = SA cagette n° + nom + date de distrib, la boutique confirme « il y a bien N articles » sinon quoi manque + pourquoi
+    //   (mail rr@ + hg@). N° continu par lieu tant que non traité à l'entrepôt, repart à 01 ensuite. Chauffeur : par cagette, comptage +
+    //   📷 photo obligatoire → « ✓ Cagette prise » (pris + vérifié) ; moins que prévu → mail rr@ (KbPdpCrateShortMailer). Prépa : traitement
+    //   rangé par cagette (en-tête : prévu / compté / photo). Règles Firestore : pdp_photos accepte crate, crateLabel, count, expected (voir MD V11.68).
     // V11.67 — Pertes : plus de F&L dans « + Ajouter » (bandeau → « 🥬 Saisir le F&L à envoyer à Montreuil »). Formulaire F&L :
     //   liste = produits ACTIFS au moins une fois cette semaine (app_config/fl_week_<lundi>, alimenté à chaque lecture du Sheet FL)
     //   + recherche dans TOUT le Sheet FL (inactifs compris) avec « ➕ Ajouter ».
@@ -4790,62 +4796,261 @@
         return { ok: !!(r && r.ok), error: (r && r.error) || '' };
       } catch (e) { return { ok: false, error: e.message }; }
     }
-    // V11.43 — POPUP DISTRIB : Henry a validé un retour PDP → la boutique met les articles dans la cagette « Retour PDP »
-    //   et coche CHAQUE article (ou « introuvable »). Ensuite seulement le chauffeur le voit.
+    // ════════════════════════════════════════════════════════════════
+    // V11.68 — CAGETTES « RETOUR PDP » NUMÉROTÉES (boutique → chauffeur → entrepôt)
+    //   • Chaque produit en retour PDP (erreur, refus client, retrait…) va dans une cagette identifiée « BOR RETOUR PDP n°03 » :
+    //     popup BLOQUANTE en distrib dès qu'un produit en retour n'a pas de cagette → « dans la n°03 (7/10) » ou « 🆕 nouvelle n°04 ».
+    //   • Max 10 ARTICLES (unités) par cagette ; à 10 elle se ferme toute seule. La boutique peut « ✅ Fermer » avant ;
+    //     une cagette d'un jour précédent est considérée fermée (envoyée au chauffeur chaque jour de distrib).
+    //   • Commande entière d'un client (validée par Henry) = SA cagette « BOR RETOUR PDP n°05 · NOM · distrib du … » : la boutique
+    //     confirme « il y a bien N articles », sinon liste de ce qui manque + pourquoi.
+    //   • Numéro : continue tant que des cagettes du lieu ne sont pas traitées à l'entrepôt ; repart à 01 quand tout est traité.
+    //   • Chauffeur : par cagette, il COMPTE les articles + 📷 photo OBLIGATOIRE → « ✓ Cagette prise ». Moins que prévu → mail rr@
+    //     (« devait avoir ces produits »), l'entrepôt vérifie le détail. Puis « 🏭 Déposé à l'entrepôt » → prépa, traité par cagette.
+    //   Champs : pdp_returns.crateId / crateNo / crateLabel / crateDay / crateBy / crateAt / crateClosedAt ;
+    //            followups.pdpCrate + pdp_pickups.crateId / crateNo / crateLabel ;
+    //            pdp_photos.crate / crateLabel / count / expected (comptage chauffeur) ; pdp_treatments/_cratemail_<photoId>.
+    // ════════════════════════════════════════════════════════════════
+    const KB_CRATE_MAX = 10;
+    const kbCrateLabel = (site, no) => `${String(site || '').toUpperCase()} RETOUR PDP n°${String(no).padStart(2, '0')}`;
+    const kbCrateNewId = (site, no) => `cr_${String(site || 'X').replace(/[^A-Za-z0-9]/g, '')}_${no}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+    const kbRetUnits = (r) => Math.max(1, Number(r && r.qty) || 1);
+    const kbIsCrateRet = (r) => !!r && r.kind !== 'rolls' && String(r.site || '').toUpperCase() !== 'PDP';
+    // cagette d'une commande client (followup ou copie pdp_pickups)
+    const kbOrderCrate = (f) => f ? (f.pdpCrate && f.pdpCrate.id ? f.pdpCrate : (f.crateId ? { id: f.crateId, no: f.crateNo, label: f.crateLabel } : null)) : null;
+    // Cagettes NON traitées d'un lieu (produits + commandes client) → numéros pris
+    function kbCrateUsedNos(manual, picks, site) {
+      const S = String(site || '').toUpperCase(), used = new Set();
+      (manual || []).forEach(r => { if (r && r.crateId && String(r.site || '').toUpperCase() === S && r.status !== 'treated') used.add(Number(r.crateNo) || 0); });
+      (picks || []).forEach(p => { const c = kbOrderCrate(p); if (c && String(p.site || '').toUpperCase() === S) used.add(Number(c.no) || 0); });
+      used.delete(0);
+      return used;
+    }
+    function kbCrateNextNo(manual, picks, site) { const u = kbCrateUsedNos(manual, picks, site); return u.size ? Math.max(...u) + 1 : 1; }
+    // Regroupe les produits (pdp_returns) par cagette
+    function kbCrateGroups(manual, site) {
+      const S = site ? String(site).toUpperCase() : null, g = {};
+      (manual || []).forEach(r => {
+        if (!r || !r.crateId || r.status === 'treated') return;
+        if (S && String(r.site || '').toUpperCase() !== S) return;
+        const c = g[r.crateId] || (g[r.crateId] = { id: r.crateId, no: Number(r.crateNo) || 0, label: r.crateLabel || kbCrateLabel(r.site, r.crateNo), site: r.site, day: r.crateDay || '', items: [], units: 0, closed: false });
+        c.items.push(r); c.units += kbRetUnits(r);
+        if (r.crateClosedAt) c.closed = true;
+        if (r.crateDay && (!c.day || r.crateDay < c.day)) c.day = r.crateDay;
+      });
+      return Object.values(g).map(c => ({ ...c, ready: c.closed || c.units >= KB_CRATE_MAX || (c.day && c.day < todayKey()),
+        allPending: c.items.every(i => i.status === 'pending' || i.status === 'missing') })).sort((a, b) => a.no - b.no);
+    }
+    function useKbCrateData() {
+      const [manual, setManual] = React.useState(null);
+      const [picks, setPicks] = React.useState(null);
+      React.useEffect(() => {
+        const u1 = storage.subscribe('pdp_returns', a => setManual(a || []));
+        const u2 = storage.subscribe('pdp_pickups', a => setPicks(a || []));
+        return () => { u1 && u1(); u2 && u2(); };
+      }, []);
+      return { manual, picks, ready: !!(manual && picks) };
+    }
+    // Ferme toutes les lignes d'une cagette (→ visible « prête » pour le chauffeur)
+    async function kbCrateClose(crate, by) {
+      const at = new Date().toISOString();
+      for (const r of crate.items) { try { await storage.setDoc('pdp_returns', r.id, { crateClosedAt: at, crateClosedBy: by }); } catch (_) {} }
+    }
+    // Gros bandeau « écris ça sur la cagette »
+    function KbCrateTag({ label, sub, color }) {
+      return (
+        <div style={{ border: '4px dashed ' + (color || '#e65100'), borderRadius: 14, padding: '10px 12px', background: '#fff8e1', textAlign: 'center', margin: '10px 0' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink-soft)' }}>✍️ Écris en GROS sur la cagette :</div>
+          <div style={{ fontSize: 28, fontWeight: 900, letterSpacing: 1, color: color || '#e65100', lineHeight: 1.15, marginTop: 4 }}>{label}</div>
+          {sub && <div style={{ fontSize: 18, fontWeight: 800, marginTop: 4 }}>{sub}</div>}
+        </div>);
+    }
+
+    // ── DISTRIB : popup bloquante « dans quelle cagette ? » + barre des cagettes ouvertes ──
+    function KbPdpCrateGate({ session, site }) {
+      const showToast = React.useContext(ToastContext);
+      const D = useKbCrateData();
+      const [busy, setBusy] = React.useState(false);
+      const [newFor, setNewFor] = React.useState(null); // { no, label } en attente de confirmation « c'est écrit »
+      const S = String(site || '').toUpperCase();
+      const active = !!(session && !session.isMaster && !session._masterView && session.role === 'distrib' && S && S !== 'PDP');
+      const todo = React.useMemo(() => !active || !D.ready ? [] : D.manual
+        .filter(r => kbIsCrateRet(r) && String(r.site || '').toUpperCase() === S && r.status === 'pending' && !r.crateId)
+        .sort((a, b) => String(a.createdAt || a.day || '').localeCompare(String(b.createdAt || b.day || ''))), [active, D.manual, D.ready, S]);
+      const groups = React.useMemo(() => !active || !D.ready ? [] : kbCrateGroups(D.manual, S), [active, D.manual, D.ready, S]);
+      const open = groups.filter(c => !c.ready && c.allPending);
+      if (!active || !D.ready) return null;
+      const who = session.name;
+      const put = async (r, crate) => {
+        // crate : { id, no, label, units } (existante) ou nouvelle
+        setBusy(true);
+        try {
+          const now = new Date().toISOString(), q = kbRetUnits(r);
+          const room = KB_CRATE_MAX - (crate.units || 0);
+          if (q > room && room > 0 && q > KB_CRATE_MAX) {
+            // > 10 articles d'un coup : on remplit la cagette, le reste repasse dans la popup (nouvelle cagette)
+            const restId = `${r.id}~${Date.now().toString(36)}`;
+            const { id: _i, crateId: _c, crateNo: _n, crateLabel: _l, ...base } = r;
+            await storage.setDoc('pdp_returns', restId, { ...base, id: restId, qty: q - room, splitFrom: r.id, createdAt: now });
+            await storage.setDoc('pdp_returns', r.id, { qty: room });
+            r = { ...r, qty: room };
+          }
+          const patch = { crateId: crate.id, crateNo: crate.no, crateLabel: crate.label, crateDay: todayKey(), crateBy: who, crateAt: now };
+          await storage.setDoc('pdp_returns', r.id, patch);
+          const units = (crate.units || 0) + kbRetUnits(r);
+          if (units >= KB_CRATE_MAX) {
+            const g = kbCrateGroups([...D.manual.filter(x => x.id !== r.id), { ...r, ...patch }], S).find(c => c.id === crate.id);
+            if (g) await kbCrateClose(g, who + ' (pleine)');
+            kbCelebrate({ title: `Cagette n°${String(crate.no).padStart(2, '0')} pleine 👍`, sub: `${KB_CRATE_MAX}/${KB_CRATE_MAX} · fermée, prête pour le chauffeur` });
+          } else showToast(`📦 Dans la cagette n°${String(crate.no).padStart(2, '0')} · ${units}/${KB_CRATE_MAX}`);
+          setNewFor(null);
+        } catch (e) { alert('Erreur : ' + ((e && e.message) || e)); } finally { setBusy(false); }
+      };
+      const closeCrate = async (c) => {
+        if (!confirm(`Fermer la cagette ${c.label} (${c.units} article${c.units > 1 ? 's' : ''}) ?\nElle part au chauffeur, plus rien ne pourra y être ajouté.`)) return;
+        setBusy(true); try { await kbCrateClose(c, who); showToast('✅ ' + c.label + ' fermée → chauffeur'); } finally { setBusy(false); }
+      };
+      const bar = open.length > 0 && (
+        <div style={{ margin: '6px 10px', border: '3px solid #e65100', borderRadius: 14, background: '#fff3e0', padding: '8px 10px' }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: '#bf360c' }}>📦 Cagette{open.length > 1 ? 's' : ''} Retour PDP ouverte{open.length > 1 ? 's' : ''}</div>
+          {open.map(c => (
+            <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+              <span style={{ flex: 1, minWidth: 160, fontSize: 17, fontWeight: 900 }}>{c.label} <span style={{ color: c.units >= 8 ? '#c62828' : '#2e7d32' }}>· {c.units}/{KB_CRATE_MAX}</span></span>
+              <button type="button" disabled={busy} onClick={() => closeCrate(c)} style={{ minHeight: 44, padding: '4px 12px', borderRadius: 10, border: '2px solid #2e7d32', background: '#fff', color: '#2e7d32', fontSize: 15, fontWeight: 800 }}>✅ Fermer → chauffeur</button>
+            </div>))}
+          <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Fermée toute seule à {KB_CRATE_MAX} articles, et en fin de journée.</div>
+        </div>);
+      if (!todo.length) return bar || null;
+      const r = todo[0], q = kbRetUnits(r);
+      const fits = open.filter(c => c.units + q <= KB_CRATE_MAX);
+      const nextNo = kbCrateNextNo(D.manual, D.picks, S);
+      const nw = newFor || null;
+      return (
+        <>
+          {bar}
+          <div className="fs-overlay">
+            <div className="fs-card fs-block" style={{ borderTop: '8px solid #e65100', maxHeight: '92vh', overflowY: 'auto' }}>
+              <div className="fs-icon">📦</div>
+              <h2>Retour PDP : dans quelle cagette ?</h2>
+              <div style={{ border: '3px solid var(--line)', borderRadius: 14, padding: '10px 12px', margin: '8px 0', textAlign: 'left' }}>
+                <div style={{ fontSize: 23, fontWeight: 900 }}>{kbProdName(r.produit || r.productLabel || '')}{q > 1 ? <span style={{ color: '#c62828' }}> ×{q}</span> : ''}</div>
+                <div style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{[r.clientName, r.reason || r.anomalyLabel || r.remark, r.dlc ? 'DLC ' + formatDateShort(r.dlc) : ''].filter(Boolean).join(' · ')}</div>
+              </div>
+              {!nw && <>
+                {fits.map(c => (
+                  <button key={c.id} type="button" disabled={busy} onClick={() => put(r, c)} style={{ width: '100%', minHeight: 70, marginTop: 8, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 20, fontWeight: 900, cursor: 'pointer' }}>
+                    ✓ Mis dans la {c.label.replace(S + ' RETOUR PDP ', 'cagette ')}<div style={{ fontSize: 15, fontWeight: 700 }}>{c.units} → {c.units + q}/{KB_CRATE_MAX} articles</div></button>))}
+                {open.length > 0 && !fits.length && <div style={{ fontSize: 15, fontWeight: 700, color: '#c62828', marginTop: 8 }}>Pas assez de place dans la cagette ouverte (max {KB_CRATE_MAX} articles).</div>}
+                <button type="button" disabled={busy} onClick={() => setNewFor({ no: nextNo, label: kbCrateLabel(S, nextNo) })} style={{ width: '100%', minHeight: 62, marginTop: 10, borderRadius: 14, border: '3px solid #e65100', background: '#fff', color: '#e65100', fontSize: 19, fontWeight: 900, cursor: 'pointer' }}>🆕 Nouvelle cagette n°{String(nextNo).padStart(2, '0')}</button>
+              </>}
+              {nw && <>
+                <KbCrateTag label={nw.label} />
+                <div style={{ fontSize: 16, fontWeight: 700 }}>Puis mets le produit dedans.</div>
+                <button type="button" disabled={busy} onClick={() => put(r, { id: kbCrateNewId(S, nw.no), no: nw.no, label: nw.label, units: 0 })} style={{ width: '100%', minHeight: 66, marginTop: 10, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 20, fontWeight: 900 }}>{busy ? '⏳…' : '✓ C\'est écrit, le produit est dedans'}</button>
+                <button type="button" disabled={busy} onClick={() => setNewFor(null)} className="btn-ghost" style={{ marginTop: 6 }}>← Retour</button>
+              </>}
+              {todo.length > 1 && <div className="fs-count">{todo.length - 1} autre(s) produit(s) à ranger</div>}
+            </div>
+          </div>
+        </>);
+    }
+    // V11.43 → V11.68 — POPUP DISTRIB : Henry a validé le retour PDP d'une commande client → SA cagette numérotée
+    //   « BOR RETOUR PDP n°05 » + nom du client + date de distrib ; la boutique confirme « il y a bien N articles »,
+    //   sinon indique ce qui n'est pas là (quantité) et POURQUOI. Ensuite seulement le chauffeur la voit.
+    const KB_CRATE_MISS_REASONS = ['Introuvable en boutique', 'Déjà donné au client', 'Abîmé / jeté', 'Mis en partage', 'Autre'];
     function KbPdpReadyOverlay({ followup, count, session, site }) {
       const f = followup;
       const items = f.items || [];
-      const [st, setSt] = React.useState({}); // idx → 'ok' | 'ko'
+      const D = useKbCrateData();
+      const [mode, setMode] = React.useState('ask'); // ask | diff
+      const [have, setHave] = React.useState({}); // idx → quantité présente
+      const [why, setWhy] = React.useState({}); // idx → raison
+      const [whyTxt, setWhyTxt] = React.useState({}); // idx → précision (Autre)
       const [ini, setIni] = React.useState('');
       const [busy, setBusy] = React.useState(false);
-      const done = items.length > 0 && items.every((_, i) => st[i]);
-      const ok = done && ini.trim().length >= 2;
-      const save = async () => {
+      const qOf = (it) => Math.max(1, Number(it.qty) || 1);
+      const total = items.reduce((t, it) => t + qOf(it), 0);
+      const hv = (i) => have[i] == null ? qOf(items[i]) : have[i];
+      const S = String(site || f.site || '').toUpperCase();
+      const existing = kbOrderCrate(f);
+      const no = existing ? existing.no : (D.ready ? kbCrateNextNo(D.manual, D.picks, S) : null);
+      const label = existing ? existing.label : (no ? kbCrateLabel(S, no) : '…');
+      const missIdx = items.map((_, i) => i).filter(i => hv(i) < qOf(items[i]));
+      const reasonsOk = missIdx.every(i => why[i] && (why[i] !== 'Autre' || String(whyTxt[i] || '').trim().length >= 3));
+      const present = items.reduce((t, it, i) => t + hv(i), 0);
+      const ok = !!no && ini.trim().length >= 2 && (mode === 'ask' || reasonsOk);
+      const save = async (allThere) => {
         setBusy(true);
         try {
           const now = new Date().toISOString(), who = `${session.name} (${ini.trim().toUpperCase()})`;
-          const keep = items.filter((_, i) => st[i] === 'ok');
-          const lost = items.filter((_, i) => st[i] === 'ko').map(it => ({ id: it.id || '', produit: it.produit, producteur: it.producteur || '', qty: Number(it.qty) || 1, reason: 'Introuvable en boutique (' + who + ')' }));
+          const keep = [], lost = [];
+          items.forEach((it, i) => {
+            const h = allThere ? qOf(it) : hv(i), m = qOf(it) - h;
+            if (h > 0) keep.push({ ...it, qty: h });
+            if (m > 0) lost.push({ id: it.id || '', produit: it.produit, producteur: it.producteur || '', qty: m, reason: (why[i] === 'Autre' ? 'Autre : ' + String(whyTxt[i] || '').trim() : why[i]) + ' (' + who + ')' });
+          });
+          const crate = existing || { id: kbCrateNewId(S, no), no, label };
+          const nKeep = keep.reduce((t, it) => t + qOf(it), 0);
           const patch = { items: keep, pdpNotReturned: [...(f.pdpNotReturned || []), ...lost], pdpReadyAt: now, pdpReadyBy: who, updatedBy: session.name, updatedAt: now,
-            ...(keep.length ? {} : { forceReturnPdp: false, status: 'resolved', resolvedBy: who, resolvedAt: now }) };
+            ...(keep.length ? { pdpCrate: { ...crate, client: f.consumer_name || '', distribDate: f.distribDate || f.day || '', units: nKeep, by: who, at: now } } : { forceReturnPdp: false, status: 'resolved', resolvedBy: who, resolvedAt: now }) };
           await storage.setDoc('followups', f.id || f.orderId, patch);
           if (keep.length) await kbPickupWrite({ ...f, ...patch });
           if (lost.length) {
-            try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: 'hg@probon.fr', subject: `⚠️ Retour PDP · ${site} n'a pas trouvé ${lost.length} article(s) · ${f.consumer_name || 'client'}`,
-              body: `${who} (${site}) n'a pas trouvé dans la commande de ${f.consumer_name || ''} :\n` + lost.map(x => `- ${x.produit} x${x.qty}`).join('\n') }); } catch (_) {}
+            try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: PDP_ALERT_EMAILS.join(', '), subject: `⚠️ Retour PDP · ${S} · ${f.consumer_name || 'client'} · ${lost.reduce((t, x) => t + x.qty, 0)} article(s) pas dans la cagette`,
+              body: `${who} (${S}) — commande de ${f.consumer_name || ''} du ${formatDateShort(f.distribDate || f.day || '')}, cagette ${crate.label} :\n${nKeep}/${total} article(s) mis dans la cagette.\nPas présent :\n` + lost.map(x => `- ${x.produit} x${x.qty} — ${x.reason}`).join('\n') }); } catch (_) {}
           }
-          if (keep.length) kbCelebrate({ title: 'Dans la cagette Retour PDP 👍', sub: `${keep.length} article(s) · le chauffeur passera les prendre` });
+          if (keep.length) kbCelebrate({ title: `${crate.label} prête 👍`, sub: `${nKeep} article(s) · ${f.consumer_name || ''} · le chauffeur passera la prendre` });
         } catch (e) { alert('Erreur : ' + e.message); } finally { setBusy(false); }
       };
-      const Btn = ({ i, v, c, t }) => <button type="button" disabled={busy} onClick={() => setSt(o => ({ ...o, [i]: o[i] === v ? undefined : v }))}
-        style={{ minHeight: 52, padding: '6px 12px', borderRadius: 12, fontSize: 16, fontWeight: 800, border: '3px solid ' + c, background: st[i] === v ? c : '#fff', color: st[i] === v ? '#fff' : c, cursor: 'pointer' }}>{t}</button>;
+      const step = (i, d) => setHave(o => ({ ...o, [i]: Math.max(0, Math.min(qOf(items[i]), hv(i) + d)) }));
       return (
         <div className="fs-overlay">
           <div className="fs-card fs-block" style={{ borderTop: '8px solid #1565c0', maxHeight: '92vh', overflowY: 'auto' }}>
             <div className="fs-icon">↩️</div>
             <h2>Retour PDP validé par {String(f.forceReturnPdpBy || 'Henry').split(' ')[0]}</h2>
-            <div style={{ fontSize: 26, fontWeight: 900, margin: '4px 0' }}>{f.consumer_name || 'Client'}</div>
-            <div style={{ fontSize: 16, color: 'var(--ink-soft)' }}>Commande du {formatDateShort(f.distribDate || f.day || '')}{f.storedCasier ? <> · casier <b style={{ fontSize: 20 }}>{f.storedCasier}</b></> : ''}</div>
-            <div style={{ margin: '12px 0', padding: '12px', borderRadius: 12, background: '#e3f2fd', fontSize: 17, fontWeight: 700, color: '#0d47a1' }}>Mets chaque article dans la cagette <b>« Retour PDP »</b> du lieu, puis coche-le ✓.</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left' }}>
-              {items.map((it, i) => (
-                <div key={i} style={{ border: '3px solid ' + (st[i] === 'ok' ? '#2e7d32' : st[i] === 'ko' ? '#c62828' : 'var(--line)'), borderRadius: 14, padding: '10px 12px', background: st[i] === 'ok' ? '#e8f5e9' : st[i] === 'ko' ? '#fdecea' : '#fff' }}>
-                  <div style={{ fontSize: 20, fontWeight: 800 }}>{kbProdName(it.produit || '')}{(Number(it.qty) || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{it.qty}</span> : ''}</div>
-                  <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                    <Btn i={i} v="ok" c="#2e7d32" t="✓ Dans la cagette" />
-                    <Btn i={i} v="ko" c="#c62828" t="❓ Introuvable" />
-                  </div>
-                </div>))}
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)' }}>Commande entière d'un client : <b>sa propre cagette</b>{f.storedCasier ? <> · rangée casier <b style={{ fontSize: 20 }}>{f.storedCasier}</b></> : ''}</div>
+            <KbCrateTag label={label} sub={`${f.consumer_name || 'Client'} · distrib du ${formatDateShort(f.distribDate || f.day || '')}`} color="#1565c0" />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, textAlign: 'left', fontSize: 17 }}>
+              {items.map((it, i) => <div key={i} style={{ fontWeight: 700 }}>• {kbProdName(it.produit || '')}{qOf(it) > 1 ? <span style={{ color: '#c62828' }}> ×{qOf(it)}</span> : ''}</div>)}
             </div>
-            <input value={ini} onChange={e => setIni(e.target.value.toUpperCase().slice(0, 5))} placeholder="Tes initiales" style={{ width: '100%', maxWidth: 200, textAlign: 'center', fontSize: 24, fontWeight: 700, marginTop: 14 }} />
-            <div className="fs-actions" style={{ marginTop: 12 }}>
-              <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={save} style={{ background: '#1565c0', borderColor: '#1565c0', opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : done ? '✅ Valider' : `Coche les ${items.length} article(s)`}</button>
-            </div>
+            {mode === 'ask' && <>
+              <div style={{ fontSize: 24, fontWeight: 900, marginTop: 14 }}>Il y a bien <span style={{ color: '#1565c0', fontSize: 34 }}>{total}</span> article{total > 1 ? 's' : ''} dans la cagette ?</div>
+              <input value={ini} onChange={e => setIni(e.target.value.toUpperCase().slice(0, 5))} placeholder="Tes initiales" style={{ width: '100%', maxWidth: 200, textAlign: 'center', fontSize: 24, fontWeight: 700, marginTop: 10 }} />
+              <div className="fs-actions" style={{ marginTop: 12 }}>
+                <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={() => save(true)} style={{ background: '#2e7d32', borderColor: '#2e7d32', opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : `✅ Oui, ${total} article${total > 1 ? 's' : ''}`}</button>
+                <button className="btn-secondary" disabled={busy} onClick={() => setMode('diff')} style={{ color: '#c62828', borderColor: '#c62828', minHeight: 56, fontSize: 18, fontWeight: 800 }}>✏️ Non, il en manque</button>
+              </div>
+            </>}
+            {mode === 'diff' && <>
+              <div style={{ margin: '12px 0', padding: '10px 12px', borderRadius: 12, background: '#fdecea', fontSize: 16, fontWeight: 700, color: '#b71c1c' }}>Mets la quantité vraiment dans la cagette. Pour ce qui manque : dis pourquoi.</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left' }}>
+                {items.map((it, i) => { const miss = hv(i) < qOf(it); return (
+                  <div key={i} style={{ border: '3px solid ' + (miss ? '#c62828' : '#2e7d32'), borderRadius: 14, padding: '10px 12px', background: miss ? '#fdecea' : '#e8f5e9' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ flex: 1, fontSize: 19, fontWeight: 800 }}>{kbProdName(it.produit || '')}</div>
+                      <button type="button" disabled={busy} onClick={() => step(i, -1)} style={{ width: 50, height: 50, borderRadius: 12, fontSize: 26, fontWeight: 800, border: '2px solid #c62828', background: '#fff' }}>−</button>
+                      <b style={{ fontSize: 24, minWidth: 54, textAlign: 'center' }}>{hv(i)}/{qOf(it)}</b>
+                      <button type="button" disabled={busy || !miss} onClick={() => step(i, 1)} style={{ width: 50, height: 50, borderRadius: 12, fontSize: 26, fontWeight: 800, border: '2px solid #2e7d32', background: '#fff' }}>+</button>
+                    </div>
+                    {miss && <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                      {KB_CRATE_MISS_REASONS.map(x => <button key={x} type="button" disabled={busy} onClick={() => setWhy(o => ({ ...o, [i]: x }))} style={{ minHeight: 44, padding: '4px 10px', borderRadius: 10, fontSize: 14, fontWeight: 800, border: '2px solid #c62828', background: why[i] === x ? '#c62828' : '#fff', color: why[i] === x ? '#fff' : '#c62828' }}>{x}</button>)}
+                      {why[i] === 'Autre' && <input value={whyTxt[i] || ''} onChange={e => setWhyTxt(o => ({ ...o, [i]: e.target.value.slice(0, 120) }))} placeholder="Pourquoi ?" style={{ width: '100%', fontSize: 17 }} />}
+                    </div>}
+                  </div>); })}
+              </div>
+              <div style={{ fontSize: 20, fontWeight: 900, marginTop: 10 }}>Dans la cagette : {present}/{total}</div>
+              <input value={ini} onChange={e => setIni(e.target.value.toUpperCase().slice(0, 5))} placeholder="Tes initiales" style={{ width: '100%', maxWidth: 200, textAlign: 'center', fontSize: 24, fontWeight: 700, marginTop: 10 }} />
+              <div className="fs-actions" style={{ marginTop: 12 }}>
+                <button className="btn-primary btn-lg" disabled={!ok || busy} onClick={() => save(false)} style={{ background: '#1565c0', borderColor: '#1565c0', opacity: ok ? 1 : .5 }}>{busy ? '⏳…' : !reasonsOk ? 'Dis pourquoi il en manque' : '✅ Valider la cagette'}</button>
+                <button className="btn-ghost" disabled={busy} onClick={() => { setMode('ask'); setHave({}); setWhy({}); }}>← Retour</button>
+              </div>
+            </>}
             {count > 1 && <div className="fs-count">{count - 1} autre(s) retour(s) PDP à préparer</div>}
           </div>
         </div>
       );
     }
+
     function NonRecupAlertOverlay({ followup, count, onSend }) {
       const f = followup;
       const [ini, setIni] = React.useState('');
@@ -31073,7 +31278,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function kbPickupFrom(f) {
       return { orderId: String(f.orderId || f.id || ''), site: f.site || '', consumer_name: kbPickupLabel(f.consumer_name), storedCasier: String(f.storedCasier || ''),
         distribDate: f.distribDate || f.day || '', items: (f.items || []).slice(0, 60).map(it => ({ produit: String(it.produit || ''), qty: it.qty || 1, dlc: it.dlc || '' })),
-        readyBy: String(f.pdpReadyBy || '').slice(0, 60) };
+        readyBy: String(f.pdpReadyBy || '').slice(0, 60),
+        ...(f.pdpCrate && f.pdpCrate.id ? { crateId: f.pdpCrate.id, crateNo: f.pdpCrate.no, crateLabel: f.pdpCrate.label, crateUnits: f.pdpCrate.units || 0 } : {}) }; // V11.68
     }
     async function kbPickupWrite(f) { const id = String(f.orderId || f.id || ''); if (id) { try { await storage.setDoc('pdp_pickups', id, kbPickupFrom(f)); } catch (e) { console.warn('pdp_pickups', e); } } }
     const KB_FU_TERMINAL = ['resolved', 'picked_up', 'credited', 'returned', 'done'];
@@ -31714,8 +31920,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               {B.valid && <div><button className="btn-ghost" style={{ fontSize: 12, marginTop: 6 }} disabled={busy} onClick={valider}>Renvoyer le récap</button></div>}
             </div>
           )}
-          {B.treatManual.map(r => (
-            <div key={r.id} style={{ border: '3px solid #1565c0', borderRadius: 16, padding: 14, background: 'var(--bg-card)' }}>
+          {(() => { // V11.68 — rangés PAR CAGETTE numérotée (en-tête : comptage chauffeur + photo)
+            const sorted = [...B.treatManual].sort((a, b) => String(a.site || '').localeCompare(String(b.site || '')) || (Number(a.crateNo) || 999) - (Number(b.crateNo) || 999) || String(a.crateId || '').localeCompare(String(b.crateId || '')));
+            return sorted.map((r, k) => (
+            <React.Fragment key={r.id}>
+            {r.crateId && (k === 0 || sorted[k - 1].crateId !== r.crateId) && <KbCrateHead crate={{ id: r.crateId, label: r.crateLabel || kbCrateLabel(r.site, r.crateNo), site: r.site }} items={sorted.filter(x => x.crateId === r.crateId).map(x => ({ produit: x.produit || x.productLabel, qty: kbRetUnits(x) }))} photos={photosAll} />}
+            <div style={{ border: '3px solid #1565c0', borderRadius: 16, padding: 14, background: 'var(--bg-card)', ...(r.crateId ? { marginLeft: 10 } : {}) }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                 <div style={{ fontSize: 23, fontWeight: 700 }}>{r.produit || r.productLabel}{(r.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{r.qty}</span> : ''}</div>
                 <span style={{ background: kbSiteColor(r.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700, height: 'fit-content' }}>{r.site}</span>
@@ -31732,9 +31942,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 : <DestButtons dlc={r.dlc} onPick={(d) => treatManual(r, d)} />}
               <LostBtn on={() => lostManual(r)} />
             </div>
-          ))}
-          {B.treatLines.map(L => (
-            <div key={L.id} style={{ border: '3px solid #1565c0', borderRadius: 16, padding: 14, background: 'var(--bg-card)' }}>
+            </React.Fragment>
+          )); })()}
+          {B.treatLines.map((L, k) => (
+            <React.Fragment key={L.id}>
+            {kbOrderCrate(L.f) && (k === 0 || B.treatLines[k - 1].f !== L.f) && <KbCrateHead crate={{ ...kbOrderCrate(L.f), site: L.f.site }} client={L.f.consumer_name} distribDate={L.f.distribDate || L.f.day} items={(L.f.items || []).map(it => ({ produit: it.produit, qty: Math.max(1, Number(it.qty) || 1) }))} photos={photosAll} />}
+            <div style={{ border: '3px solid #1565c0', borderRadius: 16, padding: 14, background: 'var(--bg-card)', ...(kbOrderCrate(L.f) ? { marginLeft: 10 } : {}) }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                 <div style={{ fontSize: 23, fontWeight: 700 }}>{L.it.produit}{(L.it.qty || 1) > 1 ? <span style={{ color: '#c62828' }}> ×{L.it.qty}</span> : ''}</div>
                 <span style={{ background: kbSiteColor(L.f.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700, height: 'fit-content' }}>{L.f.site}</span>
@@ -31744,6 +31957,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
               <DestButtons dlc={L.it.dlc} onPick={(d) => treatLine(L, d)} />
               <LostBtn on={() => lostLine(L)} />
             </div>
+            </React.Fragment>
           ))}
           {B.treatedToday.length > 0 && (
             <details className="card" style={{ padding: '12px 14px' }}>
@@ -35684,6 +35898,54 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const [take, setTake] = React.useState({}); // V11.67 — rolls : { [id]: { roll, dolly, cagette } } réellement pris
       const [allChecked, setAllChecked] = React.useState(false); // V11.67 — popup « bravo, tout vérifié »
       const drv = kbIsPdpDriver();
+      // V11.68 — cagettes Retour PDP numérotées : comptage + photo obligatoire par cagette
+      const [cnt, setCnt] = React.useState({}); // crateId → nb d'articles vus
+      const [pic, setPic] = React.useState({}); // crateId → photo (dataURL)
+      const isCr = (x) => !!((x.k === 'm' && x.r.crateId) || (x.k === 'o' && kbOrderCrate(x.f)));
+      const cratesOf = (list) => {
+        const g = {};
+        list.filter(isCr).forEach(x => {
+          if (x.k === 'm') {
+            const r = x.r, c = g[r.crateId] || (g[r.crateId] = { id: r.crateId, no: Number(r.crateNo) || 0, label: r.crateLabel || kbCrateLabel(r.site, r.crateNo), xs: [], expected: 0, closed: false, day: r.crateDay || '', client: '' });
+            c.xs.push(x); c.expected += kbRetUnits(r); if (r.crateClosedAt) c.closed = true;
+          } else {
+            const f = x.f, k = kbOrderCrate(f);
+            g[k.id] = { id: k.id, no: Number(k.no) || 0, label: k.label || kbCrateLabel(f.site, k.no), xs: [x], expected: (f.items || []).reduce((t, it) => t + Math.max(1, Number(it.qty) || 1), 0), closed: true, day: '', client: f.consumer_name || '', distribDate: f.distribDate || f.day || '' };
+          }
+        });
+        return Object.values(g).map(c => ({ ...c, ready: c.closed || c.expected >= KB_CRATE_MAX || (c.day && c.day < todayKey()) })).sort((a, b) => a.no - b.no);
+      };
+      const pickCratePhoto = async (c, files) => {
+        const f0 = files && files[0]; if (!f0) return;
+        setBusy(true);
+        try { const img = await kbImgPdp(f0); setPic(o => ({ ...o, [c.id]: img })); } catch (e) { showToast('Photo illisible, recommence'); } finally { setBusy(false); }
+      };
+      const takeCrate = async (s, c) => {
+        const n = cnt[c.id], img = pic[c.id];
+        if (n == null || !img) return;
+        if (!c.ready && !confirm(`${c.label} n'a pas encore été fermée par la boutique.\nLa prendre quand même ?`)) return;
+        setBusy(true);
+        try {
+          const at = now(), pid = `ph_${todayKey()}_${s}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          let countOk = true;
+          try { await storage.setDoc('pdp_photos', pid, { id: pid, site: s, by: session.name, at, day: todayKey(), img, crate: c.id, crateLabel: c.label, count: Number(n) || 0, expected: c.expected }, { replace: true }); }
+          catch (e) { countOk = false; await storage.setDoc('pdp_photos', pid, { id: pid, site: s, by: session.name, at, day: todayKey(), img }, { replace: true }); }
+          for (const x of c.xs) {
+            if (x.k === 'm') {
+              await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: at });
+              await storage.setDoc('pdp_returns', x.r.id, { status: 'verified', verifiedBy: session.name, verifiedAt: now() });
+            } else {
+              await pickupSet(x.f, { pdpRecoveredAt: at, pdpRecoveredBy: session.name });
+              const ck = {}; (x.f.items || []).forEach((_, i) => { ck[String(i)] = true; });
+              await pickupSet(x.f, { pdpVerifiedAt: now(), pdpVerifiedBy: session.name, pdpCheck: ck });
+            }
+          }
+          setCnt(o => { const k = { ...o }; delete k[c.id]; return k; }); setPic(o => { const k = { ...o }; delete k[c.id]; return k; });
+          if (!countOk) showToast('⚠️ Cagette prise, mais comptage non enregistré (règles V11.68 à publier) — préviens Henry');
+          else if (Number(n) < c.expected) showToast(`✓ ${c.label} prise · ${n}/${c.expected} → Raimbaud est prévenu, l'entrepôt vérifiera le détail`);
+          else muCelebrate(Number(n) || c.expected, 'article(s) dans le camion');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
       const now = () => new Date().toISOString();
       const denied = (e) => showToast(e && /permission/i.test(String(e.code || e.message)) ? '⛔ Non autorisé (règles Firestore V11.43 à publier ?)' : 'Erreur : ' + ((e && e.message) || e));
       const pickupSet = async (f, val) => {
@@ -35789,7 +36051,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         <div className="stack">
           <div>
             <h1 style={{ margin: 0, fontSize: 28 }}>↩️ Retours PDP</h1>
-            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>1️⃣ Dans chaque boutique : <b>📷 photo</b> de la cagette « Retour PDP » puis <b>✓ Pris</b>. 2️⃣ Tranquillement : <b>🔍 Vérifier</b> (tout est trouvé par défaut). 3️⃣ Une fois arrivé à PDP et déposé : <b>🏭 Déposé à l'entrepôt</b>.</div>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>1️⃣ Dans chaque boutique, pour chaque cagette numérotée : <b>compte les articles</b> + <b>📷 photo</b> puis <b>✓ Cagette prise</b>. 2️⃣ Tranquillement : <b>🔍 Vérifier</b> (tout est trouvé par défaut). 3️⃣ Une fois arrivé à PDP et déposé : <b>🏭 Déposé à l'entrepôt</b>.</div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <StepChip n={nTake} ic="📍" t="Boutiques" c="#e65100" on={step === 'lieux'} onClick={() => setStep('lieux')} />
@@ -35802,10 +36064,35 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             ? <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 21, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à prendre en boutique</div>
             : Object.keys(toTake).sort().map(s => { const list = toTake[s], ph = kbPdpPhotosFor(photos, s, null).filter(p => p.by === session.name || !drv); return (
               <div key={s} style={{ border: '3px solid ' + kbSiteColor(s), borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
-                <SiteHead s={s} right={list.length + ' à prendre'} />
+                <SiteHead s={s} right={(() => { const nc = cratesOf(list).length, ng = list.filter(x => !isCr(x)).length; return [nc ? nc + ' cagette' + (nc > 1 ? 's' : '') : '', ng ? ng + ' autre' + (ng > 1 ? 's' : '') : ''].filter(Boolean).join(' + ') + ' à prendre'; })()} />
                 <div className="stack" style={{ gap: 8, padding: 10 }}>
+                  {cratesOf(list).map(c => { const n = cnt[c.id], img = pic[c.id], can = n != null && !!img; return (
+                    <div key={c.id} style={{ border: '4px solid ' + (c.ready ? '#e65100' : '#bdbdbd'), borderRadius: 16, padding: '10px 12px', background: c.ready ? '#fff8e1' : '#f5f5f5' }}>
+                      <div style={{ fontSize: 24, fontWeight: 900, lineHeight: 1.15 }}>📦 {c.label}</div>
+                      {c.client && <div style={{ fontSize: 18, fontWeight: 800, color: '#1565c0' }}>👤 {c.client} · distrib du {formatDateShort(c.distribDate)}</div>}
+                      {!c.ready && <div style={{ fontSize: 15, fontWeight: 800, color: '#757575' }}>🔓 Pas encore fermée par la boutique</div>}
+                      <div style={{ fontSize: 20, fontWeight: 800, marginTop: 4 }}>Prévu : <span style={{ fontSize: 28, color: '#e65100' }}>{c.expected}</span> article{c.expected > 1 ? 's' : ''}</div>
+                      <details style={{ fontSize: 15, marginTop: 2 }}><summary style={{ cursor: 'pointer', color: 'var(--ink-soft)' }}>Voir le contenu</summary>
+                        {c.xs.flatMap(itemsOf).map(i => <div key={i.key}>• {i.label}{i.qty > 1 ? ' ×' + i.qty : ''}</div>)}</details>
+                      <div style={{ fontSize: 17, fontWeight: 800, marginTop: 8 }}>Combien d'articles tu vois ?</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                        <button type="button" disabled={busy} onClick={() => setCnt(o => ({ ...o, [c.id]: Math.max(0, (o[c.id] == null ? c.expected : o[c.id]) - 1) }))} style={{ width: 60, height: 60, borderRadius: 12, fontSize: 30, fontWeight: 800, border: '2px solid #c62828', background: '#fff' }}>−</button>
+                        <b style={{ flex: 1, textAlign: 'center', fontSize: 36, color: n == null ? '#bdbdbd' : n < c.expected ? '#c62828' : '#2e7d32' }}>{n == null ? '?' : n}</b>
+                        <button type="button" disabled={busy} onClick={() => setCnt(o => ({ ...o, [c.id]: (o[c.id] == null ? c.expected - 1 : o[c.id]) + 1 }))} style={{ width: 60, height: 60, borderRadius: 12, fontSize: 30, fontWeight: 800, border: '2px solid #2e7d32', background: '#fff' }}>+</button>
+                      </div>
+                      {n == null && <button type="button" disabled={busy} onClick={() => setCnt(o => ({ ...o, [c.id]: c.expected }))} style={{ width: '100%', minHeight: 50, marginTop: 6, borderRadius: 12, border: '2px solid #2e7d32', background: '#e8f5e9', color: '#1b5e20', fontSize: 17, fontWeight: 800 }}>✓ J'en vois bien {c.expected}</button>}
+                      {n != null && n < c.expected && <div style={{ fontSize: 15, fontWeight: 800, color: '#c62828', marginTop: 4 }}>Il en manque {c.expected - n} → Raimbaud sera prévenu, l'entrepôt vérifie le détail.</div>}
+                      {img ? <div style={{ position: 'relative', marginTop: 8 }}><img src={img} alt="cagette" style={{ width: '100%', maxHeight: 220, objectFit: 'cover', borderRadius: 12 }} /><button type="button" onClick={() => setPic(o => { const k = { ...o }; delete k[c.id]; return k; })} style={{ position: 'absolute', right: 6, top: 6, width: 36, height: 36, borderRadius: 18, border: 'none', background: '#c62828', color: '#fff', fontWeight: 900 }}>×</button></div>
+                        : <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 62, marginTop: 8, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', fontSize: 19, fontWeight: 800, cursor: 'pointer' }}>
+                          📷 Photo de la cagette (obligatoire)
+                          <input type="file" accept="image/*" capture="environment" disabled={busy} style={{ display: 'none' }} onChange={e => { pickCratePhoto(c, e.target.files); e.target.value = ''; }} />
+                        </label>}
+                      <button disabled={busy || !can} onClick={() => takeCrate(s, c)} style={{ width: '100%', minHeight: 64, marginTop: 8, borderRadius: 14, border: 'none', background: can ? '#2e7d32' : '#bdbdbd', color: '#fff', fontSize: 20, fontWeight: 900, cursor: can ? 'pointer' : 'default' }}>{busy ? '⏳…' : can ? `✓ Cagette prise (${n} article${n > 1 ? 's' : ''})` : n == null ? 'Compte les articles' : '📷 Prends la photo'}</button>
+                    </div>); })}
+                  {list.some(x => !isCr(x)) && <>
+                  {cratesOf(list).length > 0 && <div style={{ fontSize: 16, fontWeight: 800, marginTop: 4 }}>Autres retours (sans n° de cagette) :</div>}
                   <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Dans la cagette « Retour PDP » :</div>
-                  {list.filter(x => !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
+                  {list.filter(x => !isCr(x) && !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
                   {list.filter(x => x.k === 'm' && x.r.kind === 'rolls').map(x => { const ask = kbContOf(x.r), got = { ...ask, ...(take[x.r.id] || {}) }; return (
                     <div key={x.key} style={{ border: '3px solid #6d4c41', borderRadius: 14, padding: '10px 12px', background: '#efebe9' }}>
                       <div style={{ fontSize: 18, fontWeight: 800 }}>🛒 Contenants vides demandés : {kbContLabel(ask)}</div>
@@ -35826,7 +36113,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                     📷 {ph.length ? 'Encore une photo' : 'Prendre une photo'}
                     <input type="file" accept="image/*" capture="environment" multiple disabled={busy} style={{ display: 'none' }} onChange={e => { addPhoto(s, e.target.files); e.target.value = ''; }} />
                   </label>
-                  <button disabled={busy} onClick={() => takeSite(s, list)} style={{ minHeight: 66, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 800, cursor: 'pointer' }}>✓ J'ai pris le retour de {s}</button>
+                  <button disabled={busy} onClick={() => takeSite(s, list.filter(x => !isCr(x)))} style={{ minHeight: 66, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 21, fontWeight: 800, cursor: 'pointer' }}>✓ J'ai pris le retour de {s}</button>
+                  </>}
                 </div>
               </div>); }))}
 
@@ -38110,6 +38398,61 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             </div>
           </div>
         </div>);
+    }
+    // V11.68 — en-tête d'une cagette dans Prépa › Retours PDP : n°, client, prévu vs compté par le chauffeur, photo
+    function KbCrateHead({ crate, items, photos, client, distribDate }) {
+      const ph = (photos || []).filter(p => p.crate === crate.id);
+      const last = ph[ph.length - 1] || null;
+      const exp = (items || []).reduce((t, x) => t + (Number(x.qty) || 1), 0);
+      const expected = last && last.expected != null ? Number(last.expected) : exp;
+      const short = last && Number(last.count) < expected;
+      return (
+        <div style={{ border: '4px solid ' + (short ? '#c62828' : '#e65100'), borderRadius: 16, padding: '10px 12px', background: short ? '#fdecea' : '#fff3e0', marginTop: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 24, fontWeight: 900, flex: 1, lineHeight: 1.15 }}>📦 {crate.label}</span>
+            {crate.site && <span style={{ background: kbSiteColor(crate.site), color: '#fff', borderRadius: 8, padding: '3px 10px', fontWeight: 700 }}>{crate.site}</span>}
+          </div>
+          {client && <div style={{ fontSize: 18, fontWeight: 800, color: '#1565c0' }}>👤 {client}{distribDate ? ' · distrib du ' + formatDateShort(distribDate) : ''}</div>}
+          <div style={{ fontSize: 18, fontWeight: 800, marginTop: 2 }}>Prévu {expected} article{expected > 1 ? 's' : ''}{last ? <> · chauffeur <b style={{ color: short ? '#c62828' : '#2e7d32', fontSize: 22 }}>{last.count}</b> vu{Number(last.count) > 1 ? 's' : ''} ({last.by})</> : ''}</div>
+          {short && <div style={{ fontSize: 16, fontWeight: 900, color: '#c62828' }}>⚠️ Il en manque {expected - Number(last.count)} : vérifie produit par produit (❓ pas trouvé si absent)</div>}
+          <KbPdpPhotoStrip photos={ph} />
+        </div>);
+    }
+    // V11.68 — cagette Retour PDP : le chauffeur a compté MOINS d'articles que prévu → mail à rr@ (une fois, posté prépa / master)
+    //   « normalement il devait y avoir ces produits mais pas là » ; l'entrepôt vérifie le détail au traitement.
+    function KbPdpCrateShortMailer() {
+      const B = useKbPdpBoard();
+      const photos = useKbPdpPhotos();
+      const busy = React.useRef(false);
+      React.useEffect(() => {
+        if (!B.ready || busy.current || kbIsPdpDriver()) return;
+        const todo = (photos || []).filter(p => p.crate && Number(p.count) < Number(p.expected) && !B.tm['_cratemail_' + p.id]);
+        if (!todo.length) return;
+        busy.current = true;
+        (async () => {
+          try {
+            for (const p of todo) {
+              const at = new Date().toISOString();
+              await storage.setDoc('pdp_treatments', '_cratemail_' + p.id, { id: '_cratemail_' + p.id, crate: p.crate, at });
+              const man = (B.manualAll || []).filter(r => r.crateId === p.crate);
+              const ord = (B.orders || []).find(f => { const c = kbOrderCrate(f); return c && c.id === p.crate; });
+              const rows = man.length ? man.map(r => ({ produit: r.produit || r.productLabel, qty: kbRetUnits(r), client: r.clientName || '' }))
+                : ord ? (ord.items || []).map(it => ({ produit: it.produit, qty: Math.max(1, Number(it.qty) || 1), client: ord.consumer_name || '' })) : [];
+              const miss = Number(p.expected) - Number(p.count);
+              const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;color:#1b1b1b">`
+                + `<div style="background:#e65100;color:#fff;border-radius:12px;padding:16px 18px"><div style="font-size:24px;font-weight:900">⚠️ ${kbEsc(p.crateLabel || '')}</div><div style="font-size:18px">${kbEsc(p.by || 'Le chauffeur')} a compté <b>${Number(p.count)}</b> article(s) au lieu de <b>${Number(p.expected)}</b> · il en manque <b>${miss}</b></div></div>`
+                + (ord ? `<div style="font-size:16px;margin-top:10px">Commande entière de <b>${kbEsc(ord.consumer_name || '')}</b> · distrib du ${kbEsc(formatDateShort(ord.distribDate || ord.day || ''))}</div>` : '')
+                + `<div style="font-size:16px;font-weight:900;margin-top:12px">Normalement dans la cagette :</div>`
+                + `<table role="presentation" width="100%" style="border-collapse:collapse;margin-top:6px;border-left:6px solid #e65100">`
+                + rows.map(x => `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:17px"><b>${kbEsc(kbProdName(x.produit || ''))}</b>${x.client ? ` <span style="color:#888;font-size:13px">· ${kbEsc(x.client)}</span>` : ''}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:19px;text-align:right"><b>×${x.qty}</b></td></tr>`).join('')
+                + `</table><div style="font-size:15px;margin-top:10px">Les préparateurs vérifient le détail à l'entrepôt (Prépa › Retours PDP). Photo de la cagette dans l'appli.</div><p style="color:#999;font-size:12px;margin-top:14px">Appli Kelbongoo ${APP_VERSION}</p></div>`;
+              try { await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: PDP_ALERT_EMAILS[0], subject: `⚠️ ${p.crateLabel || 'Cagette retour PDP'} · ${p.count}/${p.expected} articles · il en manque ${miss}`, htmlBody: html,
+                body: `${p.crateLabel} : ${p.by} a compté ${p.count} au lieu de ${p.expected}.\nNormalement :\n` + rows.map(x => `- ${x.produit} x${x.qty}`).join('\n') }); } catch (_) {}
+            }
+          } finally { busy.current = false; }
+        })();
+      }, [B, photos]);
+      return null;
     }
     // V11.43 — « pas trouvé » par le chauffeur (vérification) → mail à hg@ (envoyé par un poste prépa / master ouvert, une seule fois)
     function KbPdpNotFoundMailer() {
@@ -42341,6 +42684,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             <KbQualWeekPopup session={effSession} />
             <KbPdpDepositPopup session={effSession} setTab={setTab} />
             <KbPdpNotFoundMailer />
+            <KbPdpCrateShortMailer />
             <DlcCorrectionPopup session={effSession} setTab={setTab} />
             <KbAncienAutoRun by={session.name} />
             <KbSupport session={effSession} tab={tab} site="ENTREPOT" />
@@ -42404,9 +42748,11 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         <div className={'app-shell' + (effSession.isMaster ? ' kb-wide' : '')}>
           {overlay}
             <UpdateChecker />
+          {effSession.role === 'distrib' && !session.isMaster && <KbPdpCrateGate session={effSession} site={currentSite} />}
           <KbSupport session={effSession} tab={tab} site={currentSite} />
           {session.isMaster && <KbAncienAutoRun by={session.name} />}
           {session.isMaster && <KbPdpNotFoundMailer />}
+          {session.isMaster && <KbPdpCrateShortMailer />}
           {effSession.isMaster && <KbMasterSidebar tab={tab} setTab={setTab} session={effSession} onLogout={handleLogout} />}
           <div className="topbar">
             <div className="topbar-title">
