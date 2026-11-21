@@ -795,7 +795,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.70';
+    const APP_VERSION = 'V11.71';
+    // V11.71 — (21/11/2026) 🧭 GPS : carte grise « API KEY REQUIRED » (CARTO exige maintenant une clé) → fond OpenStreetMap
+    //   (nuit = filtre sombre), ou fond TomTom jour/nuit dès qu'une clé TomTom est enregistrée (repli OSM si la clé échoue).
     // V11.70 — (21/11/2026) 🧭 GPS : on choisit le TYPE de véhicule (🛵 scooter · 🚗 voiture · 🚐 utilitaire VL ≤ 3,5 t · 🚛 poids lourd 7,5 / 12 / 19 / 44 t)
     //   au lieu de saisir les dimensions (réglage fin facultatif). Scooter = Valhalla motor_scooter / TomTom motorcycle 45 km/h sans autoroute ;
     //   voiture = auto / car ; utilitaire et PL = truck avec gabarit (hauteur, poids…). Tuile chauffeur « GPS ».
@@ -35896,6 +35898,22 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         go(0);
       });
     }
+    // V11.71 — fond de carte : TomTom (clé enregistrée, style propre jour/nuit) sinon OpenStreetMap (sans clé ; nuit = filtre sombre).
+    //   CARTO exige désormais une clé (« API KEY REQUIRED ») → abandonné. Si les tuiles TomTom échouent (clé fausse / quota), repli OSM.
+    function kbGpsBaseLayer(L, map, night, key, onSwap) {
+      if (!document.getElementById('kb-gps-css')) { const st = document.createElement('style'); st.id = 'kb-gps-css';
+        st.textContent = '.kb-tiles-night{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.9) saturate(.6)}'; document.head.appendChild(st); }
+      const osm = () => L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, className: night ? 'kb-tiles-night' : '', attribution: '© OpenStreetMap' });
+      let lay;
+      if (key) {
+        lay = L.tileLayer('https://{s}.api.tomtom.com/map/1/tile/basic/' + (night ? 'night' : 'main') + '/{z}/{x}/{y}.png?key=' + encodeURIComponent(key), { subdomains: 'abcd', maxZoom: 20, attribution: '© TomTom · © OpenStreetMap' });
+        let errs = 0, ok = 0;
+        lay.on('tileload', () => { ok++; });
+        lay.on('tileerror', () => { errs++; if (errs === 4 && ok === 0 && map.hasLayer(lay)) { map.removeLayer(lay); const o = osm().addTo(map); o.bringToBack(); onSwap && onSwap(o); } });
+      } else lay = osm();
+      lay.addTo(map); lay.bringToBack();
+      return lay;
+    }
     function kbLeaflet() {
       if (window.L && window.L.map) return Promise.resolve(window.L);
       return Promise.all([kbLoadCss(KB_GPS_LEAFLET_CSS), loadScript(KB_GPS_LEAFLET[0]).catch(() => loadScript(KB_GPS_LEAFLET[1]))])
@@ -36269,9 +36287,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => {
         const map = M.current; if (!map) return; const L = window.L;
         if (LY.current.tiles) map.removeLayer(LY.current.tiles);
-        LY.current.tiles = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/${night ? 'dark_all' : 'voyager'}/{z}/{x}/{y}{r}.png`, { subdomains: 'abcd', maxZoom: 19,
-          attribution: '© OpenStreetMap · © CARTO' + (ttKey ? ' · trafic © TomTom' : '') }).addTo(map);
-        LY.current.tiles.bringToBack();
+        LY.current.tiles = kbGpsBaseLayer(L, map, night, ttKey, l => { LY.current.tiles = l; });
       }, [ready, night, ttKey]);
       React.useEffect(() => {
         const map = M.current; if (!map) return; const L = window.L;
@@ -36801,10 +36817,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => {
         if (!ready || !el.current) return; const L = window.L;
         const map = L.map(el.current, { zoomControl: true, attributionControl: true }); map.attributionControl.setPrefix('');
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { subdomains: 'abcd', maxZoom: 19, attribution: '© OpenStreetMap · © CARTO' }).addTo(map);
         map.setView([48.84, 2.39], 11); M.current = map; LG.current = L.layerGroup().addTo(map);
         return () => { try { map.remove(); } catch (e) {} M.current = null; };
       }, [ready]);
+      const BASE = React.useRef(null);
+      React.useEffect(() => { const map = M.current; if (!map) return; if (BASE.current) map.removeLayer(BASE.current);
+        BASE.current = kbGpsBaseLayer(window.L, map, false, cfg && cfg.tomtomKey, l => { BASE.current = l; }); }, [ready, cfg && cfg.tomtomKey]);
       React.useEffect(() => {
         const map = M.current, L = window.L; if (!map || !LG.current) return; LG.current.clearLayers(); const pts = [];
         rows.forEach(d => {
