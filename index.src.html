@@ -813,7 +813,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.74';
+    const APP_VERSION = 'V11.75';
+    // V11.75 — (21/11/2026) ♻️ Enlèvement destruction : palette de cagettes = palette EPAL par défaut → comptée « EPAL envoyée à Rungis »
+    //   (suivi EPAL / compteur Rungis) ; case « Ce n'est PAS une palette EPAL » sinon. (V11.74 jamais publiée, remplacée par V11.75.)
     // V11.74 — (21/11/2026) 🔳 QR codes Rungis : Prépa › DLC & suivi › « Impression QR codes du jour » (1 étiquette ½ A4 par palette picking /
     //   dispatch, roll et dolly Kelbongoo ; pas pour les EPAL vides ni les emballages à détruire). Chauffeur › À livrer : « 🔳 Scanner » (ou
     //   appareil photo → l'appli s'ouvre) ; tous les supports d'une ligne scannés = ✅ Pris (le bouton reste). Boutique (distrib) : suivi
@@ -19065,6 +19067,7 @@
       const enl = useKbEnlevements();
       const [q, setQ] = React.useState({ rolls: 0, pal: 0 });
       const [zone, setZone] = React.useState('sec');
+      const [notEpal, setNotEpal] = React.useState(false); // V11.75 — palette de cagettes = EPAL par défaut (suivi EPAL Rungis)
       const [note, setNote] = React.useState('');
       const [ini, setIni] = React.useState('');
       const [ask, setAsk] = React.useState(''); // '' | 'fast' | 'normal'
@@ -19074,7 +19077,7 @@
       const tot = q.rolls + q.pal;
       const okIni = /^[A-Za-zÀ-ÿ]{2,4}$/.test(ini.trim());
       const pl = (n, w) => n + ' ' + w + (n > 1 ? 's' : '');
-      const recap = KB_DESTR.filter(x => q[x.k]).map(x => x.ic + ' ' + pl(q[x.k], x.unit) + ' · ' + x.contenu.toLowerCase()).join(' + ');
+      const recap = KB_DESTR.filter(x => q[x.k]).map(x => x.ic + ' ' + pl(q[x.k], x.unit) + (x.fmt === 'pal' ? (notEpal ? ' (pas EPAL)' : ' EPAL') : '') + ' · ' + x.contenu.toLowerCase()).join(' + ');
       const mine = enl.list.filter(r => (r.date === day || r.date === addDays(day, -1)) && kbEnlItems(r).some(it => String(it.code || '').toUpperCase() === 'RUNGIS'));
 
       const send = async (fast) => {
@@ -19083,9 +19086,9 @@
         try {
           const id = 'enl_' + Date.now();
           const items = KB_DESTR.filter(x => q[x.k] > 0).map((x, i) => {
-            const n = q[x.k], pal = x.fmt === 'pal' ? n : 0;
-            const lines = [{ s: 'Retour emballages', d: x.d, q: n }];
-            return { key: 'X:' + id + '_' + i, code: 'RUNGIS', type: 'DISPATCH', express: true, ref: '', n: pal, epalN: pal, epal: pal > 0, dollies: x.fmt === 'roll' ? n : 0,
+            const n = q[x.k], pal = x.fmt === 'pal' ? n : 0, ep = notEpal ? 0 : pal; // V11.75 — EPAL envoyées à Rungis → compteur EPAL
+            const lines = [{ s: 'Retour emballages', d: x.d + (pal ? (notEpal ? ' · palette non EPAL' : ' · palette EPAL') : ''), q: n }];
+            return { key: 'X:' + id + '_' + i, code: 'RUNGIS', type: 'DISPATCH', express: true, ref: '', n: pal, epalN: ep, epal: ep > 0, dollies: x.fmt === 'roll' ? n : 0,
               roll: x.fmt === 'roll', contenu: x.contenu, kbg: false, frais: false, zone, mergedWith: '', origin: 'RUNGIS', sid: '', total: n,
               sups: [{ name: '♻️ Retour emballages', qty: n }], hasPhoto: false, lines, note: note.trim().slice(0, 300), src: 'kelbongoo' };
           });
@@ -19094,7 +19097,7 @@
           const rec = { at: Date.now(), by, byKey: '', mode: 'X', express: true, date: day, totPal, totDol, totDolDispatch: totDol, totFromage: 0, status: 'attente-23h59', items, lieux, src: 'kelbongoo' };
           const payload = { action: 'request-enlevement', id, mode: 'X', by, byKey: '', date: day, at: rec.at, brand: 'KELBONGOO', photoGeneral: '', express: true,
             lieux: [{ code: 'RUNGIS', label: 'RUNGIS (retour emballages)', color: '#5d4037', dolly: 0, dollyZone: 'froid',
-              palettes: items.map(it => ({ key: it.key, type: 'DISPATCH', express: true, ref: '', n: it.n, epalN: it.epalN, dollies: it.dollies, roll: it.roll, contenu: it.contenu, kbg: false, cond: it.roll ? 'roll' : 'pal',
+              palettes: items.map(it => ({ key: it.key, type: 'DISPATCH', express: true, ref: '', n: it.n, epalN: it.epalN, epal: it.epal, dollies: it.dollies, roll: it.roll, contenu: it.contenu, kbg: false, cond: it.roll ? 'roll' : 'pal',
                 frais: false, zone, mergedWith: '', sup: it.sups, lines: it.lines, total: it.total, origin: 'RUNGIS', note: it.note, photo: '' })) }] };
           const r = await fetch(KB_RDU_ENL + '/' + id + '.json', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rec) });
           if (!r.ok) throw new Error('enregistrement refusé (HTTP ' + r.status + ')');
@@ -19108,7 +19111,7 @@
             try { fetch(KB_ENL_SCRIPT_URL, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) }).catch(() => {}); } catch (_) {}
             kbCelebrate({ title: 'Demande enregistrée ♻️', sub: recap + ' · mail à Rungis à 23h59' });
           }
-          setQ({ rolls: 0, pal: 0 }); setNote(''); setIni(''); setAsk(''); enl.reload();
+          setQ({ rolls: 0, pal: 0 }); setNotEpal(false); setNote(''); setIni(''); setAsk(''); enl.reload();
         } catch (e) { showToast('⚠️ ' + (e.message || e)); enl.reload(); }
         finally { setBusy(false); }
       };
@@ -19129,6 +19132,13 @@
               <b style={{ fontSize: 34, minWidth: 40, textAlign: 'center' }}>{q[x.k]}</b>
               <button onClick={() => setQ(o => ({ ...o, [x.k]: Math.min(30, o[x.k] + 1) }))} style={{ width: 58, height: 58, borderRadius: 14, border: 'none', background: '#5d4037', color: '#fff', fontSize: 30, fontWeight: 900, cursor: 'pointer' }}>+</button>
               </div>
+              {x.fmt === 'pal' && q[x.k] > 0 && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10, padding: '10px 12px', borderRadius: 12, border: '2px solid ' + (notEpal ? '#e65100' : '#8d6e63'), background: notEpal ? '#fff3e0' : '#fff', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={notEpal} onChange={e => setNotEpal(e.target.checked)} style={{ width: 28, height: 28, flex: '0 0 auto' }} />
+                  <span style={{ fontSize: 16, fontWeight: 800, lineHeight: 1.25 }}>Ce n'est PAS une palette EPAL
+                    <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--ink-soft)' }}>{notEpal ? 'Pas comptée dans le suivi EPAL.' : '🟫 Par défaut : palette EPAL → comptée comme EPAL envoyée à Rungis (suivi EPAL).'}</span></span>
+                </label>
+              )}
             </div>
           ))}
           <div>
@@ -19145,7 +19155,7 @@
               <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ink-mute)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Demandes récentes</div>
               {mine.slice(0, 8).map(r => { const [stT, stC] = kbEnlStatus(r); const its = kbEnlItems(r).filter(it => String(it.code || '').toUpperCase() === 'RUNGIS');
                 return (<div key={r.id} style={{ borderTop: '1px solid var(--line)', padding: '8px 0' }}>
-                  <div style={{ fontSize: 16, fontWeight: 700 }}>{its.map(it => (it.roll ? '📦 ' + pl(it.dollies, 'roll') : '🪵 ' + pl(it.n, 'palette')) + ' · ' + String(it.contenu || '').toLowerCase()).join(' + ')}</div>
+                  <div style={{ fontSize: 16, fontWeight: 700 }}>{its.map(it => (it.roll ? '📦 ' + pl(it.dollies, 'roll') : '🪵 ' + pl(it.n, 'palette') + (Number(it.epalN) > 0 ? ' EPAL' : ' (pas EPAL)')) + ' · ' + String(it.contenu || '').toLowerCase()).join(' + ')}</div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: stC }}>{stT}{r.by ? ' · ' + r.by : ''}{r.at ? ' · ' + kbHhmm(new Date(r.at).toISOString()) : ''}</div>
                 </div>); })}
             </div>
