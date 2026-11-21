@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.72) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.73) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -730,7 +730,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.72';
+const APP_VERSION = 'V11.73';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -73319,7 +73319,7 @@ async function kbVhRoute(locs, P, hd, alts) {
   const body = {
     locations: L0,
     ...kbVhCosting(P),
-    language: 'fr-FR',
+    language: kbGpsLangInfo().vh,
     units: 'kilometers',
     directions_type: 'instructions'
   };
@@ -73368,7 +73368,7 @@ function kbTtParse(rt) {
     sec: S.travelTimeInSeconds || 0,
     m: S.lengthInMeters || 0,
     delay: S.trafficDelayInSeconds || 0,
-    toll: false,
+    toll: (rt.sections || []).some(x => x.sectionType === 'TOLL_ROAD'),
     src: 'tt'
   });
 }
@@ -73381,7 +73381,7 @@ async function kbTtRoute(key, locs, P, hd, alts) {
     traffic: 'true',
     routeType: 'fastest',
     instructionsType: 'text',
-    language: 'fr-FR'
+    language: kbGpsLangInfo().tt
   });
   if (veh === 'scooter') {
     q.set('vehicleMaxSpeed', '45');
@@ -73396,6 +73396,8 @@ async function kbTtRoute(key, locs, P, hd, alts) {
     q.set('vehicleCommercial', 'true');
   }
   if (alts && locs.length === 2) q.set('maxAlternatives', '2');
+  q.append('sectionType', 'traffic');
+  q.append('sectionType', 'tollRoad');
   if (P.noToll) q.append('avoid', 'tollRoads');
   if (P.hazmat && veh === 'pl') q.set('vehicleLoadType', 'otherHazmatGeneral');
   if (hd != null) q.set('vehicleHeading', String(Math.round(hd) % 360));
@@ -73500,24 +73502,68 @@ function kbBestOrder(T, n, end) {
   }
   return ord;
 }
+function kbParseMaxH(v) {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s || /none|default|below|no/.test(s)) return null;
+  const ft = s.match(/^(\d+)\s*'\s*(\d+)?/);
+  if (ft) return (+ft[1] * 12 + (+ft[2] || 0)) * 0.0254;
+  const n = parseFloat(s.replace(',', '.'));
+  return isNaN(n) || n <= 0.5 || n > 8 ? null : n;
+}
 async function kbOverpassHaz(bb) {
   const area = (bb[2] - bb[0]) * (bb[3] - bb[1]),
     box = bb.map(x => x.toFixed(5)).join(',');
-  const q = `[out:json][timeout:25];(node["highway"="speed_camera"](${box});${area < 0.15 ? `node["highway"="traffic_signals"](${box});` : ''});out body;`;
+  const q = `[out:json][timeout:30];(node["highway"="speed_camera"](${box});${area < 0.15 ? `node["highway"="traffic_signals"](${box});` : ''}way["maxheight"](${box});node["maxheight"](${box}););out center;relation["boundary"="low_emission_zone"](${box});out geom;`;
   const j = await kbFetchJson('https://overpass-api.de/api/interpreter', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded'
     },
     body: 'data=' + encodeURIComponent(q)
-  }, 30000);
-  return (j && j.elements || []).filter(e => e.type === 'node' && e.tags).map(e => ({
-    id: e.id,
-    lat: e.lat,
-    lng: e.lon,
-    cam: e.tags.highway === 'speed_camera',
-    vmax: parseInt(e.tags.maxspeed, 10) || 0
-  }));
+  }, 35000);
+  const out = [];
+  (j && j.elements || []).forEach(e => {
+    const t = e.tags || {};
+    if (e.type === 'relation') {
+      const segs = [];
+      (e.members || []).forEach(m => {
+        if (m.role && m.role !== 'outer') return;
+        const g = m.geometry || [];
+        for (let i = 1; i < g.length; i++) if (g[i - 1] && g[i]) segs.push([g[i - 1].lat, g[i - 1].lon, g[i].lat, g[i].lon]);
+      });
+      if (segs.length) out.push({
+        id: e.id,
+        lez: true,
+        name: t.name || t['name:fr'] || 'Zone à faibles émissions',
+        segs
+      });
+      return;
+    }
+    const lat = e.lat != null ? e.lat : e.center && e.center.lat,
+      lng = e.lon != null ? e.lon : e.center && e.center.lon;
+    if (lat == null) return;
+    if (t.highway === 'speed_camera') out.push({
+      id: e.id,
+      lat,
+      lng,
+      cam: true,
+      vmax: parseInt(t.maxspeed, 10) || 0
+    });else if (t.highway === 'traffic_signals' && e.type === 'node') out.push({
+      id: e.id,
+      lat,
+      lng,
+      light: true
+    });
+    const mh = kbParseMaxH(t.maxheight);
+    if (mh) out.push({
+      id: e.id,
+      lat,
+      lng,
+      mh
+    });
+  });
+  return out;
 }
 function kbRouteBBox(R, pad) {
   let s = 90,
@@ -73533,11 +73579,48 @@ function kbRouteBBox(R, pad) {
   pad = pad || 0.003;
   return [s - pad, w - pad, n + pad, e + pad];
 }
-function kbRouteHaz(R, nodes) {
+function kbInPoly(segs, a, o) {
+  let c = false;
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s[0] > a !== s[2] > a && o < (s[3] - s[1]) * (a - s[0]) / (s[2] - s[0]) + s[1]) c = !c;
+  }
+  return c;
+}
+function kbRouteHaz(R, nodes, hR, veh) {
   const lights = [],
     zones = [],
+    bridges = [],
+    lez = [],
     [s, w, n, e] = kbRouteBBox(R, 0.001);
+  const tall = veh === 'pl' || veh === 'vl';
   (nodes || []).forEach(x => {
+    if (x.lez) {
+      let mnA = 90,
+        mxA = -90,
+        mnO = 180,
+        mxO = -180;
+      x.segs.forEach(q => {
+        mnA = Math.min(mnA, q[0], q[2]);
+        mxA = Math.max(mxA, q[0], q[2]);
+        mnO = Math.min(mnO, q[1], q[3]);
+        mxO = Math.max(mxO, q[1], q[3]);
+      });
+      for (let i = 0; i < R.pts.length; i += 3) {
+        const p = R.pts[i];
+        if (p[0] < mnA || p[0] > mxA || p[1] < mnO || p[1] > mxO) continue;
+        if (kbInPoly(x.segs, p[0], p[1])) {
+          lez.push({
+            id: x.id,
+            name: x.name,
+            s: R.cum[i],
+            segs: x.segs
+          });
+          break;
+        }
+      }
+      return;
+    }
     if (x.lat < s || x.lat > n || x.lng < w || x.lng > e) return;
     const sn = kbSnap(R, [x.lat, x.lng], -1);
     if (x.cam) {
@@ -73549,8 +73632,15 @@ function kbRouteHaz(R, nodes) {
         a,
         b: a + L
       });
-    } else if (sn.d <= 18) lights.push({
+    } else if (x.light) {
+      if (sn.d <= 18) lights.push({
+        s: sn.along,
+        lat: x.lat,
+        lng: x.lng
+      });
+    } else if (x.mh && tall && hR > 0 && sn.d <= 30 && x.mh < hR + 0.3) bridges.push({
       s: sn.along,
+      mh: x.mh,
       lat: x.lat,
       lng: x.lng
     });
@@ -73568,10 +73658,606 @@ function kbRouteHaz(R, nodes) {
       ...z
     });
   });
+  bridges.sort((a, b) => a.s - b.s);
+  const B = [];
+  bridges.forEach(b => {
+    const p = B[B.length - 1];
+    if (p && b.s - p.s < 60) {
+      if (b.mh < p.mh) p.mh = b.mh;
+    } else B.push({
+      ...b
+    });
+  });
+  lez.sort((a, b) => a.s - b.s);
   return {
     lights: L2,
-    zones: Z
+    zones: Z,
+    bridges: B,
+    lez
   };
+}
+async function kbOverpassPoi(kind, c, P) {
+  const a = `(around:6000,${(+c.lat).toFixed(5)},${(+c.lng).toFixed(5)})`;
+  const q = kind === 'fuel' ? `[out:json][timeout:20];(node["amenity"="fuel"]${a};way["amenity"="fuel"]${a};);out center;` : `[out:json][timeout:20];(node["amenity"="parking"]["hgv"~"yes|designated"]${a};way["amenity"="parking"]["hgv"~"yes|designated"]${a};node["highway"~"rest_area|services"]${a};way["highway"~"rest_area|services"]${a};);out center;`;
+  const j = await kbFetchJson('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'data=' + encodeURIComponent(q)
+  }, 25000);
+  const pl = kbVehOf(P) === 'pl';
+  return (j && j.elements || []).map(e => {
+    const t = e.tags || {},
+      lat = e.lat != null ? e.lat : e.center && e.center.lat,
+      lng = e.lon != null ? e.lon : e.center && e.center.lon;
+    if (lat == null) return null;
+    const hgv = /yes|designated/.test(t.hgv || '') || t['fuel:HGV_diesel'] === 'yes' || /rest_area|services/.test(t.highway || '');
+    return {
+      name: t.name || t.brand || (kind === 'fuel' ? 'Station' : t.highway ? 'Aire' : 'Parking PL'),
+      sub: [t.brand && t.brand !== t.name ? t.brand : '', t['addr:street'] || '', t['addr:city'] || '', t.opening_hours === '24/7' ? '24 h/24' : ''].filter(Boolean).join(' · '),
+      lat,
+      lng,
+      hgv,
+      d: kbDistM(c.lat, c.lng, lat, lng)
+    };
+  }).filter(Boolean).sort((x, y) => (pl ? y.hgv - x.hgv : 0) || x.d - y.d).slice(0, 30);
+}
+const KB_GPS_REPORTS = [{
+  k: 'works',
+  ic: '🚧',
+  l: 'Travaux',
+  voice: 'travaux',
+  c: '#ef6c00'
+}, {
+  k: 'nohgv',
+  ic: '🚫',
+  l: 'Interdit aux PL',
+  voice: 'rue interdite aux poids lourds',
+  c: '#c62828'
+}, {
+  k: 'lowbridge',
+  ic: '🌉',
+  l: 'Passage bas',
+  voice: 'passage bas',
+  c: '#b71c1c'
+}, {
+  k: 'closed',
+  ic: '⛔',
+  l: 'Route fermée',
+  voice: 'route fermée',
+  c: '#6d4c41'
+}, {
+  k: 'jam',
+  ic: '🚗',
+  l: 'Bouchon',
+  voice: 'bouchon',
+  c: '#e53935'
+}, {
+  k: 'danger',
+  ic: '⚠️',
+  l: 'Danger',
+  voice: 'danger',
+  c: '#f9a825'
+}, {
+  k: 'delivery',
+  ic: '📦',
+  l: 'Bon arrêt livraison',
+  voice: 'bon arrêt pour livrer',
+  c: '#2e7d32'
+}, {
+  k: 'police',
+  ic: '👮',
+  l: 'Contrôle',
+  voice: 'contrôle',
+  c: '#1565c0'
+}];
+const KB_GPS_LANGS = [{
+  k: 'fr',
+  l: '🇫🇷 Français',
+  vh: 'fr-FR',
+  tt: 'fr-FR',
+  sp: 'fr-FR'
+}, {
+  k: 'en',
+  l: '🇬🇧 English',
+  vh: 'en-GB',
+  tt: 'en-GB',
+  sp: 'en-GB'
+}, {
+  k: 'es',
+  l: '🇪🇸 Español',
+  vh: 'es-ES',
+  tt: 'es-ES',
+  sp: 'es-ES'
+}, {
+  k: 'pt',
+  l: '🇵🇹 Português',
+  vh: 'pt-PT',
+  tt: 'pt-PT',
+  sp: 'pt-PT'
+}, {
+  k: 'ar',
+  l: '🇲🇦 العربية',
+  vh: 'fr-FR',
+  tt: 'ar',
+  sp: 'ar-SA'
+}, {
+  k: 'ro',
+  l: '🇷🇴 Română',
+  vh: 'ro-RO',
+  tt: 'ro-RO',
+  sp: 'ro-RO'
+}, {
+  k: 'pl',
+  l: '🇵🇱 Polski',
+  vh: 'pl-PL',
+  tt: 'pl-PL',
+  sp: 'pl-PL'
+}, {
+  k: 'tr',
+  l: '🇹🇷 Türkçe',
+  vh: 'tr-TR',
+  tt: 'tr-TR',
+  sp: 'tr-TR'
+}, {
+  k: 'it',
+  l: '🇮🇹 Italiano',
+  vh: 'it-IT',
+  tt: 'it-IT',
+  sp: 'it-IT'
+}];
+const KB_GPS_TR = {
+  fr: {
+    go: "C'est parti.",
+    goTour: "C'est parti. {n} arrêts. Premier arrêt : {a}.",
+    in: 'Dans {d}, {a}',
+    rr: 'Recalcul',
+    zoneIn: 'Zone de danger dans {d}.',
+    zoneNow: 'Attention, zone de danger.',
+    bridge: 'Attention, passage limité à {h} mètres dans {d}.',
+    lez: 'Entrée en zone à faibles émissions dans {d}.',
+    rep: "Signalé par l'équipe : {a} dans {d}.",
+    arrStop: 'Arrivé : {a}.',
+    next: ' Prochain arrêt : {a}.',
+    arrived: 'Vous êtes arrivé : {a}.',
+    arrived0: 'Vous êtes arrivé.',
+    stop: 'Guidage arrêté.',
+    tourUpd: 'Tournée mise à jour par le bureau. Prochain arrêt : {a}.',
+    tourEnd: 'Tournée terminée.',
+    faster: 'Itinéraire plus rapide trouvé. Vous gagnez {n} minutes.',
+    thanks: 'Merci, signalement envoyé.',
+    test: 'Bonjour, je vous guiderai en français.',
+    m: 'mètres',
+    km1: 'kilomètre',
+    km: 'kilomètres',
+    dec: ',',
+    rep8: ['travaux', 'rue interdite aux poids lourds', 'passage bas', 'route fermée', 'bouchon', 'danger', 'bon arrêt pour livrer', 'contrôle']
+  },
+  en: {
+    go: "Let's go.",
+    goTour: "Let's go. {n} stops. First stop: {a}.",
+    in: 'In {d}, {a}',
+    rr: 'Recalculating',
+    zoneIn: 'Danger zone in {d}.',
+    zoneNow: 'Caution, danger zone.',
+    bridge: 'Caution, height limit {h} metres in {d}.',
+    lez: 'Entering a low emission zone in {d}.',
+    rep: 'Reported by the team: {a} in {d}.',
+    arrStop: 'Arrived: {a}.',
+    next: ' Next stop: {a}.',
+    arrived: 'You have arrived: {a}.',
+    arrived0: 'You have arrived.',
+    stop: 'Navigation stopped.',
+    tourUpd: 'Route updated by the office. Next stop: {a}.',
+    tourEnd: 'Route finished.',
+    faster: 'Faster route found. You save {n} minutes.',
+    thanks: 'Thanks, report sent.',
+    test: 'Hello, I will guide you in English.',
+    m: 'metres',
+    km1: 'kilometre',
+    km: 'kilometres',
+    dec: '.',
+    rep8: ['road works', 'no trucks allowed', 'low bridge', 'road closed', 'traffic jam', 'hazard', 'good delivery stop', 'police check']
+  },
+  es: {
+    go: 'Vamos.',
+    goTour: 'Vamos. {n} paradas. Primera parada: {a}.',
+    in: 'En {d}, {a}',
+    rr: 'Recalculando',
+    zoneIn: 'Zona de peligro en {d}.',
+    zoneNow: 'Atención, zona de peligro.',
+    bridge: 'Atención, gálibo limitado a {h} metros en {d}.',
+    lez: 'Entrada en zona de bajas emisiones en {d}.',
+    rep: 'Aviso del equipo: {a} en {d}.',
+    arrStop: 'Llegada: {a}.',
+    next: ' Próxima parada: {a}.',
+    arrived: 'Ha llegado: {a}.',
+    arrived0: 'Ha llegado.',
+    stop: 'Guiado detenido.',
+    tourUpd: 'Ruta actualizada por la oficina. Próxima parada: {a}.',
+    tourEnd: 'Ruta terminada.',
+    faster: 'Ruta más rápida encontrada. Ahorra {n} minutos.',
+    thanks: 'Gracias, aviso enviado.',
+    test: 'Hola, le guiaré en español.',
+    m: 'metros',
+    km1: 'kilómetro',
+    km: 'kilómetros',
+    dec: ',',
+    rep8: ['obras', 'prohibido camiones', 'paso bajo', 'carretera cortada', 'atasco', 'peligro', 'buena parada para entregar', 'control']
+  },
+  pt: {
+    go: 'Vamos.',
+    goTour: 'Vamos. {n} paragens. Primeira paragem: {a}.',
+    in: 'Em {d}, {a}',
+    rr: 'A recalcular',
+    zoneIn: 'Zona de perigo a {d}.',
+    zoneNow: 'Atenção, zona de perigo.',
+    bridge: 'Atenção, altura limitada a {h} metros a {d}.',
+    lez: 'Entrada em zona de baixas emissões a {d}.',
+    rep: 'Aviso da equipa: {a} a {d}.',
+    arrStop: 'Chegada: {a}.',
+    next: ' Próxima paragem: {a}.',
+    arrived: 'Chegou: {a}.',
+    arrived0: 'Chegou.',
+    stop: 'Navegação parada.',
+    tourUpd: 'Rota atualizada pelo escritório. Próxima paragem: {a}.',
+    tourEnd: 'Rota terminada.',
+    faster: 'Rota mais rápida encontrada. Ganha {n} minutos.',
+    thanks: 'Obrigado, aviso enviado.',
+    test: 'Olá, vou guiá-lo em português.',
+    m: 'metros',
+    km1: 'quilómetro',
+    km: 'quilómetros',
+    dec: ',',
+    rep8: ['obras', 'proibido a pesados', 'passagem baixa', 'estrada fechada', 'trânsito', 'perigo', 'bom sítio para entregar', 'controlo']
+  },
+  ar: {
+    go: 'لننطلق.',
+    goTour: 'لننطلق. {n} توقفات. أول توقف: {a}.',
+    in: 'بعد {d}، {a}',
+    rr: 'إعادة الحساب',
+    zoneIn: 'منطقة خطر بعد {d}.',
+    zoneNow: 'انتبه، منطقة خطر.',
+    bridge: 'انتبه، ارتفاع محدود {h} متر بعد {d}.',
+    lez: 'دخول منطقة منخفضة الانبعاثات بعد {d}.',
+    rep: 'تنبيه من الفريق: {a} بعد {d}.',
+    arrStop: 'وصلت: {a}.',
+    next: ' التوقف التالي: {a}.',
+    arrived: 'لقد وصلت: {a}.',
+    arrived0: 'لقد وصلت.',
+    stop: 'تم إيقاف الإرشاد.',
+    tourUpd: 'تم تحديث الجولة من المكتب. التوقف التالي: {a}.',
+    tourEnd: 'انتهت الجولة.',
+    faster: 'تم العثور على طريق أسرع. توفر {n} دقائق.',
+    thanks: 'شكرا، تم إرسال التنبيه.',
+    test: 'مرحبا، سأرشدك باللغة العربية.',
+    m: 'متر',
+    km1: 'كيلومتر',
+    km: 'كيلومتر',
+    dec: '.',
+    rep8: ['أشغال', 'ممنوع على الشاحنات', 'ممر منخفض', 'طريق مغلق', 'ازدحام', 'خطر', 'مكان جيد للتسليم', 'مراقبة']
+  },
+  ro: {
+    go: 'Să mergem.',
+    goTour: 'Să mergem. {n} opriri. Prima oprire: {a}.',
+    in: 'În {d}, {a}',
+    rr: 'Recalculare',
+    zoneIn: 'Zonă periculoasă în {d}.',
+    zoneNow: 'Atenție, zonă periculoasă.',
+    bridge: 'Atenție, înălțime limitată la {h} metri în {d}.',
+    lez: 'Intrare în zonă cu emisii scăzute în {d}.',
+    rep: 'Semnalat de echipă: {a} în {d}.',
+    arrStop: 'Ați ajuns: {a}.',
+    next: ' Următoarea oprire: {a}.',
+    arrived: 'Ați ajuns: {a}.',
+    arrived0: 'Ați ajuns.',
+    stop: 'Ghidare oprită.',
+    tourUpd: 'Traseu actualizat de birou. Următoarea oprire: {a}.',
+    tourEnd: 'Traseu terminat.',
+    faster: 'Traseu mai rapid găsit. Câștigați {n} minute.',
+    thanks: 'Mulțumesc, semnalare trimisă.',
+    test: 'Bună, vă voi ghida în română.',
+    m: 'metri',
+    km1: 'kilometru',
+    km: 'kilometri',
+    dec: ',',
+    rep8: ['lucrări', 'interzis camioanelor', 'pasaj jos', 'drum închis', 'ambuteiaj', 'pericol', 'loc bun de livrare', 'control']
+  },
+  pl: {
+    go: 'Ruszamy.',
+    goTour: 'Ruszamy. Przystanki: {n}. Pierwszy przystanek: {a}.',
+    in: 'Za {d}, {a}',
+    rr: 'Przeliczanie trasy',
+    zoneIn: 'Strefa niebezpieczna za {d}.',
+    zoneNow: 'Uwaga, strefa niebezpieczna.',
+    bridge: 'Uwaga, ograniczenie wysokości {h} metra za {d}.',
+    lez: 'Wjazd do strefy czystego transportu za {d}.',
+    rep: 'Zgłoszenie zespołu: {a} za {d}.',
+    arrStop: 'Dojechano: {a}.',
+    next: ' Następny przystanek: {a}.',
+    arrived: 'Jesteś na miejscu: {a}.',
+    arrived0: 'Jesteś na miejscu.',
+    stop: 'Nawigacja zatrzymana.',
+    tourUpd: 'Trasa zmieniona przez biuro. Następny przystanek: {a}.',
+    tourEnd: 'Trasa zakończona.',
+    faster: 'Znaleziono szybszą trasę. Oszczędzasz {n} minut.',
+    thanks: 'Dziękuję, zgłoszenie wysłane.',
+    test: 'Dzień dobry, poprowadzę cię po polsku.',
+    m: 'metrów',
+    km1: 'kilometr',
+    km: 'kilometrów',
+    dec: ',',
+    rep8: ['roboty drogowe', 'zakaz dla ciężarówek', 'niski przejazd', 'droga zamknięta', 'korek', 'niebezpieczeństwo', 'dobre miejsce na dostawę', 'kontrola']
+  },
+  tr: {
+    go: 'Hadi gidelim.',
+    goTour: 'Hadi gidelim. {n} durak. İlk durak: {a}.',
+    in: '{d} sonra, {a}',
+    rr: 'Yeniden hesaplanıyor',
+    zoneIn: '{d} sonra tehlikeli bölge.',
+    zoneNow: 'Dikkat, tehlikeli bölge.',
+    bridge: 'Dikkat, {d} sonra yükseklik sınırı {h} metre.',
+    lez: '{d} sonra düşük emisyon bölgesine giriş.',
+    rep: 'Ekip bildirimi: {d} sonra {a}.',
+    arrStop: 'Varıldı: {a}.',
+    next: ' Sonraki durak: {a}.',
+    arrived: 'Vardınız: {a}.',
+    arrived0: 'Vardınız.',
+    stop: 'Navigasyon durduruldu.',
+    tourUpd: 'Rota ofis tarafından güncellendi. Sonraki durak: {a}.',
+    tourEnd: 'Rota bitti.',
+    faster: 'Daha hızlı rota bulundu. {n} dakika kazanırsınız.',
+    thanks: 'Teşekkürler, bildirim gönderildi.',
+    test: 'Merhaba, size Türkçe rehberlik edeceğim.',
+    m: 'metre',
+    km1: 'kilometre',
+    km: 'kilometre',
+    dec: ',',
+    rep8: ['yol çalışması', 'kamyon yasak', 'alçak geçit', 'yol kapalı', 'trafik sıkışıklığı', 'tehlike', 'teslimat için iyi yer', 'kontrol']
+  },
+  it: {
+    go: 'Si parte.',
+    goTour: 'Si parte. {n} fermate. Prima fermata: {a}.',
+    in: 'Tra {d}, {a}',
+    rr: 'Ricalcolo',
+    zoneIn: 'Zona di pericolo tra {d}.',
+    zoneNow: 'Attenzione, zona di pericolo.',
+    bridge: 'Attenzione, altezza limitata a {h} metri tra {d}.',
+    lez: 'Ingresso in zona a basse emissioni tra {d}.',
+    rep: 'Segnalato dalla squadra: {a} tra {d}.',
+    arrStop: 'Arrivato: {a}.',
+    next: ' Prossima fermata: {a}.',
+    arrived: 'Sei arrivato: {a}.',
+    arrived0: 'Sei arrivato.',
+    stop: 'Navigazione fermata.',
+    tourUpd: 'Giro aggiornato dall’ufficio. Prossima fermata: {a}.',
+    tourEnd: 'Giro terminato.',
+    faster: 'Trovato un percorso più veloce. Risparmi {n} minuti.',
+    thanks: 'Grazie, segnalazione inviata.',
+    test: 'Ciao, ti guiderò in italiano.',
+    m: 'metri',
+    km1: 'chilometro',
+    km: 'chilometri',
+    dec: ',',
+    rep8: ['lavori', 'vietato ai camion', 'passaggio basso', 'strada chiusa', 'coda', 'pericolo', 'buon posto per consegnare', 'controllo']
+  }
+};
+let kbGpsLang = 'fr';
+const kbGpsLangInfo = () => KB_GPS_LANGS.find(x => x.k === kbGpsLang) || KB_GPS_LANGS[0];
+function kbT(key, v) {
+  const D = KB_GPS_TR[kbGpsLang] || KB_GPS_TR.fr;
+  let s = D[key] != null ? D[key] : KB_GPS_TR.fr[key];
+  Object.keys(v || {}).forEach(k => {
+    s = s.split('{' + k + '}').join(v[k]);
+  });
+  return s;
+}
+function kbRepVoice(type) {
+  const i = KB_GPS_REPORTS.findIndex(x => x.k === type);
+  const D = KB_GPS_TR[kbGpsLang] || KB_GPS_TR.fr;
+  return (D.rep8 || KB_GPS_TR.fr.rep8)[Math.max(0, i)];
+}
+const KB_FUEL = {
+  scooter: 3,
+  car: 6.5,
+  vl: 10,
+  f35: 10,
+  p75: 17,
+  p12: 21,
+  p19: 26,
+  s44: 33
+};
+function kbFuelL(P, m) {
+  const v = kbVehOf(P);
+  let k = v;
+  if (v === 'pl') k = KB_FUEL[P && P.k] ? P.k : +P.t >= 26 ? 's44' : +P.t >= 16 ? 'p19' : +P.t >= 10 ? 'p12' : 'p75';
+  return (KB_FUEL[k] || 25) * (m || 0) / 100000;
+}
+function KbGpsLayersSheet({
+  lay,
+  setL,
+  ttKey
+}) {
+  const opt = (cur, v, ic, l, k, dis) => React.createElement("button", {
+    key: v,
+    type: "button",
+    disabled: dis,
+    onClick: () => setL({
+      [k]: v
+    }),
+    style: {
+      flex: 1,
+      minHeight: 74,
+      borderRadius: 14,
+      border: '3px solid ' + (cur === v ? '#1e88e5' : '#e0e6ea'),
+      background: cur === v ? '#e3f2fd' : '#fff',
+      fontSize: 14,
+      fontWeight: 800,
+      opacity: dis ? 0.4 : 1
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 26
+    }
+  }, ic), l);
+  const tog = (k, ic, l, sub, dis) => React.createElement("label", {
+    key: k,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '9px 0',
+      borderBottom: '1px solid #eef1f4',
+      opacity: dis ? 0.45 : 1
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 24,
+      width: 32,
+      textAlign: 'center'
+    }
+  }, ic), React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 16
+    }
+  }, l), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 12,
+      color: '#78909c'
+    }
+  }, sub)), React.createElement("input", {
+    type: "checkbox",
+    disabled: dis,
+    checked: !!lay[k],
+    onChange: e => setL({
+      [k]: e.target.checked
+    }),
+    style: {
+      width: 26,
+      height: 26
+    }
+  }));
+  const T = {
+    fontSize: 15,
+    fontWeight: 800,
+    color: '#607d8b',
+    margin: '12px 0 6px'
+  };
+  return React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 23,
+      fontWeight: 900
+    }
+  }, "\uD83D\uDDC2\uFE0F Carte & affichage"), React.createElement("div", {
+    style: T
+  }, "Vue pendant le guidage"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, opt(lay.view, '3d', '🛣️', '3D (Waze)', 'view'), opt(lay.view, 'cap', '⬆️', '2D cap en haut', 'view'), opt(lay.view, 'nord', '🧭', '2D nord en haut', 'view')), React.createElement("div", {
+    style: T
+  }, "Fond de carte"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, opt(lay.base, 'plan', '🗺️', 'Plan', 'base'), opt(lay.base, 'sat', '🛰️', ttKey ? 'Satellite' : 'Satellite (clé TomTom)', 'base', !ttKey)), React.createElement("div", {
+    style: T
+  }, "Jour / nuit"), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8
+    }
+  }, opt(lay.night, 'auto', '🌗', 'Auto (19 h–7 h)', 'night'), opt(lay.night, 'day', '☀️', 'Jour', 'night'), opt(lay.night, 'night', '🌙', 'Nuit', 'night')), React.createElement("div", {
+    style: T
+  }, "\uD83D\uDDE3\uFE0F Langue de la voix et des consignes"), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr 1fr',
+      gap: 6
+    }
+  }, KB_GPS_LANGS.map(x => React.createElement("button", {
+    key: x.k,
+    type: "button",
+    onClick: () => {
+      setL({
+        voice: x.k
+      });
+      kbGpsLang = x.k;
+      try {
+        speechSynthesis.cancel();
+      } catch (e) {}
+      kbSay(kbT('test'));
+    },
+    style: {
+      minHeight: 48,
+      borderRadius: 12,
+      border: '3px solid ' + ((lay.voice || 'fr') === x.k ? '#1e88e5' : '#e0e6ea'),
+      background: (lay.voice || 'fr') === x.k ? '#e3f2fd' : '#fff',
+      fontSize: 14,
+      fontWeight: 800
+    }
+  }, x.l))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#78909c',
+      marginTop: 4
+    }
+  }, "Un appui = test de la voix. Le reste de l'appli reste en fran\xE7ais. Si la voix ne parle pas la langue, installe-la dans les r\xE9glages du t\xE9l\xE9phone (Synth\xE8se vocale).", lay.voice === 'ar' ? ' Arabe : consignes écrites en arabe seulement avec la clé TomTom.' : ''), React.createElement("div", {
+    style: T
+  }, "Sur la carte"), tog('traffic', '🚦', 'Trafic en direct', ttKey ? 'couleurs vert / orange / rouge sur les routes' : 'nécessite la clé TomTom (Master › Rungis)', !ttKey), tog('reports', '⚠️', "Signalements de l'équipe", 'travaux, interdit PL, passage bas… (7 jours)'), tog('bridges', '🌉', 'Passages limités en hauteur', 'ponts / tunnels proches de la hauteur du camion'), tog('zones', '🟥', 'Zones de danger', 'radars, au format légal français'), tog('lights', '🚦', 'Feux tricolores', 'sur le trajet'));
+}
+function KbGpsHelp() {
+  const R = (ic, t, d) => React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      padding: '8px 0',
+      borderBottom: '1px solid #eef1f4'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 24,
+      width: 34,
+      textAlign: 'center',
+      flex: '0 0 auto'
+    }
+  }, ic), React.createElement("span", null, React.createElement("b", {
+    style: {
+      fontSize: 16
+    }
+  }, t), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 14,
+      color: '#546e7a'
+    }
+  }, d)));
+  const T = {
+    fontSize: 15,
+    fontWeight: 800,
+    color: '#607d8b',
+    margin: '12px 0 2px'
+  };
+  return React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 23,
+      fontWeight: 900
+    }
+  }, "\u2753 Les boutons"), React.createElement("div", {
+    style: T
+  }, "Accueil"), R('🔍', 'Où va-t-on ?', 'adresse, magasin, entreprise, ou un lieu Kelbongoo'), R('📋', 'Tournée du bureau', 'les arrêts choisis dans Master › Rungis, dans le meilleur ordre'), R('🚛', 'Mon véhicule', 'scooter, voiture, utilitaire, poids lourd (taille, péages, marge de hauteur)'), R('🗂️', 'Carte & affichage', 'vue 3D / 2D, plan ou satellite, jour / nuit, ce qu’on voit sur la carte'), R('⛽', 'Stations', 'stations autour de toi (accès PL en premier)'), R('🅿️', 'Parkings PL', 'parkings poids lourds et aires autour de toi'), R('📍', 'Ma position', 'recentre la carte sur toi'), React.createElement("div", {
+    style: T
+  }, "Aper\xE7u de l\u2019itin\xE9raire"), R('⏱️', 'Cartes en haut', 'les itinéraires possibles : touche pour choisir (gris sur la carte)'), R('⚠️', 'Avertissements', 'passage limité en hauteur, ZFE, péage, gazole estimé, dangers'), R('🚀', "C'est parti", 'lance le guidage · 🧪 Simuler = test au bureau sans rouler'), React.createElement("div", {
+    style: T
+  }, "Pendant le guidage"), R('⬆️', 'Bandeau du haut', 'prochaine manœuvre, distance, rue en bleu · « puis » = manœuvre suivante'), R('🟧', 'Bandeaux d’alerte', 'zone de danger, passage limité, ZFE, signalement de l’équipe'), R('🔊', 'Son', 'coupe / remet la voix'), R('🗺️', 'Vue d’ensemble', 'tout le trajet · 📍 Recentrer pour revenir'), R('⚠️', 'Bouton jaune', 'signaler travaux, interdit PL, passage bas, bouchon… à l’endroit où tu es'), R('🔵', 'Bulle du bas', 'nom de la rue où tu roules'), R('⏰', 'Bas de l’écran', 'heure d’arrivée, temps et km restants, heure de chaque arrêt'), R('📡', 'Partage', 'partagé = le bureau te voit en direct (Master › Rungis) · off = pas de partage'), R('✕', 'Arrêter', 'arrête le guidage'));
 }
 async function kbGpsGeocode(q, near) {
   const nr = near ? '&lat=' + (+near.lat).toFixed(5) + '&lon=' + (+near.lng).toFixed(5) : '';
@@ -73693,18 +74379,25 @@ let kbGpsVoiceSel = null;
 function kbSay(txt) {
   try {
     if (!txt || !window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined') return;
+    const LI = kbGpsLangInfo();
     const u = new SpeechSynthesisUtterance(txt);
-    u.lang = 'fr-FR';
+    u.lang = LI.sp;
     u.rate = 1.05;
-    if (!kbGpsVoiceSel) kbGpsVoiceSel = (speechSynthesis.getVoices() || []).find(v => /^fr/i.test(v.lang)) || null;
+    if (!kbGpsVoiceSel || kbGpsVoiceSel._kb !== LI.k) {
+      const vs = speechSynthesis.getVoices() || [];
+      const v = vs.find(x => x.lang === LI.sp) || vs.find(x => String(x.lang).toLowerCase().startsWith(LI.k)) || null;
+      kbGpsVoiceSel = v ? Object.assign(v, {
+        _kb: LI.k
+      }) : null;
+    }
     if (kbGpsVoiceSel) u.voice = kbGpsVoiceSel;
     speechSynthesis.speak(u);
   } catch (e) {}
 }
 function kbVoiceDist(d) {
-  if (d < 1000) return (Math.round(d / 50) * 50 || 50) + ' mètres';
+  if (d < 1000) return (Math.round(d / 50) * 50 || 50) + ' ' + kbT('m');
   const k = Math.round(d / 100) / 10;
-  return kbNumFr(k) + (k >= 2 ? ' kilomètres' : ' kilomètre');
+  return String(k).replace('.', kbT('dec')) + ' ' + (k >= 2 ? kbT('km') : kbT('km1'));
 }
 function kbBanDist(d) {
   d = Math.max(0, d);
@@ -73828,6 +74521,7 @@ function KbTruckProfSheet({
 }) {
   const [p, setP] = React.useState(() => ({
     veh: 'pl',
+    marge: 0.1,
     ...(prof || KB_TRUCK_PRESETS[0])
   }));
   const [fin, setFin] = React.useState(false);
@@ -73991,11 +74685,11 @@ function KbTruckProfSheet({
       padding: 0,
       textAlign: 'left'
     }
-  }, fin ? '▾' : '▸', " R\xE9glage fin (", kbNumFr(p.h), " m de haut \xB7 ", kbNumFr(p.t), " t)"), fin && React.createElement("div", {
+  }, fin ? '▾' : '▸', " R\xE9glage fin (", kbNumFr(p.h), " m de haut \xB7 ", kbNumFr(p.t), " t \xB7 marge ", Math.round((p.marge != null && p.marge !== '' ? +p.marge : 0.1) * 100), " cm)"), fin && React.createElement("div", {
     style: {
       marginTop: 4
     }
-  }, num('h', '↕️ Hauteur', 'm'), num('w', '↔️ Largeur', 'm'), num('len', '📏 Longueur', 'm'), num('t', '⚖️ Poids total (PTAC)', 't'), num('axle', 'Poids par essieu', 't'), num('axles', "Nombre d'essieux", ''))), React.createElement("label", {
+  }, num('h', '↕️ Hauteur', 'm'), num('w', '↔️ Largeur', 'm'), num('len', '📏 Longueur', 'm'), num('t', '⚖️ Poids total (PTAC)', 't'), num('axle', 'Poids par essieu', 't'), num('axles', "Nombre d'essieux", ''), num('marge', '🛡️ Marge de sécurité hauteur', 'm'))), React.createElement("label", {
     style: {
       display: 'flex',
       alignItems: 'center',
@@ -74046,6 +74740,7 @@ function KbTruckProfSheet({
       ['h', 'w', 'len', 't', 'axle', 'axles'].forEach(k => {
         q[k] = +q[k] || 0;
       });
+      q.marge = q.marge === '' || q.marge == null || isNaN(+q.marge) ? 0.1 : Math.max(0, Math.min(0.5, +q.marge));
       if (veh !== 'pl') q.hazmat = false;
       onSave(q);
     },
@@ -74088,11 +74783,53 @@ function KbTruckGps({
       return false;
     }
   });
-  const [night, setNight] = React.useState(() => {
-    const h = new Date().getHours();
-    return h >= 19 || h < 7;
+  const [lay, setLay] = React.useState(() => {
+    let s = {};
+    try {
+      s = JSON.parse(localStorage.getItem('kb_gps_layers') || '{}') || {};
+    } catch (e) {}
+    return {
+      base: 'plan',
+      view: '3d',
+      night: 'auto',
+      traffic: true,
+      lights: true,
+      zones: true,
+      reports: true,
+      bridges: true,
+      ...s
+    };
   });
-  const [traffic, setTraffic] = React.useState(true);
+  const setL = patch => setLay(l => {
+    const n = {
+      ...l,
+      ...patch
+    };
+    try {
+      localStorage.setItem('kb_gps_layers', JSON.stringify(n));
+    } catch (e) {}
+    return n;
+  });
+  const [hourTick, setHourTick] = React.useState(0);
+  React.useEffect(() => {
+    const t = setInterval(() => setHourTick(x => x + 1), 300000);
+    return () => clearInterval(t);
+  }, []);
+  const night = lay.night === 'night' || lay.night === 'auto' && (() => {
+    const hh = new Date().getHours();
+    return hh >= 19 || hh < 7;
+  })();
+  const traffic = lay.traffic;
+  kbGpsLang = KB_GPS_TR[lay.voice] ? lay.voice : 'fr';
+  const langRef = React.useRef(kbGpsLang);
+  React.useEffect(() => {
+    if (langRef.current === kbGpsLang) return;
+    langRef.current = kbGpsLang;
+    if (S.current.mode === 'nav' && NV.current) reroute('lang');
+  }, [lay.voice]);
+  const [sheet, setSheet] = React.useState('');
+  const [poi, setPoi] = React.useState(null);
+  const [reports, setReports] = React.useState([]);
   const [cfg, setCfg] = React.useState(null);
   const [tour, setTour] = React.useState(null);
   const [arrived, setArrived] = React.useState(null);
@@ -74117,7 +74854,8 @@ function KbTruckGps({
     });
   const HAZ = React.useRef(null),
     firstFix = React.useRef(true),
-    S = React.useRef({});
+    S = React.useRef({}),
+    TILT = React.useRef(false);
   S.current = {
     mode,
     follow,
@@ -74126,7 +74864,9 @@ function KbTruckGps({
     cfg,
     prof,
     tour,
-    traffic
+    traffic,
+    lay,
+    reports
   };
   const say = t => {
     if (!S.current.muted) kbSay(t);
@@ -74138,13 +74878,17 @@ function KbTruckGps({
   }, []);
   React.useEffect(() => kbDocSub('gps_config', 'main', d => setCfg(d || {})), []);
   React.useEffect(() => kbDocSub('gps_tour', day, d => setTour(d)), [day]);
+  React.useEffect(() => storage.subscribe('gps_reports', a => {
+    const t0 = Date.now() - 7 * 86400000;
+    setReports((a || []).filter(r => r && r.lat != null && Date.parse(r.at) > t0));
+  }), []);
   const lieux = React.useMemo(() => cfg && cfg.lieux || kbLieuxCached() || null, [cfg]);
   const places = React.useMemo(() => kbGpsPlaces(lieux), [lieux]);
   const ttKey = cfg && cfg.tomtomKey ? String(cfg.tomtomKey) : '';
   const layout = () => {
     const r = rootEl.current && rootEl.current.getBoundingClientRect();
     if (!r || !boxEl.current) return;
-    const D = Math.ceil(Math.hypot(r.width, r.height)) + 4;
+    const D = Math.ceil(Math.hypot(r.width, r.height) * (TILT.current ? 1.9 : 1)) + 4;
     Object.assign(boxEl.current.style, {
       width: D + 'px',
       height: D + 'px',
@@ -74158,11 +74902,17 @@ function KbTruckGps({
       d = ((deg - cur) % 360 + 540) % 360 - 180;
     cur += d;
     ROT.current = cur;
-    if (boxEl.current) boxEl.current.style.transform = `rotate(${-cur}deg)`;
+    if (boxEl.current) boxEl.current.style.transform = (TILT.current ? 'perspective(1100px) rotateX(52deg) ' : '') + `rotate(${-cur}deg)`;
+  };
+  const setTilt = on => {
+    if (TILT.current === on) return;
+    TILT.current = on;
+    layout();
+    setRot(ROT.current);
   };
   const pads = (top, bottom) => {
     const r = rootEl.current.getBoundingClientRect(),
-      D = Math.ceil(Math.hypot(r.width, r.height)) + 4,
+      D = Math.ceil(Math.hypot(r.width, r.height) * (TILT.current ? 1.9 : 1)) + 4,
       px = (D - r.width) / 2,
       py = (D - r.height) / 2;
     return {
@@ -74213,10 +74963,16 @@ function KbTruckGps({
     if (!map) return;
     const L = window.L;
     if (LY.current.tiles) map.removeLayer(LY.current.tiles);
-    LY.current.tiles = kbGpsBaseLayer(L, map, night, ttKey, l => {
+    if (lay.base === 'sat' && ttKey) {
+      LY.current.tiles = L.tileLayer('https://api.tomtom.com/map/1/tile/sat/main/{z}/{x}/{y}.jpg?key=' + encodeURIComponent(ttKey), {
+        maxZoom: 19,
+        attribution: '© TomTom'
+      }).addTo(map);
+      LY.current.tiles.bringToBack();
+    } else LY.current.tiles = kbGpsBaseLayer(L, map, night, ttKey, l => {
       LY.current.tiles = l;
     });
-  }, [ready, night, ttKey]);
+  }, [ready, night, ttKey, lay.base]);
   React.useEffect(() => {
     const map = M.current;
     if (!map) return;
@@ -74387,8 +75143,11 @@ function KbTruckGps({
   const camera = (ll, hd, spd) => {
     const map = M.current;
     if (!map || !S.current.follow) return;
-    const z = spd == null || spd < 8 ? 17 : spd < 17 ? 16 : 15;
-    if (hd == null) {
+    const v = S.current.lay.view,
+      z = (spd == null || spd < 8 ? 17 : spd < 17 ? 16 : 15) - (v === '3d' ? 0.5 : 0);
+    setTilt(v === '3d');
+    if (hd == null || v === 'nord') {
+      setRot(0);
       map.setView(ll, z, {
         animate: true,
         duration: 0.8
@@ -74397,7 +75156,7 @@ function KbTruckGps({
     }
     setRot(hd);
     const r = rootEl.current.getBoundingClientRect(),
-      off = r.height * 0.24,
+      off = r.height * (v === '3d' ? 0.2 : 0.24),
       a = hd * Math.PI / 180;
     const p = map.project(ll, z),
       c = map.unproject([p.x + Math.sin(a) * off, p.y - Math.cos(a) * off], z);
@@ -74410,8 +75169,12 @@ function KbTruckGps({
   const computeRoutes = async (stops, alts) => {
     const fx = F.current;
     if (!fx) throw new Error('position GPS pas encore trouvée');
-    const P = S.current.prof || KB_TRUCK_PRESETS[0],
+    const P0 = S.current.prof || KB_TRUCK_PRESETS[0],
       key = S.current.cfg && S.current.cfg.tomtomKey;
+    const P = kbVehOf(P0) === 'pl' || kbVehOf(P0) === 'vl' ? {
+      ...P0,
+      h: Math.round((+P0.h + (P0.marge != null ? +P0.marge : 0.1)) * 100) / 100
+    } : P0;
     const locs = [{
       lat: fx.lat,
       lng: fx.lng
@@ -74484,6 +75247,7 @@ function KbTruckGps({
       });
       setMode('preview');
       drawPreview(routes, 0, st);
+      previewHaz(routes);
     } catch (e) {
       setMsg('⚠️ ' + (e.message || 'erreur'));
     } finally {
@@ -74493,7 +75257,7 @@ function KbTruckGps({
   const clearRoute = () => {
     const map = M.current;
     if (!map) return;
-    ['alts', 'casing', 'line', 'stopsL', 'lightsL', 'zonesL'].forEach(k => {
+    ['alts', 'casing', 'line', 'stopsL', 'lightsL', 'zonesL', 'bridgesL', 'lezL'].forEach(k => {
       if (LY.current[k]) {
         map.removeLayer(LY.current[k]);
         LY.current[k] = null;
@@ -74516,6 +75280,7 @@ function KbTruckGps({
       L = window.L;
     if (!map) return;
     clearRoute();
+    setTilt(false);
     setRot(0);
     setFollow(false);
     map.dragging.enable();
@@ -74537,6 +75302,27 @@ function KbTruckGps({
     }).addTo(map);
     LY.current.stopsL = stopMarkers(stops).addTo(map);
     map.fitBounds(L.latLngBounds(R.pts), pads(80, 300));
+  };
+  const previewHaz = async routes => {
+    try {
+      const bb = routes.map(r => kbRouteBBox(r, 0.02)).reduce((a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]);
+      const nodes = await kbOverpassHaz(bb);
+      HAZ.current = {
+        bb,
+        nodes
+      };
+      const hR = +((S.current.prof || {}).h || 0),
+        veh = kbVehOf(S.current.prof);
+      routes.forEach(r => {
+        r.haz = kbRouteHaz(r, nodes, hR, veh);
+      });
+      setPlan(p => p && p.routes === routes ? {
+        ...p,
+        hazAt: Date.now()
+      } : p);
+    } catch (e) {
+      console.warn('dangers aperçu', e);
+    }
   };
   const selRoute = i => setPlan(p => {
     if (!p) return p;
@@ -74566,9 +75352,14 @@ function KbTruckGps({
     const map = M.current,
       L = window.L;
     if (!map || !H) return;
-    if (LY.current.lightsL) map.removeLayer(LY.current.lightsL);
-    if (LY.current.zonesL) map.removeLayer(LY.current.zonesL);
-    LY.current.zonesL = L.layerGroup(H.zones.map(z => {
+    const ly = S.current.lay;
+    ['lightsL', 'zonesL', 'bridgesL', 'lezL'].forEach(k => {
+      if (LY.current[k]) {
+        map.removeLayer(LY.current[k]);
+        LY.current[k] = null;
+      }
+    });
+    if (ly.zones) LY.current.zonesL = L.layerGroup(H.zones.map(z => {
       const a = kbAtAlong(R, z.a),
         b = kbAtAlong(R, z.b);
       return L.polyline([[a.lat, a.lng]].concat(R.pts.slice(a.i + 1, b.i + 1), [[b.lat, b.lng]]), {
@@ -74578,7 +75369,7 @@ function KbTruckGps({
         dashArray: '8 8'
       });
     })).addTo(map);
-    LY.current.lightsL = L.layerGroup(H.lights.map(l => L.marker([l.lat, l.lng], {
+    if (ly.lights) LY.current.lightsL = L.layerGroup(H.lights.map(l => L.marker([l.lat, l.lng], {
       interactive: false,
       icon: L.divIcon({
         className: '',
@@ -74586,6 +75377,22 @@ function KbTruckGps({
         iconAnchor: [10, 10],
         html: '<div style="font-size:15px;line-height:20px;text-align:center;filter:drop-shadow(0 1px 1px rgba(0,0,0,.5))">🚦</div>'
       })
+    }))).addTo(map);
+    if (ly.bridges) LY.current.bridgesL = L.layerGroup((H.bridges || []).map(b => L.marker([b.lat, b.lng], {
+      interactive: false,
+      icon: L.divIcon({
+        className: '',
+        iconSize: [46, 46],
+        iconAnchor: [23, 23],
+        html: `<div style="width:42px;height:42px;border-radius:21px;background:#fff;border:4px solid #e53935;display:flex;align-items:center;justify-content:center;font:900 12px system-ui;color:#111;box-shadow:0 2px 6px rgba(0,0,0,.4)">${kbNumFr(b.mh.toFixed(2))}</div>`
+      })
+    }))).addTo(map);
+    LY.current.lezL = L.layerGroup((H.lez || []).map(z => L.polyline(z.segs.map(s => [[s[0], s[1]], [s[2], s[3]]]), {
+      color: '#6a1b9a',
+      weight: 2,
+      opacity: 0.55,
+      dashArray: '4 6',
+      interactive: false
     }))).addTo(map);
   };
   const loadHaz = async N => {
@@ -74603,7 +75410,8 @@ function KbTruckGps({
         };
       }
       if (NV.current !== N || N.R !== R) return;
-      N.haz = kbRouteHaz(R, nodes);
+      N.nodes = nodes;
+      N.haz = kbRouteHaz(R, nodes, +((S.current.prof || {}).h || 0), kbVehOf(S.current.prof));
       drawHaz(R, N.haz);
     } catch (e) {
       console.warn('feux/zones', e);
@@ -74639,7 +75447,10 @@ function KbTruckGps({
     try {
       if (window.speechSynthesis) speechSynthesis.cancel();
     } catch (e) {}
-    say(p.stops.length > 1 ? `C'est parti. ${p.stops.length} arrêts. Premier arrêt : ${p.stops[0].name || ''}.` : "C'est parti.");
+    say(p.stops.length > 1 ? kbT('goTour', {
+      n: p.stops.length,
+      a: p.stops[0].name || ''
+    }) : kbT('go'));
     if (sim) startSim(R);
     if (F.current) navStep(F.current, HD.current);
   };
@@ -74678,6 +75489,7 @@ function KbTruckGps({
     wakeOff();
     clearRoute();
     setHud(null);
+    setTilt(false);
     setRot(0);
     setFollow(true);
     const map = M.current;
@@ -74721,7 +75533,7 @@ function KbTruckGps({
     try {
       const left = N.stops.slice(N.leg);
       if (!left.length) return;
-      if (why === 'off') say('Recalcul');
+      if (why === 'off') say(kbT('rr'));
       const rs = await computeRoutes(left, false);
       if (NV.current !== N) return;
       applyRoute(N, rs[0]);
@@ -74748,7 +75560,9 @@ function KbTruckGps({
           applyRoute(N, rs[0]);
           const m = Math.round(gain / 60);
           setMsg(`🔀 Itinéraire plus rapide : −${m} min`);
-          say(`Itinéraire plus rapide trouvé. Vous gagnez ${m} minutes.`);
+          say(kbT('faster', {
+            n: m
+          }));
           setTimeout(() => setMsg(''), 12000);
         }
       } catch (e) {} finally {
@@ -74769,7 +75583,7 @@ function KbTruckGps({
         const st = await planTour(tour);
         if (NV.current !== N) return;
         if (!st.length) {
-          say('Tournée terminée.');
+          say(kbT('tourEnd'));
           stopNav();
           return;
         }
@@ -74777,7 +75591,9 @@ function KbTruckGps({
         if (NV.current !== N) return;
         applyRoute(N, rs[0], st);
         setMsg('📋 Tournée mise à jour par le bureau');
-        say('Tournée mise à jour par le bureau. Prochain arrêt : ' + (st[0].name || '') + '.');
+        say(kbT('tourUpd', {
+          a: st[0].name || ''
+        }));
         setTimeout(() => setMsg(''), 10000);
       } catch (e) {
         setMsg('⚠️ ' + e.message);
@@ -74803,13 +75619,19 @@ function KbTruckGps({
       const s = N.stops[N.leg],
         nx = N.stops[N.leg + 1];
       markDone(s);
-      say(`Arrivé : ${s.name || 'arrêt'}.` + (nx ? ` Prochain arrêt : ${nx.name || ''}.` : ''));
+      say(kbT('arrStop', {
+        a: s.name || ''
+      }) + (nx ? kbT('next', {
+        a: nx.name || ''
+      }) : ''));
       N.leg++;
     }
     if (total - along < 40 && sn.d < 60) {
       const s = N.stops[N.stops.length - 1];
       markDone(s);
-      say(`Vous êtes arrivé${s && s.name ? ' : ' + s.name : ''}.`);
+      say(s && s.name ? kbT('arrived', {
+        a: s.name
+      }) : kbT('arrived0'));
       setArrived(s || {});
       setMode('arrived');
       if (SIM.current) {
@@ -74819,6 +75641,7 @@ function KbTruckGps({
       NV.current = null;
       wakeOff();
       setHud(null);
+      setTilt(false);
       setRot(0);
       const map = M.current;
       if (map) map.dragging.enable();
@@ -74848,7 +75671,10 @@ function KbTruckGps({
     if (!m.arrive && m.kind !== 'straight') {
       if (!N.sp[k + 'f'] && dist <= farD && dist > nearD + 80) {
         N.sp[k + 'f'] = 1;
-        say('Dans ' + kbVoiceDist(dist) + ', ' + kbLc(m.alert));
+        say(kbT('in', {
+          d: kbVoiceDist(dist),
+          a: kbGpsLang === 'de' ? m.alert : kbLc(m.alert)
+        }));
       }
       if (!N.sp[k + 'n'] && dist <= nearD) {
         N.sp[k + 'n'] = 1;
@@ -74865,12 +75691,14 @@ function KbTruckGps({
           key = 'z' + Math.round(z.a);
         if (!inZ && !N.sp[key + 's'] && z.a - along < 450) {
           N.sp[key + 's'] = 1;
-          say('Zone de danger dans ' + kbVoiceDist(z.a - along));
+          say(kbT('zoneIn', {
+            d: kbVoiceDist(z.a - along)
+          }));
         }
         if (inZ && !N.sp[key + 'i']) {
           N.sp[key + 'i'] = 1;
           N.sp[key + 's'] = 1;
-          say('Attention, zone de danger.');
+          say(kbT('zoneNow'));
         }
         zone = inZ ? {
           in: true,
@@ -74882,6 +75710,75 @@ function KbTruckGps({
       }
       const lt = N.haz.lights.find(l => l.s > along - 5);
       if (lt && lt.s - along < 400) light = Math.max(0, lt.s - along);
+    }
+    let bridge = null,
+      zfe = null,
+      rep = null;
+    if (N.haz) {
+      const b = (N.haz.bridges || []).find(x => x.s > along - 10 && x.s - along < 1200);
+      if (b) {
+        bridge = {
+          d: Math.max(0, b.s - along),
+          mh: b.mh
+        };
+        const key = 'b' + Math.round(b.s);
+        if (!N.sp[key] && b.s - along < 700) {
+          N.sp[key] = 1;
+          say(kbT('bridge', {
+            h: b.mh.toFixed(2).replace('.', kbT('dec')),
+            d: kbVoiceDist(b.s - along)
+          }));
+        }
+      }
+      const z = (N.haz.lez || []).find(x => x.s > along - 5 && x.s - along < 2000);
+      if (z) {
+        zfe = {
+          d: Math.max(0, z.s - along),
+          name: z.name
+        };
+        if (!N.sp['lez' + z.id]) {
+          N.sp['lez' + z.id] = 1;
+          say(kbT('lez', {
+            d: kbVoiceDist(z.s - along)
+          }));
+        }
+      } else {
+        const inside = (N.haz.lez || []).find(x => x.s <= 0);
+        if (inside) zfe = {
+          d: 0,
+          name: inside.name,
+          in: true
+        };
+      }
+    }
+    const RP = S.current.lay.reports ? S.current.reports || [] : [];
+    if (RP.length) {
+      if (!N.repS || N.repR !== R || N.repN !== RP.length) {
+        N.repR = R;
+        N.repN = RP.length;
+        N.repS = RP.map(r => {
+          const s = kbSnap(R, [r.lat, r.lng], -1);
+          return s.d < 40 ? {
+            ...r,
+            s: s.along
+          } : null;
+        }).filter(Boolean).sort((a, b) => a.s - b.s);
+      }
+      const r = N.repS.find(x => x.s > along - 5 && x.s - along < 800);
+      if (r) {
+        const T = KB_GPS_REPORTS.find(x => x.k === r.type) || KB_GPS_REPORTS[0];
+        rep = {
+          d: r.s - along,
+          T
+        };
+        if (!N.sp['r' + r.id] && r.s - along < 500) {
+          N.sp['r' + r.id] = 1;
+          say(kbT('rep', {
+            a: kbRepVoice(T.k),
+            d: kbVoiceDist(r.s - along)
+          }));
+        }
+      }
     }
     const onR = sn.d < 25,
       i1 = Math.min(sn.i + 1, R.pts.length - 1);
@@ -74918,8 +75815,80 @@ function KbTruckGps({
       etas,
       leg: N.leg,
       src: R.src,
-      delay: R.delay
+      delay: R.delay,
+      bridge,
+      zfe,
+      rep,
+      cur: mc.street || ''
     });
+  };
+  React.useEffect(() => {
+    const map = M.current,
+      L = window.L;
+    if (!map) return;
+    if (LY.current.repL) {
+      map.removeLayer(LY.current.repL);
+      LY.current.repL = null;
+    }
+    if (!lay.reports) return;
+    LY.current.repL = L.layerGroup(reports.map(r => {
+      const T = KB_GPS_REPORTS.find(x => x.k === r.type) || KB_GPS_REPORTS[0];
+      return L.marker([r.lat, r.lng], {
+        icon: L.divIcon({
+          className: '',
+          iconSize: [40, 40],
+          iconAnchor: [20, 20],
+          html: `<div style="width:38px;height:38px;border-radius:19px;background:${T.c};border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;font-size:20px">${T.ic}</div>`
+        })
+      }).bindPopup(`<b>${T.ic} ${T.l}</b><br>${kbEsc(r.by || '')} · ${kbHM(r.at)} ${formatDateShort(String(r.at).slice(0, 10))}`);
+    })).addTo(map);
+  }, [ready, reports, lay.reports]);
+  React.useEffect(() => {
+    const N = NV.current;
+    if (N && N.R && N.haz) drawHaz(N.R, N.haz);
+  }, [lay.lights, lay.zones, lay.bridges]);
+  const sendReport = async T => {
+    const fx = F.current;
+    if (!fx) {
+      setMsg('⚠️ GPS pas encore trouvé');
+      return;
+    }
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    try {
+      await storage.setDoc('gps_reports', id, {
+        type: T.k,
+        lat: +fx.lat.toFixed(6),
+        lng: +fx.lng.toFixed(6),
+        at: new Date().toISOString(),
+        day: todayKey(),
+        by: session && session.name || ''
+      }, {
+        replace: true
+      });
+      setSheet('');
+      setMsg(`✓ Signalé : ${T.ic} ${T.l} — merci !`);
+      say(kbT('thanks'));
+      setTimeout(() => setMsg(''), 6000);
+    } catch (e) {
+      setMsg('⚠️ Signalement refusé : ' + e.message);
+    }
+  };
+  const openPoi = async kind => {
+    const fx = F.current;
+    if (!fx) {
+      setMsg('⚠️ GPS pas encore trouvé');
+      return;
+    }
+    setSheet(kind);
+    setPoi(null);
+    try {
+      const r = await kbOverpassPoi(kind, fx, S.current.prof);
+      setPoi(r);
+    } catch (e) {
+      setPoi({
+        err: e.message
+      });
+    }
   };
   React.useEffect(() => {
     if (mode !== 'search') return;
@@ -74973,6 +75942,7 @@ function KbTruckGps({
     if (!map) return;
     setFollow(false);
     S.current.follow = false;
+    setTilt(false);
     setRot(0);
     map.dragging.enable();
     if (N && N.R) map.fitBounds(window.L.latLngBounds(N.R.pts), pads(160, 220));
@@ -75112,9 +76082,10 @@ function KbTruckGps({
     }
   }, kbBanDist(hud.dist)), React.createElement("div", {
     style: {
-      fontSize: 19,
-      fontWeight: 700,
+      fontSize: 21,
+      fontWeight: 800,
       marginTop: 4,
+      color: hud.off ? '#fff' : '#7fd3ff',
       overflow: 'hidden',
       textOverflow: 'ellipsis',
       display: '-webkit-box',
@@ -75151,7 +76122,41 @@ function KbTruckGps({
       textAlign: 'center',
       boxShadow: '0 3px 10px rgba(0,0,0,.25)'
     }
-  }, "\u26A0\uFE0F ZONE DE DANGER ", hud.zone.in ? `· encore ${kbBanDist(hud.zone.left)}` : `dans ${kbBanDist(hud.zone.d)}`), msg && React.createElement("div", {
+  }, "\u26A0\uFE0F ZONE DE DANGER ", hud.zone.in ? `· encore ${kbBanDist(hud.zone.left)}` : `dans ${kbBanDist(hud.zone.d)}`), hud.bridge && React.createElement("div", {
+    style: {
+      marginTop: 6,
+      background: hud.bridge.d < 300 ? '#d32f2f' : '#ef6c00',
+      color: '#fff',
+      borderRadius: 14,
+      padding: '8px 12px',
+      fontSize: 18,
+      fontWeight: 900,
+      textAlign: 'center',
+      boxShadow: '0 3px 10px rgba(0,0,0,.25)'
+    }
+  }, "\uD83C\uDF09 PASSAGE LIMIT\xC9 ", kbNumFr(hud.bridge.mh.toFixed(2)), " m \xB7 dans ", kbBanDist(hud.bridge.d)), hud.zfe && React.createElement("div", {
+    style: {
+      marginTop: 6,
+      background: '#6a1b9a',
+      color: '#fff',
+      borderRadius: 14,
+      padding: '7px 12px',
+      fontSize: 16,
+      fontWeight: 800,
+      textAlign: 'center'
+    }
+  }, "\uD83D\uDFEA ", hud.zfe.in ? 'En ZFE' : 'ZFE dans ' + kbBanDist(hud.zfe.d), " \xB7 ", hud.zfe.name, " \xB7 vignette Crit'Air"), hud.rep && React.createElement("div", {
+    style: {
+      marginTop: 6,
+      background: hud.rep.T.c,
+      color: '#fff',
+      borderRadius: 14,
+      padding: '7px 12px',
+      fontSize: 17,
+      fontWeight: 800,
+      textAlign: 'center'
+    }
+  }, hud.rep.T.ic, " ", hud.rep.T.l, " (\xE9quipe) \xB7 dans ", kbBanDist(hud.rep.d)), msg && React.createElement("div", {
     style: {
       marginTop: 6,
       ...card,
@@ -75231,13 +76236,46 @@ function KbTruckGps({
     style: {
       position: 'absolute',
       right: 10,
-      top: mode === 'nav' ? hud && hud.zone ? 196 : 150 : 'calc(76px + env(safe-area-inset-top))',
+      top: mode === 'nav' ? 150 + (hud ? (hud.zone ? 46 : 0) + (hud.bridge ? 46 : 0) + (hud.zfe ? 40 : 0) + (hud.rep ? 40 : 0) : 0) : 'calc(76px + env(safe-area-inset-top))',
       display: 'flex',
       flexDirection: 'column',
       gap: 10,
       zIndex: 15
     }
-  }, mode === 'home' && fab(kbVehInfo(P).ic, true, () => setShowProf(true)), fab(night ? '☀️' : '🌙', true, () => setNight(n => !n)), ttKey ? fab('🚦', traffic, () => setTraffic(t => !t)) : null, mode === 'nav' && fab(muted ? '🔇' : '🔊', true, toggleMute), mode === 'nav' && fab('🗺️', true, overview)), (!follow || mode === 'home') && (mode === 'nav' || mode === 'home') && React.createElement("button", {
+  }, mode === 'home' && fab(kbVehInfo(P).ic, true, () => setShowProf(true)), fab('🗂️', true, () => setSheet('layers')), mode === 'nav' && fab(muted ? '🔇' : '🔊', true, toggleMute), mode === 'nav' && fab('🗺️', true, overview), mode === 'home' && fab('⛽', true, () => openPoi('fuel')), mode === 'home' && fab('🅿️', true, () => openPoi('parking')), fab('❓', true, () => setSheet('help'))), mode === 'nav' && React.createElement("button", {
+    type: "button",
+    onClick: () => setSheet('report'),
+    style: {
+      position: 'absolute',
+      right: 12,
+      bottom: 'calc(150px + env(safe-area-inset-bottom))',
+      zIndex: 16,
+      width: 72,
+      height: 72,
+      borderRadius: 20,
+      border: 'none',
+      background: '#ffd54f',
+      fontSize: 34,
+      boxShadow: '0 4px 12px rgba(0,0,0,.3)'
+    }
+  }, "\u26A0\uFE0F"), mode === 'nav' && hud && hud.cur && follow && React.createElement("div", {
+    style: {
+      position: 'absolute',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      bottom: 'calc(160px + env(safe-area-inset-bottom))',
+      zIndex: 15,
+      ...card,
+      borderRadius: 18,
+      padding: '6px 16px',
+      fontSize: 18,
+      fontWeight: 800,
+      maxWidth: '50%',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, hud.cur), (!follow || mode === 'home') && (mode === 'nav' || mode === 'home') && React.createElement("button", {
     type: "button",
     onClick: recenter,
     style: {
@@ -75560,7 +76598,36 @@ function KbTruckGps({
         fontWeight: 600,
         margin: '2px 0 8px'
       }
-    }, R.src === 'tt' ? '🚦 Trafic en direct inclus' : 'Sans trafic en direct', " \xB7 ", kbVehLabel(P), P.noToll ? ' · sans péage' : ''), plan.stops.length > 1 && React.createElement("div", {
+    }, R.src === 'tt' ? '🚦 Trafic en direct inclus' : 'Sans trafic en direct', " \xB7 ", kbVehLabel(P), P.noToll ? ' · sans péage' : ''), R.haz && R.haz.bridges.length > 0 && React.createElement("div", {
+      style: {
+        background: '#fff3e0',
+        border: '2px solid #ef6c00',
+        borderRadius: 14,
+        padding: '8px 12px',
+        marginBottom: 8,
+        fontSize: 15,
+        fontWeight: 700
+      }
+    }, "\u26A0\uFE0F ", R.haz.bridges.length > 1 ? R.haz.bridges.length + ' passages limités' : 'Un passage limité', " \xE0 ", kbNumFr(Math.min(...R.haz.bridges.map(b => b.mh)).toFixed(2)), " m sur ou tout pr\xE8s du trajet (ton camion : ", kbNumFr(P.h), " m). V\xE9rifie la hauteur r\xE9elle du chargement et respecte les panneaux."), (() => {
+      const L = R.m || R.cum[R.cum.length - 1],
+        lit = kbFuelL(P, L),
+        v = kbVehOf(P),
+        pr = cfg && +cfg[v === 'car' || v === 'scooter' ? 'fuelPriceSp' : 'fuelPrice'] || (v === 'car' || v === 'scooter' ? 1.85 : 1.7);
+      const row = (a, b) => React.createElement("div", {
+        style: {
+          display: 'flex',
+          justifyContent: 'space-between',
+          padding: '7px 0',
+          borderTop: '1px solid #eef1f4',
+          fontSize: 16
+        }
+      }, React.createElement("span", null, a), React.createElement("b", null, b));
+      return React.createElement("div", {
+        style: {
+          marginBottom: 8
+        }
+      }, row(v === 'car' || v === 'scooter' ? '⛽ Carburant estimé' : '⛽ Gazole estimé', `≈ ${Math.round(lit)} L · ≈ ${Math.round(lit * pr)} €`), row('💶 Péage', R.toll ? 'oui, sur le trajet' : P.noToll ? 'évité' : 'non'), R.haz && row('🟪 ZFE', R.haz.lez.length ? R.haz.lez.map(z => z.name).join(', ') : 'aucune'), R.haz && row('⚠️ Dangers', `${R.haz.zones.length} zone${R.haz.zones.length > 1 ? 's' : ''} de danger · ${R.haz.lights.length} feux`), !R.haz && row('⚠️ Dangers', '⏳ analyse du trajet…'));
+    })(), plan.stops.length > 1 && React.createElement("div", {
       style: {
         background: '#f5f7f9',
         borderRadius: 14,
@@ -75708,7 +76775,7 @@ function KbTruckGps({
   }, React.createElement("button", {
     type: "button",
     onClick: () => {
-      say('Guidage arrêté.');
+      say(kbT('stop'));
       stopNav();
     },
     style: {
@@ -75750,7 +76817,14 @@ function KbTruckGps({
       fontWeight: 700,
       color: share ? '#2e7d32' : '#b0bec5'
     },
-    onClick: () => isDriver && setShare(s => !s)
+    onClick: () => {
+      setShare(s => {
+        const v = !s;
+        S.current.share = v;
+        if (!v) livePush(true);else livePush(false);
+        return v;
+      });
+    }
   }, "\uD83D\uDCE1", React.createElement("br", null), share ? 'partagé' : 'off')), hud.etas && hud.etas.length > 1 && React.createElement("div", {
     style: {
       display: 'flex',
@@ -75810,7 +76884,141 @@ function KbTruckGps({
       fontSize: 21,
       fontWeight: 800
     }
-  }, "\u2713 Terminer")), showProf && React.createElement(KbTruckProfSheet, {
+  }, "\u2713 Terminer")), sheet && React.createElement("div", {
+    style: {
+      position: 'absolute',
+      inset: 0,
+      background: 'rgba(0,0,0,.45)',
+      zIndex: 60,
+      display: 'flex',
+      alignItems: 'flex-end'
+    },
+    onClick: () => setSheet('')
+  }, React.createElement("div", {
+    onClick: e => e.stopPropagation(),
+    style: {
+      background: '#fff',
+      color: ink,
+      width: '100%',
+      maxHeight: '88%',
+      overflowY: 'auto',
+      borderRadius: '22px 22px 0 0',
+      padding: '16px 16px calc(18px + env(safe-area-inset-bottom))'
+    }
+  }, sheet === 'layers' && React.createElement(KbGpsLayersSheet, {
+    lay: lay,
+    setL: setL,
+    ttKey: ttKey
+  }), sheet === 'report' && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 23,
+      fontWeight: 900,
+      marginBottom: 4
+    }
+  }, "\u26A0\uFE0F Signaler ici"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: '#607d8b',
+      marginBottom: 10
+    }
+  }, "\xC0 l'endroit o\xF9 tu es. Visible par toute l'\xE9quipe pendant 7 jours, annonc\xE9 \xE0 la voix aux autres chauffeurs."), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gap: 8
+    }
+  }, KB_GPS_REPORTS.map(T => React.createElement("button", {
+    key: T.k,
+    type: "button",
+    onClick: () => sendReport(T),
+    style: {
+      minHeight: 92,
+      borderRadius: 18,
+      border: 'none',
+      background: T.c,
+      color: '#fff',
+      fontSize: 17,
+      fontWeight: 800
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 34
+    }
+  }, T.ic), T.l)))), (sheet === 'fuel' || sheet === 'parking') && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 23,
+      fontWeight: 900,
+      marginBottom: 8
+    }
+  }, sheet === 'fuel' ? '⛽ Stations autour de moi' : '🅿️ Parkings poids lourds / aires'), !poi && React.createElement("div", {
+    style: {
+      fontSize: 16,
+      color: '#1e88e5',
+      fontWeight: 700
+    }
+  }, "\u23F3 Recherche\u2026"), poi && poi.err && React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: '#c62828'
+    }
+  }, "\u26A0\uFE0F ", poi.err), poi && Array.isArray(poi) && !poi.length && React.createElement("div", {
+    style: {
+      fontSize: 15,
+      color: '#90a4ae'
+    }
+  }, "Rien trouv\xE9 \xE0 moins de 6 km."), poi && Array.isArray(poi) && poi.map((x, i) => React.createElement("button", {
+    key: i,
+    type: "button",
+    onClick: () => {
+      setSheet('');
+      goTo([{
+        id: '',
+        name: x.name,
+        lat: x.lat,
+        lng: x.lng
+      }]);
+    },
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      width: '100%',
+      textAlign: 'left',
+      border: 'none',
+      borderBottom: '1px solid #eef1f4',
+      background: '#fff',
+      padding: '10px 4px'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 26
+    }
+  }, sheet === 'fuel' ? '⛽' : '🅿️'), React.createElement("span", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 17
+    }
+  }, x.name), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 13,
+      color: '#607d8b'
+    }
+  }, x.sub)), x.hgv && pill('🚛 PL', '#2e7d32'), React.createElement("b", {
+    style: {
+      fontSize: 15
+    }
+  }, kbBanDist(x.d)))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: '#90a4ae',
+      marginTop: 8
+    }
+  }, "Donn\xE9es OpenStreetMap. \xAB \uD83D\uDE9B PL \xBB = acc\xE8s poids lourds indiqu\xE9.")), sheet === 'help' && React.createElement(KbGpsHelp, null))), showProf && React.createElement(KbTruckProfSheet, {
     prof: prof,
     onClose: () => {
       if (prof) setShowProf(false);else {
@@ -76474,6 +77682,35 @@ function KbDriverLiveCard({
     className: "btn-primary",
     onClick: saveKey
   }, "Enregistrer")), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      marginTop: 8,
+      fontSize: 13,
+      flexWrap: 'wrap'
+    }
+  }, "\u26FD Prix pour l'estimation : gazole", React.createElement("input", {
+    type: "number",
+    step: "0.01",
+    defaultValue: cfg && cfg.fuelPrice || 1.7,
+    onBlur: e => storage.setDoc('gps_config', 'main', {
+      fuelPrice: +e.target.value || 1.7
+    }).catch(err => showToast('Erreur : ' + err.message)),
+    style: {
+      width: 70
+    }
+  }), " \u20AC/L \xB7 essence", React.createElement("input", {
+    type: "number",
+    step: "0.01",
+    defaultValue: cfg && cfg.fuelPriceSp || 1.85,
+    onBlur: e => storage.setDoc('gps_config', 'main', {
+      fuelPriceSp: +e.target.value || 1.85
+    }).catch(err => showToast('Erreur : ' + err.message)),
+    style: {
+      width: 70
+    }
+  }), " \u20AC/L"), React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-mute)',
