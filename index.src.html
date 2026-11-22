@@ -813,7 +813,8 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.76';
+    const APP_VERSION = 'V11.77';
+    // V11.77 — (22/11/2026) 🔒 SÉCURITÉ : clé du proxy Geotab retirée du fichier ; le suivi camion envoie le jeton de l'utilisateur connecté (POST), vérifié par le script GEOTAB_SUIVI_PROXY.
     // V11.76 — (22/11/2026) 🔒 SÉCURITÉ : la base Centrale PDP (Firebase kelbongoo-prep) n'est plus ouverte au public.
     //   Tous les accès de l'appli à cette base (enlèvements Rungis, QR chauffeur, EPAL, sapins, Centrale en direct, retours Rungis)
     //   portent un jeton : connexion anonyme à kelbongoo-prep + session ouverte par le serveur du registre (PRIBON RECEPTION,
@@ -35119,7 +35120,14 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     const KB_ENL_URL = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/enlevements.json';
     // V10.12 — Suivi camion Rungis frais (Geotab). Renseigner après déploiement du proxy GEOTAB_SUIVI_PROXY.gs :
     const GEOTAB_PROXY_URL = 'https://script.google.com/macros/s/AKfycbzh_5sp-uNSnpj3FNP7fTvyqa-JOwx2ANk6KQ6SPRAUmwkvalV9NRSEXYmm2lUr-GjV7A/exec';   // V10.49
-    const GEOTAB_PROXY_KEY = 'spycamion';   // V10.52 — = propriété SHARED du projet Apps Script
+    // V11.77 — SÉCURITÉ : plus de clé dans le fichier. Le proxy Geotab vérifie le jeton de l'utilisateur connecté (POST, jamais dans l'adresse).
+    async function geotabPost(params, opts) {
+      const u = fb && fb.auth && fb.auth.currentUser;
+      if (!u) throw new Error('connexion requise');
+      const tok = await u.getIdToken();
+      const nat = window.__kbNativeFetch || fetch;
+      return nat(GEOTAB_PROXY_URL, { ...(opts || {}), method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ ...params, tok }) });
+    }
     // V10.15 — 2e camion (F&L) : numéro d'appareil Geotab (ex. b12). Vide = carte « à configurer ».
     const GEOTAB_DEVICE_FL = 'b8D';   // V10.49 — 2e camion (sec / F&L) ; le camion frais b8C est le défaut du proxy
     function kbCompass(b){ const d=['N','NE','E','SE','S','SO','O','NO']; return d[Math.round(((Number(b)||0)%360)/45)%8]; }
@@ -35135,7 +35143,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         let stop=false; setD(undefined);
         const ctl=(typeof AbortController!=='undefined')?new AbortController():null;
         const to=setTimeout(()=>{ try{ ctl&&ctl.abort(); }catch(e){} }, 15000);
-        fetch(GEOTAB_PROXY_URL+'?k='+encodeURIComponent(GEOTAB_PROXY_KEY)+'&addr=1'+(multi?'&device='+encodeURIComponent(device):'')+'&t='+Date.now(), ctl?{signal:ctl.signal}:{})
+        geotabPost({ addr: '1', ...(multi ? { device } : {}) }, ctl?{signal:ctl.signal}:{})
           .then(r=>r.json()).then(j=>{ if(stop) return; if(j&&j.ok) setD(j); else { setD(null); setErr((j&&j.error)||'réponse invalide'); } })
           .catch(e=>{ if(!stop){ setD(null); setErr(e.message||String(e)); } }).finally(()=>clearTimeout(to));
         return ()=>{ stop=true; clearTimeout(to); try{ ctl&&ctl.abort(); }catch(e){} };
@@ -35149,7 +35157,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         {inner}
       </div>);
       if(d==='noconf' && multi && GEOTAB_PROXY_URL) return Wrap(<div style={{fontSize:13,marginTop:6}}>À configurer : renseigner le numéro d'appareil Geotab de ce camion (<code>GEOTAB_DEVICE_FL</code>) dans l'appli.</div>);
-      if(d==='noconf') return Wrap(<div style={{fontSize:13,marginTop:6}}>Suivi Geotab à configurer : déployer le proxy <b>GEOTAB_SUIVI_PROXY.gs</b> puis renseigner <code>GEOTAB_PROXY_URL</code> et <code>GEOTAB_PROXY_KEY</code> dans l'appli.</div>);
+      if(d==='noconf') return Wrap(<div style={{fontSize:13,marginTop:6}}>Suivi Geotab à configurer : déployer le proxy <b>GEOTAB_SUIVI_PROXY.gs</b> puis renseigner <code>GEOTAB_PROXY_URL</code> dans l'appli.</div>);
       if(d===undefined) return Wrap(<div style={{fontSize:13,marginTop:6}}>Localisation du camion…</div>);
       if(d===null) return Wrap(<div style={{fontSize:13,marginTop:6,color:'var(--danger)'}}>⚠️ Position indisponible : {err} <button className="btn-secondary" style={{fontSize:12,marginLeft:6}} onClick={()=>setTick(x=>x+1)}>Réessayer</button></div>);
       if(!d.found) return Wrap(<div style={{fontSize:13,marginTop:6}}>Camion non localisé (appareil {d.device}).</div>);
@@ -35177,7 +35185,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     // ============================================================
     async function kbGeocode(adr) {
       if (!GEOTAB_PROXY_URL) return null;
-      try { const r = await fetch(GEOTAB_PROXY_URL + '?k=' + encodeURIComponent(GEOTAB_PROXY_KEY) + '&geo=' + encodeURIComponent(adr)); return await r.json(); } catch (e) { return null; }
+      try { const r = await geotabPost({ geo: adr }); return await r.json(); } catch (e) { return null; }
     }
     function kbDistM(a, b, c, d) { const R = 6371000, t = Math.PI / 180, x = (c - a) * t, y = (d - b) * t; const h = Math.sin(x / 2) ** 2 + Math.cos(a * t) * Math.cos(c * t) * Math.sin(y / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(h)); }
     function kbHM(iso) { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); }
@@ -35244,7 +35252,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         let stop = false;
         const d0 = new Date(); d0.setHours(0, 0, 0, 0); const from = d0.toISOString();
         const defs = [{ label: '❄️ Frais', dev: '' }].concat(GEOTAB_DEVICE_FL ? [{ label: '🥬 F&L', dev: GEOTAB_DEVICE_FL }] : []);
-        Promise.all(defs.map(t => fetch(GEOTAB_PROXY_URL + '?k=' + encodeURIComponent(GEOTAB_PROXY_KEY) + '&trips=1&from=' + encodeURIComponent(from) + (t.dev ? '&device=' + encodeURIComponent(t.dev) : '') + '&t=' + Math.floor(Date.now() / 30000))
+        Promise.all(defs.map(t => geotabPost({ trips: '1', from, ...(t.dev ? { device: t.dev } : {}) })
           .then(r => r.json()).then(d => ({ ...t, d: d && d.ok ? d : null, err: d && !d.ok ? d.error : '' })).catch(e => ({ ...t, d: null, err: String(e && e.message || e) }))))
           .then(r => { if (!stop) setTrucks(r); });
         const iv = setTimeout(() => setTick(x => x + 1), everyMs || 60000);
