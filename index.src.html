@@ -813,7 +813,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.75';
+    const APP_VERSION = 'V11.76';
+    // V11.76 — (22/11/2026) 🔒 SÉCURITÉ : la base Centrale PDP (Firebase kelbongoo-prep) n'est plus ouverte au public.
+    //   Tous les accès de l'appli à cette base (enlèvements Rungis, QR chauffeur, EPAL, sapins, Centrale en direct, retours Rungis)
+    //   portent un jeton : connexion anonyme à kelbongoo-prep + session ouverte par le serveur du registre (PRIBON RECEPTION,
+    //   action kbg-prep-session) après vérification du jeton Kelbongoo (code perso / master Google). Rien à faire pour l'équipe.
     // V11.75 — (21/11/2026) ♻️ Enlèvement destruction : palette de cagettes = palette EPAL par défaut → comptée « EPAL envoyée à Rungis »
     //   (suivi EPAL / compteur Rungis) ; case « Ce n'est PAS une palette EPAL » sinon. (V11.74 jamais publiée, remplacée par V11.75.)
     // V11.74 — (21/11/2026) 🔳 QR codes Rungis : Prépa › DLC & suivi › « Impression QR codes du jour » (1 étiquette ½ A4 par palette picking /
@@ -1920,6 +1924,81 @@
       }
       return window.__kbClaims;
     }
+    // ============================================================
+    // V11.76 — ACCÈS SÉCURISÉ À LA BASE CENTRALE PDP (kelbongoo-prep)
+    //   1. Compte anonyme sur kelbongoo-prep (API REST Identity Toolkit) : seul, il n'ouvre rien.
+    //   2. Le serveur du registre vérifie le jeton Kelbongoo (utilisateur connecté) puis ouvre une session (12 h)
+    //      dans la base. Les règles de la base n'acceptent que ces sessions.
+    //   3. Chaque appel REST vers la base reçoit « auth=<jeton> » automatiquement (enrobage de fetch).
+    //   Aucun secret ici : clé publique du projet + adresse publique du serveur (qui vérifie tout).
+    // ============================================================
+    const KB_PREP_HOST = 'kelbongoo-prep-default-rtdb.firebaseio.com';
+    const KB_PREP_KEY = 'AIzaSyDtcoRoknYM4JrJJfcuhpnVMeS-OurwYdU';
+    const KB_PREP_SESSION_URL = 'https://script.google.com/macros/s/AKfycbzSMWziEuPvxY6UvM6FimJlFCTE1v9u1mWh3gJXbOtMVlHcb478_gASeIwZ1PMEw7-2Sw/exec';
+    const KB_PREP_LS = 'kb_prep_anon_v1';
+    const kbPrep = { tok: '', tokExp: 0, sessExp: 0, sessUid: '', busy: null };
+    function kbPrepStore(o) { try { if (o) localStorage.setItem(KB_PREP_LS, JSON.stringify(o)); else localStorage.removeItem(KB_PREP_LS); } catch (_) {} }
+    function kbPrepLoad() { try { return JSON.parse(localStorage.getItem(KB_PREP_LS) || 'null'); } catch (_) { return null; } }
+    async function kbPrepAnonToken() {
+      if (kbPrep.tok && kbPrep.tokExp > Date.now() + 120000) return kbPrep.tok;
+      const saved = kbPrepLoad(), nat = window.__kbNativeFetch || fetch;
+      let j = null;
+      if (saved && saved.rt) {
+        const r = await nat('https://securetoken.googleapis.com/v1/token?key=' + KB_PREP_KEY, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(saved.rt) });
+        if (r.ok) { const x = await r.json(); j = { idToken: x.id_token, refreshToken: x.refresh_token, expiresIn: x.expires_in, localId: x.user_id }; }
+      }
+      if (!j) {
+        const r = await nat('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + KB_PREP_KEY, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ returnSecureToken: true }) });
+        if (!r.ok) throw new Error('connexion anonyme Centrale refusée (' + r.status + ')');
+        j = await r.json(); kbPrep.sessExp = 0;
+      }
+      kbPrep.tok = j.idToken; kbPrep.tokExp = Date.now() + (Number(j.expiresIn) || 3600) * 1000;
+      if (kbPrep.sessUid !== j.localId) { kbPrep.sessUid = j.localId; kbPrep.sessExp = (saved && saved.uid === j.localId && saved.sessExp) || 0; }
+      kbPrepStore({ rt: j.refreshToken, uid: j.localId, sessExp: kbPrep.sessExp });
+      return kbPrep.tok;
+    }
+    // Ouvre (ou rouvre) la session sur la base Centrale. Renvoie true si une session valide existe.
+    async function kbPrepEnsure(force) {
+      if (!force && kbPrep.sessExp > Date.now() + 300000) return true;
+      if (kbPrep.busy) return kbPrep.busy;
+      const job = (async () => {
+        try {
+          const u = fb && fb.auth && fb.auth.currentUser;
+          if (!u) return false;                                   // pas connecté à l'appli → pas d'accès à la Centrale
+          const kbgToken = await u.getIdToken();
+          const anon = await kbPrepAnonToken();
+          const nat = window.__kbNativeFetch || fetch;
+          const r = await nat(KB_PREP_SESSION_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'kbg-prep-session', kbgToken, fb: { prep: anon } }) });
+          const j = await r.json().catch(() => null);
+          const exp = j && j.ok && j.sessions && Number(j.sessions.prep);
+          if (!exp) { console.warn('[Centrale] session refusée', j && j.error); return false; }
+          kbPrep.sessExp = exp; const s = kbPrepLoad(); if (s) kbPrepStore({ ...s, sessExp: exp });
+          return true;
+        } catch (e) { console.warn('[Centrale] session impossible', e && e.message); return false; }
+      })();
+      kbPrep.busy = job;
+      job.finally(() => { if (kbPrep.busy === job) kbPrep.busy = null; });
+      return job;
+    }
+    function kbPrepReset() { kbPrep.tok = ''; kbPrep.tokExp = 0; kbPrep.sessExp = 0; kbPrep.sessUid = ''; kbPrepStore(null); }
+    (function kbPrepWrapFetch() {
+      if (window.__kbNativeFetch) return;
+      const nat = window.fetch.bind(window); window.__kbNativeFetch = nat;
+      const withAuth = (url, tok) => { const u = new URL(url); u.searchParams.set('auth', tok); return u.toString(); };
+      window.fetch = async function (input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (!url || url.indexOf(KB_PREP_HOST) < 0 || /[?&]auth=/.test(url)) return nat(input, init);
+        try {
+          await kbPrepEnsure(false);
+          let r = await nat(withAuth(url, await kbPrepAnonToken()), init);
+          if (r.status === 401) {                                   // session expirée / effacée → on la rouvre une fois
+            if (await kbPrepEnsure(true)) r = await nat(withAuth(url, await kbPrepAnonToken()), init);
+          }
+          return r;
+        } catch (e) { return nat(input, init); }
+      };
+    })();
+
     function kbCallable(name) {
       if (!window.__fns) throw new Error('Serveur non initialisé');
       return window.__firebase.httpsCallable(window.__fns, name);
@@ -1960,6 +2039,7 @@
     }
     async function kbSignOut() {
       window.__kbClaims = null;
+      kbPrepReset();   // V11.76 — nouvel identifiant anonyme au prochain utilisateur : l'ancienne session Centrale ne sert plus
       try { if (fb && fb.auth) await window.__firebase.signOut(fb.auth); } catch (_) {}
     }
     // Session locale acceptée seulement si elle correspond au jeton Firebase (anti-falsification localStorage)
