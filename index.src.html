@@ -813,7 +813,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.79';
+    const APP_VERSION = 'V11.80';
+    // V11.80 — (23/11/2026) 🧾 Qualité : « Retiré mais présent (à refacturer) » — produit noté en rupture à la prépa que le client a quand même eu :
+    //   on coche le produit « retiré en prépa » de sa commande, montant à refacturer calculé (prix × quantité), suivi dans Master › SAV › 💶 À refacturer (✅ Refacturé).
     // V11.79 — (23/11/2026) 🧾 Qualité / SAV : montant de l'avoir et du remboursement calculé tout seul (prix payé × quantité des produits
     //   cochés), modifiable, « ↺ » remet le calcul ; enregistré PRODUIT PAR PRODUIT (avant : le même montant recopié sur chaque produit).
     //   👋 Petit dessin fait main qui dit bonjour sur l'accueil (matin / midi / après-midi / soir, dessin différent, mot doux, jamais de chiffres),
@@ -1799,12 +1801,14 @@
       { id:"inversion_casier", label:"Inversion casier", color:"warn" },
       { id:"oubli_casier", label:"Article oublié dans casier", color:"warn" },
       { id:"retour_pdp", label:"↩️ Retour PDP (produit non attribué)", color:"warn" },
+      { id:"retire_present", label:"Retiré mais présent (à refacturer)", color:"warn" }, // V11.80
     ];
     const ACTIONS = [
       { id:"remise", label:"Remise" },
       { id:"remboursement", label:"Remboursement" },
       { id:"offert", label:"Offert" },
       { id:"avoir", label:"Avoir" },
+      { id:"refacturer", label:"À refacturer" }, // V11.80 — produit donné alors que noté en rupture
     ];
 
     const PREP_REASONS = [
@@ -5765,6 +5769,7 @@
       const [actions, setActions] = React.useState(editing?.actions || []);
       const [amountRefund, setAmountRefund] = React.useState(editing?.amountRefund || '');
       const [amountCredit, setAmountCredit] = React.useState(editing?.amountCredit || '');
+      const [amountRebill, setAmountRebill] = React.useState(editing?.amountRebill || ''); // V11.80
       const [remark, setRemark] = React.useState(editing?.remark || '');
       const [retourQty, setRetourQty] = React.useState(editing?.retourQty ? String(editing.retourQty) : '1');
       const [retourDlc, setRetourDlc] = React.useState(editing?.retourDlc || '');
@@ -5781,15 +5786,20 @@
       React.useEffect(() => { if (!coDay && coAll.list.length) { const days = [...new Set(coAll.list.map(x => x.day))]; if (days.length === 1) setCoDay(days[0]); } }, [coAll.list]);
       const coLines = React.useMemo(() => {
         const out = [];
-        coAll.list.filter(x => x.day === coDay).forEach(({ order }) => (order.items || []).forEach((it, idx) => out.push({ key: order.orderId + '__' + (it.id || idx), it, order })));
-        return out.sort((a, b) => String(a.it.produit).localeCompare(String(b.it.produit), 'fr'));
-      }, [coAll.list, coDay]);
+        coAll.list.filter(x => x.day === coDay).forEach(({ order }) => {
+          (order.items || []).forEach((it, idx) => out.push({ key: order.orderId + '__' + (it.id || idx), it, order }));
+          // V11.80 — produits RETIRÉS (rupture à la prépa) : seulement pour « Retiré mais présent »
+          if (anomalyTypes.includes('retire_present')) (order.removed || []).forEach((it, idx) => out.push({ key: order.orderId + '__rm_' + (it.id || idx), it, order, removed: true }));
+        });
+        return out.sort((a, b) => ((b.removed ? 1 : 0) - (a.removed ? 1 : 0)) || String(a.it.produit).localeCompare(String(b.it.produit), 'fr'));
+      }, [coAll.list, coDay, anomalyTypes.includes('retire_present')]);
       const isRetourPdp = anomalyTypes.includes('retour_pdp');
       const isInversion = anomalyTypes.includes('erreur_produit'); // V10.47 — le produit mis à la place part en Retour PDP
       const isDlcCourte = anomalyTypes.includes('dlc_courte');
       const isDlcDepassee = anomalyTypes.includes('dlc');
       const isEnTrop = anomalyTypes.includes('en_trop');
       const isOubli = anomalyTypes.includes('oubli_casier');
+      const isRetirePresent = anomalyTypes.includes('retire_present'); // V11.80 — noté en rupture à la prépa mais le client l'a eu
       const isWhole = isOubli && wholeCas;
       // V11.06 — client choisi → le produit se choisit dans SA commande (sauf « en trop » : pas commandé, et inversion : produit reçu à côté)
       const orderMode = !editing && !!clientName && !!(selectedKey || clientEmail) && !isEnTrop && !isWhole && (coAll.loading || coAll.list.length > 0);
@@ -5827,6 +5837,9 @@
       const autoTxt = autoCents > 0 ? (autoCents / 100).toFixed(2) : '';
       React.useEffect(() => { if (!touchR && actions.includes('remboursement')) setAmountRefund(autoTxt); }, [autoTxt, actions.includes('remboursement'), touchR]);
       React.useEffect(() => { if (!touchC && actions.includes('avoir')) setAmountCredit(autoTxt); }, [autoTxt, actions.includes('avoir'), touchC]);
+      const [touchB, setTouchB] = React.useState(!!(editing && editing.amountRebill));
+      React.useEffect(() => { if (!touchB && actions.includes('refacturer')) setAmountRebill(autoTxt); }, [autoTxt, actions.includes('refacturer'), touchB]);
+      React.useEffect(() => { if (isRetirePresent && !actions.includes('refacturer')) setActions(a => a.includes('refacturer') ? a : a.concat(['refacturer'])); }, [isRetirePresent]); // V11.80
       const toggle = (list, setList, id) => {
         if (list.includes(id)) setList(list.filter(x => x !== id));
         else setList([...list, id]);
@@ -5879,6 +5892,8 @@
             anomalyTypes, actions, wholeCasier: !!isWhole,
             amountRefund: L.amtR != null ? L.amtR : (parseFloat(amountRefund) || 0), // V11.79 — montant de CE produit
             amountCredit: L.amtC != null ? L.amtC : (parseFloat(amountCredit) || 0),
+            amountRebill: L.amtB != null ? L.amtB : (parseFloat(amountRebill) || 0), // V11.80 — à refacturer
+            rebillStatus: actions.includes('refacturer') ? ((editing && editing.rebillStatus) || 'a_faire') : '',
             retourQty: parseInt(retourQty, 10) || 1,
             retourDlc: needsDlc ? retourDlc : '',
             retourPerteSeche: !!isPerteSeche,
@@ -6029,8 +6044,8 @@
         if (list.length > 1) {
           const split = (tot) => { const T = Math.round((parseFloat(tot) || 0) * 100), W = list.reduce((a, L) => a + (L.cents || 0), 0); let rest = T;
             return list.map((L, i) => { const c = i === list.length - 1 ? rest : (W > 0 ? Math.round(T * (L.cents || 0) / W) : (i === 0 ? T : 0)); rest -= c; return c / 100; }); };
-          const r = split(amountRefund), c = split(amountCredit);
-          list.forEach((L, i) => { L.amtR = r[i]; L.amtC = c[i]; });
+          const r = split(amountRefund), c = split(amountCredit), b = split(amountRebill);
+          list.forEach((L, i) => { L.amtR = r[i]; L.amtC = c[i]; L.amtB = b[i]; });
         }
         setBusy(true);
         try {
@@ -6114,7 +6129,7 @@
                           <div key={l.key} style={{ borderRadius: 12, border: '2px solid ' + (c.on ? 'var(--accent-dark)' : 'var(--border)'), background: c.on ? 'var(--accent-soft)' : '#fff', padding: '8px 10px' }}>
                             <div onClick={() => upd(l.key, { on: !c.on, qty: c.qty || q })} style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', minHeight: 40 }}>
                               <span style={{ fontSize: 24 }}>{c.on ? '☑️' : '⬜'}</span>
-                              <span style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{l.it.produit}{q > 1 ? <span style={{ color: 'var(--danger)' }}> ×{q}</span> : ''}<div style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-mute)' }}>{l.it.producteur || ''}</div></span>
+                              <span style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{l.removed ? <span style={{ display: 'inline-block', background: '#e65100', color: '#fff', borderRadius: 6, padding: '0 6px', fontSize: 12, marginRight: 6 }}>retiré en prépa</span> : null}{l.it.produit}{q > 1 ? <span style={{ color: 'var(--danger)' }}> ×{q}</span> : ''}<div style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-mute)' }}>{l.it.producteur || ''}</div></span>
                             </div>
                             {c.on && (q > 1 || needsDlc) && (
                               <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 6 }}>
@@ -6210,6 +6225,14 @@
                 <label>Montant de l'avoir (€)</label>
                 <input type="number" step="0.01" min="0" value={amountCredit} onChange={e => { setTouchC(true); setAmountCredit(e.target.value); }} placeholder="0.00" />
                 <KbAnAutoHint auto={autoTxt} val={amountCredit} touched={touchC} reset={() => { setTouchC(false); setAmountCredit(autoTxt); }} />
+              </div>
+            )}
+            {actions.includes('refacturer') && (
+              <div className="field">
+                <label>Montant à refacturer au client (€)</label>
+                <input type="number" step="0.01" min="0" value={amountRebill} onChange={e => { setTouchB(true); setAmountRebill(e.target.value); }} placeholder="0.00" />
+                <KbAnAutoHint auto={autoTxt} val={amountRebill} touched={touchB} reset={() => { setTouchB(false); setAmountRebill(autoTxt); }} />
+                {isRetirePresent && <div style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4 }}>Coche le produit marqué « retiré en prépa » que le client a quand même eu. Il apparaît dans Master › SAV › 💶 À refacturer jusqu'à ce que tu le marques refacturé.</div>}
               </div>
             )}
             <div className="field">
@@ -8537,10 +8560,11 @@
                           return <span key={t} className="badge badge-info">{def?.label || t}</span>;
                         })}
                       </div>
-                      {(a.amountRefund > 0 || a.amountCredit > 0) && (
+                      {(a.amountRefund > 0 || a.amountCredit > 0 || a.amountRebill > 0) && (
                         <div style={{marginTop:6,fontSize:13,color:'var(--ink-soft)'}}>
                           {a.amountRefund > 0 && <>Remb. {a.amountRefund.toFixed(2)}€ </>}
-                          {a.amountCredit > 0 && <>· Avoir {a.amountCredit.toFixed(2)}€</>}
+                          {a.amountCredit > 0 && <>· Avoir {a.amountCredit.toFixed(2)}€ </>}
+                          {a.amountRebill > 0 && <b style={{ color: '#e65100' }}>· À refacturer {a.amountRebill.toFixed(2)}€{a.rebillStatus === 'fait' ? ' ✓ fait' : ''}</b>}
                         </div>
                       )}
                       {a.remark && <div style={{marginTop:6,fontSize:13,fontStyle:'italic',color:'var(--ink-soft)'}}>« {a.remark} »</div>}
@@ -12410,6 +12434,52 @@
       );
     }
 
+    // V11.80 — Master › SAV : 💶 À refacturer (« Retiré mais présent » : noté en rupture à la prépa mais le client l'a eu)
+    //   Lit les anomalies des 35 derniers jours ; « ✅ Refacturé » note qui / quand sur l'anomalie.
+    function KbRebillCard({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [rows, setRows] = React.useState(null);
+      const [showDone, setShowDone] = React.useState(false);
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => { let stop = false;
+        (async () => { const t = todayKey(), out = [];
+          for (let i = 0; i <= 35; i += 7) {
+            const part = await Promise.all(Array.from({ length: 7 }, (_, k) => addDays(t, -(i + k))).map(d => storage.getAll(`day_${d}_anomalies`).then(a => (a || []).map(x => ({ ...x, _day: d }))).catch(() => [])));
+            part.forEach(a => a.forEach(x => { if ((x.actions || []).includes('refacturer') || (x.anomalyTypes || []).includes('retire_present')) out.push(x); }));
+          }
+          if (!stop) setRows(out.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))));
+        })();
+        return () => { stop = true; }; }, [tick]);
+      if (!rows || !rows.length) return null;
+      const todo = rows.filter(r => r.rebillStatus !== 'fait'), done = rows.filter(r => r.rebillStatus === 'fait');
+      const tot = todo.reduce((t, r) => t + (Number(r.amountRebill) || 0), 0);
+      const mark = async (r, v) => {
+        try { await storage.setDoc(`day_${r._day}_anomalies`, r.id, { rebillStatus: v ? 'fait' : 'a_faire', rebilledBy: v ? (session.name || '') : '', rebilledAt: v ? new Date().toISOString() : '' });
+          showToast(v ? '✅ Noté refacturé' : '↩️ Remis à refacturer'); setTick(x => x + 1); } catch (e) { showToast('Erreur : ' + e.message); }
+      };
+      const line = r => (
+        <div key={r._day + r.id} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '8px 0', borderTop: '1px solid var(--line)' }}>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <b>{r.clientName || '—'}</b> <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>· {r.site} · distrib {formatDateShort(r.fromOrderDay || r.distribDate || r._day)}</span>
+            <span style={{ display: 'block', fontSize: 14 }}>{r.productLabel || '—'}{r.retourQty > 1 ? ' ×' + r.retourQty : ''} · <b style={{ color: '#e65100' }}>{(Number(r.amountRebill) || 0).toFixed(2).replace('.', ',')} €</b>{r.clientEmail ? <span style={{ color: 'var(--ink-mute)' }}> · {r.clientEmail}</span> : null}</span>
+            {r.rebillStatus === 'fait' && <span style={{ display: 'block', fontSize: 12, color: 'var(--accent-dark)' }}>✓ refacturé{r.rebilledBy ? ' par ' + r.rebilledBy : ''}{r.rebilledAt ? ' le ' + formatDateShort(r.rebilledAt.slice(0, 10)) : ''}</span>}
+          </span>
+          {r.rebillStatus === 'fait' ? <button className="btn-ghost" onClick={() => mark(r, false)} style={{ fontSize: 13 }}>Annuler</button>
+            : <button className="btn-primary" onClick={() => mark(r, true)} style={{ fontSize: 14, whiteSpace: 'nowrap' }}>✅ Refacturé</button>}
+        </div>);
+      return (
+        <div className="card" style={{ border: '2px solid #e65100' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <h3 style={{ margin: 0, flex: 1, fontSize: 17 }}>💶 À refacturer · {todo.length}{tot ? ' · ' + tot.toFixed(2).replace('.', ',') + ' €' : ''}</h3>
+            {done.length > 0 && <button className="btn-ghost" onClick={() => setShowDone(v => !v)} style={{ fontSize: 13 }}>{showDone ? 'Masquer' : 'Voir'} les refacturés ({done.length})</button>}
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--ink-soft)', margin: '2px 0 4px' }}>Produits notés en rupture à la prépa mais que le client a eus (35 derniers jours).</div>
+          {todo.length ? todo.map(line) : <div style={{ fontSize: 14, color: 'var(--accent-dark)', padding: '6px 0' }}>✓ Rien à refacturer.</div>}
+          {showDone && done.map(line)}
+        </div>
+      );
+    }
+
     function MasterRecapPage({ session, consumersByEmail, catalogue, products }) {
       const showToast = React.useContext(ToastContext);
       const [savQ, setSavQ] = React.useState(false); // V11.41
@@ -12668,6 +12738,7 @@
             extra={() => storage.setDoc('followups', nrPick.id || nrPick.orderId, { pdpDecision: 'retour', decidedBy: session.name, decidedAt: new Date().toISOString() })} />}
           {nrOpen && <KbNrOrderSheet key={nrOpen.id || nrOpen.orderId} f={followups.find(x => (x.id || x.orderId) === (nrOpen.id || nrOpen.orderId)) || nrOpen} session={session} catalogue={catalogue} onClose={() => setNrOpen(null)} />}
           {savQ && <KbSavQualite session={session} consumersByEmail={consumersByEmail} products={products} onClose={() => setSavQ(false)} />}
+          <KbRebillCard session={session} />
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <h1 style={{ margin: 0 }}>📋 Récap master — tous locaux</h1>
             <button className="btn-primary" onClick={() => setSavQ(true)} style={{ fontSize: 17, fontWeight: 800, padding: '12px 18px', borderRadius: 12, background: '#c62828', borderColor: '#c62828' }}>📧 Qualité SAV</button>

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.79) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.80) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -731,7 +731,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.79';
+const APP_VERSION = 'V11.80';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -1290,6 +1290,10 @@ const ANOMALIES = [{
   id: "retour_pdp",
   label: "↩️ Retour PDP (produit non attribué)",
   color: "warn"
+}, {
+  id: "retire_present",
+  label: "Retiré mais présent (à refacturer)",
+  color: "warn"
 }];
 const ACTIONS = [{
   id: "remise",
@@ -1303,6 +1307,9 @@ const ACTIONS = [{
 }, {
   id: "avoir",
   label: "Avoir"
+}, {
+  id: "refacturer",
+  label: "À refacturer"
 }];
 const PREP_REASONS = [{
   id: "fin_saison",
@@ -7556,6 +7563,7 @@ function AnomalyForm({
   const [actions, setActions] = React.useState(editing?.actions || []);
   const [amountRefund, setAmountRefund] = React.useState(editing?.amountRefund || '');
   const [amountCredit, setAmountCredit] = React.useState(editing?.amountCredit || '');
+  const [amountRebill, setAmountRebill] = React.useState(editing?.amountRebill || '');
   const [remark, setRemark] = React.useState(editing?.remark || '');
   const [retourQty, setRetourQty] = React.useState(editing?.retourQty ? String(editing.retourQty) : '1');
   const [retourDlc, setRetourDlc] = React.useState(editing?.retourDlc || '');
@@ -7581,19 +7589,28 @@ function AnomalyForm({
     const out = [];
     coAll.list.filter(x => x.day === coDay).forEach(({
       order
-    }) => (order.items || []).forEach((it, idx) => out.push({
-      key: order.orderId + '__' + (it.id || idx),
-      it,
-      order
-    })));
-    return out.sort((a, b) => String(a.it.produit).localeCompare(String(b.it.produit), 'fr'));
-  }, [coAll.list, coDay]);
+    }) => {
+      (order.items || []).forEach((it, idx) => out.push({
+        key: order.orderId + '__' + (it.id || idx),
+        it,
+        order
+      }));
+      if (anomalyTypes.includes('retire_present')) (order.removed || []).forEach((it, idx) => out.push({
+        key: order.orderId + '__rm_' + (it.id || idx),
+        it,
+        order,
+        removed: true
+      }));
+    });
+    return out.sort((a, b) => (b.removed ? 1 : 0) - (a.removed ? 1 : 0) || String(a.it.produit).localeCompare(String(b.it.produit), 'fr'));
+  }, [coAll.list, coDay, anomalyTypes.includes('retire_present')]);
   const isRetourPdp = anomalyTypes.includes('retour_pdp');
   const isInversion = anomalyTypes.includes('erreur_produit');
   const isDlcCourte = anomalyTypes.includes('dlc_courte');
   const isDlcDepassee = anomalyTypes.includes('dlc');
   const isEnTrop = anomalyTypes.includes('en_trop');
   const isOubli = anomalyTypes.includes('oubli_casier');
+  const isRetirePresent = anomalyTypes.includes('retire_present');
   const isWhole = isOubli && wholeCas;
   const orderMode = !editing && !!clientName && !!(selectedKey || clientEmail) && !isEnTrop && !isWhole && (coAll.loading || coAll.list.length > 0);
   const needsDlc = !sav && (isRetourPdp || isDlcCourte || isDlcDepassee || isEnTrop || isInversion);
@@ -7632,6 +7649,13 @@ function AnomalyForm({
   React.useEffect(() => {
     if (!touchC && actions.includes('avoir')) setAmountCredit(autoTxt);
   }, [autoTxt, actions.includes('avoir'), touchC]);
+  const [touchB, setTouchB] = React.useState(!!(editing && editing.amountRebill));
+  React.useEffect(() => {
+    if (!touchB && actions.includes('refacturer')) setAmountRebill(autoTxt);
+  }, [autoTxt, actions.includes('refacturer'), touchB]);
+  React.useEffect(() => {
+    if (isRetirePresent && !actions.includes('refacturer')) setActions(a => a.includes('refacturer') ? a : a.concat(['refacturer']));
+  }, [isRetirePresent]);
   const toggle = (list, setList, id) => {
     if (list.includes(id)) setList(list.filter(x => x !== id));else setList([...list, id]);
   };
@@ -7715,6 +7739,8 @@ function AnomalyForm({
       wholeCasier: !!isWhole,
       amountRefund: L.amtR != null ? L.amtR : parseFloat(amountRefund) || 0,
       amountCredit: L.amtC != null ? L.amtC : parseFloat(amountCredit) || 0,
+      amountRebill: L.amtB != null ? L.amtB : parseFloat(amountRebill) || 0,
+      rebillStatus: actions.includes('refacturer') ? editing && editing.rebillStatus || 'a_faire' : '',
       retourQty: parseInt(retourQty, 10) || 1,
       retourDlc: needsDlc ? retourDlc : '',
       retourPerteSeche: !!isPerteSeche,
@@ -7944,10 +7970,12 @@ function AnomalyForm({
         });
       };
       const r = split(amountRefund),
-        c = split(amountCredit);
+        c = split(amountCredit),
+        b = split(amountRebill);
       list.forEach((L, i) => {
         L.amtR = r[i];
         L.amtC = c[i];
+        L.amtB = b[i];
       });
     }
     setBusy(true);
@@ -8170,7 +8198,17 @@ function AnomalyForm({
           fontSize: 16,
           fontWeight: 700
         }
-      }, l.it.produit, q > 1 ? React.createElement("span", {
+      }, l.removed ? React.createElement("span", {
+        style: {
+          display: 'inline-block',
+          background: '#e65100',
+          color: '#fff',
+          borderRadius: 6,
+          padding: '0 6px',
+          fontSize: 12,
+          marginRight: 6
+        }
+      }, "retir\xE9 en pr\xE9pa") : null, l.it.produit, q > 1 ? React.createElement("span", {
         style: {
           color: 'var(--danger)'
         }
@@ -8404,7 +8442,33 @@ function AnomalyForm({
       setTouchC(false);
       setAmountCredit(autoTxt);
     }
-  })), React.createElement("div", {
+  })), actions.includes('refacturer') && React.createElement("div", {
+    className: "field"
+  }, React.createElement("label", null, "Montant \xE0 refacturer au client (\u20AC)"), React.createElement("input", {
+    type: "number",
+    step: "0.01",
+    min: "0",
+    value: amountRebill,
+    onChange: e => {
+      setTouchB(true);
+      setAmountRebill(e.target.value);
+    },
+    placeholder: "0.00"
+  }), React.createElement(KbAnAutoHint, {
+    auto: autoTxt,
+    val: amountRebill,
+    touched: touchB,
+    reset: () => {
+      setTouchB(false);
+      setAmountRebill(autoTxt);
+    }
+  }), isRetirePresent && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-soft)',
+      marginTop: 4
+    }
+  }, "Coche le produit marqu\xE9 \xAB retir\xE9 en pr\xE9pa \xBB que le client a quand m\xEAme eu. Il appara\xEEt dans Master \u203A SAV \u203A \uD83D\uDCB6 \xC0 refacturer jusqu'\xE0 ce que tu le marques refactur\xE9.")), React.createElement("div", {
     className: "field"
   }, React.createElement("label", null, "Remarque"), React.createElement("textarea", {
     rows: 3,
@@ -12653,13 +12717,17 @@ function QualityPage({
       key: t,
       className: "badge badge-info"
     }, def?.label || t);
-  })), (a.amountRefund > 0 || a.amountCredit > 0) && React.createElement("div", {
+  })), (a.amountRefund > 0 || a.amountCredit > 0 || a.amountRebill > 0) && React.createElement("div", {
     style: {
       marginTop: 6,
       fontSize: 13,
       color: 'var(--ink-soft)'
     }
-  }, a.amountRefund > 0 && React.createElement(React.Fragment, null, "Remb. ", a.amountRefund.toFixed(2), "\u20AC "), a.amountCredit > 0 && React.createElement(React.Fragment, null, "\xB7 Avoir ", a.amountCredit.toFixed(2), "\u20AC")), a.remark && React.createElement("div", {
+  }, a.amountRefund > 0 && React.createElement(React.Fragment, null, "Remb. ", a.amountRefund.toFixed(2), "\u20AC "), a.amountCredit > 0 && React.createElement(React.Fragment, null, "\xB7 Avoir ", a.amountCredit.toFixed(2), "\u20AC "), a.amountRebill > 0 && React.createElement("b", {
+    style: {
+      color: '#e65100'
+    }
+  }, "\xB7 \xC0 refacturer ", a.amountRebill.toFixed(2), "\u20AC", a.rebillStatus === 'fait' ? ' ✓ fait' : '')), a.remark && React.createElement("div", {
     style: {
       marginTop: 6,
       fontSize: 13,
@@ -20591,6 +20659,142 @@ function KbSavQualite({
     }
   }, siteLabel(c))))))));
 }
+function KbRebillCard({
+  session
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [rows, setRows] = React.useState(null);
+  const [showDone, setShowDone] = React.useState(false);
+  const [tick, setTick] = React.useState(0);
+  React.useEffect(() => {
+    let stop = false;
+    (async () => {
+      const t = todayKey(),
+        out = [];
+      for (let i = 0; i <= 35; i += 7) {
+        const part = await Promise.all(Array.from({
+          length: 7
+        }, (_, k) => addDays(t, -(i + k))).map(d => storage.getAll(`day_${d}_anomalies`).then(a => (a || []).map(x => ({
+          ...x,
+          _day: d
+        }))).catch(() => [])));
+        part.forEach(a => a.forEach(x => {
+          if ((x.actions || []).includes('refacturer') || (x.anomalyTypes || []).includes('retire_present')) out.push(x);
+        }));
+      }
+      if (!stop) setRows(out.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))));
+    })();
+    return () => {
+      stop = true;
+    };
+  }, [tick]);
+  if (!rows || !rows.length) return null;
+  const todo = rows.filter(r => r.rebillStatus !== 'fait'),
+    done = rows.filter(r => r.rebillStatus === 'fait');
+  const tot = todo.reduce((t, r) => t + (Number(r.amountRebill) || 0), 0);
+  const mark = async (r, v) => {
+    try {
+      await storage.setDoc(`day_${r._day}_anomalies`, r.id, {
+        rebillStatus: v ? 'fait' : 'a_faire',
+        rebilledBy: v ? session.name || '' : '',
+        rebilledAt: v ? new Date().toISOString() : ''
+      });
+      showToast(v ? '✅ Noté refacturé' : '↩️ Remis à refacturer');
+      setTick(x => x + 1);
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    }
+  };
+  const line = r => React.createElement("div", {
+    key: r._day + r.id,
+    style: {
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      padding: '8px 0',
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("span", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, React.createElement("b", null, r.clientName || '—'), " ", React.createElement("span", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)'
+    }
+  }, "\xB7 ", r.site, " \xB7 distrib ", formatDateShort(r.fromOrderDay || r.distribDate || r._day)), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 14
+    }
+  }, r.productLabel || '—', r.retourQty > 1 ? ' ×' + r.retourQty : '', " \xB7 ", React.createElement("b", {
+    style: {
+      color: '#e65100'
+    }
+  }, (Number(r.amountRebill) || 0).toFixed(2).replace('.', ','), " \u20AC"), r.clientEmail ? React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, " \xB7 ", r.clientEmail) : null), r.rebillStatus === 'fait' && React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 12,
+      color: 'var(--accent-dark)'
+    }
+  }, "\u2713 refactur\xE9", r.rebilledBy ? ' par ' + r.rebilledBy : '', r.rebilledAt ? ' le ' + formatDateShort(r.rebilledAt.slice(0, 10)) : '')), r.rebillStatus === 'fait' ? React.createElement("button", {
+    className: "btn-ghost",
+    onClick: () => mark(r, false),
+    style: {
+      fontSize: 13
+    }
+  }, "Annuler") : React.createElement("button", {
+    className: "btn-primary",
+    onClick: () => mark(r, true),
+    style: {
+      fontSize: 14,
+      whiteSpace: 'nowrap'
+    }
+  }, "\u2705 Refactur\xE9"));
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      border: '2px solid #e65100'
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("h3", {
+    style: {
+      margin: 0,
+      flex: 1,
+      fontSize: 17
+    }
+  }, "\uD83D\uDCB6 \xC0 refacturer \xB7 ", todo.length, tot ? ' · ' + tot.toFixed(2).replace('.', ',') + ' €' : ''), done.length > 0 && React.createElement("button", {
+    className: "btn-ghost",
+    onClick: () => setShowDone(v => !v),
+    style: {
+      fontSize: 13
+    }
+  }, showDone ? 'Masquer' : 'Voir', " les refactur\xE9s (", done.length, ")")), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      margin: '2px 0 4px'
+    }
+  }, "Produits not\xE9s en rupture \xE0 la pr\xE9pa mais que le client a eus (35 derniers jours)."), todo.length ? todo.map(line) : React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--accent-dark)',
+      padding: '6px 0'
+    }
+  }, "\u2713 Rien \xE0 refacturer."), showDone && done.map(line));
+}
 function MasterRecapPage({
   session,
   consumersByEmail,
@@ -21042,6 +21246,8 @@ function MasterRecapPage({
     consumersByEmail: consumersByEmail,
     products: products,
     onClose: () => setSavQ(false)
+  }), React.createElement(KbRebillCard, {
+    session: session
   }), React.createElement("div", {
     style: {
       display: 'flex',
