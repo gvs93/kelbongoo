@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.91) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.92) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.91';
+const APP_VERSION = 'V11.92';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -39880,23 +39880,37 @@ const kbQrHm = t => t ? new Date(t).toLocaleTimeString('fr-FR', {
   hour: '2-digit',
   minute: '2-digit'
 }) : '';
-function PrintQrPage({
-  session,
-  setTab
-}) {
-  const showToast = React.useContext(ToastContext);
+const KB_QR_CAL_BACK = 2,
+  KB_QR_CAL_FWD = 6;
+const kbQrCalDays = () => {
+  const t = todayKey(),
+    o = [];
+  for (let i = -KB_QR_CAL_BACK; i <= KB_QR_CAL_FWD; i++) o.push(addDays(t, i));
+  return o;
+};
+function kbQrDayUnits(lines, Pmap) {
+  const o = [];
+  lines.forEach(l => l.units.forEach((u, i) => {
+    const k = i + 1;
+    const st = kbQrUnitState(Pmap, l, k);
+    o.push({
+      l,
+      k,
+      u,
+      key: l.id + '|' + k,
+      st,
+      todo: !st.stuck || st.changed
+    });
+  }));
+  return o;
+}
+function useKbQrBoard() {
   const enl = useKbEnlevements();
   const P = useKbQrPrinted();
   const [runs, setRuns] = React.useState([]);
   const [picks, setPicks] = React.useState([]);
   React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
   React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
-  const today = todayKey();
-  const [day, setDay] = React.useState(today);
-  const [sel, setSel] = React.useState({});
-  const [busy, setBusy] = React.useState(false);
-  const [ask, setAsk] = React.useState(null);
-  const who = String(session && session.name || 'Équipe').slice(0, 60);
   const pk = React.useMemo(() => {
     const m = {};
     (picks || []).forEach(p => {
@@ -39904,45 +39918,81 @@ function PrintQrPage({
     });
     return m;
   }, [picks]);
-  const lines = React.useMemo(() => kbQrAllLines(enl.list, runs, day).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')).sort((a, b) => kbQrIsKbg(b) - kbQrIsKbg(a) || a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat)), [enl.list, runs, day, pk]);
-  const units = React.useMemo(() => {
-    const o = [];
-    lines.forEach(l => l.units.forEach((u, i) => {
-      const k = i + 1;
-      o.push({
-        l,
-        k,
-        u,
-        key: l.id + '|' + k,
-        st: kbQrUnitState(P.map, l, k)
-      });
-    }));
+  const byDay = React.useMemo(() => {
+    const o = {};
+    kbQrCalDays().forEach(d => {
+      const lines = kbQrAllLines(enl.list, runs, d).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden')).sort((a, b) => kbQrIsKbg(b) - kbQrIsKbg(a) || a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat));
+      const units = kbQrDayUnits(lines, P.map);
+      o[d] = {
+        lines,
+        units,
+        todo: units.filter(x => x.todo).length,
+        done: units.filter(x => !x.todo).length
+      };
+    });
     return o;
-  }, [lines, P.map]);
-  const isOn = x => sel[x.key] !== undefined ? sel[x.key] : !x.st.stuck || x.st.changed;
-  const chosen = units.filter(isOn);
-  const nTodo = units.filter(x => !x.st.stuck || x.st.changed).length;
-  const nDone = units.length - nTodo;
-  const days = [addDays(today, -1), today, addDays(today, 1)];
-  const dayLbl = d => d === today ? "Aujourd'hui" : d < today ? 'Hier' : 'Demain';
+  }, [enl.list, runs, pk, P.map]);
+  const ready = enl.raw !== undefined && P.raw !== undefined;
+  return {
+    enl,
+    P,
+    pk,
+    byDay,
+    ready
+  };
+}
+const KB_QR_DOW = ['dim.', 'lun.', 'mar.', 'mer.', 'jeu.', 'ven.', 'sam.'];
+const kbQrDayName = d => {
+  const t = todayKey();
+  return d === t ? "Aujourd'hui" : d === addDays(t, 1) ? 'Demain' : d === addDays(t, -1) ? 'Hier' : KB_QR_DOW[new Date(d + 'T12:00:00').getDay()];
+};
+function PrintQrPage({
+  session,
+  setTab
+}) {
+  const showToast = React.useContext(ToastContext);
+  const B0 = useKbQrBoard();
+  const {
+    enl,
+    P,
+    pk,
+    byDay
+  } = B0;
+  const today = todayKey();
+  const cal = kbQrCalDays();
+  const [day, setDay] = React.useState(null);
+  const autoDay = cal.find(d => d >= addDays(today, -1) && byDay[d] && byDay[d].todo) || cal.find(d => d < today && byDay[d] && byDay[d].todo) || today;
+  const cur = day || autoDay;
+  const D = byDay[cur] || {
+    lines: [],
+    units: [],
+    todo: 0,
+    done: 0
+  };
+  const [busy, setBusy] = React.useState(false);
+  const [ask, setAsk] = React.useState(null);
+  const [pickMode, setPickMode] = React.useState(null);
+  const who = String(session && session.name || 'Équipe').slice(0, 60);
   const mark = async (list, stuck, printedOnly) => {
     if (!list.length) return;
     const up = {},
       now = Date.now();
     list.forEach(x => {
+      const st = kbQrUnitState(P.map, x.l, x.k);
       up[x.l.id + '/at'] = now;
       up[x.l.id + '/n'] = x.l.units.length;
       if (printedOnly) up[x.l.id + '/u/' + x.k + '/p'] = now;else up[x.l.id + '/u/' + x.k] = stuck ? {
         ok: now,
         by: who,
-        p: x.st.printedAt || now
-      } : x.st.printedAt ? {
-        p: x.st.printedAt
+        p: st.printedAt || now
+      } : st.printedAt ? {
+        p: st.printedAt
       } : null;
     });
     P.set(m => {
       const c = JSON.parse(JSON.stringify(m));
       list.forEach(x => {
+        const st = kbQrUnitState(m, x.l, x.k);
         const r = c[x.l.id] = c[x.l.id] || {};
         r.at = now;
         r.n = x.l.units.length;
@@ -39953,19 +40003,10 @@ function PrintQrPage({
         };else r.u[x.k] = stuck ? {
           ok: now,
           by: who,
-          p: x.st.printedAt || now
-        } : x.st.printedAt ? {
-          p: x.st.printedAt
+          p: st.printedAt || now
+        } : st.printedAt ? {
+          p: st.printedAt
         } : null;
-      });
-      return c;
-    });
-    setSel(s => {
-      const c = {
-        ...s
-      };
-      list.forEach(x => {
-        delete c[x.key];
       });
       return c;
     });
@@ -39976,9 +40017,9 @@ function PrintQrPage({
     }
     P.reload();
   };
-  const print = async () => {
-    const todo = chosen.slice();
+  const print = async todo => {
     if (!todo.length) return;
+    setDay(cur);
     const w = window.open('', '_blank');
     if (!w) {
       showToast('Autorise les fenêtres pop-up pour imprimer');
@@ -40002,7 +40043,7 @@ function PrintQrPage({
       });
       const css = '@page{size:A4 portrait;margin:8mm}*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;color:#111}' + '.lb{height:136mm;border:2.4mm solid #111;border-radius:5mm;overflow:hidden;display:flex;flex-direction:column;margin-bottom:6mm;page-break-inside:avoid;break-inside:avoid}' + '.lb:nth-child(2n){page-break-after:always;break-after:page;margin-bottom:0}' + '.brand,.top,.cat{-webkit-print-color-adjust:exact;print-color-adjust:exact}' + '.brand{color:#fff;display:flex;align-items:center;gap:4mm;padding:2mm 4mm;height:17mm}.logo{height:13mm;width:13mm;border-radius:2mm;background:#fff;object-fit:contain}.bic{font-size:10mm}' + '.bn{font-size:9mm;font-weight:900;letter-spacing:.4mm}.bw{font-size:4.5mm;font-weight:700;opacity:.9}' + '.badge{margin-left:auto;background:#fff;border-radius:3mm;padding:1mm 4mm;font-size:10mm;font-weight:900;line-height:1}' + '.top{color:#fff;display:flex;align-items:baseline;gap:5mm;padding:2mm 6mm}' + '.to{font-size:4.5mm;font-weight:700}.code{font-size:14mm;font-weight:900;line-height:1}.nm{font-size:6.5mm;font-weight:700}' + '.mid{flex:1;display:flex;align-items:center;gap:6mm;padding:3mm 6mm}.qr{flex:0 0 82mm;height:82mm}.qr svg{width:82mm;height:82mm;display:block}' + '.info{flex:1;min-width:0}.cat{display:inline-block;color:#fff;border-radius:2.5mm;padding:1mm 3mm;font-size:7.5mm;font-weight:900}' + '.unit{font-size:10mm;font-weight:700;margin-top:2mm}.unit b{font-size:13mm}' + '.det{font-size:4.4mm;margin-top:1.5mm;color:#333}.day{font-size:5mm;font-weight:700;margin-top:2.5mm}' + '.foot{font-size:3.6mm;color:#555;text-align:center;padding:0 4mm 2mm}';
       w.document.open();
-      w.document.write('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>QR Rungis ' + kbQrEsc(formatDateShort(day)) + '</title><style>' + css + '</style></head><body>' + labels.join('') + '</body></html>');
+      w.document.write('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>QR Rungis ' + kbQrEsc(formatDateShort(cur)) + '</title><style>' + css + '</style></head><body>' + labels.join('') + '</body></html>');
       w.document.close();
       setTimeout(() => {
         try {
@@ -40021,7 +40062,130 @@ function PrintQrPage({
       setBusy(false);
     }
   };
-  const groups = [['kbg', lines.filter(kbQrIsKbg)], ['pdp', lines.filter(l => !kbQrIsKbg(l))]];
+  const allStuck = list => mark(list, true).then(() => kbCelebrate({
+    title: list.length + ' étiquette' + (list.length > 1 ? 's' : '') + ' collée' + (list.length > 1 ? 's' : ''),
+    sub: 'Le chauffeur n\'a plus qu\'à scanner'
+  }));
+  const todoList = D.units.filter(x => x.todo);
+  const groups = [['kbg', D.lines.filter(kbQrIsKbg)], ['pdp', D.lines.filter(l => !kbQrIsKbg(l))]];
+  const bigBtn = bg => ({
+    width: '100%',
+    minHeight: 76,
+    borderRadius: 18,
+    border: 'none',
+    background: bg,
+    color: '#fff',
+    fontSize: 23,
+    fontWeight: 900,
+    cursor: 'pointer'
+  });
+  if (pickMode) {
+    const nOn = pickMode.list.filter(x => pickMode.on[x.key]).length;
+    return React.createElement("div", {
+      className: "stack"
+    }, React.createElement("h1", {
+      style: {
+        margin: 0
+      }
+    }, "\u270B Lesquelles sont coll\xE9es ?"), React.createElement("div", {
+      style: {
+        fontSize: 16,
+        color: 'var(--ink-soft)'
+      }
+    }, "Touche chaque \xE9tiquette ", React.createElement("b", null, "imprim\xE9e et coll\xE9e"), ". Les autres restent \xAB \xE0 imprimer \xBB pour la prochaine fois."), React.createElement("button", {
+      onClick: () => setPickMode(m => ({
+        ...m,
+        on: Object.fromEntries(m.list.map(x => [x.key, nOn < m.list.length]))
+      })),
+      className: "btn-secondary",
+      style: {
+        minHeight: 48,
+        fontSize: 16
+      }
+    }, nOn < pickMode.list.length ? '☑️ Tout toucher' : '⬜ Tout enlever'), pickMode.list.map(x => {
+      const on = !!pickMode.on[x.key];
+      const C = kbQrCatOf(x.l);
+      const B = KB_QR_BRAND[kbQrIsKbg(x.l) ? 'kbg' : 'pdp'];
+      return React.createElement("button", {
+        key: x.key,
+        onClick: () => setPickMode(m => ({
+          ...m,
+          on: {
+            ...m.on,
+            [x.key]: !on
+          }
+        })),
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          padding: '12px 14px',
+          borderRadius: 16,
+          cursor: 'pointer',
+          textAlign: 'left',
+          border: '3px solid ' + (on ? '#2e7d32' : 'var(--line)'),
+          background: on ? '#e8f5e9' : 'var(--bg-card)'
+        }
+      }, React.createElement("span", {
+        style: {
+          fontSize: 34,
+          width: 40,
+          textAlign: 'center'
+        }
+      }, on ? '✅' : '⬜'), React.createElement("span", {
+        style: {
+          background: B.col,
+          color: '#fff',
+          borderRadius: 8,
+          padding: '2px 8px',
+          fontWeight: 900,
+          fontSize: 15
+        }
+      }, B.badge), React.createElement("span", {
+        style: {
+          background: SITE_NAMES[x.l.site] ? kbSiteColor(x.l.site) : '#607d8b',
+          color: '#fff',
+          borderRadius: 8,
+          padding: '2px 8px',
+          fontWeight: 900,
+          fontSize: 17
+        }
+      }, x.l.site), React.createElement("span", {
+        style: {
+          flex: 1,
+          minWidth: 0
+        }
+      }, React.createElement("b", {
+        style: {
+          fontSize: 18
+        }
+      }, x.u, " ", x.k, "/", x.l.units.length), React.createElement("span", {
+        style: {
+          display: 'block',
+          fontSize: 13,
+          color: 'var(--ink-soft)'
+        }
+      }, C.ic, " ", C.t)));
+    }), React.createElement("button", {
+      disabled: !nOn,
+      onClick: () => {
+        const L = pickMode.list.filter(x => pickMode.on[x.key]);
+        setPickMode(null);
+        allStuck(L);
+      },
+      style: {
+        ...bigBtn(nOn ? '#2e7d32' : '#bdbdbd'),
+        cursor: nOn ? 'pointer' : 'default'
+      }
+    }, "\u2705 Valider : ", nOn, " coll\xE9e", nOn > 1 ? 's' : ''), React.createElement("button", {
+      onClick: () => setPickMode(null),
+      className: "btn-secondary",
+      style: {
+        minHeight: 52,
+        fontSize: 17
+      }
+    }, "Annuler"));
+  }
   return React.createElement("div", {
     className: "stack"
   }, React.createElement(KbBackToHub, {
@@ -40030,50 +40194,7 @@ function PrintQrPage({
     style: {
       margin: 0
     }
-  }, "\uD83D\uDD33 QR codes pour le chauffeur"), React.createElement("div", {
-    style: {
-      fontSize: 15,
-      color: 'var(--ink-soft)'
-    }
-  }, "Toutes les \xE9tiquettes : ", React.createElement("b", {
-    style: {
-      color: '#2e7d32'
-    }
-  }, "\uD83E\uDD6C Kelbongoo"), " (rolls, dollies des commandes) et ", React.createElement("b", null, "\uD83C\uDFED Centrale PDP"), " (dispatch, picking, \u26A1 fast delivery, dolly fromage). Une fois coll\xE9e, coche ", React.createElement("b", null, "\u2705 Imprim\xE9 et coll\xE9"), " : toute l'\xE9quipe le voit, pas de doublon."), React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 8
-    }
-  }, days.map(d => React.createElement("button", {
-    key: d,
-    onClick: () => {
-      setDay(d);
-      setSel({});
-    },
-    style: {
-      flex: 1,
-      minHeight: 56,
-      borderRadius: 14,
-      fontSize: 17,
-      fontWeight: 800,
-      cursor: 'pointer',
-      border: '3px solid #1565c0',
-      background: day === d ? '#1565c0' : '#fff',
-      color: day === d ? '#fff' : '#1565c0'
-    }
-  }, dayLbl(d), React.createElement("span", {
-    style: {
-      display: 'block',
-      fontSize: 13,
-      fontWeight: 600
-    }
-  }, formatDateShort(d))))), (enl.raw === undefined || P.raw === undefined) && React.createElement("div", {
-    className: "card",
-    style: {
-      padding: 16,
-      fontSize: 18
-    }
-  }, "Chargement\u2026"), enl.raw === null && React.createElement("div", {
+  }, "\uD83D\uDD33 QR codes pour le chauffeur"), enl.raw === null && React.createElement("div", {
     className: "card",
     style: {
       padding: 14,
@@ -40093,65 +40214,137 @@ function PrintQrPage({
   }, "\u26A0\uFE0F Impossible de lire les \xE9tiquettes d\xE9j\xE0 coll\xE9es \u2014 v\xE9rifie avant de r\xE9imprimer. ", React.createElement("button", {
     className: "btn-secondary",
     onClick: P.reload
-  }, "\u21BB")), units.length > 0 && React.createElement("div", {
+  }, "\u21BB")), React.createElement("div", {
     style: {
-      display: 'flex',
+      display: 'grid',
+      gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
       gap: 8
     }
-  }, React.createElement("div", {
+  }, cal.map(d => {
+    const x = byDay[d] || {
+      todo: 0,
+      done: 0
+    };
+    const sel = d === cur;
+    const past = d < today;
+    const tone = !B0.ready ? ['#f5f5f5', '#9e9e9e'] : x.todo ? ['#fff3e0', '#e65100'] : x.done ? ['#e8f5e9', '#2e7d32'] : ['#fafafa', '#bdbdbd'];
+    return React.createElement("button", {
+      key: d,
+      onClick: () => setDay(d),
+      style: {
+        minHeight: 104,
+        borderRadius: 18,
+        cursor: 'pointer',
+        padding: '8px 4px',
+        border: sel ? '5px solid #1565c0' : '2px solid ' + tone[1] + '66',
+        background: tone[0],
+        opacity: past && !x.todo && !sel ? .6 : 1,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 2
+      }
+    }, React.createElement("span", {
+      style: {
+        fontSize: 15,
+        fontWeight: 800,
+        color: d === today ? '#1565c0' : '#455a64'
+      }
+    }, kbQrDayName(d)), React.createElement("span", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700,
+        color: '#78909c'
+      }
+    }, formatDateShort(d)), !B0.ready ? React.createElement("span", {
+      style: {
+        fontSize: 20
+      }
+    }, "\u2026") : x.todo ? React.createElement("span", {
+      style: {
+        fontSize: 30,
+        fontWeight: 900,
+        color: '#e65100',
+        lineHeight: 1.1
+      }
+    }, "\uD83D\uDDA8\uFE0F ", x.todo) : x.done ? React.createElement("span", {
+      style: {
+        fontSize: 26,
+        fontWeight: 900,
+        color: '#2e7d32',
+        lineHeight: 1.1
+      }
+    }, "\u2705") : React.createElement("span", {
+      style: {
+        fontSize: 20,
+        color: '#bdbdbd'
+      }
+    }, "\u2014"), B0.ready && x.todo > 0 && React.createElement("span", {
+      style: {
+        fontSize: 12,
+        fontWeight: 800,
+        color: '#e65100'
+      }
+    }, "\xE0 imprimer"), B0.ready && !x.todo && x.done > 0 && React.createElement("span", {
+      style: {
+        fontSize: 12,
+        fontWeight: 800,
+        color: '#2e7d32'
+      }
+    }, "tout coll\xE9"));
+  })), React.createElement("div", {
     style: {
-      flex: 1,
-      borderRadius: 14,
-      padding: '10px 12px',
-      background: nTodo ? '#fff3e0' : '#e8f5e9',
-      border: '2px solid ' + (nTodo ? '#ef6c00' : '#2e7d32')
-    }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 30,
+      fontSize: 24,
       fontWeight: 900,
-      color: nTodo ? '#ef6c00' : '#2e7d32'
+      marginTop: 4
     }
-  }, nTodo), React.createElement("div", {
+  }, kbQrDayName(cur), " ", formatDateShort(cur)), !B0.ready && React.createElement("div", {
+    className: "card",
     style: {
-      fontSize: 14,
-      fontWeight: 700
+      padding: 16,
+      fontSize: 18
     }
-  }, "\xE0 imprimer / coller")), React.createElement("div", {
-    style: {
-      flex: 1,
-      borderRadius: 14,
-      padding: '10px 12px',
-      background: '#e8f5e9',
-      border: '2px solid #2e7d32'
-    }
-  }, React.createElement("div", {
-    style: {
-      fontSize: 30,
-      fontWeight: 900,
-      color: '#2e7d32'
-    }
-  }, nDone), React.createElement("div", {
-    style: {
-      fontSize: 14,
-      fontWeight: 700
-    }
-  }, "d\xE9j\xE0 coll\xE9e", nDone > 1 ? 's' : ''))), enl.raw !== undefined && !lines.length && React.createElement("div", {
+  }, "Chargement\u2026"), B0.ready && !D.units.length && React.createElement("div", {
     className: "card",
     style: {
       textAlign: 'center',
-      padding: '24px 14px',
+      padding: '22px 14px',
       fontSize: 20,
       fontWeight: 700,
       color: 'var(--ink-soft)'
     }
-  }, "Rien \xE0 \xE9tiqueter pour le ", formatDateShort(day), ".", React.createElement("div", {
+  }, "Rien \xE0 \xE9tiqueter ce jour-l\xE0.", React.createElement("div", {
     style: {
       fontSize: 14,
       fontWeight: 600,
       marginTop: 6
     }
-  }, "Les palettes apparaissent d\xE8s la demande d'enl\xE8vement dans la Centrale, les rolls Kelbongoo \xE0 la cl\xF4ture de la pr\xE9pa.")), groups.map(([g, L]) => {
+  }, "Les palettes apparaissent d\xE8s la demande d'enl\xE8vement dans la Centrale, les rolls Kelbongoo \xE0 la cl\xF4ture de la pr\xE9pa.")), B0.ready && D.todo > 0 && React.createElement("button", {
+    disabled: busy,
+    onClick: () => print(todoList),
+    style: bigBtn('#1565c0')
+  }, busy ? 'Préparation…' : `🖨️ Tout imprimer (${D.todo})`), B0.ready && !D.todo && D.done > 0 && React.createElement("div", {
+    style: {
+      borderRadius: 18,
+      padding: '16px 14px',
+      background: '#e8f5e9',
+      border: '3px solid #2e7d32',
+      textAlign: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 900,
+      color: '#2e7d32'
+    }
+  }, "\u2705 Tout est imprim\xE9 et coll\xE9"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: '#33691e',
+      marginTop: 4
+    }
+  }, D.done, " \xE9tiquette", D.done > 1 ? 's' : '', " \xB7 rien \xE0 refaire")), groups.map(([g, L]) => {
     if (!L.length) return null;
     const B = KB_QR_BRAND[g];
     const bySite = {};
@@ -40221,7 +40414,7 @@ function PrintQrPage({
     }, siteLabel(s) !== s ? siteLabel(s) : KB_ENL_STORE_LONG[s] || '')), bySite[s].map(l => {
       const C = kbQrCatOf(l);
       const drv = pk[l.id] && pk[l.id].status;
-      const U = units.filter(x => x.l === l);
+      const U = D.units.filter(x => x.l === l);
       return React.createElement("div", {
         key: l.id,
         style: {
@@ -40274,107 +40467,73 @@ function PrintQrPage({
       }, l.sub), React.createElement("div", {
         style: {
           display: 'flex',
-          flexDirection: 'column',
+          flexWrap: 'wrap',
           gap: 6,
           marginTop: 8
         }
       }, U.map(x => {
-        const on = isOn(x);
         const st = x.st;
-        return React.createElement("div", {
+        const ok = st.stuck && !st.changed;
+        return React.createElement("span", {
           key: x.key,
+          title: ok ? 'collée par ' + (st.by || '—') + ' à ' + kbQrHm(st.at) : st.changed ? 'nombre changé : à réimprimer' : st.printedAt ? 'imprimée à ' + kbQrHm(st.printedAt) + ', pas cochée collée' : 'à imprimer',
           style: {
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            borderRadius: 12,
-            padding: '6px 8px',
-            background: st.stuck && !st.changed ? '#e8f5e9' : st.changed ? '#fdecea' : 'var(--bg)',
-            border: '1px solid var(--line)'
-          }
-        }, React.createElement("label", {
-          style: {
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            flex: 1,
-            minWidth: 0,
-            cursor: 'pointer'
-          },
-          title: "Imprimer cette \xE9tiquette"
-        }, React.createElement("input", {
-          type: "checkbox",
-          checked: on,
-          onChange: () => setSel(m => ({
-            ...m,
-            [x.key]: !on
-          })),
-          style: {
-            width: 26,
-            height: 26,
-            flex: '0 0 auto'
-          }
-        }), React.createElement("span", {
-          style: {
-            fontSize: 16
-          }
-        }, "\uD83D\uDDA8\uFE0F ", React.createElement("b", null, x.u, " ", x.k, "/", l.units.length), st.changed && React.createElement("span", {
-          style: {
-            display: 'block',
-            fontSize: 12,
-            fontWeight: 700,
-            color: '#c62828'
-          }
-        }, "\u26A0\uFE0F le nombre a chang\xE9 (", P.map[l.id].n, " \u2192 ", l.units.length, ") : r\xE9imprimer"), st.stuck && !st.changed && React.createElement("span", {
-          style: {
-            display: 'block',
-            fontSize: 12,
-            color: '#2e7d32'
-          }
-        }, "coll\xE9e par ", st.by || '—', " \xE0 ", kbQrHm(st.at)), !st.stuck && st.printedAt > 0 && React.createElement("span", {
-          style: {
-            display: 'block',
-            fontSize: 12,
-            color: '#e65100'
-          }
-        }, "imprim\xE9e \xE0 ", kbQrHm(st.printedAt), ", pas encore coch\xE9e coll\xE9e"))), React.createElement("button", {
-          onClick: () => mark([x], !st.stuck),
-          style: {
-            flex: '0 0 auto',
-            minHeight: 48,
-            borderRadius: 12,
-            cursor: 'pointer',
-            fontSize: 14,
+            borderRadius: 10,
+            padding: '5px 10px',
+            fontSize: 15,
             fontWeight: 800,
-            padding: '0 10px',
-            border: '2px solid #2e7d32',
-            background: st.stuck ? '#2e7d32' : '#fff',
-            color: st.stuck ? '#fff' : '#2e7d32'
+            border: '2px solid ' + (ok ? '#2e7d32' : st.changed ? '#c62828' : '#ef6c00'),
+            background: ok ? '#e8f5e9' : st.changed ? '#fdecea' : '#fff3e0',
+            color: ok ? '#2e7d32' : st.changed ? '#c62828' : '#e65100'
           }
-        }, st.stuck ? '✅ Imprimé et collé' : '⬜ Imprimé et collé'));
+        }, ok ? '✅' : st.changed ? '⚠️' : '🖨️', " ", x.u, " ", x.k, "/", l.units.length, ok && React.createElement("span", {
+          style: {
+            fontSize: 11,
+            fontWeight: 600,
+            marginLeft: 4
+          }
+        }, (st.by || '').split(' ')[0], " ", kbQrHm(st.at)), st.changed && React.createElement("span", {
+          style: {
+            fontSize: 11,
+            fontWeight: 600,
+            marginLeft: 4
+          }
+        }, "nombre chang\xE9"));
       })));
     }))));
-  }), lines.length > 0 && React.createElement("button", {
-    disabled: busy || !chosen.length,
-    onClick: print,
+  }), B0.ready && D.units.length > 0 && React.createElement("div", {
     style: {
-      width: '100%',
-      minHeight: 72,
-      borderRadius: 16,
-      border: 'none',
-      background: chosen.length ? '#1565c0' : '#bdbdbd',
-      color: '#fff',
-      fontSize: 22,
-      fontWeight: 900,
-      cursor: chosen.length ? 'pointer' : 'default'
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap'
     }
-  }, busy ? 'Préparation…' : chosen.length ? `🖨️ Imprimer ${chosen.length} étiquette${chosen.length > 1 ? 's' : ''}` : '✅ Tout est déjà collé'), lines.length > 0 && React.createElement("div", {
+  }, D.todo > 0 && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      flex: 1,
+      minHeight: 52,
+      fontSize: 15
+    },
+    onClick: () => setPickMode({
+      list: todoList,
+      on: {}
+    })
+  }, "\u270B D\xE9j\xE0 coll\xE9es (imprim\xE9es avant) : cocher"), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      flex: 1,
+      minHeight: 52,
+      fontSize: 15
+    },
+    disabled: busy,
+    onClick: () => print(D.units)
+  }, "\uD83D\uDD01 Tout r\xE9imprimer (", D.units.length, ")")), D.units.length > 0 && React.createElement("div", {
     style: {
       fontSize: 13,
       color: 'var(--ink-mute)',
       textAlign: 'center'
     }
-  }, "2 \xE9tiquettes par feuille A4. Imprimer en couleur : vert = Kelbongoo, noir = Centrale PDP, couleur du lieu pour le tri. Une \xE9tiquette d\xE9j\xE0 coll\xE9e n'est pas recoch\xE9e (sauf si tu la coches toi-m\xEAme)."), ask && React.createElement("div", {
+  }, "2 \xE9tiquettes par feuille A4, en couleur : vert = Kelbongoo, noir = Centrale PDP. Vu par toute l'\xE9quipe : une \xE9tiquette coll\xE9e n'est plus \xE0 imprimer."), ask && React.createElement("div", {
     style: {
       position: 'fixed',
       inset: 0,
@@ -40390,7 +40549,7 @@ function PrintQrPage({
       background: 'var(--bg-card, #fff)',
       borderRadius: 20,
       padding: 20,
-      maxWidth: 460,
+      maxWidth: 480,
       width: '100%'
     }
   }, React.createElement("div", {
@@ -40398,50 +40557,49 @@ function PrintQrPage({
       fontSize: 24,
       fontWeight: 900
     }
-  }, "\uD83D\uDD33 ", ask.length, " \xE9tiquette", ask.length > 1 ? 's' : '', " envoy\xE9e", ask.length > 1 ? 's' : '', " \xE0 l'imprimante"), React.createElement("div", {
+  }, "\uD83D\uDDA8\uFE0F ", ask.length, " \xE9tiquette", ask.length > 1 ? 's' : '', " \xE0 l'imprimante"), React.createElement("div", {
     style: {
       fontSize: 16,
       color: 'var(--ink-soft)',
       margin: '8px 0 16px'
     }
-  }, "Une fois coll\xE9es sur les palettes / rolls / dollies, confirme : l'\xE9quipe verra qu'elles sont faites."), React.createElement("button", {
+  }, "Colle-les sur les palettes / rolls / dollies, puis dis-le ici."), React.createElement("button", {
     onClick: () => {
       const a = ask;
       setAsk(null);
-      mark(a.map(x => ({
-        ...x,
-        st: kbQrUnitState(P.map, x.l, x.k)
-      })), true).then(() => kbCelebrate({
-        title: a.length + ' étiquette' + (a.length > 1 ? 's' : '') + ' collée' + (a.length > 1 ? 's' : ''),
-        sub: 'Le chauffeur n\'a plus qu\'à scanner'
-      }));
+      allStuck(a);
+    },
+    style: bigBtn('#2e7d32')
+  }, "\u2705 Tout a \xE9t\xE9 imprim\xE9 et coll\xE9"), React.createElement("button", {
+    onClick: () => {
+      const a = ask;
+      setAsk(null);
+      setPickMode({
+        list: a,
+        on: {}
+      });
     },
     style: {
-      width: '100%',
+      ...bigBtn('#ef6c00'),
       minHeight: 64,
-      borderRadius: 14,
-      border: 'none',
-      background: '#2e7d32',
-      color: '#fff',
-      fontSize: 20,
-      fontWeight: 900,
-      cursor: 'pointer'
+      fontSize: 19,
+      marginTop: 10
     }
-  }, "\u2705 Imprim\xE9 et coll\xE9"), React.createElement("button", {
+  }, "\u270B Pas tout : je coche une par une"), React.createElement("button", {
     onClick: () => setAsk(null),
     style: {
       width: '100%',
-      minHeight: 56,
+      minHeight: 48,
       marginTop: 10,
       borderRadius: 14,
       border: '2px solid var(--line)',
       background: '#fff',
-      color: '#333',
-      fontSize: 17,
+      color: '#555',
+      fontSize: 15,
       fontWeight: 700,
       cursor: 'pointer'
     }
-  }, "Plus tard (je cocherai une par une)"))));
+  }, "Plus tard"))));
 }
 function KbQrScanOverlay({
   onScan,
@@ -41209,6 +41367,12 @@ function PrepSuiviHub({
       stop = true;
     };
   }, [day]);
+  const qrB = useKbQrBoard();
+  const qrTom = addDays(day, 1);
+  const qrN = d => qrB.byDay[d] && qrB.byDay[d].todo || 0;
+  const qrTodo = qrB.ready ? Object.keys(qrB.byDay).filter(d => d <= qrTom).reduce((a, d) => a + qrN(d), 0) : 0;
+  const qrLate = qrB.ready ? Object.keys(qrB.byDay).filter(d => d < day).reduce((a, d) => a + qrN(d), 0) : 0;
+  const qrSub = !qrB.ready ? 'Chargement…' : !qrTodo ? 'Rien à imprimer' : [qrLate ? `en retard ${qrLate}` : '', qrN(day) ? `aujourd'hui ${qrN(day)}` : '', qrN(qrTom) ? `demain ${qrN(qrTom)}` : ''].filter(Boolean).join(' · ');
   const go = k => {
     setTab(k);
     try {
@@ -41260,7 +41424,9 @@ function PrepSuiviHub({
     bg: '#efe7ff',
     ink: '#4a2c91',
     t: 'Imprimer les QR codes',
-    sub: 'pour le chauffeur'
+    sub: qrSub,
+    auto: qrB.ready ? !qrTodo : undefined,
+    n: qrTodo
   }, ...(domTom > 0 ? [{
     k: 'printlabels',
     img: '🏷️',

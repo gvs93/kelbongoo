@@ -825,7 +825,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.91';
+    const APP_VERSION = 'V11.92';
+    // V11.92 — (24/11/2026) 🔳 QR chauffeur : 📅 gros calendrier (avant-hier → J+6, nombre à imprimer par jour, ✅ si tout collé), jour choisi tout seul ;
+    //   « 🖨️ Tout imprimer » puis « ✅ Tout a été imprimé et collé » ou « ✋ Pas tout : je coche une par une » ; Atelier : la tuile QR montre
+    //   combien restent à imprimer (en retard / aujourd'hui / demain) et se coche toute seule quand tout est collé.
     // V11.91 — (24/11/2026) 🧰 Atelier › 🔳 QR codes chauffeur : toutes les étiquettes (🥬 Kelbongoo rolls/dollies + 🏭 Centrale PDP dispatch, picking,
     //   ⚡ fast delivery, dolly fromage) dès la demande d'enlèvement (⏳ avant validation Rungis, même QR) ; jours hier / aujourd'hui / demain ;
     //   étiquette avec bandeau de marque KELBONGOO (vert, logo) ou CENTRALE PDP (noir) + badge KBG / PDP ; case « ✅ Imprimé et collé » par
@@ -20502,56 +20505,73 @@
     }
     const kbQrHm = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
 
-    function PrintQrPage({ session, setTab }) {
-      const showToast = React.useContext(ToastContext);
+    // V11.92 — 📅 étiquettes à faire PAR JOUR (avant-hier → J+6) : pour le calendrier de la page et la tuile de l'Atelier
+    const KB_QR_CAL_BACK = 2, KB_QR_CAL_FWD = 6;
+    const kbQrCalDays = () => { const t = todayKey(), o = []; for (let i = -KB_QR_CAL_BACK; i <= KB_QR_CAL_FWD; i++) o.push(addDays(t, i)); return o; };
+    function kbQrDayUnits(lines, Pmap) {
+      const o = [];
+      lines.forEach(l => l.units.forEach((u, i) => { const k = i + 1; const st = kbQrUnitState(Pmap, l, k); o.push({ l, k, u, key: l.id + '|' + k, st, todo: !st.stuck || st.changed }); }));
+      return o;
+    }
+    function useKbQrBoard() {
       const enl = useKbEnlevements();
       const P = useKbQrPrinted();
       const [runs, setRuns] = React.useState([]);
       const [picks, setPicks] = React.useState([]);
       React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
       React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
-      const today = todayKey();
-      const [day, setDay] = React.useState(today);
-      const [sel, setSel] = React.useState({});      // choix manuel : 'id|k' → true / false (sinon : pas encore collée = cochée)
-      const [busy, setBusy] = React.useState(false);
-      const [ask, setAsk] = React.useState(null);     // après impression : « c'est collé ? »
-      const who = String((session && session.name) || 'Équipe').slice(0, 60);
       const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
-      const lines = React.useMemo(() => kbQrAllLines(enl.list, runs, day)
-        .filter(l => !(pk[l.id] && pk[l.id].status === 'hidden'))
-        .sort((a, b) => (kbQrIsKbg(b) - kbQrIsKbg(a)) || a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat)), [enl.list, runs, day, pk]);
-      const units = React.useMemo(() => {
-        const o = [];
-        lines.forEach(l => l.units.forEach((u, i) => { const k = i + 1; o.push({ l, k, u, key: l.id + '|' + k, st: kbQrUnitState(P.map, l, k) }); }));
+      const byDay = React.useMemo(() => {
+        const o = {};
+        kbQrCalDays().forEach(d => {
+          const lines = kbQrAllLines(enl.list, runs, d).filter(l => !(pk[l.id] && pk[l.id].status === 'hidden'))
+            .sort((a, b) => (kbQrIsKbg(b) - kbQrIsKbg(a)) || a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat));
+          const units = kbQrDayUnits(lines, P.map);
+          o[d] = { lines, units, todo: units.filter(x => x.todo).length, done: units.filter(x => !x.todo).length };
+        });
         return o;
-      }, [lines, P.map]);
-      const isOn = (x) => sel[x.key] !== undefined ? sel[x.key] : (!x.st.stuck || x.st.changed);
-      const chosen = units.filter(isOn);
-      const nTodo = units.filter(x => !x.st.stuck || x.st.changed).length;
-      const nDone = units.length - nTodo;
-      const days = [addDays(today, -1), today, addDays(today, 1)];
-      const dayLbl = (d) => d === today ? "Aujourd'hui" : d < today ? 'Hier' : 'Demain';
+      }, [enl.list, runs, pk, P.map]);
+      const ready = enl.raw !== undefined && P.raw !== undefined;
+      return { enl, P, pk, byDay, ready };
+    }
+    const KB_QR_DOW = ['dim.', 'lun.', 'mar.', 'mer.', 'jeu.', 'ven.', 'sam.'];
+    const kbQrDayName = (d) => { const t = todayKey(); return d === t ? "Aujourd'hui" : d === addDays(t, 1) ? 'Demain' : d === addDays(t, -1) ? 'Hier' : KB_QR_DOW[new Date(d + 'T12:00:00').getDay()]; };
+
+    function PrintQrPage({ session, setTab }) {
+      const showToast = React.useContext(ToastContext);
+      const B0 = useKbQrBoard();
+      const { enl, P, pk, byDay } = B0;
+      const today = todayKey();
+      const cal = kbQrCalDays();
+      const [day, setDay] = React.useState(null);   // null = choix automatique (1er jour avec quelque chose à imprimer)
+      const autoDay = cal.find(d => d >= addDays(today, -1) && byDay[d] && byDay[d].todo) || cal.find(d => d < today && byDay[d] && byDay[d].todo) || today;
+      const cur = day || autoDay;
+      const D = byDay[cur] || { lines: [], units: [], todo: 0, done: 0 };
+      const [busy, setBusy] = React.useState(false);
+      const [ask, setAsk] = React.useState(null);     // après impression : liste imprimée
+      const [pickMode, setPickMode] = React.useState(null); // « une par une » : { list, on: {key:true} }
+      const who = String((session && session.name) || 'Équipe').slice(0, 60);
 
       // Écrit l'état d'étiquettes (partagé) — optimiste, puis relecture
       const mark = async (list, stuck, printedOnly) => {
         if (!list.length) return;
         const up = {}, now = Date.now();
         list.forEach(x => {
+          const st = kbQrUnitState(P.map, x.l, x.k);
           up[x.l.id + '/at'] = now; up[x.l.id + '/n'] = x.l.units.length;
           if (printedOnly) up[x.l.id + '/u/' + x.k + '/p'] = now;
-          else up[x.l.id + '/u/' + x.k] = stuck ? { ok: now, by: who, p: x.st.printedAt || now } : (x.st.printedAt ? { p: x.st.printedAt } : null);
+          else up[x.l.id + '/u/' + x.k] = stuck ? { ok: now, by: who, p: st.printedAt || now } : (st.printedAt ? { p: st.printedAt } : null);
         });
-        P.set(m => { const c = JSON.parse(JSON.stringify(m)); list.forEach(x => { const r = c[x.l.id] = c[x.l.id] || {}; r.at = now; r.n = x.l.units.length; r.u = r.u || {};
-          if (printedOnly) r.u[x.k] = { ...(r.u[x.k] || {}), p: now }; else r.u[x.k] = stuck ? { ok: now, by: who, p: x.st.printedAt || now } : (x.st.printedAt ? { p: x.st.printedAt } : null); }); return c; });
-        setSel(s => { const c = { ...s }; list.forEach(x => { delete c[x.key]; }); return c; });
+        P.set(m => { const c = JSON.parse(JSON.stringify(m)); list.forEach(x => { const st = kbQrUnitState(m, x.l, x.k); const r = c[x.l.id] = c[x.l.id] || {}; r.at = now; r.n = x.l.units.length; r.u = r.u || {};
+          if (printedOnly) r.u[x.k] = { ...(r.u[x.k] || {}), p: now }; else r.u[x.k] = stuck ? { ok: now, by: who, p: st.printedAt || now } : (st.printedAt ? { p: st.printedAt } : null); }); return c; });
         try { await kbQrPatch(KB_QR_PRINTED, up); }
         catch (e) { showToast('⚠️ Pas enregistré (' + (e.message || e) + ') — réessaie'); }
         P.reload();
       };
 
-      const print = async () => {
-        const todo = chosen.slice();
+      const print = async (todo) => {
         if (!todo.length) return;
+        setDay(cur);   // on reste sur ce jour après l'impression (pas de saut au jour suivant)
         const w = window.open('', '_blank');
         if (!w) { showToast('Autorise les fenêtres pop-up pour imprimer'); return; }
         w.document.write('<p style="font:20px sans-serif;padding:20px">Préparation des QR codes…</p>');
@@ -20591,7 +20611,7 @@
             + '.det{font-size:4.4mm;margin-top:1.5mm;color:#333}.day{font-size:5mm;font-weight:700;margin-top:2.5mm}'
             + '.foot{font-size:3.6mm;color:#555;text-align:center;padding:0 4mm 2mm}';
           w.document.open();
-          w.document.write('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>QR Rungis ' + kbQrEsc(formatDateShort(day)) + '</title><style>' + css + '</style></head><body>' + labels.join('') + '</body></html>');
+          w.document.write('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>QR Rungis ' + kbQrEsc(formatDateShort(cur)) + '</title><style>' + css + '</style></head><body>' + labels.join('') + '</body></html>');
           w.document.close();
           setTimeout(() => { try { w.focus(); w.print(); } catch (_) {} }, 600);
           mark(todo, false, true);   // trace « imprimée » (pas encore « collée »)
@@ -20599,24 +20619,68 @@
         } catch (e) { try { w.close(); } catch (_) {} showToast('⚠️ ' + (e.message || e)); }
         finally { setBusy(false); }
       };
+      const allStuck = (list) => mark(list, true).then(() => kbCelebrate({ title: list.length + ' étiquette' + (list.length > 1 ? 's' : '') + ' collée' + (list.length > 1 ? 's' : ''), sub: 'Le chauffeur n\'a plus qu\'à scanner' }));
 
-      const groups = [['kbg', lines.filter(kbQrIsKbg)], ['pdp', lines.filter(l => !kbQrIsKbg(l))]];
+      const todoList = D.units.filter(x => x.todo);
+      const groups = [['kbg', D.lines.filter(kbQrIsKbg)], ['pdp', D.lines.filter(l => !kbQrIsKbg(l))]];
+      const bigBtn = (bg) => ({ width: '100%', minHeight: 76, borderRadius: 18, border: 'none', background: bg, color: '#fff', fontSize: 23, fontWeight: 900, cursor: 'pointer' });
+
+      // ── Mode « une par une » : on touche celles qui sont collées, puis Valider ──
+      if (pickMode) {
+        const nOn = pickMode.list.filter(x => pickMode.on[x.key]).length;
+        return (
+          <div className="stack">
+            <h1 style={{ margin: 0 }}>✋ Lesquelles sont collées ?</h1>
+            <div style={{ fontSize: 16, color: 'var(--ink-soft)' }}>Touche chaque étiquette <b>imprimée et collée</b>. Les autres restent « à imprimer » pour la prochaine fois.</div>
+            <button onClick={() => setPickMode(m => ({ ...m, on: Object.fromEntries(m.list.map(x => [x.key, nOn < m.list.length])) }))} className="btn-secondary" style={{ minHeight: 48, fontSize: 16 }}>{nOn < pickMode.list.length ? '☑️ Tout toucher' : '⬜ Tout enlever'}</button>
+            {pickMode.list.map(x => { const on = !!pickMode.on[x.key]; const C = kbQrCatOf(x.l); const B = KB_QR_BRAND[kbQrIsKbg(x.l) ? 'kbg' : 'pdp'];
+              return (
+                <button key={x.key} onClick={() => setPickMode(m => ({ ...m, on: { ...m.on, [x.key]: !on } }))} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 16, cursor: 'pointer', textAlign: 'left', border: '3px solid ' + (on ? '#2e7d32' : 'var(--line)'), background: on ? '#e8f5e9' : 'var(--bg-card)' }}>
+                  <span style={{ fontSize: 34, width: 40, textAlign: 'center' }}>{on ? '✅' : '⬜'}</span>
+                  <span style={{ background: B.col, color: '#fff', borderRadius: 8, padding: '2px 8px', fontWeight: 900, fontSize: 15 }}>{B.badge}</span>
+                  <span style={{ background: SITE_NAMES[x.l.site] ? kbSiteColor(x.l.site) : '#607d8b', color: '#fff', borderRadius: 8, padding: '2px 8px', fontWeight: 900, fontSize: 17 }}>{x.l.site}</span>
+                  <span style={{ flex: 1, minWidth: 0 }}><b style={{ fontSize: 18 }}>{x.u} {x.k}/{x.l.units.length}</b><span style={{ display: 'block', fontSize: 13, color: 'var(--ink-soft)' }}>{C.ic} {C.t}</span></span>
+                </button>); })}
+            <button disabled={!nOn} onClick={() => { const L = pickMode.list.filter(x => pickMode.on[x.key]); setPickMode(null); allStuck(L); }} style={{ ...bigBtn(nOn ? '#2e7d32' : '#bdbdbd'), cursor: nOn ? 'pointer' : 'default' }}>✅ Valider : {nOn} collée{nOn > 1 ? 's' : ''}</button>
+            <button onClick={() => setPickMode(null)} className="btn-secondary" style={{ minHeight: 52, fontSize: 17 }}>Annuler</button>
+          </div>
+        );
+      }
+
       return (
         <div className="stack">
           <KbBackToHub setTab={setTab} />
           <h1 style={{ margin: 0 }}>🔳 QR codes pour le chauffeur</h1>
-          <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Toutes les étiquettes : <b style={{ color: '#2e7d32' }}>🥬 Kelbongoo</b> (rolls, dollies des commandes) et <b>🏭 Centrale PDP</b> (dispatch, picking, ⚡ fast delivery, dolly fromage). Une fois collée, coche <b>✅ Imprimé et collé</b> : toute l'équipe le voit, pas de doublon.</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {days.map(d => <button key={d} onClick={() => { setDay(d); setSel({}); }} style={{ flex: 1, minHeight: 56, borderRadius: 14, fontSize: 17, fontWeight: 800, cursor: 'pointer', border: '3px solid #1565c0', background: day === d ? '#1565c0' : '#fff', color: day === d ? '#fff' : '#1565c0' }}>{dayLbl(d)}<span style={{ display: 'block', fontSize: 13, fontWeight: 600 }}>{formatDateShort(d)}</span></button>)}
-          </div>
-          {(enl.raw === undefined || P.raw === undefined) && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
           {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 700 }}>⚠️ Enlèvements illisibles ({enl.err}) <button className="btn-secondary" onClick={enl.reload}>↻</button></div>}
           {P.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 700 }}>⚠️ Impossible de lire les étiquettes déjà collées — vérifie avant de réimprimer. <button className="btn-secondary" onClick={P.reload}>↻</button></div>}
-          {units.length > 0 && <div style={{ display: 'flex', gap: 8 }}>
-            <div style={{ flex: 1, borderRadius: 14, padding: '10px 12px', background: nTodo ? '#fff3e0' : '#e8f5e9', border: '2px solid ' + (nTodo ? '#ef6c00' : '#2e7d32') }}><div style={{ fontSize: 30, fontWeight: 900, color: nTodo ? '#ef6c00' : '#2e7d32' }}>{nTodo}</div><div style={{ fontSize: 14, fontWeight: 700 }}>à imprimer / coller</div></div>
-            <div style={{ flex: 1, borderRadius: 14, padding: '10px 12px', background: '#e8f5e9', border: '2px solid #2e7d32' }}><div style={{ fontSize: 30, fontWeight: 900, color: '#2e7d32' }}>{nDone}</div><div style={{ fontSize: 14, fontWeight: 700 }}>déjà collée{nDone > 1 ? 's' : ''}</div></div>
+
+          {/* 📅 Calendrier : un gros carré par jour, avec ce qu'il reste à imprimer */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
+            {cal.map(d => { const x = byDay[d] || { todo: 0, done: 0 }; const sel = d === cur; const past = d < today;
+              const tone = !B0.ready ? ['#f5f5f5', '#9e9e9e'] : x.todo ? ['#fff3e0', '#e65100'] : x.done ? ['#e8f5e9', '#2e7d32'] : ['#fafafa', '#bdbdbd'];
+              return (
+                <button key={d} onClick={() => setDay(d)} style={{ minHeight: 104, borderRadius: 18, cursor: 'pointer', padding: '8px 4px', border: sel ? '5px solid #1565c0' : '2px solid ' + tone[1] + '66', background: tone[0], opacity: past && !x.todo && !sel ? .6 : 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2 }}>
+                  <span style={{ fontSize: 15, fontWeight: 800, color: d === today ? '#1565c0' : '#455a64' }}>{kbQrDayName(d)}</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: '#78909c' }}>{formatDateShort(d)}</span>
+                  {!B0.ready ? <span style={{ fontSize: 20 }}>…</span>
+                    : x.todo ? <span style={{ fontSize: 30, fontWeight: 900, color: '#e65100', lineHeight: 1.1 }}>🖨️ {x.todo}</span>
+                    : x.done ? <span style={{ fontSize: 26, fontWeight: 900, color: '#2e7d32', lineHeight: 1.1 }}>✅</span>
+                    : <span style={{ fontSize: 20, color: '#bdbdbd' }}>—</span>}
+                  {B0.ready && x.todo > 0 && <span style={{ fontSize: 12, fontWeight: 800, color: '#e65100' }}>à imprimer</span>}
+                  {B0.ready && !x.todo && x.done > 0 && <span style={{ fontSize: 12, fontWeight: 800, color: '#2e7d32' }}>tout collé</span>}
+                </button>); })}
+          </div>
+
+          <div style={{ fontSize: 24, fontWeight: 900, marginTop: 4 }}>{kbQrDayName(cur)} {formatDateShort(cur)}</div>
+          {!B0.ready && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
+          {B0.ready && !D.units.length && <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 20, fontWeight: 700, color: 'var(--ink-soft)' }}>Rien à étiqueter ce jour-là.<div style={{ fontSize: 14, fontWeight: 600, marginTop: 6 }}>Les palettes apparaissent dès la demande d'enlèvement dans la Centrale, les rolls Kelbongoo à la clôture de la prépa.</div></div>}
+
+          {B0.ready && D.todo > 0 && <button disabled={busy} onClick={() => print(todoList)} style={bigBtn('#1565c0')}>{busy ? 'Préparation…' : `🖨️ Tout imprimer (${D.todo})`}</button>}
+          {B0.ready && !D.todo && D.done > 0 && <div style={{ borderRadius: 18, padding: '16px 14px', background: '#e8f5e9', border: '3px solid #2e7d32', textAlign: 'center' }}>
+            <div style={{ fontSize: 22, fontWeight: 900, color: '#2e7d32' }}>✅ Tout est imprimé et collé</div>
+            <div style={{ fontSize: 14, color: '#33691e', marginTop: 4 }}>{D.done} étiquette{D.done > 1 ? 's' : ''} · rien à refaire</div>
           </div>}
-          {enl.raw !== undefined && !lines.length && <div className="card" style={{ textAlign: 'center', padding: '24px 14px', fontSize: 20, fontWeight: 700, color: 'var(--ink-soft)' }}>Rien à étiqueter pour le {formatDateShort(day)}.<div style={{ fontSize: 14, fontWeight: 600, marginTop: 6 }}>Les palettes apparaissent dès la demande d'enlèvement dans la Centrale, les rolls Kelbongoo à la clôture de la prépa.</div></div>}
+
           {groups.map(([g, L]) => {
             if (!L.length) return null;
             const B = KB_QR_BRAND[g];
@@ -20633,7 +20697,7 @@
                     <div style={{ background: SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b', color: '#fff', padding: '6px 12px', fontSize: 20, fontWeight: 800 }}>{s} <span style={{ fontSize: 14, fontWeight: 600 }}>{siteLabel(s) !== s ? siteLabel(s) : (KB_ENL_STORE_LONG[s] || '')}</span></div>
                     {bySite[s].map(l => {
                       const C = kbQrCatOf(l); const drv = pk[l.id] && pk[l.id].status;
-                      const U = units.filter(x => x.l === l);
+                      const U = D.units.filter(x => x.l === l);
                       return (
                         <div key={l.id} style={{ padding: '10px 12px', borderTop: '1px solid var(--line)' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -20643,20 +20707,15 @@
                           </div>
                           <div style={{ fontSize: 17, fontWeight: 700, marginTop: 4 }}>{l.label}</div>
                           {l.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</div>}
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
-                            {U.map(x => { const on = isOn(x); const st = x.st;
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                            {U.map(x => { const st = x.st; const ok = st.stuck && !st.changed;
                               return (
-                                <div key={x.key} style={{ display: 'flex', alignItems: 'center', gap: 10, borderRadius: 12, padding: '6px 8px', background: st.stuck && !st.changed ? '#e8f5e9' : st.changed ? '#fdecea' : 'var(--bg)', border: '1px solid var(--line)' }}>
-                                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, cursor: 'pointer' }} title="Imprimer cette étiquette">
-                                    <input type="checkbox" checked={on} onChange={() => setSel(m => ({ ...m, [x.key]: !on }))} style={{ width: 26, height: 26, flex: '0 0 auto' }} />
-                                    <span style={{ fontSize: 16 }}>🖨️ <b>{x.u} {x.k}/{l.units.length}</b>
-                                      {st.changed && <span style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#c62828' }}>⚠️ le nombre a changé ({P.map[l.id].n} → {l.units.length}) : réimprimer</span>}
-                                      {st.stuck && !st.changed && <span style={{ display: 'block', fontSize: 12, color: '#2e7d32' }}>collée par {st.by || '—'} à {kbQrHm(st.at)}</span>}
-                                      {!st.stuck && st.printedAt > 0 && <span style={{ display: 'block', fontSize: 12, color: '#e65100' }}>imprimée à {kbQrHm(st.printedAt)}, pas encore cochée collée</span>}
-                                    </span>
-                                  </label>
-                                  <button onClick={() => mark([x], !st.stuck)} style={{ flex: '0 0 auto', minHeight: 48, borderRadius: 12, cursor: 'pointer', fontSize: 14, fontWeight: 800, padding: '0 10px', border: '2px solid #2e7d32', background: st.stuck ? '#2e7d32' : '#fff', color: st.stuck ? '#fff' : '#2e7d32' }}>{st.stuck ? '✅ Imprimé et collé' : '⬜ Imprimé et collé'}</button>
-                                </div>); })}
+                                <span key={x.key} title={ok ? 'collée par ' + (st.by || '—') + ' à ' + kbQrHm(st.at) : st.changed ? 'nombre changé : à réimprimer' : st.printedAt ? 'imprimée à ' + kbQrHm(st.printedAt) + ', pas cochée collée' : 'à imprimer'}
+                                  style={{ borderRadius: 10, padding: '5px 10px', fontSize: 15, fontWeight: 800, border: '2px solid ' + (ok ? '#2e7d32' : st.changed ? '#c62828' : '#ef6c00'), background: ok ? '#e8f5e9' : st.changed ? '#fdecea' : '#fff3e0', color: ok ? '#2e7d32' : st.changed ? '#c62828' : '#e65100' }}>
+                                  {ok ? '✅' : st.changed ? '⚠️' : '🖨️'} {x.u} {x.k}/{l.units.length}
+                                  {ok && <span style={{ fontSize: 11, fontWeight: 600, marginLeft: 4 }}>{(st.by || '').split(' ')[0]} {kbQrHm(st.at)}</span>}
+                                  {st.changed && <span style={{ fontSize: 11, fontWeight: 600, marginLeft: 4 }}>nombre changé</span>}
+                                </span>); })}
                           </div>
                         </div>);
                     })}
@@ -20664,18 +20723,19 @@
                 ))}
               </div>);
           })}
-          {lines.length > 0 && (
-            <button disabled={busy || !chosen.length} onClick={print} style={{ width: '100%', minHeight: 72, borderRadius: 16, border: 'none', background: chosen.length ? '#1565c0' : '#bdbdbd', color: '#fff', fontSize: 22, fontWeight: 900, cursor: chosen.length ? 'pointer' : 'default' }}>
-              {busy ? 'Préparation…' : chosen.length ? `🖨️ Imprimer ${chosen.length} étiquette${chosen.length > 1 ? 's' : ''}` : '✅ Tout est déjà collé'}
-            </button>
-          )}
-          {lines.length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', textAlign: 'center' }}>2 étiquettes par feuille A4. Imprimer en couleur : vert = Kelbongoo, noir = Centrale PDP, couleur du lieu pour le tri. Une étiquette déjà collée n'est pas recochée (sauf si tu la coches toi-même).</div>}
+          {B0.ready && D.units.length > 0 && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {D.todo > 0 && <button className="btn-secondary" style={{ flex: 1, minHeight: 52, fontSize: 15 }} onClick={() => setPickMode({ list: todoList, on: {} })}>✋ Déjà collées (imprimées avant) : cocher</button>}
+            <button className="btn-secondary" style={{ flex: 1, minHeight: 52, fontSize: 15 }} disabled={busy} onClick={() => print(D.units)}>🔁 Tout réimprimer ({D.units.length})</button>
+          </div>}
+          {D.units.length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', textAlign: 'center' }}>2 étiquettes par feuille A4, en couleur : vert = Kelbongoo, noir = Centrale PDP. Vu par toute l'équipe : une étiquette collée n'est plus à imprimer.</div>}
+
           {ask && <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
-            <div style={{ background: 'var(--bg-card, #fff)', borderRadius: 20, padding: 20, maxWidth: 460, width: '100%' }}>
-              <div style={{ fontSize: 24, fontWeight: 900 }}>🔳 {ask.length} étiquette{ask.length > 1 ? 's' : ''} envoyée{ask.length > 1 ? 's' : ''} à l'imprimante</div>
-              <div style={{ fontSize: 16, color: 'var(--ink-soft)', margin: '8px 0 16px' }}>Une fois collées sur les palettes / rolls / dollies, confirme : l'équipe verra qu'elles sont faites.</div>
-              <button onClick={() => { const a = ask; setAsk(null); mark(a.map(x => ({ ...x, st: kbQrUnitState(P.map, x.l, x.k) })), true).then(() => kbCelebrate({ title: a.length + ' étiquette' + (a.length > 1 ? 's' : '') + ' collée' + (a.length > 1 ? 's' : ''), sub: 'Le chauffeur n\'a plus qu\'à scanner' })); }} style={{ width: '100%', minHeight: 64, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 20, fontWeight: 900, cursor: 'pointer' }}>✅ Imprimé et collé</button>
-              <button onClick={() => setAsk(null)} style={{ width: '100%', minHeight: 56, marginTop: 10, borderRadius: 14, border: '2px solid var(--line)', background: '#fff', color: '#333', fontSize: 17, fontWeight: 700, cursor: 'pointer' }}>Plus tard (je cocherai une par une)</button>
+            <div style={{ background: 'var(--bg-card, #fff)', borderRadius: 20, padding: 20, maxWidth: 480, width: '100%' }}>
+              <div style={{ fontSize: 24, fontWeight: 900 }}>🖨️ {ask.length} étiquette{ask.length > 1 ? 's' : ''} à l'imprimante</div>
+              <div style={{ fontSize: 16, color: 'var(--ink-soft)', margin: '8px 0 16px' }}>Colle-les sur les palettes / rolls / dollies, puis dis-le ici.</div>
+              <button onClick={() => { const a = ask; setAsk(null); allStuck(a); }} style={bigBtn('#2e7d32')}>✅ Tout a été imprimé et collé</button>
+              <button onClick={() => { const a = ask; setAsk(null); setPickMode({ list: a, on: {} }); }} style={{ ...bigBtn('#ef6c00'), minHeight: 64, fontSize: 19, marginTop: 10 }}>✋ Pas tout : je coche une par une</button>
+              <button onClick={() => setAsk(null)} style={{ width: '100%', minHeight: 48, marginTop: 10, borderRadius: 14, border: '2px solid var(--line)', background: '#fff', color: '#555', fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>Plus tard</button>
             </div>
           </div>}
         </div>
@@ -20905,13 +20965,20 @@
       React.useEffect(() => { let stop = false; const tm = addDays(day, 1);
         storage.getDoc(`day_${tm}_orders`, 'data').then(d => { if (!stop) setDomTom(((d && d.orders) || []).filter(o => String(o.site || '').toUpperCase() === 'DOM').length); }).catch(() => { if (!stop) setDomTom(0); });
         return () => { stop = true; }; }, [day]);
+      // V11.92 — QR chauffeur : combien d'étiquettes restent à imprimer (jours passés en retard + aujourd'hui + demain)
+      const qrB = useKbQrBoard();
+      const qrTom = addDays(day, 1);
+      const qrN = (d) => (qrB.byDay[d] && qrB.byDay[d].todo) || 0;
+      const qrTodo = qrB.ready ? Object.keys(qrB.byDay).filter(d => d <= qrTom).reduce((a, d) => a + qrN(d), 0) : 0;
+      const qrLate = qrB.ready ? Object.keys(qrB.byDay).filter(d => d < day).reduce((a, d) => a + qrN(d), 0) : 0;
+      const qrSub = !qrB.ready ? 'Chargement…' : !qrTodo ? 'Rien à imprimer' : [qrLate ? `en retard ${qrLate}` : '', qrN(day) ? `aujourd'hui ${qrN(day)}` : '', qrN(qrTom) ? `demain ${qrN(qrTom)}` : ''].filter(Boolean).join(' · ');
       const go = k => { setTab(k); try { window.scrollTo({ top: 0 }); } catch (_) {} };
       const toggle = async (k) => { const on = !marks[k]; try { await storage.setDoc('v4_cache', 'atelier_' + day, { marks: { [k]: on ? { at: Date.now() } : null } }); } catch (_) {} };
       const steps = [
         { k: 'dlcwatch', img: '🧹', bg: '#ffe0e0', ink: '#b71c1c', t: 'Retirer les DLC', sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : 'Rien à retirer', auto: board.ready && !nDlc, n: nDlc },
         { k: 'pdpreturns', img: '↩️', bg: '#dff0ff', ink: '#0d47a1', t: 'Traiter les retours PDP', sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : 'Rien à traiter', auto: pdp.ready && !pdp.toTreat, n: pdp.toTreat },
         { k: 'printpain', img: '🍞', bg: '#fff3d6', ink: '#8a5a00', t: 'Imprimer le dispatch pain', sub: '1 feuille par lieu' },
-        { k: 'printqr', img: '🔳', bg: '#efe7ff', ink: '#4a2c91', t: 'Imprimer les QR codes', sub: 'pour le chauffeur' },
+        { k: 'printqr', img: '🔳', bg: '#efe7ff', ink: '#4a2c91', t: 'Imprimer les QR codes', sub: qrSub, auto: qrB.ready ? !qrTodo : undefined, n: qrTodo },  // V11.92
         ...(domTom > 0 ? [{ k: 'printlabels', img: '🏷️', bg: '#e3f8ec', ink: '#1b5e20', t: 'Imprimer les étiquettes livraison', sub: `${domTom} livraison${domTom > 1 ? 's' : ''} demain · après la clôture` }] : []),
       ];
       const isDone = s => s.auto !== undefined ? s.auto : !!marks[s.k];
