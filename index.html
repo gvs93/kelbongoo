@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.82) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.85) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -287,6 +287,12 @@
       .kb-wide .kb-vs-top, .kb-wide .kb-out-top { display: none !important; }
     }
     @keyframes kbSideIn { from { transform: translateX(-100%); } to { transform: none; } }
+    /* V11.83 — menu net : texte blanc plein, plus épais, lissage standard (le gris clair fin sur fond sombre paraissait flou) */
+    .kb-side { -webkit-font-smoothing: auto; -moz-osx-font-smoothing: auto; text-rendering: optimizeLegibility; }
+    .kb-side button.kb-side-it.kb-flat, .kb-side .kb-grp button.kb-side-it.kb-flat { color: #fff; font-weight: 600; }
+    .kb-side .kb-grp-h { font-weight: 800; color: #fff; text-shadow: none; }
+    .kb-side-brand small, .kb-side-foot div small { color: #b9c7b3; }
+    @media (max-width: 1099px) { .kb-side.kb-side-open { animation-fill-mode: none; } .kb-side button.kb-side-it.kb-flat { font-size: 16.5px; } }
     @media (min-width: 1100px) { .kb-side .kb-side-x { display: none !important; } } /* V11.74 — pas de ✕ sur PC (menu toujours ouvert) */
 
     .kb-muted { color: var(--ink-mute); }
@@ -731,7 +737,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.82';
+const APP_VERSION = 'V11.85';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -908,6 +914,12 @@ function kbDlcRulesNorm(r) {
     min: 30
   } : n).filter(n => n.dow >= 0 && n.dow <= 6).sort((a, b) => a.dow - b.dow || a.hour - b.hour || a.min - b.min);
   const checkDow = (Array.isArray(r.checkDow) && r.checkDow.length ? r.checkDow : d.checkDow).map(Number).filter(x => x >= 0 && x <= 6);
+  const pr = r.pdpRet || {};
+  const pdpRet = {
+    sameDay: pr.sameDay === undefined ? true : !!pr.sameDay,
+    closedOk: pr.closedOk === undefined ? true : !!pr.closedOk,
+    extraDays: Math.max(0, Math.min(3, Math.round(Number(pr.extraDays) || 0)))
+  };
   return {
     navV1162: true,
     minDays: isNaN(minDays) ? d.minDays : minDays,
@@ -915,6 +927,7 @@ function kbDlcRulesNorm(r) {
     navettes: navettes.length ? navettes : d.navettes,
     checkDow,
     anticipe: r.anticipe === undefined ? d.anticipe : !!r.anticipe,
+    pdpRet,
     updatedBy: r.updatedBy || '',
     updatedAt: r.updatedAt || ''
   };
@@ -2608,7 +2621,11 @@ function kbReplCheckLocal(from, to) {
   if (from.prix > 0 && to.prix > 0 && to.prix < from.prix) {
     out.prixPct = Math.max(1, Math.min(99, Math.round((1 - to.prix / from.prix) * 100)));
     out.why.push(`Moins cher : ${to.prix.toFixed(2)} € au lieu de ${from.prix.toFixed(2)} € → remise −${out.prixPct} % (différence remboursée au client).`);
-  } else if (from.prix > 0 && to.prix > 0 && to.prix > from.prix) out.why.push(`Plus cher (${to.prix.toFixed(2)} €) : le client paie le prix commandé (${from.prix.toFixed(2)} €).`);else if (from.prix > 0 && to.prix > 0) out.why.push(`Même prix (${to.prix.toFixed(2)} €).`);else out.why.push('⚠️ Prix inconnu : pas de remise prix automatique.');
+  } else if (from.prix > 0 && to.prix > 0 && to.prix > from.prix * 1.10 + 0.001) {
+    out.verdict = 'non';
+    out.prixNon = true;
+    out.why.push(`⛔ Trop cher : ${to.prix.toFixed(2)} € au lieu de ${from.prix.toFixed(2)} € (+${Math.round((to.prix / from.prix - 1) * 100)} %). Maximum +10 % → pas de remplacement possible.`);
+  } else if (from.prix > 0 && to.prix > 0 && to.prix > from.prix) out.why.push(`Plus cher (${to.prix.toFixed(2)} €, +${Math.round((to.prix / from.prix - 1) * 100)} %, max +10 %) : le client paie le prix commandé (${from.prix.toFixed(2)} €).`);else if (from.prix > 0 && to.prix > 0) out.why.push(`Même prix (${to.prix.toFixed(2)} €).`);else out.why.push('⚠️ Prix inconnu : pas de remise prix automatique.');
   out.pct = Math.max(out.poidsPct, out.prixPct);
   return out;
 }
@@ -4671,6 +4688,65 @@ function kbHpExpected(deb, fin, now) {
   b.setHours(h2, m2, 0, 0);
   if (b <= a) return null;
   return Math.max(0, Math.min(100, Math.round((d - a) / (b - a) * 100)));
+}
+const _kbPaceHist = {};
+function kbPaceSlot(ts) {
+  const d = new Date(ts);
+  return String(d.getHours()).padStart(2, '0') + String(Math.floor(d.getMinutes() / 15) * 15).padStart(2, '0');
+}
+function kbPaceMin(slot) {
+  return parseInt(slot.slice(0, 2), 10) * 60 + parseInt(slot.slice(2), 10);
+}
+function kbPaceAt(map, m) {
+  const pts = Object.keys(map || {}).filter(s => /^\d{4}$/.test(s)).map(s => [kbPaceMin(s), Number(map[s])]).filter(p => isFinite(p[1])).sort((a, b) => a[0] - b[0]);
+  if (pts.length < 2) return null;
+  if (m < pts[0][0]) return pts[0][1] <= 2 ? 0 : null;
+  const last = pts[pts.length - 1];
+  if (m >= last[0]) return last[1] >= 98 ? 100 : m - last[0] <= 20 ? last[1] : null;
+  for (let i = 1; i < pts.length; i++) if (m <= pts[i][0]) {
+    const [a, va] = pts[i - 1],
+      [b, vb] = pts[i];
+    if (b - a > 75) return null;
+    return va + (vb - va) * (m - a) / Math.max(1, b - a);
+  }
+  return null;
+}
+function kbPaceLearned(work, profKey, kind, now) {
+  const k = work + '|' + profKey,
+    c = _kbPaceHist[k];
+  if (!c) {
+    _kbPaceHist[k] = {
+      days: [],
+      at: Date.now()
+    };
+    (async () => {
+      const out = [];
+      for (let w = 1; w <= 8 && out.length < 6; w++) {
+        const d = addDays(work, -7 * w);
+        const doc = await storage.getDoc('v4_cache', 'pace_' + d).catch(() => null);
+        if (doc && doc.profile === profKey) out.push({
+          prep: doc.prep || {},
+          mu: doc.mu || {}
+        });
+      }
+      _kbPaceHist[k] = {
+        days: out,
+        at: Date.now()
+      };
+      try {
+        window.dispatchEvent(new CustomEvent('kb:pace-hist'));
+      } catch (_) {}
+    })();
+    return null;
+  }
+  const dt = new Date(now),
+    m = dt.getHours() * 60 + dt.getMinutes();
+  const vals = c.days.map(d => kbPaceAt(d[kind], m)).filter(v => v != null);
+  if (vals.length < 2) return null;
+  return {
+    pct: Math.max(0, Math.min(100, Math.round(vals.reduce((s, v) => s + v, 0) / vals.length))),
+    n: vals.length
+  };
 }
 const KB_TOUR_KEEP = /carotte|pomme de terre|pommes de terre|patate|oignon|echalote|ail\b|orange|citron|clementine|mandarine|pamplemousse|pomelo|kiwi|pomme|poires?\b|courge|potimarron|butternut|betterave|navet|panais|celeri|topinambour|radis noir|chou\b|choux|rutabaga|coing/;
 function kbTourKeeps(name) {
@@ -13942,6 +14018,17 @@ const KB_CARNET = [{
   ic: '📋',
   t: 'Infos du jour',
   d: 'Messages et consignes de la journée'
+}, {
+  k: 'temp',
+  ic: '🌡️',
+  t: 'Température',
+  d: 'Relevés du frigo / de la chambre froide',
+  boutique: true
+}, {
+  k: 'bureau',
+  ic: '✉️',
+  t: 'Message au bureau',
+  d: 'Besoins en fournitures · problème boutique · autre'
 }];
 function KbCarnetPage({
   session,
@@ -13950,22 +14037,18 @@ function KbCarnetPage({
   isClosed,
   consumersByEmail
 }) {
-  const [sec, setSec] = React.useState(() => {
-    try {
-      return sessionStorage.getItem('kb_carnet_sec') || '';
-    } catch (_) {
-      return '';
-    }
-  });
+  const [sec, setSec] = React.useState('');
   const go = k => {
     setSec(k);
-    try {
-      sessionStorage.setItem('kb_carnet_sec', k);
-    } catch (_) {}
     window.scrollTo({
       top: 0
     });
   };
+  React.useEffect(() => {
+    const h = () => go('');
+    window.addEventListener('kb:carnet-home', h);
+    return () => window.removeEventListener('kb:carnet-home', h);
+  }, []);
   const [fu, setFu] = React.useState([]);
   const [forg, setForg] = React.useState([]);
   const [oubTab, setOubTab] = React.useState('oublis');
@@ -13979,7 +14062,8 @@ function KbCarnetPage({
     nonrecup: nNr,
     oublis: nOub
   };
-  const cur = KB_CARNET.find(x => x.k === sec);
+  const items = KB_CARNET.filter(x => !x.boutique || BOUTIQUES.includes(currentSite));
+  const cur = items.find(x => x.k === sec);
   if (cur) return React.createElement("div", {
     className: "stack"
   }, React.createElement("button", {
@@ -14033,6 +14117,12 @@ function KbCarnetPage({
   }), sec === 'infos' && React.createElement(InfosPage, {
     session: session,
     currentSite: currentSite
+  }), sec === 'temp' && React.createElement(TemperaturePage, {
+    session: session,
+    currentSite: currentSite
+  }), sec === 'bureau' && React.createElement(DistribMessageCard, {
+    session: session,
+    currentSite: currentSite
   }));
   return React.createElement("div", {
     className: "stack"
@@ -14046,7 +14136,7 @@ function KbCarnetPage({
       gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
       gap: 10
     }
-  }, KB_CARNET.map(x => React.createElement("button", {
+  }, items.map(x => React.createElement("button", {
     key: x.k,
     onClick: () => go(x.k),
     style: {
@@ -14518,6 +14608,445 @@ function KbPdpReturnPicker({
     }
   }, "\u26A0\uFE0F Raison manquante : ", missing.map(r => r.it.produit).join(', ')));
 }
+function kbDlcPdpLimit(site, today) {
+  const R = kbDlcRules().pdpRet || {
+    sameDay: true,
+    closedOk: true,
+    extraDays: 0
+  };
+  let lim = R.sameDay ? addDays(today, R.extraDays || 0) : null;
+  let nextOpen = null;
+  if (R.closedOk) {
+    let d = today;
+    for (let i = 0; i < 14; i++) {
+      d = addDays(d, 1);
+      if (sitesForDate(d).includes(site)) {
+        nextOpen = d;
+        break;
+      }
+    }
+    if (nextOpen) {
+      const before = addDays(nextOpen, -1);
+      if (!lim || before > lim) lim = before;
+    }
+  }
+  return {
+    lim,
+    nextOpen,
+    R
+  };
+}
+function kbDlcPdpAllowed(dlc, site, today) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dlc || ''))) return false;
+  const {
+    lim
+  } = kbDlcPdpLimit(site, today || todayKey());
+  return !!lim && dlc <= lim && dlc >= addDays(today || todayKey(), -7);
+}
+async function kbCompressPhoto(file, maxBytes) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error('photo illisible'));
+      i.src = url;
+    });
+    let w = img.naturalWidth,
+      hh = img.naturalHeight,
+      side = 1280;
+    for (let t = 0; t < 6; t++) {
+      const sc = Math.min(1, side / Math.max(w, hh)),
+        cv = document.createElement('canvas');
+      cv.width = Math.round(w * sc);
+      cv.height = Math.round(hh * sc);
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      for (const q of [0.75, 0.6, 0.45]) {
+        const d = cv.toDataURL('image/jpeg', q);
+        if (d.length * 0.75 < maxBytes) return d;
+      }
+      side = Math.round(side * 0.75);
+    }
+    throw new Error('photo trop lourde');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+function KbDlcWithdrawModal({
+  f,
+  session,
+  onClose
+}) {
+  const showToast = React.useContext(ToastContext);
+  const today = todayKey();
+  const all = (Array.isArray(f.items) ? f.items : []).filter(it => it && it.produit);
+  const [sel, setSel] = React.useState({});
+  const [photo, setPhoto] = React.useState('');
+  const [chk, setChk] = React.useState({
+    a: false,
+    b: false,
+    c: false
+  });
+  const [busy, setBusy] = React.useState(false);
+  const lim = kbDlcPdpLimit(f.site, today);
+  const rows = all.map((it, i) => ({
+    it,
+    i,
+    max: Math.max(1, Number(it.qty) || 1),
+    c: sel[i]
+  }));
+  const chosen = rows.filter(r => r.c && r.c.q > 0);
+  const bad = chosen.filter(r => !kbDlcPdpAllowed(r.c.dlc, f.site, today));
+  const ok = chosen.length && !bad.length && photo && chk.a && chk.b && chk.c && !busy;
+  const since = f.distribDate || f.day || '';
+  const nDays = since ? Math.max(0, Math.round((new Date(today + 'T12:00:00') - new Date(since + 'T12:00:00')) / 86400000)) : 0;
+  const onPhoto = async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      setPhoto(await kbCompressPhoto(file, 280000));
+    } catch (er) {
+      showToast('Photo : ' + er.message);
+    }
+  };
+  const save = async () => {
+    if (!ok) return;
+    setBusy(true);
+    const by = session && session.name || '—',
+      at = Date.now(),
+      id = 'wd_' + at + '_' + Math.random().toString(36).slice(2, 6);
+    const list = chosen.map(r => ({
+      id: r.it.id || '',
+      produit: String(r.it.produit),
+      producteur: String(r.it.producteur || ''),
+      qty: r.c.q,
+      dlc: r.c.dlc,
+      unitPrice: Number(r.it.unitPrice || r.it.price || 0) || 0
+    }));
+    try {
+      await storage.setDoc('day_' + today + '_dlcwd', id, {
+        id,
+        followupId: f.id || f.orderId || '',
+        orderId: f.orderId || '',
+        site: f.site || '',
+        client: f.consumer_name || '',
+        items: list,
+        img: photo,
+        by,
+        at,
+        since,
+        nDays
+      }, {
+        replace: true
+      });
+      const left = all.map((it, i) => {
+        const c = sel[i];
+        return c && c.q > 0 ? {
+          ...it,
+          qty: Math.max(0, (Number(it.qty) || 1) - c.q)
+        } : it;
+      }).filter(it => (Number(it.qty) || 0) > 0);
+      await storage.setDoc('followups', f.id || f.orderId, {
+        items: left,
+        itemsInit: Array.isArray(f.itemsInit) && f.itemsInit.length ? f.itemsInit : all,
+        dlcWithdrawn: [...(f.dlcWithdrawn || []), {
+          wdId: id,
+          items: list,
+          by,
+          at
+        }],
+        updatedBy: by,
+        updatedAt: new Date().toISOString()
+      });
+      for (let k = 0; k < list.length; k++) {
+        const x = list[k],
+          lid = 'losswd_' + id + '_' + k;
+        await storage.setDoc('losses', lid, {
+          id: lid,
+          productKey: `${x.producteur}|${x.produit}`,
+          producteur: x.producteur,
+          produit: x.produit,
+          destination: 'partage',
+          reason: 'dlc',
+          usingWeight: false,
+          quantity: x.qty,
+          weight: 0,
+          unitPrice: x.unitPrice,
+          totalValue: Math.round(x.unitPrice * x.qty * 100) / 100,
+          dlc: x.dlc,
+          site: f.site || '',
+          remark: `Retrait DLC panier non récupéré · ${f.consumer_name || 'client'} · photo ${id}`,
+          day: today,
+          createdBy: by,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
+      const b64 = photo.split(',')[1],
+        att = {
+          dataB64: b64,
+          mimeType: 'image/jpeg',
+          name: 'retrait_dlc_' + today + '.jpg'
+        };
+      const prodTxt = list.map(x => `• ${x.produit}${x.qty > 1 ? ' ×' + x.qty : ''} (DLC ${formatDateShort(x.dlc)})`).join('\n');
+      let mailOk = false;
+      if (f.email) {
+        const body = `Bonjour ${f.consumer_name || ''},\n\nNous vous rappelons que votre panier Kelbongoo est à récupérer à ${siteLabel(f.site)} depuis le ${since ? formatDateShort(since) : '—'}, soit ${nDays} jour${nDays > 1 ? 's' : ''}.\n\nPour des raisons sanitaires, nous avons dû retirer le${list.length > 1 ? 's' : ''} produit${list.length > 1 ? 's' : ''} suivant${list.length > 1 ? 's' : ''}, arrivé${list.length > 1 ? 's' : ''} à sa date limite de consommation :\n${prodTxt}\n\nLa photo prise au moment du retrait est jointe à ce message.\n\nLe reste de votre panier vous attend : n'hésitez pas à passer le récupérer lors de la prochaine distribution.\n\nBelle journée,\nL'équipe Kelbongoo`;
+        const cl = {
+          email: f.email,
+          name: f.consumer_name || '',
+          site: f.site,
+          siteName: siteLabel(f.site),
+          subject: 'Votre panier Kelbongoo à récupérer',
+          body,
+          tag: 'retrait-dlc'
+        };
+        try {
+          const r = await freshdeskPost({
+            secret: FRESHDESK_SECRET,
+            clients: [{
+              ...cl,
+              attachment: att
+            }]
+          });
+          mailOk = !!(r && r.ok && r.success);
+        } catch (_) {}
+        if (!mailOk) {
+          try {
+            const r = await freshdeskPost({
+              secret: FRESHDESK_SECRET,
+              clients: [{
+                ...cl,
+                body: body.replace('La photo prise au moment du retrait est jointe à ce message.\n\n', '')
+              }]
+            });
+            mailOk = !!(r && r.ok && r.success);
+          } catch (_) {}
+        }
+      }
+      try {
+        await stockPost({
+          secret: FRESHDESK_SECRET,
+          action: 'send_mail',
+          to: PDP_ALERT_EMAILS.join(', '),
+          subject: `🧺 Retrait DLC · ${f.site || ''} · ${f.consumer_name || 'client'} · ${by}`,
+          body: `${by} (${siteLabel(f.site)}) a décidé de retirer, photo à l'appui, car DLC du jour (ou lieu fermé jusqu'à la DLC) :\n${prodTxt}\n\nPanier non récupéré depuis le ${since ? formatDateShort(since) : '—'} (${nDays} j). Produit(s) mis en partage équipe.\nMail cliente : ${f.email ? mailOk ? 'envoyé' : 'ÉCHEC' : 'pas d\'adresse'}.`,
+          attachment: att
+        });
+      } catch (_) {}
+      await storage.setDoc('day_' + today + '_dlcwd', id, {
+        mailClient: f.email ? mailOk ? 'ok' : 'echec' : 'sans-email'
+      });
+      showToast(`🧺 Retiré : ${list.length} produit${list.length > 1 ? 's' : ''} → partage équipe${f.email ? mailOk ? ' · mail cliente envoyé' : ' · ⚠️ mail cliente pas parti' : ''}`);
+      onClose && onClose();
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return React.createElement(KbSheet, {
+    title: '🧺 Retirer un produit DLC — ' + (f.consumer_name || 'client'),
+    onClose: onClose
+  }, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      background: '#faf5ff',
+      border: '2px solid #ce93d8',
+      borderRadius: 12,
+      padding: '8px 10px',
+      marginBottom: 8
+    }
+  }, "Seulement si la DLC est ", React.createElement("b", null, "aujourd'hui"), lim.R.extraDays ? ` (ou J+${lim.R.extraDays})` : '', lim.R.closedOk && lim.nextOpen ? React.createElement(React.Fragment, null, " ou tombe avant la prochaine ouverture de ", f.site, " (", React.createElement("b", null, formatDateShort(lim.nextOpen)), ")") : null, ".", React.createElement("br", null), "DLC accept\xE9e jusqu'au ", React.createElement("b", null, lim.lim ? formatDateShort(lim.lim) : '—'), "."), React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 16,
+      margin: '4px 0'
+    }
+  }, "1\uFE0F\u20E3 Quel produit ?"), rows.map(r => {
+    const on = r.c && r.c.q > 0,
+      okD = on && kbDlcPdpAllowed(r.c.dlc, f.site, today);
+    return React.createElement("div", {
+      key: r.i,
+      style: {
+        borderRadius: 12,
+        padding: '8px 10px',
+        marginBottom: 6,
+        border: '2px solid ' + (on ? okD ? '#6a1b9a' : '#c62828' : 'var(--border)'),
+        background: on ? '#f3e5f5' : '#fff'
+      }
+    }, React.createElement("div", {
+      onClick: () => setSel(s => ({
+        ...s,
+        [r.i]: on ? {
+          q: 0,
+          dlc: ''
+        } : {
+          q: r.max,
+          dlc: s[r.i] && s[r.i].dlc || today
+        }
+      })),
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        cursor: 'pointer',
+        minHeight: 44
+      }
+    }, React.createElement("span", {
+      style: {
+        fontSize: 26
+      }
+    }, on ? '☑️' : '⬜'), React.createElement("span", {
+      style: {
+        flex: 1,
+        fontSize: 17,
+        fontWeight: 700
+      }
+    }, r.it.produit, r.max > 1 ? ` ×${r.max}` : '', React.createElement("span", {
+      style: {
+        display: 'block',
+        fontSize: 12,
+        fontWeight: 400,
+        color: 'var(--ink-mute)'
+      }
+    }, r.it.producteur || ''))), on && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 10,
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        marginTop: 6
+      }
+    }, React.createElement("label", {
+      style: {
+        fontSize: 15
+      }
+    }, "DLC ", React.createElement("input", {
+      type: "date",
+      value: r.c.dlc,
+      onChange: e => setSel(s => ({
+        ...s,
+        [r.i]: {
+          ...s[r.i],
+          dlc: e.target.value
+        }
+      })),
+      style: {
+        fontSize: 16
+      }
+    })), r.max > 1 && React.createElement("span", {
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6
+      }
+    }, React.createElement("button", {
+      type: "button",
+      className: "btn-secondary",
+      onClick: () => setSel(s => ({
+        ...s,
+        [r.i]: {
+          ...s[r.i],
+          q: Math.max(1, s[r.i].q - 1)
+        }
+      }))
+    }, "\u2212"), React.createElement("b", null, r.c.q), React.createElement("button", {
+      type: "button",
+      className: "btn-secondary",
+      onClick: () => setSel(s => ({
+        ...s,
+        [r.i]: {
+          ...s[r.i],
+          q: Math.min(r.max, s[r.i].q + 1)
+        }
+      }))
+    }, "+")), !okD && React.createElement("span", {
+      style: {
+        color: '#c62828',
+        fontWeight: 800,
+        fontSize: 14
+      }
+    }, "\u26D4 DLC pas dans la r\xE8gle : on ne retire pas")));
+  }), React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 16,
+      margin: '10px 0 4px'
+    }
+  }, "2\uFE0F\u20E3 Photo obligatoire"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginBottom: 6
+    }
+  }, "On doit voir le ", React.createElement("b", null, "nom du produit"), ", la ", React.createElement("b", null, "DLC"), " et le ", React.createElement("b", null, "casier de la cliente"), " avec ses produits en dessous."), React.createElement("label", {
+    style: {
+      display: 'block',
+      textAlign: 'center',
+      padding: 14,
+      borderRadius: 14,
+      border: '3px dashed #6a1b9a',
+      background: '#faf5ff',
+      fontSize: 17,
+      fontWeight: 800,
+      color: '#6a1b9a',
+      cursor: 'pointer'
+    }
+  }, "\uD83D\uDCF7 ", photo ? 'Reprendre la photo' : 'Prendre la photo', React.createElement("input", {
+    type: "file",
+    accept: "image/*",
+    capture: "environment",
+    onChange: onPhoto,
+    style: {
+      display: 'none'
+    }
+  })), photo && React.createElement("img", {
+    src: photo,
+    alt: "photo du retrait",
+    style: {
+      width: '100%',
+      borderRadius: 12,
+      marginTop: 8
+    }
+  }), photo && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 16,
+      margin: '10px 0 4px'
+    }
+  }, "3\uFE0F\u20E3 Sur la photo, on voit bien :"), [['a', 'le nom du produit'], ['b', 'la DLC'], ['c', 'les produits de la cliente en dessous (son casier)']].map(([k, l]) => React.createElement("label", {
+    key: k,
+    style: {
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      fontSize: 17,
+      padding: '6px 0'
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: chk[k],
+    onChange: e => setChk(o => ({
+      ...o,
+      [k]: e.target.checked
+    })),
+    style: {
+      width: 26,
+      height: 26
+    }
+  }), l))), React.createElement("button", {
+    className: "btn-primary",
+    disabled: !ok,
+    onClick: save,
+    style: {
+      width: '100%',
+      minHeight: 60,
+      fontSize: 18,
+      marginTop: 12,
+      background: ok ? '#6a1b9a' : '#bdbdbd'
+    }
+  }, busy ? '⏳…' : !chosen.length ? 'Choisis un produit' : bad.length ? 'DLC hors règle' : !photo ? 'Photo obligatoire' : !(chk.a && chk.b && chk.c) ? 'Coche les 3 cases' : `🧺 Retirer → partage équipe + mail cliente`));
+}
 const KB_NR_DECISIONS = [{
   k: 'pdp',
   ic: '↩️',
@@ -14875,6 +15404,7 @@ function NonRecupSubPage({
   });
   const [pdpPick, setPdpPick] = React.useState(null);
   const sendToPdpNow = f => setPdpPick(f);
+  const [dlcWd, setDlcWd] = React.useState(null);
   const setStatus = async (f, newStatus) => {
     const docId = f.id || f.orderId;
     if (!docId) {
@@ -15043,6 +15573,10 @@ function NonRecupSubPage({
     ask: !session.isMaster,
     onClose: () => setPdpPick(null),
     onDone: () => setPdpPick(null)
+  }), dlcWd && React.createElement(KbDlcWithdrawModal, {
+    f: dlcWd,
+    session: session,
+    onClose: () => setDlcWd(null)
   }), React.createElement("h1", null, "Non-r\xE9cup\xE9r\xE9s \xB7 ", currentSite), React.createElement("p", {
     style: {
       color: 'var(--ink-soft)',
@@ -15357,7 +15891,16 @@ function NonRecupSubPage({
         fontSize: 12
       },
       onClick: () => setStatus(f, 'resolved')
-    }, "\u2713 R\xE9solu"), !f.forceReturnPdp && (!f.pdpAsk || f.pdpAsk.refusedAt) && React.createElement("button", {
+    }, "\u2713 R\xE9solu"), Array.isArray(f.items) && f.items.length > 0 && React.createElement("button", {
+      className: "btn-ghost",
+      style: {
+        padding: '6px 10px',
+        fontSize: 12,
+        color: '#6a1b9a',
+        border: '1px solid #ce93d8'
+      },
+      onClick: () => setDlcWd(f)
+    }, "\uD83E\uDDFA Retirer un produit DLC"), !f.forceReturnPdp && (!f.pdpAsk || f.pdpAsk.refusedAt) && React.createElement("button", {
       className: "btn-secondary",
       style: {
         padding: '8px 12px',
@@ -19237,7 +19780,8 @@ function InventoryPage({
   const [mqSending, setMqSending] = React.useState(false);
   const [stockProducts, setStockProducts] = React.useState(null);
   const [stockNote, setStockNote] = React.useState('');
-  const invLv = useStockLevels(invDate);
+  const invTheoDate = useKbInvTheoDate(invDate);
+  const invLv = useStockLevels(invTheoDate);
   React.useEffect(() => {
     (async () => {
       try {
@@ -19995,6 +20539,7 @@ function InventoryPage({
           secret: FRESHDESK_SECRET,
           action: 'inv_new',
           date: invDate,
+          theoDate: kbInvTheoDate(invDate, await kbInvRulesLoad(true)),
           by: who,
           type: invType
         });
@@ -20102,10 +20647,19 @@ function InventoryPage({
       setClosingInv(false);
     }
   };
+  const [consoAsk, setConsoAsk] = React.useState(false);
+  const consoOk = React.useRef(false);
   const validateStock = async () => {
     if (!STOCK_PROXY_URL) {
       showToast('⚠️ Proxy stock non configuré (STOCK_PROXY_URL vide)');
       return;
+    }
+    if (!consoOk.current) {
+      const cc = await storage.getDoc('inventory_meta', 'consommables').catch(() => null);
+      if (cc && cc.countedAt && new Date(cc.countedAt).toLocaleDateString('sv-SE') === todayKey()) consoOk.current = true;else {
+        setConsoAsk(true);
+        return;
+      }
     }
     if (invType === 'complet' || invType === 'tournant') {
       return validateStockNew();
@@ -20283,7 +20837,22 @@ function InventoryPage({
   };
   return React.createElement("div", {
     className: "stack"
-  }, React.createElement("h1", null, "\uD83D\uDCCB Inventaire"), session.isMaster && React.createElement("div", {
+  }, React.createElement("h1", null, "\uD83D\uDCCB Inventaire"), consoAsk && React.createElement(KbConsoCountModal, {
+    operator: session && session.name,
+    onDone: () => {
+      consoOk.current = true;
+      setConsoAsk(false);
+      showToast('✓ Consommables comptés · tu peux clôturer');
+      validateStock();
+    },
+    onCancel: () => setConsoAsk(false)
+  }), invLv && invLv.sheet ? React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)',
+      margin: '-6px 2px 0'
+    }
+  }, "Stock th\xE9orique = \xAB Stock fin \xBB de la feuille ", React.createElement("b", null, invLv.sheet), " (r\xE8gle inventaire)") : null, session.isMaster && React.createElement("div", {
     className: "card",
     style: {
       borderLeft: '3px solid var(--master)'
@@ -26295,7 +26864,7 @@ function kbCelebrate(opts) {
     wrap.appendChild(cv);
     const card = document.createElement('div');
     card.style.cssText = 'position:relative;max-width:340px;margin:16px;padding:22px 20px 16px;background:rgba(255,255,255,.96);border-radius:18px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.45);animation:kbPop .55s ease-out';
-    card.innerHTML = (xmas ? '<div style="font-size:46px;line-height:1">🎅</div><div style="font-weight:900;font-size:24px;color:#c62828;letter-spacing:2px;margin-top:2px">HO HO HO !</div>' : '<div style="font-size:46px;line-height:1">🎆</div>') + '<div style="font-weight:800;font-size:20px;color:#1a4d2e;margin-top:6px">' + kbEsc(o.title || 'Terminé') + '</div>' + (o.sub ? '<div style="font-size:13px;color:#2e7d32;margin-top:4px">' + kbEsc(o.sub) + '</div>' : '') + '<div style="margin-top:14px;color:#33691e;font-size:15px;line-height:1.35;border-top:1px dashed #a5d6a7;padding-top:12px">' + (xmas ? '<b style="color:#c62828">' + kbEsc(xm) + '</b>' : qFact ? '<b>Le saviez-vous ?</b> ' + kbEsc(q.t) : '<i>« ' + kbEsc(q.t) + ' »</i>' + (q.a ? '<div style="font-size:12px;color:#558b2f;margin-top:4px">— ' + kbEsc(q.a) + '</div>' : '')) + '</div>' + '<div style="margin-top:12px;font-size:11px;color:#999">Touche pour fermer</div>';
+    card.innerHTML = (xmas ? '<div style="font-size:46px;line-height:1">🎅</div><div style="font-weight:900;font-size:24px;color:#c62828;letter-spacing:2px;margin-top:2px">HO HO HO !</div>' : '<div style="font-size:46px;line-height:1">🎆</div>') + '<div style="font-weight:800;font-size:20px;color:#1a4d2e;margin-top:6px">' + kbEsc(o.title || 'Terminé') + '</div>' + (o.sub ? '<div style="font-size:13px;color:#2e7d32;margin-top:4px">' + kbEsc(o.sub) + '</div>' : '') + '<div style="margin-top:14px;color:#33691e;font-size:15px;line-height:1.35;border-top:1px dashed #a5d6a7;padding-top:12px">' + (xmas ? '<b style="color:#c62828">' + kbEsc(xm) + '</b><div style="margin-top:10px">' : '') + (qFact ? '<b>Le saviez-vous ?</b> ' + kbEsc(q.t) : '<i>« ' + kbEsc(q.t) + ' »</i>' + (q.a ? '<div style="font-size:12px;color:#558b2f;margin-top:4px">— ' + kbEsc(q.a) + '</div>' : '')) + (xmas ? '</div>' : '') + '</div>' + '<div style="margin-top:12px;font-size:11px;color:#999">Touche pour fermer</div>';
     wrap.appendChild(card);
     document.body.appendChild(wrap);
     try {
@@ -27649,6 +28218,92 @@ function MuCard({
     setInProgress('');
     setFinalQty('');
   };
+  const [ruptOpen, setRuptOpen] = React.useState(false);
+  const [ruptQty, setRuptQty] = React.useState('');
+  const [ruptBusy, setRuptBusy] = React.useState(false);
+  const openRupt = () => {
+    const ipNow = parseInt(inProgress, 10) || myActive && myActive.inProgress || 0;
+    setRuptQty(String((doneCount || 0) + ipNow));
+    setRuptOpen(true);
+  };
+  const confirmRupt = async () => {
+    const tot = Math.max(0, parseInt(ruptQty, 10) || 0),
+      add = Math.max(0, tot - (doneCount || 0)),
+      now = Date.now(),
+      need = est || 0;
+    setRuptBusy(true);
+    try {
+      if (myActive) {
+        if (add > 0) {
+          const elapsed = (myActive.elapsedMs || 0) + (myActive.status !== 'paused' ? now - (myActive.startedAt || now) : 0);
+          await storage.setDoc(coll, myActive.id, {
+            status: 'done',
+            done: add,
+            finishedAt: now,
+            durationMs: elapsed,
+            inProgress: add,
+            ruptureEnd: true
+          });
+        } else await storage.deleteDoc(coll, myActive.id);
+      } else if (add > 0) {
+        await storage.setDoc(coll, muNewId(), {
+          product: name,
+          target: add,
+          uv: item.uv || '',
+          operator,
+          startedAt: now,
+          elapsedMs: 0,
+          inProgress: add,
+          status: 'done',
+          done: add,
+          finishedAt: now,
+          durationMs: 0,
+          ruptureEnd: true
+        }, {
+          replace: true
+        });
+      }
+      await storage.setDoc(coll, kbMuRuptId(name), {
+        status: 'rupture',
+        product: name,
+        uv: item.uv || '',
+        need,
+        fait: tot,
+        manque: Math.max(0, need - tot),
+        stock: item._reel ? Number(item._reel.stock) || 0 : null,
+        commandes: item._reel ? Number(item._reel.commandes) || 0 : null,
+        operator,
+        at: now
+      }, {
+        replace: true
+      });
+      setRuptOpen(false);
+      setPhase('idle');
+      setInProgress('');
+      setFinalQty('');
+    } catch (e) {
+      alert('Erreur : ' + e.message);
+    } finally {
+      setRuptBusy(false);
+    }
+  };
+  const ruptTot = Math.max(0, parseInt(ruptQty, 10) || 0),
+    ruptManque = Math.max(0, (est || 0) - ruptTot);
+  const ruptBtn = React.createElement("button", {
+    className: "btn-ghost",
+    onClick: openRupt,
+    style: {
+      width: '100%',
+      marginTop: 8,
+      padding: '10px',
+      fontSize: 15,
+      fontWeight: 700,
+      color: '#c62828',
+      border: '2px solid #ef9a9a',
+      borderRadius: 10,
+      background: '#fff'
+    }
+  }, "\uD83D\uDEAB Plus de produit (rupture)");
   const ip = myActive && myActive.inProgress || 0;
   const pct = est > 0 ? Math.min(100, Math.round((doneCount + ip) / est * 100)) : 0;
   const active = phase !== 'idle';
@@ -27758,7 +28413,98 @@ function MuCard({
       color: 'var(--ink-mute)',
       marginBottom: 6
     }
-  }, "\uD83E\uDDD1 ", busyBy.join(', '), " en cours\u2026"), phase === 'idle' && React.createElement("button", {
+  }, "\uD83E\uDDD1 ", busyBy.join(', '), " en cours\u2026"), ruptOpen && React.createElement("div", {
+    style: {
+      background: '#fff5f5',
+      border: '3px solid #c62828',
+      borderRadius: 12,
+      padding: 12,
+      marginBottom: 8
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 900,
+      color: '#c62828'
+    }
+  }, "\uD83D\uDEAB Plus de ", name, " ?"), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      marginTop: 4
+    }
+  }, "Combien de sachets as-tu pu faire ", React.createElement("b", null, "en tout"), " aujourd'hui ?", doneCount > 0 ? React.createElement(React.Fragment, null, " (d\xE9j\xE0 valid\xE9s : ", doneCount, ")") : null), React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 14,
+      margin: '10px 0'
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      width: 52,
+      height: 52,
+      borderRadius: '50%',
+      fontSize: 26,
+      fontWeight: 700
+    },
+    onClick: () => setRuptQty(s => String(Math.max(0, (parseInt(s, 10) || 0) - 1)))
+  }, "\u2212"), React.createElement("input", {
+    type: "number",
+    inputMode: "numeric",
+    value: ruptQty,
+    onChange: e => setRuptQty(e.target.value),
+    onFocus: e => e.target.select(),
+    style: {
+      width: 84,
+      textAlign: 'center',
+      fontSize: 36,
+      fontWeight: 800,
+      border: '2px solid #ef9a9a',
+      borderRadius: 10
+    }
+  }), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      width: 52,
+      height: 52,
+      borderRadius: '50%',
+      fontSize: 26,
+      fontWeight: 700
+    },
+    onClick: () => setRuptQty(s => String((parseInt(s, 10) || 0) + 1))
+  }, "+")), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      lineHeight: 1.45,
+      background: '#fff',
+      borderRadius: 10,
+      padding: '8px 10px'
+    }
+  }, "\u2705 Valid\xE9 : ", React.createElement("b", null, ruptTot), " sachet", ruptTot > 1 ? 's' : '', item._reel && Number(item._reel.stock) > 0 ? React.createElement(React.Fragment, null, " + ", React.createElement("b", null, item._reel.stock), " d\xE9j\xE0 en stock") : null, React.createElement("br", null), ruptManque > 0 ? React.createElement(React.Fragment, null, "\uD83D\uDEAB En rupture : ", React.createElement("b", {
+    style: {
+      color: '#c62828'
+    }
+  }, ruptManque), " sachet", ruptManque > 1 ? 's' : '', " (sur ", est || 0, " \xE0 faire)", React.createElement("br", null), "\uD83D\uDC49 La pr\xE9pa est pr\xE9venue : elle met ", React.createElement("b", null, "rupture"), " ou ", React.createElement("b", null, "partiel"), " aux clients concern\xE9s.") : React.createElement(React.Fragment, null, "Tout le \xAB \xE0 faire \xBB est couvert : rien en rupture.")), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 10
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    disabled: ruptBusy,
+    onClick: () => setRuptOpen(false)
+  }, "\u2190 Retour"), React.createElement("button", {
+    className: "btn-primary",
+    disabled: ruptBusy,
+    style: {
+      flex: 1,
+      background: '#c62828'
+    },
+    onClick: confirmRupt
+  }, "\uD83D\uDEAB Confirmer la rupture"))), phase === 'idle' && !ruptOpen && React.createElement(React.Fragment, null, React.createElement("button", {
     className: "btn-primary",
     style: {
       width: '100%',
@@ -27767,7 +28513,7 @@ function MuCard({
       fontWeight: 700
     },
     onClick: start
-  }, "\u25B6 Je commence !"), phase === 'running' && React.createElement("div", {
+  }, "\u25B6 Je commence !"), ruptBtn), phase === 'running' && React.createElement("div", {
     style: {
       background: '#fff3e0',
       borderRadius: 10,
@@ -27834,7 +28580,7 @@ function MuCard({
       background: '#ef6c00'
     },
     onClick: openFinish
-  }, "\u2713 Termin\xE9 !"))), phase === 'paused' && React.createElement("div", {
+  }, "\u2713 Termin\xE9 !")), !ruptOpen && ruptBtn), phase === 'paused' && React.createElement("div", {
     style: {
       background: '#fff8e1',
       borderRadius: 10,
@@ -27872,7 +28618,7 @@ function MuCard({
       background: '#ef6c00'
     },
     onClick: openFinish
-  }, "\u2713 Termin\xE9 !"))), phase === 'finishing' && React.createElement("div", {
+  }, "\u2713 Termin\xE9 !")), !ruptOpen && ruptBtn), phase === 'finishing' && React.createElement("div", {
     style: {
       background: '#fff8f1',
       borderRadius: 10,
@@ -28358,6 +29104,746 @@ function muLinesFromOrders(orders) {
     });
   });
   return out;
+}
+function kbMuRuptId(name) {
+  return 'rupt_' + muKey(name).replace(/\s+/g, '_').slice(0, 120);
+}
+function kbMuRuptMap(list) {
+  const m = {};
+  (list || []).forEach(e => {
+    if (e && e.status === 'rupture' && e.product) m[muKey(e.product)] = e;
+  });
+  return m;
+}
+const KB_CONSO_DEF = {
+  perPack: 1000,
+  codes: {
+    G: '20381',
+    P: '20355'
+  },
+  dims: {
+    G: '20×9×29',
+    P: '14×9×26'
+  },
+  labels: {
+    G: 'Grand sachet MU (1 kg)',
+    P: 'Petit sachet MU (500 g et autres)'
+  },
+  mins: {
+    filmPal: 3,
+    filmFro: 4
+  },
+  counts: {
+    G: 7,
+    P: 0,
+    filmPal: null,
+    filmFro: null
+  },
+  countedAt: new Date('2026-11-24T14:52:00+01:00').getTime(),
+  countedBy: 'stock de départ (Henry)',
+  sizeOv: {},
+  alertTo: ''
+};
+function kbConsoNorm(d) {
+  d = d || {};
+  const D = KB_CONSO_DEF;
+  const num = (v, def) => v === null || v === '' || v === undefined || isNaN(Number(v)) ? def : Math.max(0, Math.round(Number(v)));
+  return {
+    perPack: num(d.perPack, D.perPack) || D.perPack,
+    codes: {
+      G: String(d.codes && d.codes.G || D.codes.G).slice(0, 20),
+      P: String(d.codes && d.codes.P || D.codes.P).slice(0, 20)
+    },
+    dims: {
+      G: String(d.dims && d.dims.G || D.dims.G).slice(0, 30),
+      P: String(d.dims && d.dims.P || D.dims.P).slice(0, 30)
+    },
+    labels: D.labels,
+    mins: {
+      filmPal: num(d.mins && d.mins.filmPal, D.mins.filmPal),
+      filmFro: num(d.mins && d.mins.filmFro, D.mins.filmFro)
+    },
+    counts: {
+      G: num(d.counts && d.counts.G, D.counts.G),
+      P: num(d.counts && d.counts.P, D.counts.P),
+      filmPal: num(d.counts && d.counts.filmPal, null),
+      filmFro: num(d.counts && d.counts.filmFro, null)
+    },
+    countedAt: Number(d.countedAt) || D.countedAt,
+    countedBy: String(d.countedBy || D.countedBy).slice(0, 60),
+    sizeOv: d.sizeOv && typeof d.sizeOv === 'object' ? d.sizeOv : {},
+    alertTo: String(d.alertTo || '').slice(0, 200),
+    history: Array.isArray(d.history) ? d.history.slice(-30) : []
+  };
+}
+function kbConsoAlertTo(c) {
+  const t = String(c && c.alertTo || '').trim();
+  return t || PDP_ALERT_EMAILS[0];
+}
+function kbConsoEmailsOk(s) {
+  return String(s || '').split(/[,;\s]+/).filter(Boolean).every(x => /^[^@\s<>"']+@[^@\s<>"']+\.[a-z]{2,}$/i.test(x));
+}
+function kbConsoSize(product, uv, sizeOv) {
+  const k = muKey(product);
+  if (sizeOv && (sizeOv[k] === 'G' || sizeOv[k] === 'P')) return sizeOv[k];
+  const m = String(uv || '').toLowerCase().replace(',', '.').match(/(\d+(?:\.\d+)?)\s*(kg|g)\b/);
+  if (!m) return 'P';
+  const kg = m[2] === 'kg' ? Number(m[1]) : Number(m[1]) / 1000;
+  return kg >= 0.8 ? 'G' : 'P';
+}
+let _kbConsoUse = null,
+  _kbConsoUseAt = 0,
+  _kbConsoUseP = null;
+async function kbConsoUsage(conf, force) {
+  if (!force && _kbConsoUse && Date.now() - _kbConsoUseAt < 30 * 60000) return _kbConsoUse;
+  if (_kbConsoUseP) return _kbConsoUseP;
+  _kbConsoUseP = (async () => {
+    const today = todayKey(),
+      days = [];
+    for (let i = 0; i < 36; i++) days.push(addDays(today, -i));
+    const byDay = {},
+      products = {},
+      entries = [];
+    for (let i = 0; i < days.length; i += 6) {
+      const part = await Promise.all(days.slice(i, i + 6).map(d => storage.getAll('mu_' + d).catch(() => [])));
+      part.forEach(list => (list || []).forEach(e => {
+        if (e && e.status === 'done' && e.product && Number(e.done) > 0) entries.push(e);
+      }));
+    }
+    const seen = new Set();
+    entries.forEach(e => {
+      const id = (e.id || '') + '|' + (e.finishedAt || '');
+      if (seen.has(id)) return;
+      seen.add(id);
+      const sz = kbConsoSize(e.product, e.uv, conf.sizeOv),
+        n = Number(e.done) || 0;
+      const at = Number(e.finishedAt) || 0,
+        dk = at ? new Date(at).toLocaleDateString('sv-SE') : '';
+      if (dk) {
+        byDay[dk] = byDay[dk] || {
+          G: 0,
+          P: 0
+        };
+        byDay[dk][sz] += n;
+      }
+      const pk = muKey(e.product);
+      products[pk] = products[pk] || {
+        name: e.product,
+        uv: e.uv || '',
+        n: 0,
+        auto: kbConsoSize(e.product, e.uv, {})
+      };
+      products[pk].n += n;
+    });
+    _kbConsoUse = {
+      byDay,
+      products,
+      entries,
+      at: Date.now()
+    };
+    _kbConsoUseAt = Date.now();
+    return _kbConsoUse;
+  })();
+  try {
+    return await _kbConsoUseP;
+  } finally {
+    _kbConsoUseP = null;
+  }
+}
+function kbConsoCalc(conf, use, now) {
+  now = now || Date.now();
+  const today = new Date(now).toLocaleDateString('sv-SE');
+  const out = {};
+  ['G', 'P'].forEach(s => {
+    let usedSince = 0;
+    (use.entries || []).forEach(e => {
+      if ((Number(e.finishedAt) || 0) > conf.countedAt && kbConsoSize(e.product, e.uv, conf.sizeOv) === s) usedSince += Number(e.done) || 0;
+    });
+    const dowSum = [0, 0, 0, 0, 0, 0, 0],
+      dowN = [0, 0, 0, 0, 0, 0, 0];
+    for (let i = 1; i <= 28; i++) {
+      const d = addDays(today, -i),
+        w = kbDowOf(d);
+      dowN[w]++;
+      dowSum[w] += (use.byDay[d] || {})[s] || 0;
+    }
+    const dowAvg = dowSum.map((v, i) => dowN[i] ? v / dowN[i] : 0);
+    const week = dowAvg.reduce((a, b) => a + b, 0);
+    const dow = kbDowOf(today);
+    let untilSun = Math.max(0, dowAvg[dow] - ((use.byDay[today] || {})[s] || 0));
+    for (let w = dow === 0 ? 7 : dow + 1; w <= 7; w++) untilSun += dowAvg[w % 7];
+    if (dow === 0) untilSun = Math.max(0, dowAvg[0] - ((use.byDay[today] || {})[s] || 0));
+    const theo = conf.counts[s] * conf.perPack - usedSince;
+    const atMonday = theo - untilSun;
+    const short = Math.max(0, Math.ceil(week - atMonday));
+    out[s] = {
+      theo: Math.round(theo),
+      usedSince,
+      week: Math.round(week),
+      daily: Math.round(week / 7),
+      untilSun: Math.round(untilSun),
+      atMonday: Math.round(atMonday),
+      short,
+      packs: short > 0 ? Math.ceil(short / conf.perPack) : 0,
+      days: week > 0 ? Math.floor(theo / (week / 7)) : null
+    };
+  });
+  out.filmPal = {
+    n: conf.counts.filmPal,
+    min: conf.mins.filmPal,
+    low: conf.counts.filmPal != null && conf.counts.filmPal < conf.mins.filmPal
+  };
+  out.filmFro = {
+    n: conf.counts.filmFro,
+    min: conf.mins.filmFro,
+    low: conf.counts.filmFro != null && conf.counts.filmFro < conf.mins.filmFro
+  };
+  return out;
+}
+function useKbConso() {
+  const [conf, setConf] = React.useState(null);
+  const [use, setUse] = React.useState(null);
+  React.useEffect(() => kbDocSub('inventory_meta', 'consommables', d => setConf(kbConsoNorm(d))), []);
+  React.useEffect(() => {
+    if (!conf) return;
+    let ok = true;
+    kbConsoUsage(conf).then(u => {
+      if (ok) setUse(u);
+    }).catch(() => {});
+    return () => {
+      ok = false;
+    };
+  }, [conf && JSON.stringify(conf.sizeOv), conf && conf.countedAt]);
+  const calc = React.useMemo(() => conf && use ? kbConsoCalc(conf, use) : null, [conf, use]);
+  return {
+    conf,
+    use,
+    calc
+  };
+}
+function kbNextMonday(dayKey) {
+  const w = kbDowOf(dayKey);
+  return addDays(dayKey, w === 0 ? 1 : 8 - w);
+}
+function kbConsoMailText(conf, calc) {
+  const L = [];
+  ['G', 'P'].forEach(s => {
+    const c = calc[s];
+    if (c.short > 0) L.push(`Stock théorique ${c.theo} sachets pour réf. code fournisseur ${conf.codes[s]} (${conf.dims[s]}, ${s === 'G' ? 'grand' : 'petit'} sachet). Besoin estimé pour la semaine prochaine : ${c.week} sachets (stock prévu lundi : ${Math.max(0, c.atMonday)}). Il manque environ ${c.short} sachets, soit ${c.packs} paquet${c.packs > 1 ? 's' : ''} de ${conf.perPack}. Merci de passer la commande.`);
+  });
+  if (calc.filmPal.low) L.push(`Film palette : ${calc.filmPal.n} rouleau${calc.filmPal.n > 1 ? 'x' : ''} en stock (minimum ${calc.filmPal.min}). Merci de passer la commande.`);
+  if (calc.filmFro.low) L.push(`Petit film fromage : ${calc.filmFro.n} rouleau${calc.filmFro.n > 1 ? 'x' : ''} en stock (minimum ${calc.filmFro.min}). Merci de passer la commande.`);
+  return L;
+}
+function KbConsoAlerter() {
+  const {
+    conf,
+    calc
+  } = useKbConso();
+  React.useEffect(() => {
+    if (!conf || !calc) return;
+    const now = new Date(),
+      today = todayKey(),
+      dow = kbDowOf(today);
+    if (!(dow === 3 && now.getHours() >= 8) && !(dow >= 4 || dow === 0)) return;
+    const lines = kbConsoMailText(conf, calc);
+    if (!lines.length) return;
+    const lockId = 'conso_alert_' + kbNextMonday(today);
+    let off = false;
+    (async () => {
+      const ex = await storage.getDoc('inventory_meta', lockId).catch(() => null);
+      if (ex || off) return;
+      const tok = Math.random().toString(36).slice(2, 10);
+      await storage.setDoc('inventory_meta', lockId, {
+        tok,
+        at: Date.now(),
+        state: 'envoi'
+      }, {
+        replace: true
+      });
+      await new Promise(r => setTimeout(r, 1500));
+      const me = await storage.getDoc('inventory_meta', lockId).catch(() => null);
+      if (!me || me.tok !== tok || off) return;
+      const body = 'Bonjour,\n\n' + lines.join('\n\n') + '\n\nCalcul fait par l\'appli Kelbongoo d\'après le dernier comptage (' + new Date(conf.countedAt).toLocaleString('fr-FR') + ', ' + conf.countedBy + ') et la consommation des 4 dernières semaines.\n\nMerci.';
+      let ok = false;
+      try {
+        const r = await stockPost({
+          secret: FRESHDESK_SECRET,
+          action: 'send_mail',
+          to: kbConsoAlertTo(conf),
+          subject: '🧻 Commande consommables · semaine du ' + formatDateShort(kbNextMonday(today)),
+          body
+        });
+        ok = !(r && r.ok === false);
+      } catch (_) {}
+      await storage.setDoc('inventory_meta', lockId, {
+        state: ok ? 'envoyé' : 'échec',
+        sentAt: Date.now(),
+        lines
+      });
+      if (!ok) await storage.deleteDoc('inventory_meta', lockId).catch(() => {});
+    })();
+    return () => {
+      off = true;
+    };
+  }, [conf && conf.countedAt, calc && JSON.stringify(calc)]);
+  return null;
+}
+function KbConsoCountModal({
+  operator,
+  onDone,
+  onCancel
+}) {
+  const {
+    conf
+  } = useKbConso();
+  const [v, setV] = React.useState({
+    G: '',
+    P: '',
+    filmPal: '',
+    filmFro: ''
+  });
+  const [busy, setBusy] = React.useState(false);
+  if (!conf) return null;
+  const okN = k => v[k] !== '' && /^\d{1,4}$/.test(String(v[k]));
+  const all = ['G', 'P', 'filmPal', 'filmFro'].every(okN);
+  const save = async () => {
+    if (!all) return;
+    setBusy(true);
+    try {
+      const counts = {
+          G: +v.G,
+          P: +v.P,
+          filmPal: +v.filmPal,
+          filmFro: +v.filmFro
+        },
+        at = Date.now();
+      await storage.setDoc('inventory_meta', 'consommables', {
+        counts,
+        countedAt: at,
+        countedBy: String(operator || '—').slice(0, 60),
+        history: [...(conf.history || []), {
+          counts,
+          at,
+          by: String(operator || '—').slice(0, 60)
+        }].slice(-30)
+      });
+      _kbConsoUseAt = 0;
+      onDone && onDone();
+    } catch (e) {
+      alert('Erreur : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const row = (k, ic, lbl, sub) => React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '8px 0',
+      borderTop: '1px solid #eee'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 26
+    }
+  }, ic), React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 16
+    }
+  }, lbl), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 13,
+      color: '#666'
+    }
+  }, sub)), React.createElement("input", {
+    type: "number",
+    inputMode: "numeric",
+    min: "0",
+    value: v[k],
+    onChange: e => setV(o => ({
+      ...o,
+      [k]: e.target.value.replace(/[^0-9]/g, '').slice(0, 4)
+    })),
+    placeholder: "?",
+    style: {
+      width: 80,
+      fontSize: 26,
+      fontWeight: 800,
+      textAlign: 'center',
+      borderRadius: 10,
+      border: '2px solid ' + (okN(k) ? '#2e7d32' : '#ef9a9a')
+    }
+  }));
+  return React.createElement("div", {
+    className: "fs-overlay"
+  }, React.createElement("div", {
+    className: "fs-card",
+    style: {
+      maxWidth: 480,
+      textAlign: 'left'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 900
+    }
+  }, "\uD83E\uDDFB Avant de cl\xF4turer : compte les consommables"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      background: '#fff8e1',
+      borderRadius: 10,
+      padding: '8px 10px',
+      margin: '8px 0'
+    }
+  }, "Sachets : compte seulement les ", React.createElement("b", null, "paquets de ", conf.perPack, " PLEINS"), ". Un paquet ouvert ne compte pas. Films : compte les ", React.createElement("b", null, "rouleaux"), "."), row('G', '🛍️', 'Grand sachet MU · paquets pleins', `${conf.dims.G} · code ${conf.codes.G} · MU 1 kg`), row('P', '🛍️', 'Petit sachet MU · paquets pleins', `${conf.dims.P} · code ${conf.codes.P} · MU 500 g et autres`), row('filmPal', '🎞️', 'Film palette · rouleaux', `minimum ${conf.mins.filmPal}`), row('filmFro', '🧀', 'Petit film fromage · rouleaux', `minimum ${conf.mins.filmFro}`), React.createElement("button", {
+    className: "btn-primary",
+    disabled: !all || busy,
+    onClick: save,
+    style: {
+      width: '100%',
+      minHeight: 56,
+      fontSize: 18,
+      marginTop: 10
+    }
+  }, all ? '✓ Enregistrer et continuer' : 'Remplis les 4 cases (0 si aucun)'), React.createElement("button", {
+    className: "btn-secondary",
+    disabled: busy,
+    onClick: onCancel,
+    style: {
+      width: '100%',
+      marginTop: 8
+    }
+  }, "\u2190 Retour \xE0 l'inventaire")));
+}
+function KbConsoPage({
+  session,
+  master
+}) {
+  const showToast = React.useContext(ToastContext);
+  const {
+    conf,
+    use,
+    calc
+  } = useKbConso();
+  const [count, setCount] = React.useState(false);
+  const [ed, setEd] = React.useState(null);
+  const [q, setQ] = React.useState('');
+  if (!conf) return React.createElement("div", {
+    className: "card"
+  }, "Chargement\u2026");
+  const who = session && session.name || '—';
+  const saveCfg = async (patch, msg) => {
+    try {
+      await storage.setDoc('inventory_meta', 'consommables', {
+        ...patch,
+        cfgBy: who,
+        cfgAt: Date.now()
+      });
+      _kbConsoUseAt = 0;
+      showToast(msg || '✓ Enregistré');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    }
+  };
+  const bag = s => {
+    const c = calc && calc[s];
+    return React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 12,
+        border: '2px solid ' + (c && c.short > 0 ? '#c62828' : '#c8e6c9'),
+        background: c && c.short > 0 ? '#fff5f5' : '#fff'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 17,
+        fontWeight: 900
+      }
+    }, "\uD83D\uDECD\uFE0F ", conf.labels[s]), React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: '#666'
+      }
+    }, conf.dims[s], " \xB7 code fournisseur ", conf.codes[s], " \xB7 paquets de ", conf.perPack), !c ? React.createElement("div", {
+      style: {
+        fontSize: 14,
+        marginTop: 6
+      }
+    }, "Calcul de la consommation\u2026") : React.createElement(React.Fragment, null, React.createElement("div", {
+      style: {
+        fontSize: 28,
+        fontWeight: 900,
+        marginTop: 4
+      }
+    }, c.theo, " ", React.createElement("span", {
+      style: {
+        fontSize: 15,
+        fontWeight: 600
+      }
+    }, "sachets en stock (th\xE9orique)")), React.createElement("div", {
+      style: {
+        fontSize: 14
+      }
+    }, "Compt\xE9 : ", conf.counts[s], " paquet", conf.counts[s] > 1 ? 's' : '', " le ", new Date(conf.countedAt).toLocaleString('fr-FR', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    }), " \xB7 ", c.usedSince, " utilis\xE9s depuis (MU faites)"), React.createElement("div", {
+      style: {
+        fontSize: 14
+      }
+    }, "\uD83E\uDDE0 Conso apprise : ~", c.daily, "/jour \xB7 ", React.createElement("b", null, c.week, "/semaine"), c.days != null ? ` · tient ~${c.days} jour${c.days > 1 ? 's' : ''}` : ''), React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 800,
+        marginTop: 4,
+        color: c.short > 0 ? '#c62828' : '#2e7d32'
+      }
+    }, c.short > 0 ? `⚠️ Ne couvre pas la semaine prochaine : il manque ~${c.short} (${c.packs} paquet${c.packs > 1 ? 's' : ''})` : '✓ Couvre la semaine prochaine')));
+  };
+  const film = (k, lbl, ic) => {
+    const f = calc ? calc[k] : {
+      n: conf.counts[k],
+      min: conf.mins[k],
+      low: false
+    };
+    return React.createElement("div", {
+      className: "card",
+      style: {
+        padding: 12,
+        border: '2px solid ' + (f.low ? '#c62828' : '#c8e6c9'),
+        background: f.low ? '#fff5f5' : '#fff'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 17,
+        fontWeight: 900
+      }
+    }, ic, " ", lbl), React.createElement("div", {
+      style: {
+        fontSize: 26,
+        fontWeight: 900
+      }
+    }, f.n == null ? '—' : f.n, " ", React.createElement("span", {
+      style: {
+        fontSize: 15,
+        fontWeight: 600
+      }
+    }, "rouleau", f.n > 1 ? 'x' : '', " \xB7 minimum ", f.min)), f.low && React.createElement("div", {
+      style: {
+        fontSize: 15,
+        fontWeight: 800,
+        color: '#c62828'
+      }
+    }, "\u26A0\uFE0F Sous le minimum : \xE0 commander"), master && React.createElement("label", {
+      style: {
+        fontSize: 14,
+        display: 'block',
+        marginTop: 6
+      }
+    }, "Minimum : ", React.createElement("input", {
+      type: "number",
+      min: "0",
+      max: "99",
+      defaultValue: f.min,
+      onBlur: e => {
+        const n = Math.max(0, Math.min(99, parseInt(e.target.value, 10) || 0));
+        if (n !== f.min) saveCfg({
+          mins: {
+            [k]: n
+          }
+        }, '✓ Minimum enregistré');
+      },
+      style: {
+        width: 70,
+        fontSize: 16
+      }
+    })));
+  };
+  const prods = use ? Object.entries(use.products).sort((a, b) => b[1].n - a[1].n).filter(([k, p]) => !q || k.includes(muKey(q))) : [];
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: '0 0 4px'
+    }
+  }, "\uD83E\uDDFB Stock consommables"), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 10,
+      fontSize: 14
+    }
+  }, "Sachets MU et films. Le stock se recompte \xE0 chaque inventaire du mardi (ou complet / tournant). Entre deux comptages, l'appli retire les sachets utilis\xE9s en MU. Si le stock ne tient pas la semaine suivante, un mail part le mercredi."), React.createElement("button", {
+    className: "btn-primary",
+    onClick: () => setCount(true),
+    style: {
+      minHeight: 52,
+      fontSize: 17
+    }
+  }, "\u270F\uFE0F Recompter maintenant"), bag('G'), bag('P'), film('filmPal', 'Film palette', '🎞️'), film('filmFro', 'Petit film fromage', '🧀'), master && React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 900
+    }
+  }, "\u2699\uFE0F R\xE9glages (Master)"), React.createElement("label", {
+    style: {
+      fontSize: 14,
+      display: 'block',
+      marginTop: 8
+    }
+  }, "\uD83D\uDCE7 Alerte commande envoy\xE9e \xE0 ", React.createElement("input", {
+    type: "text",
+    defaultValue: conf.alertTo,
+    placeholder: kbConsoAlertTo({}),
+    onBlur: e => {
+      const t = e.target.value.trim();
+      if (t && !kbConsoEmailsOk(t)) {
+        showToast('Adresse invalide');
+        return;
+      }
+      if (t !== conf.alertTo) saveCfg({
+        alertTo: t
+      }, '✓ Adresse enregistrée');
+    },
+    style: {
+      width: '100%',
+      fontSize: 15
+    }
+  })), React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      flexWrap: 'wrap',
+      marginTop: 8
+    }
+  }, ['G', 'P'].map(s => React.createElement("label", {
+    key: s,
+    style: {
+      fontSize: 14
+    }
+  }, s === 'G' ? 'Grand' : 'Petit', " : code ", React.createElement("input", {
+    defaultValue: conf.codes[s],
+    maxLength: 20,
+    onBlur: e => {
+      const t = e.target.value.trim();
+      if (t && t !== conf.codes[s]) saveCfg({
+        codes: {
+          [s]: t
+        }
+      });
+    },
+    style: {
+      width: 80
+    }
+  }), " dimension ", React.createElement("input", {
+    defaultValue: conf.dims[s],
+    maxLength: 30,
+    onBlur: e => {
+      const t = e.target.value.trim();
+      if (t && t !== conf.dims[s]) saveCfg({
+        dims: {
+          [s]: t
+        }
+      });
+    },
+    style: {
+      width: 90
+    }
+  })))), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      marginTop: 12
+    }
+  }, "Taille de sachet par produit"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#666'
+    }
+  }, "Automatique : UV \u2265 0,8 kg \u2192 grand, sinon petit. Change si un produit utilise l'autre sachet."), React.createElement("input", {
+    value: q,
+    onChange: e => setQ(e.target.value),
+    placeholder: "\uD83D\uDD0D produit",
+    style: {
+      width: '100%',
+      fontSize: 15,
+      margin: '6px 0'
+    }
+  }), prods.slice(0, 60).map(([k, p]) => {
+    const cur = conf.sizeOv[k] || p.auto;
+    return React.createElement("div", {
+      key: k,
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '4px 0',
+        borderTop: '1px solid #eee',
+        fontSize: 14
+      }
+    }, React.createElement("span", {
+      style: {
+        flex: 1
+      }
+    }, p.name, " ", React.createElement("span", {
+      style: {
+        color: '#888'
+      }
+    }, p.uv, " \xB7 ", p.n, " sachets/35 j")), ['G', 'P'].map(s => React.createElement("button", {
+      key: s,
+      className: cur === s ? 'btn-primary' : 'btn-secondary',
+      style: {
+        padding: '4px 10px',
+        fontSize: 13
+      },
+      onClick: () => saveCfg({
+        sizeOv: {
+          ...conf.sizeOv,
+          [k]: s === p.auto ? null : s
+        }
+      }, '✓ ' + p.name + ' → ' + (s === 'G' ? 'grand' : 'petit'))
+    }, s === 'G' ? 'Grand' : 'Petit')));
+  }), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 800,
+      marginTop: 12
+    }
+  }, "Derniers comptages"), (conf.history || []).slice().reverse().slice(0, 8).map((x, i) => React.createElement("div", {
+    key: i,
+    style: {
+      fontSize: 13
+    }
+  }, new Date(x.at).toLocaleString('fr-FR'), " \xB7 ", x.by, " \xB7 G ", x.counts.G, " pq \xB7 P ", x.counts.P, " pq \xB7 film palette ", x.counts.filmPal, " \xB7 film fromage ", x.counts.filmFro)), calc && React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      marginTop: 10
+    },
+    onClick: () => {
+      const L = kbConsoMailText(conf, calc);
+      alert(L.length ? 'Le mail du mercredi dirait :\n\n' + L.join('\n\n') : 'Rien à commander pour l\'instant : pas de mail.');
+    }
+  }, "\uD83D\uDC41\uFE0F Voir le mail qui partirait")), count && React.createElement(KbConsoCountModal, {
+    operator: who,
+    onDone: () => {
+      setCount(false);
+      showToast('✓ Consommables comptés');
+    },
+    onCancel: () => setCount(false)
+  }));
 }
 function muFaitFromEntries(list) {
   const out = {};
@@ -29529,7 +31015,8 @@ function MuDuJourPage({
   }));
   const faitByK = React.useMemo(() => muFaitFromEntries(Object.values(entries || {})), [entries]);
   const muFaitOf = it => faitByK[muKey(muName(it))] || 0;
-  const muResteOf = it => Math.max(0, muEst(it) - muFaitOf(it));
+  const ruptByK = React.useMemo(() => kbMuRuptMap(Object.values(entries || {})), [entries]);
+  const muResteOf = it => ruptByK[muKey(muName(it))] ? 0 : Math.max(0, muEst(it) - muFaitOf(it));
   const muFini = it => muEst(it) > 0 && muResteOf(it) <= 0;
   const q = search.trim() ? muStrip(search.toLowerCase()) : null;
   const filtered = React.useMemo(() => {
@@ -29539,7 +31026,7 @@ function MuDuJourPage({
       _keep: true
     })), ...base.filter(it => !kbTourKeeps(muName(it)))];
     return q ? base.filter(it => muStrip(muName(it).toLowerCase()).includes(q)) : base;
-  }, [plannedItems, faitByK, q, muWork.tourAdvance]);
+  }, [plannedItems, faitByK, ruptByK, q, muWork.tourAdvance]);
   const filteredExtra = React.useMemo(() => {
     const pool = extraPool.filter(it => !(muName(it) in extraAdded));
     return q ? pool.filter(it => muStrip(muName(it).toLowerCase()).includes(q)) : pool;
@@ -29710,6 +31197,9 @@ function MuDuJourPage({
         n = muEst(it);
       nk[k] = (nk[k] || 0) + n;
     });
+    Object.keys(nk).forEach(k => {
+      if (ruptByK[k]) nk[k] = Math.min(nk[k], faitByK[k] || 0);
+    });
     Object.entries(nk).forEach(([k, n]) => {
       need += n;
       done += Math.min(n, faitByK[k] || 0);
@@ -29723,7 +31213,7 @@ function MuDuJourPage({
       avance,
       pct: need > 0 ? Math.min(100, Math.round(done / need * 100)) : 0
     };
-  }, [plannedItems, faitByK]);
+  }, [plannedItems, faitByK, ruptByK]);
   const theo = React.useCallback(rows => {
     let brut = 0,
       stock = 0,
@@ -29845,7 +31335,62 @@ function MuDuJourPage({
   }), React.createElement(MuCmdBanner, {
     info: reel.cmdInfo,
     setTab: setTab
-  }), flErr && React.createElement("div", {
+  }), Object.keys(ruptByK).length > 0 && React.createElement("div", {
+    className: "card",
+    style: {
+      border: '3px solid #c62828',
+      background: '#fff5f5',
+      padding: '10px 12px'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 900,
+      color: '#c62828',
+      marginBottom: 4
+    }
+  }, "\uD83D\uDEAB Ruptures MU du jour (", Object.keys(ruptByK).length, ")"), Object.values(ruptByK).sort((a, b) => (b.at || 0) - (a.at || 0)).map(r => React.createElement("div", {
+    key: r.id,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      padding: '6px 0',
+      borderTop: '1px solid #f3c7c7',
+      fontSize: 15
+    }
+  }, React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("b", null, r.product), " : ", r.fait, " fait", r.fait > 1 ? 's' : '', " sur ", r.need, " \u2192 ", React.createElement("b", {
+    style: {
+      color: '#c62828'
+    }
+  }, r.manque, " en rupture"), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, r.operator, " \xB7 ", r.at ? new Date(r.at).toLocaleTimeString('fr-FR', {
+    hour: '2-digit',
+    minute: '2-digit'
+  }) : '')), React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      fontSize: 13
+    },
+    onClick: () => {
+      if (confirm('Annuler la rupture de ' + r.product + ' ? Le produit revient dans « à faire ».')) storage.deleteDoc('mu_' + dateKey, r.id);
+    }
+  }, "Annuler"))), React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: '#7f1d1d',
+      marginTop: 4
+    }
+  }, "La pr\xE9pa voit ces ruptures en haut de \xAB Pr\xE9pa du jour \xBB.")), flErr && React.createElement("div", {
     style: {
       background: '#fff3e0',
       border: '1px solid #ffcc80',
@@ -32103,7 +33648,7 @@ function KbBackToHub({
       alignSelf: 'flex-start'
     },
     onClick: () => setTab('suivi')
-  }, "\u2190 DLC & suivi") : null;
+  }, "\u2190 Atelier") : null;
 }
 const KB_BRUT_ORDER = ['Brioche tressée', 'Meule 1 kg BIO', 'Meule 500 g BIO', 'Meule graine BIO', 'Pain complet BIO', 'Pain norvégien BIO', 'Petit épeautre BIO', 'Sarrasin Riz'];
 const KB_BRUT_ALIAS = {
@@ -39082,215 +40627,311 @@ function PrepSuiviHub({
   const board = useDlcBoard();
   const pdp = useKbPdpBoard();
   const nDlc = board.ready ? board.total : 0;
-  const groups = [{
-    title: '🖨️ Impression',
-    items: [{
-      key: 'printpain',
-      icon: '🍞',
-      label: 'Impression dispatch pain',
-      desc: '1 feuille A4 par lieu — mise en cartons à 5h'
-    }, {
-      key: 'printlabels',
-      icon: '🏷️',
-      label: 'Impression étiquettes livraison',
-      desc: 'Livraison à domicile — 1 étiquette par carton (après clôture)'
-    }, {
-      key: 'printqr',
-      icon: '🔳',
-      label: 'Impression QR codes du jour',
-      desc: 'Picking · dispatch · rolls · dollies Kelbongoo — le chauffeur scanne au chargement'
-    }]
+  const day = todayKey();
+  const [marks, setMarks] = React.useState({});
+  React.useEffect(() => kbDocSub('v4_cache', 'atelier_' + day, d => setMarks(d && d.marks || {})), [day]);
+  const go = k => {
+    setTab(k);
+    try {
+      window.scrollTo({
+        top: 0
+      });
+    } catch (_) {}
+  };
+  const toggle = async k => {
+    const on = !marks[k];
+    try {
+      await storage.setDoc('v4_cache', 'atelier_' + day, {
+        marks: {
+          [k]: on ? {
+            at: Date.now()
+          } : null
+        }
+      });
+    } catch (_) {}
+  };
+  const steps = [{
+    k: 'dlcwatch',
+    img: '🧹',
+    bg: '#ffe0e0',
+    ink: '#b71c1c',
+    t: 'Retirer les DLC',
+    sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : 'Rien à retirer',
+    auto: board.ready && !nDlc,
+    n: nDlc
   }, {
-    title: '♻️ Enlèvement Rungis',
-    items: [{
-      key: 'enldestr',
-      icon: '♻️',
-      label: 'Demande d\'enlèvement · destruction',
-      desc: 'Rolls de cartons écrasés · palettes de cagettes en bois → Rungis'
-    }]
+    k: 'pdpreturns',
+    img: '↩️',
+    bg: '#dff0ff',
+    ink: '#0d47a1',
+    t: 'Traiter les retours PDP',
+    sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : 'Rien à traiter',
+    auto: pdp.ready && !pdp.toTreat,
+    n: pdp.toTreat
   }, {
-    title: '🧭 Suivi',
-    items: [{
-      key: 'losses',
-      icon: '🗑️',
-      label: 'Pertes',
-      desc: 'Saisie des pertes'
-    }]
+    k: 'printpain',
+    img: '🍞',
+    bg: '#fff3d6',
+    ink: '#8a5a00',
+    t: 'Imprimer le dispatch pain',
+    sub: '1 feuille par lieu'
+  }, {
+    k: 'printqr',
+    img: '🔳',
+    bg: '#efe7ff',
+    ink: '#4a2c91',
+    t: 'Imprimer les QR codes',
+    sub: 'pour le chauffeur'
+  }, {
+    k: 'printlabels',
+    img: '🏷️',
+    bg: '#e3f8ec',
+    ink: '#1b5e20',
+    t: 'Imprimer les étiquettes livraison',
+    sub: 'après la clôture'
+  }];
+  const isDone = s => s.auto !== undefined ? s.auto : !!marks[s.k];
+  const nDone = steps.filter(isDone).length,
+    pct = Math.round(nDone / steps.length * 100);
+  const tiles = [{
+    k: 'losses',
+    img: '🗑️',
+    bg: '#ffe9d6',
+    ink: '#a14a00',
+    t: 'Pertes',
+    sub: 'saisir une perte'
+  }, {
+    k: 'enldestr',
+    img: '♻️',
+    bg: '#e6f4d9',
+    ink: '#33691e',
+    t: 'Enlèvement Rungis',
+    sub: 'cartons · palettes'
+  }, {
+    k: 'conso',
+    img: '🛍️',
+    bg: '#e0f7fa',
+    ink: '#006064',
+    t: 'Sachets & films',
+    sub: 'stock consommables'
   }, ...(kbIsSecure() ? [{
-    title: '🔐 Magasins Pribon',
-    items: [{
-      key: 'painpribon',
-      icon: '🥖',
-      label: 'Commande pain des magasins Pribon',
-      desc: 'Pribon Bichat · ajoutée au dispatch pain · suivi facturation'
-    }]
+    k: 'painpribon',
+    img: '🥖',
+    bg: '#fdf0d5',
+    ink: '#7a4b00',
+    t: 'Pain Pribon',
+    sub: 'magasins Pribon'
   }] : [])];
   return React.createElement("div", {
-    className: "stack"
-  }, React.createElement("h1", null, "\uD83D\uDCC5 DLC & suivi"), React.createElement("button", {
-    onClick: () => setTab('dlcwatch'),
+    className: "stack",
     style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 16,
-      padding: '18px 16px',
-      textAlign: 'left',
-      cursor: 'pointer',
-      border: '3px solid ' + (nDlc ? '#c62828' : '#2e7d32'),
-      borderRadius: 'var(--radius)',
-      background: nDlc ? '#fdecea' : '#e8f5e9',
-      width: '100%'
+      gap: 12
     }
-  }, React.createElement("span", {
+  }, React.createElement("h1", {
     style: {
-      fontSize: 40,
-      lineHeight: 1
+      margin: 0
     }
-  }, "\uD83D\uDCC5"), React.createElement("span", {
-    style: {
-      display: 'flex',
-      flexDirection: 'column',
-      minWidth: 0
-    }
-  }, React.createElement("span", {
-    style: {
-      fontSize: 22,
-      fontWeight: 700,
-      color: 'var(--ink)'
-    }
-  }, "\uD83E\uDDF9 DLC \xE0 retirer"), React.createElement("span", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600,
-      color: nDlc ? '#b71c1c' : '#1b5e20'
-    }
-  }, !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer${board.morning && board.morning.takenBy ? ' · ' + board.morning.takenBy + " s'en occupe" : ''}` : board.done.length ? '🎉 Tout a été traité' : 'Rien à retirer 👍')), nDlc > 0 && React.createElement("span", {
-    style: {
-      marginLeft: 'auto',
-      background: '#c62828',
-      color: '#fff',
-      borderRadius: 20,
-      padding: '4px 12px',
-      fontWeight: 700,
-      fontSize: 20
-    }
-  }, nDlc)), React.createElement(DlcMorningBanner, {
+  }, "\uD83E\uDDF0 Atelier"), React.createElement(DlcMorningBanner, {
     board: board
-  }), React.createElement("button", {
-    onClick: () => setTab('pdpreturns'),
+  }), React.createElement("div", {
+    style: {
+      borderRadius: 22,
+      background: '#fffdf5',
+      border: '3px solid #ffd54f',
+      padding: '14px 12px'
+    }
+  }, React.createElement("div", {
     style: {
       display: 'flex',
       alignItems: 'center',
-      gap: 16,
-      padding: '18px 16px',
-      textAlign: 'left',
-      cursor: 'pointer',
-      border: '3px solid ' + (pdp.toTreat ? '#1565c0' : 'var(--line)'),
-      borderRadius: 'var(--radius)',
-      background: pdp.toTreat ? '#e3f2fd' : 'var(--bg-card)',
-      width: '100%'
-    }
-  }, React.createElement("span", {
-    style: {
-      fontSize: 40,
-      lineHeight: 1
-    }
-  }, "\u21A9\uFE0F"), React.createElement("span", {
-    style: {
-      display: 'flex',
-      flexDirection: 'column',
-      minWidth: 0
-    }
-  }, React.createElement("span", {
-    style: {
-      fontSize: 22,
-      fontWeight: 700,
-      color: 'var(--ink)'
-    }
-  }, "Retours PDP"), React.createElement("span", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600,
-      color: pdp.toTreat ? '#0d47a1' : 'var(--ink-mute)'
-    }
-  }, !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter à l'entrepôt` : pdp.treatedToday.length && !pdp.valid ? 'Tout traité · à valider' : 'Rien à traiter 👍')), pdp.toTreat > 0 && React.createElement("span", {
-    style: {
-      marginLeft: 'auto',
-      background: '#1565c0',
-      color: '#fff',
-      borderRadius: 20,
-      padding: '4px 12px',
-      fontWeight: 700,
-      fontSize: 20
-    }
-  }, pdp.toTreat)), groups.map(g => React.createElement(React.Fragment, {
-    key: g.title
-  }, React.createElement("div", null, React.createElement("div", {
-    style: {
-      fontSize: 12,
-      fontWeight: 700,
-      letterSpacing: '.05em',
-      textTransform: 'uppercase',
-      color: 'var(--ink-mute)',
-      margin: '6px 2px'
-    }
-  }, g.title), React.createElement("div", {
-    style: {
-      display: 'grid',
-      gridTemplateColumns: '1fr',
       gap: 10
     }
-  }, g.items.map(it => React.createElement("button", {
-    key: it.key,
-    onClick: () => {
-      setTab(it.key);
-      try {
-        window.scrollTo({
-          top: 0
-        });
-      } catch (_) {}
-    },
+  }, React.createElement("span", {
     style: {
+      fontSize: 34
+    }
+  }, pct === 100 ? '🎉' : '✅'), React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 21,
+      fontWeight: 900,
+      color: '#5d4037'
+    }
+  }, pct === 100 ? 'Journée finie, merci !' : 'Ma fin de journée'), React.createElement("span", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: '#8d6e63'
+    }
+  }, nDone, " / ", steps.length, " fait", nDone > 1 ? 's' : ''))), React.createElement("div", {
+    style: {
+      height: 14,
+      borderRadius: 7,
+      background: '#ffecb3',
+      margin: '10px 0 12px',
+      overflow: 'hidden'
+    }
+  }, React.createElement("div", {
+    style: {
+      width: pct + '%',
+      height: '100%',
+      background: pct === 100 ? '#43a047' : '#ffb300',
+      transition: 'width .4s'
+    }
+  })), steps.map((s, i) => {
+    const d = isDone(s);
+    return React.createElement("div", {
+      key: s.k,
+      style: {
+        display: 'flex',
+        alignItems: 'stretch',
+        gap: 8,
+        marginBottom: 8
+      }
+    }, React.createElement("button", {
+      onClick: () => go(s.k),
+      style: {
+        flex: 1,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '10px 12px',
+        borderRadius: 18,
+        border: d ? '2px solid #a5d6a7' : '3px solid ' + s.ink,
+        background: d ? '#f1f8e9' : s.bg,
+        cursor: 'pointer',
+        textAlign: 'left',
+        opacity: d ? .75 : 1
+      }
+    }, React.createElement("span", {
+      style: {
+        width: 58,
+        height: 58,
+        flex: '0 0 58px',
+        borderRadius: '50%',
+        background: '#fff',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 34,
+        boxShadow: '0 2px 6px rgba(0,0,0,.08)'
+      }
+    }, s.img), React.createElement("span", {
+      style: {
+        flex: 1,
+        minWidth: 0
+      }
+    }, React.createElement("span", {
+      style: {
+        display: 'block',
+        fontSize: 18,
+        fontWeight: 900,
+        color: d ? '#2e7d32' : s.ink,
+        textDecoration: d ? 'line-through' : 'none'
+      }
+    }, i + 1, ". ", s.t), React.createElement("span", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700,
+        color: d ? '#558b2f' : s.ink,
+        opacity: .85
+      }
+    }, s.sub)), s.n > 0 && React.createElement("span", {
+      style: {
+        background: s.ink,
+        color: '#fff',
+        borderRadius: 16,
+        padding: '3px 11px',
+        fontWeight: 900,
+        fontSize: 19
+      }
+    }, s.n)), s.auto === undefined ? React.createElement("button", {
+      onClick: () => toggle(s.k),
+      "aria-label": d ? 'Décocher' : 'Marquer fait',
+      style: {
+        width: 62,
+        flex: '0 0 62px',
+        borderRadius: 18,
+        border: '3px solid ' + (d ? '#43a047' : '#cfd8dc'),
+        background: d ? '#43a047' : '#fff',
+        color: d ? '#fff' : '#90a4ae',
+        fontSize: 30,
+        fontWeight: 900,
+        cursor: 'pointer'
+      }
+    }, "\u2713") : React.createElement("span", {
+      style: {
+        width: 62,
+        flex: '0 0 62px',
+        borderRadius: 18,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 28,
+        background: d ? '#43a047' : '#eceff1',
+        color: '#fff'
+      }
+    }, d ? '✓' : '⏳'));
+  })), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 800,
+      color: 'var(--ink-mute)',
+      margin: '4px 2px 0'
+    }
+  }, "Autres outils"), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+      gap: 10
+    }
+  }, tiles.map(t => React.createElement("button", {
+    key: t.k,
+    onClick: () => go(t.k),
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 6,
+      padding: '16px 8px',
+      borderRadius: 20,
+      border: '2px solid ' + t.ink + '33',
+      background: t.bg,
+      cursor: 'pointer',
+      minHeight: 140
+    }
+  }, React.createElement("span", {
+    style: {
+      width: 70,
+      height: 70,
+      borderRadius: '50%',
+      background: '#fff',
       display: 'flex',
       alignItems: 'center',
-      gap: 16,
-      padding: '16px 16px',
-      textAlign: 'left',
-      cursor: 'pointer',
-      border: '1px solid var(--line)',
-      borderRadius: 'var(--radius)',
-      background: 'var(--bg-card)',
-      width: '100%',
-      boxShadow: 'var(--shadow-sm)'
+      justifyContent: 'center',
+      fontSize: 42,
+      boxShadow: '0 2px 6px rgba(0,0,0,.08)'
     }
-  }, React.createElement("span", {
+  }, t.img), React.createElement("span", {
     style: {
-      fontSize: 34,
-      lineHeight: 1
+      fontSize: 17,
+      fontWeight: 900,
+      color: t.ink,
+      textAlign: 'center'
     }
-  }, it.icon), React.createElement("span", {
-    style: {
-      display: 'flex',
-      flexDirection: 'column'
-    }
-  }, React.createElement("span", {
-    style: {
-      fontSize: 18,
-      fontWeight: 700,
-      color: 'var(--ink)'
-    }
-  }, it.label), React.createElement("span", {
+  }, t.t), React.createElement("span", {
     style: {
       fontSize: 13,
-      color: 'var(--ink-mute)'
+      fontWeight: 700,
+      color: t.ink,
+      opacity: .8,
+      textAlign: 'center'
     }
-  }, it.desc)), React.createElement("span", {
-    style: {
-      marginLeft: 'auto',
-      fontSize: 26,
-      color: 'var(--ink-mute)'
-    }
-  }, "\u203A"))))), g.title === '🖨️ Impression' && React.createElement(KbMiseEnPlace, null))));
+  }, t.sub)))));
 }
 const KB_LIEUX_DOW = [[3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam']];
 const KB_LIEUX_DOW_ALL = [[1, 'Lun'], [2, 'Mar'], [3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam'], [0, 'Dim']];
@@ -40801,6 +42442,10 @@ function useKbPace(prepPct, tour) {
       nb[k] = fri ? c : Math.max(0, c - st);
       if (fri) hier += st;
     });
+    const rk = kbMuRuptMap(list);
+    Object.keys(nb).forEach(k => {
+      if (rk[k]) nb[k] = Math.min(nb[k], (fri ? Math.min(nb[k], Math.max(0, Number(snap.items[k].stock) || 0)) : 0) + (fb[k] || 0));
+    });
     if (fri) {
       Object.entries(nb).forEach(([k, n]) => {
         const st = Math.min(n, Math.max(0, Number(snap.items[k].stock) || 0));
@@ -40830,8 +42475,38 @@ function useKbPace(prepPct, tour) {
     } : null);
   }), [work]);
   const pr = kbHpProfile(hp, tour, work);
-  const eP = kbHpExpected(pr.prepDeb, pr.prepFin, now),
-    eM = kbHpExpected(pr.muDeb, pr.muFin, now);
+  const profKey = pr.key + '_' + kbDowOf(work);
+  const [, setHistTick] = React.useState(0);
+  React.useEffect(() => {
+    const f = () => setHistTick(x => x + 1);
+    window.addEventListener('kb:pace-hist', f);
+    return () => window.removeEventListener('kb:pace-hist', f);
+  }, []);
+  const lastW = React.useRef('');
+  React.useEffect(() => {
+    const slot = kbPaceSlot(now),
+      sig = slot + '|' + prepPct + '|' + (mu ? mu.pct : '');
+    if (lastW.current.startsWith(slot + '|')) return;
+    if (prepPct == null && !mu) return;
+    lastW.current = sig;
+    const upd = {
+      profile: profKey,
+      day: work,
+      at: Date.now()
+    };
+    if (prepPct != null) upd.prep = {
+      [slot]: Math.max(0, Math.min(100, Math.round(prepPct)))
+    };
+    if (mu) upd.mu = {
+      [slot]: mu.pct
+    };
+    storage.setDoc('v4_cache', 'pace_' + work, upd).catch(() => {});
+  }, [now, prepPct, mu, profKey, work]);
+  const lP = kbPaceLearned(work, profKey, 'prep', now),
+    lM = kbPaceLearned(work, profKey, 'mu', now);
+  const eP = lP ? lP.pct : kbHpExpected(pr.prepDeb, pr.prepFin, now),
+    eM = lM ? lM.pct : kbHpExpected(pr.muDeb, pr.muFin, now);
+  const learnN = Math.max(lP ? lP.n : 0, lM ? lM.n : 0);
   if (eP == null && eM == null) return null;
   const h = new Date(now).toLocaleTimeString('fr-FR', {
     hour: '2-digit',
@@ -40864,8 +42539,47 @@ function useKbPace(prepPct, tour) {
     mu,
     tP,
     tM,
-    bad
+    bad,
+    learnN
   };
+}
+function KbMuRuptBanner() {
+  const [list, setList] = React.useState([]);
+  const work = todayKey();
+  React.useEffect(() => storage.subscribe('mu_' + work, arr => setList(Object.values(kbMuRuptMap(arr || [])))), [work]);
+  if (!list.length) return null;
+  return React.createElement("div", {
+    style: {
+      border: '3px solid #c62828',
+      background: '#fff5f5',
+      borderRadius: 14,
+      padding: '10px 14px',
+      margin: '8px 0'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 19,
+      fontWeight: 900,
+      color: '#c62828'
+    }
+  }, "\uD83D\uDEAB Rupture en MU : pas assez de sachets"), list.map(r => React.createElement("div", {
+    key: r.id,
+    style: {
+      fontSize: 16,
+      padding: '5px 0',
+      borderTop: '1px solid #f3c7c7'
+    }
+  }, React.createElement("b", null, r.product), " : ", r.stock > 0 ? React.createElement(React.Fragment, null, r.stock, " en stock + ") : null, r.fait, " faits", r.commandes ? React.createElement(React.Fragment, null, " pour ", r.commandes, " command\xE9s") : null, " \u2192 ", React.createElement("b", {
+    style: {
+      color: '#c62828'
+    }
+  }, r.manque, " manquent"))), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 4,
+      color: '#7f1d1d'
+    }
+  }, "\uD83D\uDC49 Seuls les sachets en stock ou faits sont donn\xE9s : mets ", React.createElement("b", null, "rupture"), " ou ", React.createElement("b", null, "partiel"), " aux clients en trop."));
 }
 function kbEtaWho(pres, now) {
   const prep = [],
@@ -41102,7 +42816,8 @@ function KbPaceStrip({
     mu,
     tP,
     tM,
-    bad
+    bad,
+    learnN
   } = P;
   const part = (lbl, real, exp, tg, sub) => React.createElement("div", {
     style: {
@@ -41150,7 +42865,7 @@ function KbPaceStrip({
       color: '#555',
       marginBottom: 4
     }
-  }, "⏱️ À ", h, " — ", pr.label, " (prépa ", pr.prepDeb.replace(':', 'h'), "-", pr.prepFin.replace(':', 'h'), " · MU ", pr.muDeb.replace(':', 'h'), "-", pr.muFin.replace(':', 'h'), ")"), React.createElement("div", {
+  }, "⏱️ À ", h, " — ", pr.label, " (prépa ", pr.prepDeb.replace(':', 'h'), "-", pr.prepFin.replace(':', 'h'), " · MU ", pr.muDeb.replace(':', 'h'), "-", pr.muFin.replace(':', 'h'), ")", learnN ? ` · 🧠 « normalement » appris sur ${learnN} ${['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'][kbDowOf(todayKey())] || 'jour'}${learnN > 1 ? 's' : ''} passés` : ' · 🧠 en apprentissage (montée régulière en attendant)'), React.createElement("div", {
     style: {
       display: 'flex',
       gap: 12,
@@ -41230,7 +42945,7 @@ function KbHorairesPrepaPage({
       padding: 12,
       fontSize: 14
     }
-  }, "Sert au bandeau de la pr\xE9pa : \xAB \xE0 cette heure-ci, normalement X % de pr\xE9pa et Y % de MU \xBB. Le % attendu monte r\xE9guli\xE8rement entre le d\xE9but et la fin. Les profils \xAB tourn\xE9e unique \xBB s'appliquent seulement si la case \uD83D\uDE9A Tourn\xE9e unique vendredi est coch\xE9e."), React.createElement("div", {
+  }, "Sert au bandeau de la pr\xE9pa : \xAB \xE0 cette heure-ci, normalement X % de pr\xE9pa et Y % de MU \xBB. \uD83E\uDDE0 L'appli apprend : chaque jour elle note le % r\xE9el toutes les 15 min ; d\xE8s 2 m\xEAmes jours de semaine enregistr\xE9s, le \xAB normalement \xBB vient de ces jours pass\xE9s (moyenne des 6 derniers). En attendant, le % attendu monte r\xE9guli\xE8rement entre le d\xE9but et la fin. Les profils \xAB tourn\xE9e unique \xBB s'appliquent seulement si la case \uD83D\uDE9A Tourn\xE9e unique vendredi est coch\xE9e."), React.createElement("div", {
     className: "card",
     style: {
       padding: 14
@@ -42888,6 +44603,7 @@ function PrepaDuJourPage({
     if (b.iaBusy) return 'L\'IA vérifie…';
     if (b.local.needPoids && !kbParseGrams(b.poidsReel)) return 'Pèse 1 article du remplaçant et indique son poids.';
     if (b.local.poidsNon) return 'Poids trop différent : pas de remplacement possible.';
+    if (b.local.prixNon) return 'Plus de 10 % plus cher : pas de remplacement possible.';
     if (!Object.keys(b.sel || {}).length) return 'Coche au moins un client.';
     if (b.ia) return b.ia.verdict === 'non' ? 'L\'IA refuse : produit pas similaire.' : '';
     return b.local.simNon ? 'Produit pas similaire : pas de remplacement possible.' : '';
@@ -45229,7 +46945,7 @@ function PrepaDuJourPage({
         maxWidth: 340,
         margin: '8px auto 0'
       }
-    }, "🏷️ Étiquettes livraison et 🍞 dispatch pain : onglet ", React.createElement("b", null, "DLC & suivi"), "."), React.createElement("button", {
+    }, "🏷️ Étiquettes livraison et 🍞 dispatch pain : onglet ", React.createElement("b", null, "Atelier"), "."), React.createElement("button", {
       className: "pdj-close",
       style: {
         marginTop: 12,
@@ -46127,7 +47843,7 @@ function PrepaDuJourPage({
   }), !prep.closed && globalProg.t > 0 && React.createElement(KbPaceStrip, {
     prepPct: globalProg.pct,
     tour: tourCfg
-  }), React.createElement("div", {
+  }), !prep.closed && React.createElement(KbMuRuptBanner, null), React.createElement("div", {
     className: "pdj-topbar"
   }, React.createElement("div", {
     className: "pdj-modebar"
@@ -50987,10 +52703,7 @@ function InfosPage({
       fontSize: 13,
       marginTop: -8
     }
-  }, "Produits manquants et leur raison \u2014 pour informer les clients."), React.createElement(DistribMessageCard, {
-    session: session,
-    currentSite: currentSite
-  }), !isDistrib ? React.createElement("div", {
+  }, "Produits manquants et leur raison \u2014 pour informer les clients."), !isDistrib ? React.createElement("div", {
     className: "empty-state"
   }, React.createElement("div", {
     className: "icon"
@@ -58862,14 +60575,16 @@ function KbTodoBoard({
   const LV = {
     red: ['#fdecea', '#c62828'],
     orange: ['#fff4e5', '#ef6c00'],
-    blue: ['#eef4ff', '#1565c0']
+    blue: ['#eef4ff', '#1565c0'],
+    done: ['#f1f8e9', '#7cb342']
   };
   const rank = {
     red: 0,
     orange: 1,
-    blue: 2
+    blue: 2,
+    done: 3
   };
-  const total = todo.filter(x => x.lv !== 'blue').length;
+  const total = todo.filter(x => x.lv !== 'blue' && x.lv !== 'done').length;
   return React.createElement("div", {
     className: "card",
     style: {
@@ -58953,14 +60668,14 @@ function KbTodoBoard({
         alignItems: 'center',
         gap: 8
       }
-    }, g.t, items.length > 0 && React.createElement("span", {
+    }, g.t, items.filter(x => x.lv !== 'done').length > 0 && React.createElement("span", {
       className: "badge",
       style: {
         background: g.c,
         color: '#fff',
         fontWeight: 700
       }
-    }, items.length)), !items.length && React.createElement("div", {
+    }, items.filter(x => x.lv !== 'done').length)), !items.length && React.createElement("div", {
       style: {
         fontSize: 14,
         color: 'var(--accent-dark)',
@@ -58993,7 +60708,9 @@ function KbTodoBoard({
     }, React.createElement("div", {
       style: {
         fontWeight: 700,
-        fontSize: 15
+        fontSize: 15,
+        textDecoration: x.lv === 'done' ? 'line-through' : 'none',
+        color: x.lv === 'done' ? '#689f38' : undefined
       }
     }, x.t), x.d && React.createElement("div", {
       style: {
@@ -59029,6 +60746,22 @@ function KbTodayPage({
   const [po, setPo] = React.useState(null);
   const [to, setTo] = React.useState(null);
   const [mailErr, setMailErr] = React.useState('');
+  const [painDoc, setPainDoc] = React.useState(null);
+  const [drv, setDrv] = React.useState([]);
+  const [det, setDet] = React.useState('');
+  React.useEffect(() => storage.subscribe('driver_live', a => setDrv(a || [])), []);
+  const showDet = k => {
+    setDet(k);
+    setTimeout(() => {
+      try {
+        const el = document.getElementById(k === 'prep' ? 'kb-today-prep' : 'kb-today-det');
+        el && el.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+      } catch (_) {}
+    }, 80);
+  };
   const [flN, setFlN] = React.useState(() => {
     try {
       const v = localStorage.getItem('kb_fl_info_n');
@@ -59080,10 +60813,11 @@ function KbTodayPage({
     if (!prepDay) return;
     let stop = false;
     const tick = async () => {
-      const [m, d] = await Promise.all([storage.getDoc(`day_${prepDay}_prep`, 'meta').catch(() => null), storage.getDoc(`day_${prepDay}_prep`, 'dromy').catch(() => null)]);
+      const [m, d, pn] = await Promise.all([storage.getDoc(`day_${prepDay}_prep`, 'meta').catch(() => null), storage.getDoc(`day_${prepDay}_prep`, 'dromy').catch(() => null), storage.getDoc('app_config', 'painbdp_' + prepDay).catch(() => null)]);
       if (!stop) {
         setMeta(m || {});
         setDromy(d || null);
+        setPainDoc(pn || null);
       }
     };
     tick();
@@ -59188,6 +60922,13 @@ function KbTodayPage({
   try {
     v4 = JSON.parse(localStorage.getItem('kb_v4_last') || 'null');
   } catch (_) {}
+  const tourT = useKbTour();
+  const PK = useKbPace(prepDay && poR.length && !closed ? pct : null, tourT);
+  const muP = PK && PK.mu ? {
+    ...PK.mu,
+    exp: PK.eM,
+    tag: PK.tM
+  } : null;
   const todo = [];
   const goRecap = sec => {
     try {
@@ -59364,13 +61105,41 @@ function KbTodayPage({
       });
     }
   }
+  if (prepDay && poR.length && closed) todo.push({
+    who: 'ops',
+    lv: 'done',
+    ic: '🥬',
+    t: `Prépa du ${formatDateShort(prepDay)} terminée${meta && meta.closedBy ? ' · ' + meta.closedBy : ''}`,
+    d: agg ? `${agg.d || 0}/${agg.t || 0} lignes · ${agg.ruptures || 0} rupture(s)` : '',
+    on: () => showDet('prep')
+  });
+  if (muP) todo.push({
+    who: 'ops',
+    lv: muP.pct >= 100 ? 'done' : muP.tag && muP.tag.c === '#c62828' ? 'red' : 'orange',
+    ic: '🥕',
+    t: muP.pct >= 100 ? `MU du jour terminée : ${muP.fait} sachets` : `MU du jour : ${muP.pct} %`,
+    d: `${muP.fait} / ${muP.need} sachets${muP.exp != null ? ` · normalement ${muP.exp} % à cette heure` : ''}`,
+    on: () => showDet('mu')
+  });
+  {
+    const dl = drv.filter(x => x && x.at && now - Date.parse(x.at) < 12 * 3600000).sort((a, b) => String(b.at).localeCompare(String(a.at)))[0];
+    const age = dl ? Math.round((now - Date.parse(dl.at)) / 60000) : null;
+    todo.push({
+      who: 'ops',
+      lv: dl && dl.active && age < 5 ? 'orange' : 'blue',
+      ic: '🚚',
+      t: dl ? `Camion : ${dl.active && age < 5 ? 'en route' : 'à l\'arrêt'}${dl.name ? ' · ' + dl.name : ''}` : 'Suivi camion : pas de GPS actif aujourd\'hui',
+      d: dl ? `position ${age < 1 ? 'à l\'instant' : 'il y a ' + (age < 60 ? age + ' min' : Math.floor(age / 60) + ' h ' + String(age % 60).padStart(2, '0'))}${dl.dest && dl.dest.label ? ' · vers ' + dl.dest.label : ''}` : 'Le chauffeur active son GPS dans l\'appli',
+      on: () => showDet('camion')
+    });
+  }
   if (prepDay && poR.length && !closed) todo.push({
     who: 'ops',
     lv: 'orange',
     ic: '🥬',
     t: `Prépa du ${formatDateShort(prepDay)} en cours : ${pct} %`,
     d: agg ? `${agg.d || 0}/${agg.t || 0} lignes · ${agg.ruptures || 0} rupture(s)` : 'pas encore commencée',
-    on: () => goSub('live')
+    on: () => showDet('prep')
   });
   if (domN && !(meta && (meta.domClosed || meta.closed))) todo.push({
     who: 'ops',
@@ -59396,14 +61165,30 @@ function KbTodayPage({
     d: 'Pilotage › Dromy',
     on: () => goSub('dromy')
   });
-  if (pains) todo.push({
-    who: 'ops',
-    lv: 'blue',
-    ic: '🍞',
-    t: `Commande pain : ${pains} pain(s) pour le ${formatDateShort(prepDay)}`,
-    d: 'Bon de commande Brut de Pains + étiquettes',
-    on: () => go('mpain')
-  });
+  if (pains) {
+    const pd = painDoc && painDoc.passedAt;
+    todo.push(pd && Number(painDoc.total) === Number(pains) ? {
+      who: 'ops',
+      lv: 'done',
+      ic: '🍞',
+      t: `Commande pain réalisée le ${new Date(pd).toLocaleDateString('fr-FR', {
+        day: '2-digit',
+        month: '2-digit'
+      })} à ${new Date(pd).toLocaleTimeString('fr-FR', {
+        hour: '2-digit',
+        minute: '2-digit'
+      })}`,
+      d: `${pains} pain(s) pour le ${formatDateShort(prepDay)}${painDoc.passedBy ? ' · ' + painDoc.passedBy : ''}`,
+      on: () => go('mpain')
+    } : {
+      who: 'ops',
+      lv: pd ? 'orange' : 'blue',
+      ic: '🍞',
+      t: pd ? `Commande pain changée : ${pains} pain(s) (passée : ${painDoc.total})` : `Commande pain : ${pains} pain(s) pour le ${formatDateShort(prepDay)}`,
+      d: pd ? 'Prévenir Brut de Pains puis « Commande mise à jour passée »' : 'Bon de commande Brut de Pains + étiquettes',
+      on: () => go('mpain')
+    });
+  }
   const LV = {
     red: ['#fdecea', 'var(--danger)'],
     orange: ['#fff4e5', '#ef6c00'],
@@ -59458,11 +61243,13 @@ function KbTodayPage({
   }), React.createElement(KbAncienRunAlert, {
     session: session
   }), React.createElement("div", {
+    id: "kb-today-prep",
     className: "card",
     style: {
       background: 'linear-gradient(135deg,#1f3a24,#3f6e31)',
       color: '#fff',
-      padding: '16px 18px'
+      padding: '16px 18px',
+      scrollMarginTop: 70
     }
   }, React.createElement("div", {
     style: {
@@ -59647,9 +61434,100 @@ function KbTodayPage({
       fontWeight: 700,
       margin: '6px 0 -4px'
     }
-  }, "\uD83D\uDFE2 En direct"), React.createElement(KbLivePage, null), React.createElement(KbTodayTeamStats, {
+  }, "\uD83D\uDFE2 En direct"), React.createElement(KbLivePage, null), React.createElement("button", {
+    type: "button",
+    onClick: () => goSub('rungis'),
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      width: '100%',
+      textAlign: 'left',
+      cursor: 'pointer',
+      padding: '14px 16px',
+      borderRadius: 16,
+      border: 'none',
+      background: 'linear-gradient(135deg,#33b5ff,#1e88e5)',
+      color: '#fff',
+      boxShadow: '0 3px 10px rgba(30,136,229,.3)'
+    }
+  }, React.createElement("span", {
+    style: {
+      fontSize: 34,
+      lineHeight: 1
+    }
+  }, "\uD83D\uDE9A"), React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 19,
+      fontWeight: 800
+    }
+  }, "Suivre camion"), React.createElement("span", {
+    style: {
+      display: 'block',
+      fontSize: 13,
+      opacity: .95
+    }
+  }, "Position du chauffeur en direct \xB7 camions Rungis \xB7 tourn\xE9e GPS")), React.createElement("span", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800
+    }
+  }, "\u203A")), React.createElement(KbTodayTeamStats, {
     prepDay: prepDay
-  }));
+  }), React.createElement("div", {
+    id: "kb-today-det",
+    style: {
+      scrollMarginTop: 70
+    }
+  }, det === 'mu' && React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 19,
+      flex: 1
+    }
+  }, "\uD83E\uDD55 MU du jour \xB7 d\xE9tail"), React.createElement("button", {
+    className: "btn-ghost",
+    onClick: () => setDet('')
+  }, "\u2715")), React.createElement(KbPaceStrip, {
+    prepPct: prepDay && poR.length && !closed ? pct : null,
+    tour: tourT
+  })), det === 'camion' && React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 19,
+      flex: 1
+    }
+  }, "\uD83D\uDE9A Suivi camion \xB7 d\xE9tail"), React.createElement("button", {
+    className: "btn-ghost",
+    onClick: () => setDet('')
+  }, "\u2715")), React.createElement(KbDriverLiveCard, {
+    session: session
+  }))));
 }
 const KB_CENT_DB = 'https://kelbongoo-prep-default-rtdb.firebaseio.com/';
 const kbCentCache = {};
@@ -62704,6 +64582,7 @@ function KbDlcRulesPage({
         navettes: clean.navettes,
         checkDow: clean.checkDow,
         anticipe: clean.anticipe,
+        pdpRet: clean.pdpRet,
         updatedBy: session.name || '',
         updatedAt: new Date().toISOString()
       };
@@ -62738,6 +64617,83 @@ function KbDlcRulesPage({
       margin: 0
     }
   }, "\uD83D\uDCC5 R\xE8gles DLC"), React.createElement("div", {
+    className: "card",
+    style: {
+      border: '3px solid #6a1b9a',
+      background: '#faf5ff'
+    }
+  }, React.createElement("div", {
+    style: {
+      ...big,
+      fontSize: 19,
+      marginBottom: 6
+    }
+  }, "\uD83E\uDDFA Retrait DLC d'une commande non r\xE9cup\xE9r\xE9e"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginBottom: 8
+    }
+  }, "Le distributeur peut retirer un produit d'un panier pas r\xE9cup\xE9r\xE9 (photo obligatoire), le produit part en partage \xE9quipe et la cliente re\xE7oit un mail. Autoris\xE9 si :"), React.createElement("label", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      fontSize: 16,
+      padding: '6px 0'
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: (f.pdpRet || {}).sameDay !== false,
+    onChange: e => set('pdpRet', {
+      ...(f.pdpRet || {}),
+      sameDay: e.target.checked
+    }),
+    style: {
+      width: 24,
+      height: 24
+    }
+  }), "La DLC est ", React.createElement("b", null, "aujourd'hui"), (f.pdpRet || {}).extraDays ? ` (ou dans ${(f.pdpRet || {}).extraDays} j)` : ''), React.createElement("label", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      fontSize: 16,
+      padding: '6px 0'
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    checked: (f.pdpRet || {}).closedOk !== false,
+    onChange: e => set('pdpRet', {
+      ...(f.pdpRet || {}),
+      closedOk: e.target.checked
+    }),
+    style: {
+      width: 24,
+      height: 24
+    }
+  }), "La DLC tombe un jour o\xF9 ", React.createElement("b", null, "le lieu est ferm\xE9"), ", avant sa prochaine ouverture (ex. samedi, ferm\xE9 dim\u2192mer : DLC dim\u2192mer OK)"), React.createElement("label", {
+    style: {
+      fontSize: 15,
+      display: 'block',
+      marginTop: 4
+    }
+  }, "Marge en plus (jours) : ", React.createElement("select", {
+    value: (f.pdpRet || {}).extraDays || 0,
+    onChange: e => set('pdpRet', {
+      ...(f.pdpRet || {}),
+      extraDays: Number(e.target.value)
+    }),
+    style: inp
+  }, [0, 1, 2, 3].map(n => React.createElement("option", {
+    key: n,
+    value: n
+  }, n === 0 ? 'aucune (DLC du jour)' : 'J+' + n)))), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: '#6a1b9a',
+      marginTop: 6
+    }
+  }, "Pense \xE0 \xAB Enregistrer \xBB en bas de la page.")), React.createElement("div", {
     className: "card",
     style: {
       border: '3px solid #2e7d32',
@@ -63031,9 +64987,18 @@ function SuiviGeneralPage({
     session: session
   }), sub === 'dlcrules' && React.createElement(KbDlcRulesPage, {
     session: session
-  }), sub === 'theme' && React.createElement(KbThemePage, {
+  }), sub === 'invrules' && React.createElement(KbInvRulesPage, {
     session: session
-  }), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement(KbGpsTourCard, {
+  }), sub === 'conso' && React.createElement(KbConsoPage, {
+    session: session,
+    master: true
+  }), React.createElement(KbConsoAlerter, null), sub === 'theme' && React.createElement(KbThemePage, {
+    session: session
+  }), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement("h1", {
+    style: {
+      margin: '0 0 4px'
+    }
+  }, "\uD83D\uDE9A Camion Rungis"), React.createElement(KbGpsSettingsCard, null), React.createElement(KbGpsTourCard, {
     session: session
   }), React.createElement(KbDriverLiveCard, {
     session: session
@@ -80884,6 +82849,181 @@ function KbGpsTourCard({
     }
   }, "Envoy\xE9e ", tour.updatedBy ? 'par ' + tour.updatedBy + ' ' : '', "\xE0 ", kbHM(tour.updatedAt), draft ? ' · ⚠️ modifications pas encore envoyées' : '')));
 }
+function KbGpsSettingsCard() {
+  const showToast = React.useContext(ToastContext);
+  const [cfg, setCfg] = React.useState(undefined);
+  const [key, setKey] = React.useState('');
+  const [fp, setFp] = React.useState(null);
+  const isAdmin = !!(window.__kbClaims && window.__kbClaims.admin === true);
+  React.useEffect(() => kbDocSub('gps_config', 'main', d => setCfg(d || null)), []);
+  React.useEffect(() => {
+    if (cfg !== undefined && fp === null) setFp({
+      g: String(cfg && cfg.fuelPrice || 1.7),
+      e: String(cfg && cfg.fuelPriceSp || 1.85)
+    });
+  }, [cfg]);
+  const save = async (patch, ok) => {
+    try {
+      await storage.setDoc('gps_config', 'main', patch);
+      showToast(ok);
+      return true;
+    } catch (e) {
+      showToast(/permission/i.test(e.message || '') ? '⛔ Refusé : réservé au master (règles Firestore gps_config)' : 'Erreur : ' + e.message);
+      return false;
+    }
+  };
+  const saveKey = async () => {
+    const k = key.trim();
+    if (k && !/^[A-Za-z0-9]{20,64}$/.test(k)) {
+      showToast('⚠️ Clé TomTom invalide (lettres et chiffres seulement)');
+      return;
+    }
+    if (await save({
+      tomtomKey: k,
+      keyAt: new Date().toISOString()
+    }, k ? '✓ Clé TomTom enregistrée' : 'Clé retirée')) setKey('');
+  };
+  const savePrices = () => {
+    const g = parseFloat(String(fp.g).replace(',', '.')),
+      e = parseFloat(String(fp.e).replace(',', '.'));
+    if (!(g > 0.5 && g < 5) || !(e > 0.5 && e < 5)) {
+      showToast('⚠️ Prix entre 0,50 et 5 €/L');
+      return;
+    }
+    save({
+      fuelPrice: g,
+      fuelPriceSp: e
+    }, '✓ Prix enregistrés');
+  };
+  const row = {
+    display: 'flex',
+    gap: 8,
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    marginTop: 8
+  };
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: '12px 14px',
+      borderLeft: '4px solid #8e7cc3'
+    }
+  }, React.createElement("h3", {
+    style: {
+      margin: 0,
+      fontSize: 17
+    }
+  }, "\u2699\uFE0F R\xE9glages GPS chauffeur"), !isAdmin ? React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: 'var(--ink-soft)',
+      marginTop: 6
+    }
+  }, "R\xE9serv\xE9 au master.") : cfg === undefined ? React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 6
+    }
+  }, "Chargement\u2026") : React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 8
+    }
+  }, "\uD83D\uDEA6 Cl\xE9 TomTom (trafic en direct, satellite)"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 2,
+      color: cfg && cfg.tomtomKey ? '#2e7d32' : 'var(--ink-soft)',
+      fontWeight: 600
+    }
+  }, cfg && cfg.tomtomKey ? `✓ Clé enregistrée${cfg.keyAt ? ' le ' + formatDateShort(String(cfg.keyAt).slice(0, 10)) + ' à ' + kbHM(cfg.keyAt) : ''} (pas réaffichée, par sécurité)` : '✗ Pas de clé : itinéraire OpenStreetMap, sans bouchons'), React.createElement("div", {
+    style: row
+  }, React.createElement("input", {
+    type: "password",
+    autoComplete: "off",
+    value: key,
+    onChange: e => setKey(e.target.value),
+    placeholder: cfg && cfg.tomtomKey ? 'Coller une nouvelle clé' : 'Coller la clé TomTom',
+    style: {
+      flex: 1,
+      minWidth: 180,
+      padding: '10px 12px',
+      borderRadius: 8,
+      border: '1px solid var(--line)',
+      fontSize: 15
+    }
+  }), React.createElement("button", {
+    type: "button",
+    className: "btn-primary",
+    disabled: !key.trim(),
+    onClick: saveKey
+  }, "Enregistrer"), cfg && cfg.tomtomKey && React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    onClick: () => save({
+      tomtomKey: '',
+      keyAt: new Date().toISOString()
+    }, 'Clé retirée')
+  }, "Retirer")), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 4
+    }
+  }, "La cl\xE9 se trouve sur my.tomtom.com \u203A API & SDK keys (clic = copi\xE9e). Gard\xE9e dans Firestore (gps_config), jamais dans le fichier."), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 14
+    }
+  }, "\u26FD Prix carburant (estimation sur l'aper\xE7u du trajet)"), fp && React.createElement("div", {
+    style: row
+  }, "Gazole ", React.createElement("input", {
+    type: "text",
+    inputMode: "decimal",
+    value: fp.g,
+    onChange: e => setFp(x => ({
+      ...x,
+      g: e.target.value
+    })),
+    style: {
+      width: 70,
+      padding: '8px',
+      borderRadius: 8,
+      border: '1px solid var(--line)'
+    }
+  }), " \u20AC/L \xB7 Essence ", React.createElement("input", {
+    type: "text",
+    inputMode: "decimal",
+    value: fp.e,
+    onChange: e => setFp(x => ({
+      ...x,
+      e: e.target.value
+    })),
+    style: {
+      width: 70,
+      padding: '8px',
+      borderRadius: 8,
+      border: '1px solid var(--line)'
+    }
+  }), " \u20AC/L", React.createElement("button", {
+    type: "button",
+    className: "btn-secondary",
+    onClick: savePrices
+  }, "Enregistrer")), React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginTop: 14
+    }
+  }, "\uD83D\uDCCD Lieux envoy\xE9s au GPS"), React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 2
+    }
+  }, cfg && cfg.lieux ? `${Object.keys(cfg.lieux.sites || {}).length} lieux · mis à jour ${kbHM(cfg.lieuxAt)}` : '— (envoyés automatiquement à l’ouverture de cette page)', ". Adresses et GPS : R\xE9glages \u203A \uD83D\uDCCD Lieux & horaires boutiques.")));
+}
 function KbDriverLiveCard({
   session
 }) {
@@ -80987,7 +83127,7 @@ function KbDriverLiveCard({
     const m = Math.round((now - Date.parse(iso)) / 60000);
     return m < 1 ? "à l'instant" : m < 60 ? `il y a ${m} min` : `il y a ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`;
   };
-  const saveKey = async () => {
+  const saveKeyOld = async () => {
     try {
       await storage.setDoc('gps_config', 'main', {
         tomtomKey: key.trim(),
@@ -81081,79 +83221,13 @@ function KbDriverLiveCard({
         color: '#1565c0'
       }
     }, "\u2248 ", kbHM(e.eta))))));
-  }), isAdmin && React.createElement("details", {
-    style: {
-      marginTop: 8
-    }
-  }, React.createElement("summary", {
-    style: {
-      cursor: 'pointer',
-      fontWeight: 700,
-      fontSize: 14
-    }
-  }, "\u2699\uFE0F Trafic en direct (cl\xE9 TomTom)"), React.createElement("div", {
-    style: {
-      fontSize: 13,
-      color: 'var(--ink-soft)',
-      margin: '6px 0'
-    }
-  }, cfg && cfg.tomtomKey ? '✓ Clé enregistrée (trafic + itinéraire camion TomTom actifs).' : 'Sans clé : itinéraire camion OpenStreetMap, sans bouchons.', " La cl\xE9 est gard\xE9e dans Firestore (gps_config), jamais dans le fichier."), React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 6
-    }
-  }, React.createElement("input", {
-    type: "password",
-    autoComplete: "off",
-    value: key,
-    onChange: e => setKey(e.target.value),
-    placeholder: cfg && cfg.tomtomKey ? 'Nouvelle clé (vide = retirer)' : 'Clé API TomTom',
-    style: {
-      flex: 1,
-      padding: '8px 10px',
-      borderRadius: 8,
-      border: '1px solid var(--line)'
-    }
-  }), React.createElement("button", {
-    type: "button",
-    className: "btn-primary",
-    onClick: saveKey
-  }, "Enregistrer")), React.createElement("div", {
-    style: {
-      display: 'flex',
-      gap: 8,
-      alignItems: 'center',
-      marginTop: 8,
-      fontSize: 13,
-      flexWrap: 'wrap'
-    }
-  }, "\u26FD Prix pour l'estimation : gazole", React.createElement("input", {
-    type: "number",
-    step: "0.01",
-    defaultValue: cfg && cfg.fuelPrice || 1.7,
-    onBlur: e => storage.setDoc('gps_config', 'main', {
-      fuelPrice: +e.target.value || 1.7
-    }).catch(err => showToast('Erreur : ' + err.message)),
-    style: {
-      width: 70
-    }
-  }), " \u20AC/L \xB7 essence", React.createElement("input", {
-    type: "number",
-    step: "0.01",
-    defaultValue: cfg && cfg.fuelPriceSp || 1.85,
-    onBlur: e => storage.setDoc('gps_config', 'main', {
-      fuelPriceSp: +e.target.value || 1.85
-    }).catch(err => showToast('Erreur : ' + err.message)),
-    style: {
-      width: 70
-    }
-  }), " \u20AC/L"), React.createElement("div", {
+  }), isAdmin && React.createElement("div", {
     style: {
       fontSize: 12,
       color: 'var(--ink-mute)',
-      marginTop: 4
+      marginTop: 8
     }
-  }, "Lieux envoy\xE9s au GPS : ", cfg && cfg.lieux ? Object.keys(cfg.lieux.sites || {}).length + ' · ' + kbHM(cfg.lieuxAt) : '—')));
+  }, "\u2699\uFE0F Cl\xE9 TomTom, prix carburant : Master \u203A R\xE9glages \u203A \uD83D\uDE9A Camion Rungis."));
 }
 function kbImgPdp(file) {
   return new Promise((ok, ko) => {
@@ -83310,34 +85384,11 @@ function RungisLivraisonView({
       await save(l, {
         status: 'missed',
         motif,
-        note: String(note || '').slice(0, 600)
-      });
-      let ok = false;
-      try {
-        const r = await kbRungisCall('rungis_alert', {
-          by: session.name,
-          alert: {
-            kind: l.kind,
-            site: l.site,
-            siteLabel: siteLabel(l.site),
-            label: l.label,
-            motif,
-            note,
-            day: l.when,
-            ref: l.id
-          }
-        });
-        ok = !!(r && r.ok);
-      } catch (e) {
-        ok = false;
-      }
-      await save(l, {
-        status: 'missed',
-        motif,
         note: String(note || '').slice(0, 600),
-        alertOk: ok
+        alertOk: false,
+        info: true
       });
-      showToast(ok ? '📧 Alerte envoyée à Raimbaud, gestion et Henry' : '⚠️ Noté, mais le mail d\'alerte n\'est pas parti : préviens le bureau');
+      showToast('📝 Noté · le bureau le voit dans l\'appli');
       setAsk(null);
     } catch (e) {
       showToast('Erreur : ' + e.message);
@@ -83918,7 +85969,7 @@ function RungisLivraisonView({
         fontWeight: 600,
         marginTop: 2
       }
-    }, p.alertOk ? '📧 Alerte envoyée' : '⚠️ Alerte mail non partie', p.at ? ' · ' + kbHhmm(p.at) : ''), canWrite && React.createElement("button", {
+    }, p.alertOk ? '📧 Alerte envoyée' : p.info ? '📝 Noté (info, pas de mail)' : '⚠️ Alerte mail non partie', p.at ? ' · ' + kbHhmm(p.at) : ''), canWrite && React.createElement("button", {
       className: "btn-ghost",
       disabled: busy,
       onClick: () => undoMissed(l),
@@ -88261,6 +90312,141 @@ function kbHhmm(iso) {
   }
 }
 const kbMorningId = d => '_morning_' + d;
+const KB_INV_RULES_DEF = {
+  back: {
+    0: 1,
+    1: 1,
+    2: 4,
+    3: 1,
+    4: 1,
+    5: 1,
+    6: 1
+  }
+};
+let _kbInvRules = KB_INV_RULES_DEF,
+  _kbInvRulesAt = 0;
+function kbInvRulesNorm(r) {
+  const b = {};
+  for (let d = 0; d < 7; d++) {
+    const v = r && r.back && r.back[d] != null ? Math.round(Number(r.back[d])) : KB_INV_RULES_DEF.back[d];
+    b[d] = isNaN(v) ? KB_INV_RULES_DEF.back[d] : Math.max(0, Math.min(7, v));
+  }
+  return {
+    back: b,
+    by: r && r.by || '',
+    at: r && r.at || 0
+  };
+}
+async function kbInvRulesLoad(force) {
+  if (!force && _kbInvRulesAt && Date.now() - _kbInvRulesAt < 60000) return _kbInvRules;
+  try {
+    const d = await storage.getDoc('app_config', 'inv_rules');
+    _kbInvRules = kbInvRulesNorm(d);
+    _kbInvRulesAt = Date.now();
+  } catch (_) {
+    _kbInvRules = kbInvRulesNorm(null);
+  }
+  return _kbInvRules;
+}
+function kbInvTheoDate(invDate, rules) {
+  const r = rules || _kbInvRules;
+  const n = r && r.back ? r.back[kbDowOf(invDate)] : 1;
+  return n ? addDays(invDate, -n) : invDate;
+}
+function useKbInvTheoDate(invDate) {
+  const [r, setR] = React.useState(_kbInvRulesAt ? _kbInvRules : null);
+  React.useEffect(() => {
+    kbInvRulesLoad().then(setR);
+  }, []);
+  return r && invDate ? kbInvTheoDate(invDate, r) : null;
+}
+function KbInvRulesPage({
+  session
+}) {
+  const showToast = React.useContext(ToastContext);
+  const [r, setR] = React.useState(null);
+  React.useEffect(() => {
+    kbInvRulesLoad(true).then(x => setR(JSON.parse(JSON.stringify(x))));
+  }, []);
+  if (!r) return React.createElement("div", {
+    className: "card"
+  }, "Chargement\u2026");
+  const DOW = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+  const save = async next => {
+    try {
+      await storage.setDoc('app_config', 'inv_rules', {
+        back: next.back,
+        by: session && session.name || '—',
+        at: Date.now()
+      }, {
+        replace: true
+      });
+      _kbInvRules = kbInvRulesNorm(next);
+      _kbInvRulesAt = Date.now();
+      setR(next);
+      showToast('✓ Règle inventaire enregistrée');
+    } catch (e) {
+      showToast('Erreur : ' + e.message);
+    }
+  };
+  const lbl = (d, n) => n === 0 ? 'feuille du jour même' : `feuille du ${DOW[(d - n % 7 + 7) % 7]} (J−${n})`;
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: '0 0 4px'
+    }
+  }, "\uD83D\uDCCB R\xE8gle inventaire"), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12,
+      fontSize: 14
+    }
+  }, React.createElement("b", null, "Stock th\xE9orique"), " d'un inventaire = colonne Y \xAB Stock fin \xBB d'une feuille de stock ", React.createElement("b", null, "d'avant"), ". La feuille du jour contient d\xE9j\xE0 les commandes : elle fausse le th\xE9orique (exemple : le mardi, 71 anomalies au lieu d'une trentaine).", React.createElement("br", null), React.createElement("b", null, "\xC9criture"), " : le comptage s'\xE9crit toujours sur le classeur d'inventaire du jour, rien ne change.", React.createElement("br", null), "Si la feuille du jour choisi n'existe pas, l'appli prend la derni\xE8re feuille d'avant."), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, [2, 3, 4, 5, 6, 0, 1].map(d => React.createElement("div", {
+    key: d,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '8px 0',
+      borderTop: '1px solid var(--line)'
+    }
+  }, React.createElement("b", {
+    style: {
+      width: 100,
+      fontSize: 16,
+      textTransform: 'capitalize'
+    }
+  }, DOW[d]), React.createElement("select", {
+    value: r.back[d],
+    onChange: e => save({
+      ...r,
+      back: {
+        ...r.back,
+        [d]: Number(e.target.value)
+      }
+    }),
+    style: {
+      fontSize: 16,
+      padding: 6,
+      flex: 1
+    }
+  }, [0, 1, 2, 3, 4, 5, 6, 7].map(n => React.createElement("option", {
+    key: n,
+    value: n
+  }, lbl(d, n)))))), r.by ? React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 6
+    }
+  }, "Modifi\xE9 par ", r.by, r.at ? ' le ' + new Date(r.at).toLocaleString('fr-FR') : '') : null));
+}
 function useStockLevels(date) {
   const [lv, setLv] = React.useState(() => window.__kbStockLv && window.__kbStockLv[date] || null);
   React.useEffect(() => {
@@ -100947,7 +103133,14 @@ function App() {
     }), tab === 'enldestr' && React.createElement(KbEnlDestructionPage, {
       session: effSession,
       setTab: setTab
-    }), tab === 'painpribon' && (kbIsSecure() ? React.createElement(PainPribonPage, {
+    }), React.createElement(KbConsoAlerter, null), tab === 'conso' && React.createElement("div", {
+      className: "stack"
+    }, React.createElement(KbBackToHub, {
+      setTab: setTab
+    }), React.createElement(KbConsoPage, {
+      session: effSession,
+      master: !!(effSession && effSession.isMaster)
+    })), tab === 'painpribon' && (kbIsSecure() ? React.createElement(PainPribonPage, {
       session: effSession,
       setTab: setTab,
       catalogue: catalogue
@@ -101005,14 +103198,14 @@ function App() {
     }, React.createElement("span", {
       className: "tab-icon"
     }, "\uD83D\uDE9A"), "Manquants & ND"), React.createElement("button", {
-      className: ['suivi', 'pdpreturns', 'dlcwatch', 'losses', 'printpain', 'printlabels', 'printqr', 'enldestr', 'muload', 'cmdload', 'painpribon', 'rungisdu'].includes(tab) ? 'active' : '',
+      className: ['suivi', 'pdpreturns', 'dlcwatch', 'losses', 'printpain', 'printlabels', 'printqr', 'enldestr', 'muload', 'cmdload', 'painpribon', 'rungisdu', 'conso'].includes(tab) ? 'active' : '',
       onClick: () => setTab('suivi')
     }, React.createElement("span", {
       className: "tab-icon",
       style: {
         position: 'relative'
       }
-    }, "\uD83D\uDCC5", React.createElement(KbDlcTabDot, null)), "DLC & suivi"), React.createElement("button", {
+    }, "\uD83E\uDDF0", React.createElement(KbDlcTabDot, null)), "Atelier"), React.createElement("button", {
       className: tab === 'inventory' ? 'active' : '',
       onClick: () => setTab('inventory')
     }, React.createElement("span", {
@@ -101162,7 +103355,17 @@ function App() {
   }), tab === 'temp' && !effSession.isMaster && BOUTIQUES.includes(currentSite) && React.createElement(TemperaturePage, {
     session: effSession,
     currentSite: currentSite
-  }), tab === 'closure' && React.createElement(ClosurePage, {
+  }), tab === 'nonrecup' && !effSession.isMaster && React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: '2px 0'
+    }
+  }, "\uD83D\uDCDE Non r\xE9cup\xE9r\xE9s \xB7 ", currentSite), React.createElement(NonRecupSubPage, {
+    session: effSession,
+    currentSite: currentSite,
+    consumersByEmail: consumersByEmail
+  })), tab === 'closure' && React.createElement(ClosurePage, {
     session: effSession,
     currentSite: currentSite,
     orders: orders,
@@ -101229,15 +103432,20 @@ function App() {
     className: "tab-icon"
   }, "\u26A0\uFE0F"), "Qualit\xE9"), !effSession.isMaster && React.createElement("button", {
     className: tab === 'followup' ? 'active' : '',
-    onClick: () => setTab('followup')
+    onClick: () => {
+      setTab('followup');
+      try {
+        window.dispatchEvent(new CustomEvent('kb:carnet-home'));
+      } catch (_) {}
+    }
   }, React.createElement("span", {
     className: "tab-icon"
-  }, "\uD83D\uDCD2"), "Carnet"), !effSession.isMaster && BOUTIQUES.includes(currentSite) && React.createElement("button", {
-    className: tab === 'temp' ? 'active' : '',
-    onClick: () => setTab('temp')
+  }, "\uD83D\uDCD2"), "Carnet"), !effSession.isMaster && React.createElement("button", {
+    className: tab === 'nonrecup' ? 'active' : '',
+    onClick: () => setTab('nonrecup')
   }, React.createElement("span", {
     className: "tab-icon"
-  }, "\uD83C\uDF21\uFE0F"), "Temp."), !effSession.isMaster && React.createElement("button", {
+  }, "\uD83D\uDCDE"), "Non r\xE9cup."), !effSession.isMaster && React.createElement("button", {
     className: tab === 'closure' ? 'active' : '',
     onClick: () => setTab('closure'),
     style: {
@@ -101400,10 +103608,6 @@ const KB_MNAV = [{
     sub: 'factweb',
     l: 'Facturation web',
     ic: '🧾'
-  }, {
-    sub: 'ancien',
-    l: 'Synchro ancien site',
-    ic: '🔁'
   }]
 }, {
   s: 'appro',
@@ -101423,6 +103627,10 @@ const KB_MNAV = [{
     t: 'minv',
     l: 'Inventaire magasin',
     ic: '📋'
+  }, {
+    sub: 'conso',
+    l: 'Sachets MU & films',
+    ic: '🛍️'
   }]
 }, {
   s: 'chif',
@@ -101446,18 +103654,18 @@ const KB_MNAV = [{
     sub: 'stats',
     l: 'Statistiques équipes',
     ic: '📊'
-  }, {
-    sub: 'rungis',
-    l: 'Camion Rungis',
-    ic: '🚚'
   }]
 }, {
   s: 'plus',
-  l: 'Livraison & réglages',
-  sh: 'Plus',
+  l: 'Réglages & livraison',
+  sh: 'Réglages',
   ic: '⚙️',
   c: '#8e7cc3',
   items: [{
+    sub: 'rungis',
+    l: 'Camion Rungis (suivi · GPS · clé TomTom)',
+    ic: '🚚'
+  }, {
     sub: 'dromy',
     l: 'Dromy : envoi & étiquettes',
     ic: '🛵'
@@ -101494,9 +103702,17 @@ const KB_MNAV = [{
     l: 'Règles DLC',
     ic: '📅'
   }, {
+    sub: 'invrules',
+    l: 'Règle inventaire',
+    ic: '📋'
+  }, {
     sub: 'theme',
     l: 'Design & thèmes',
     ic: '🎨'
+  }, {
+    sub: 'ancien',
+    l: 'Synchro ancien site',
+    ic: '🔁'
   }]
 }];
 const KB_MSUBS = [...KB_MNAV.flatMap(g => g.items.filter(i => i.sub).map(i => i.sub)), 'cmails', 'live'];
