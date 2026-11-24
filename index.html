@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.81) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.82) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -731,7 +731,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.81';
+const APP_VERSION = 'V11.82';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -5784,8 +5784,28 @@ const KB_SANTA = {
   meta: 'santa_2026_meta',
   closeMs: Date.UTC(2026, 11, 4, 23, 0, 0),
   budget: 10,
-  showUntil: '2026-12-31'
+  showUntil: '2026-12-30',
+  lieux: [{
+    k: 'PDP',
+    label: 'Maison du Père Noël · Porte de Pantin',
+    ic: '🎅'
+  }, {
+    k: 'ROB',
+    label: 'Pribon Robespierre',
+    ic: '🧝'
+  }, {
+    k: 'TOL',
+    label: 'Pribon Tolbiac',
+    ic: '🦌'
+  }, {
+    k: 'BIC',
+    label: 'Pribon Bichat',
+    ic: '⛄'
+  }]
 };
+function kbSantaLieu(k) {
+  return KB_SANTA.lieux.find(x => x.k === k) || null;
+}
 function kbSantaOpenNow() {
   return Date.now() < KB_SANTA.closeMs;
 }
@@ -5820,48 +5840,56 @@ async function kbSantaDrawIfDue(who) {
     merge: true
   });
   const snap = await F.getDocs(F.collection(fb.db, KB_SANTA.col));
-  const ppl = [];
+  const byLieu = {};
   snap.forEach(d => {
     const x = d.data();
-    if (x && x.name && x.active !== false) ppl.push({
+    if (x && x.name && x.active !== false && kbSantaLieu(x.lieu)) (byLieu[x.lieu] = byLieu[x.lieu] || []).push({
       uid: d.id,
       name: x.name,
       wish: x.wish || ''
     });
   });
-  if (ppl.length < 2) {
-    await F.setDoc(stRef, {
-      drawn: false,
-      drawing: null,
-      count: ppl.length,
-      note: 'moins de 2 participants'
-    }, {
-      merge: true
+  const b = F.writeBatch(fb.db),
+    now = new Date().toISOString(),
+    counts = {};
+  let total = 0;
+  Object.entries(byLieu).forEach(([lieu, ppl]) => {
+    counts[lieu] = ppl.length;
+    if (ppl.length < 2) {
+      ppl.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.uid), {
+        giverName: p.name,
+        lieu,
+        alone: true,
+        receiverName: '',
+        receiverWish: '',
+        at: now
+      }));
+      return;
+    }
+    kbSantaPairs(ppl).forEach(p => {
+      total++;
+      b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), {
+        giverName: p.giver.name,
+        lieu,
+        receiverName: p.receiver.name,
+        receiverWish: p.receiver.wish,
+        at: now
+      });
     });
-    return {
-      count: ppl.length
-    };
-  }
-  const pairs = kbSantaPairs(ppl);
-  const b = F.writeBatch(fb.db);
-  pairs.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), {
-    giverName: p.giver.name,
-    receiverName: p.receiver.name,
-    receiverWish: p.receiver.wish,
-    at: new Date().toISOString()
-  }));
+  });
   b.set(stRef, {
     drawn: true,
     drawing: null,
-    drawnAt: new Date().toISOString(),
-    count: pairs.length,
+    drawnAt: now,
+    count: total,
+    byLieu: counts,
     by: who || ''
   }, {
     merge: true
   });
   await b.commit();
   return {
-    count: pairs.length
+    count: total
   };
 }
 function KbSantaPage({
@@ -5874,6 +5902,7 @@ function KbSantaPage({
   const [me, setMe] = React.useState(null);
   const [reg, setReg] = React.useState(undefined);
   const [wish, setWish] = React.useState('');
+  const [lieu, setLieu] = React.useState('');
   const [draw, setDraw] = React.useState(null);
   const [reveal, setReveal] = React.useState(false);
   const [now, setNow] = React.useState(Date.now());
@@ -5923,6 +5952,7 @@ function KbSantaPage({
       } catch (_) {}
       setReg(x && x.active !== false ? x : null);
       setWish(x && x.wish || '');
+      setLieu(x && kbSantaLieu(x.lieu) ? x.lieu : '');
     } catch (e) {
       setErr(kbErrMsg(e));
     } finally {
@@ -5932,11 +5962,16 @@ function KbSantaPage({
   };
   const join = async () => {
     const w = String(wish || '').trim().slice(0, 300);
+    if (!kbSantaLieu(lieu)) {
+      setErr('Choisis ta maison des lutins 🏠');
+      return;
+    }
     setBusy(true);
     setErr('');
     try {
       const data = {
         name: me.name,
+        lieu,
         wish: w,
         active: true,
         at: new Date().toISOString()
@@ -6261,7 +6296,46 @@ function KbSantaPage({
       marginTop: 12,
       fontSize: 16
     }
-  }, reg ? React.createElement(React.Fragment, null, "\u2705 ", React.createElement("b", null, "Tu participes au Santa secret."), " Tu peux changer ton souhait jusqu'au 4 d\xE9cembre 23h59.") : React.createElement(React.Fragment, null, "Confirme ton envie de participer au ", React.createElement("b", null, "Santa secret"), " \u2014 budget ", React.createElement("b", null, KB_SANTA.budget, " \u20AC max"), ".")), React.createElement("div", {
+  }, reg && kbSantaLieu(reg.lieu) ? React.createElement(React.Fragment, null, "\u2705 ", React.createElement("b", null, "Tu participes au Santa secret"), " \xB7 ", kbSantaLieu(reg.lieu).ic, " ", kbSantaLieu(reg.lieu).label, ". Tu peux changer jusqu'au 4 d\xE9cembre 23h59.") : reg ? React.createElement(React.Fragment, null, "\u26A0\uFE0F ", React.createElement("b", null, "Choisis ta maison des lutins"), " puis touche \xAB Mettre \xE0 jour \xBB, sinon tu ne seras pas dans le tirage.") : React.createElement(React.Fragment, null, "Confirme ton envie de participer au ", React.createElement("b", null, "Santa secret"), " \u2014 budget ", React.createElement("b", null, KB_SANTA.budget, " \u20AC max"), ".")), React.createElement("div", {
+    style: {
+      marginTop: 12,
+      fontSize: 15,
+      textAlign: 'left',
+      fontWeight: 700
+    }
+  }, "\uD83C\uDFE0 Choisis le lieu de ta maison des lutins :"), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gap: 8,
+      marginTop: 6
+    }
+  }, KB_SANTA.lieux.map(l => React.createElement("button", {
+    key: l.k,
+    type: "button",
+    onClick: () => setLieu(l.k),
+    style: {
+      padding: '12px 8px',
+      borderRadius: 16,
+      border: lieu === l.k ? '4px solid #c62828' : '3px dashed #2e7d32',
+      background: lieu === l.k ? '#ffebee' : '#fff',
+      color: '#3b0a0a',
+      fontWeight: 800,
+      fontSize: 14,
+      cursor: 'pointer',
+      transform: lieu === l.k ? 'scale(1.04)' : 'none',
+      transition: 'transform .15s'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 30
+    }
+  }, l.ic), l.label, lieu === l.k ? ' ✓' : ''))), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      marginTop: 4
+    }
+  }, "Le tirage se fait entre les lutins de la m\xEAme maison."), React.createElement("div", {
     style: {
       marginTop: 10,
       fontSize: 15,
@@ -6276,9 +6350,16 @@ function KbSantaPage({
     placeholder: "ex. du th\xE9, un livre de cuisine, des chaussettes rigolotes\u2026"
   }), React.createElement("button", {
     className: "btn g",
-    disabled: busy,
+    disabled: busy || !lieu,
     onClick: join
-  }, reg ? '🎁 Mettre à jour mon souhait' : '🎅 Je participe !'), reg && React.createElement("button", {
+  }, reg ? '🎁 Mettre à jour' : '🎅 Je participe !'), !lieu && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 6,
+      color: '#b71c1c',
+      fontWeight: 700
+    }
+  }, "\uD83D\uDC46 Choisis d'abord ta maison des lutins"), reg && React.createElement("button", {
     className: "btn-ghost",
     style: {
       marginTop: 8,
@@ -6313,7 +6394,13 @@ function KbSantaPage({
     style: {
       marginTop: 16
     }
-  }, !reveal ? React.createElement("div", {
+  }, draw.alone ? React.createElement("div", {
+    className: "pop",
+    style: {
+      fontSize: 16,
+      marginTop: 8
+    }
+  }, "\uD83E\uDDDD Tu \xE9tais le seul lutin inscrit dans ta maison (", (kbSantaLieu(draw.lieu) || {}).label || draw.lieu, ") : pas de tirage cette ann\xE9e. Joyeux No\xEBl quand m\xEAme ! \uD83C\uDF84") : !reveal ? React.createElement("div", {
     className: "gift"
   }, "\uD83C\uDF81") : React.createElement("div", {
     className: "pop",
@@ -79337,6 +79424,23 @@ function KbTruckGps({
       });
     }
   };
+  const searchFrom = React.useRef('home');
+  const openSearch = () => {
+    searchFrom.current = mode;
+    setMode('search');
+    setQ('');
+    setRes([]);
+    setMsg('');
+  };
+  const backFromSearch = () => setMode(searchFrom.current === 'nav' && NV.current ? 'nav' : searchFrom.current === 'preview' && plan ? 'preview' : 'home');
+  const goSearch = stops => {
+    if (NV.current) stopNav(true);else {
+      setMode('home');
+      setPlan(null);
+      clearRoute();
+    }
+    goTo(stops);
+  };
   React.useEffect(() => {
     if (mode !== 'search') return;
     const s = q.trim();
@@ -79641,12 +79745,7 @@ function KbTruckGps({
     }
   }, mode === 'home' || mode === 'arrived' ? '✕' : '←'), (mode === 'home' || mode === 'arrived') && React.createElement("button", {
     type: "button",
-    onClick: () => {
-      setMode('search');
-      setQ('');
-      setRes([]);
-      setMsg('');
-    },
+    onClick: openSearch,
     style: {
       ...card,
       flex: 1,
@@ -79679,7 +79778,19 @@ function KbTruckGps({
       fontSize: 13,
       color: '#607d8b'
     }
-  }, kbVehLabel(P)))), (mode === 'home' || mode === 'nav') && React.createElement("div", {
+  }, kbVehLabel(P))), mode === 'preview' && React.createElement("button", {
+    type: "button",
+    onClick: openSearch,
+    style: {
+      ...card,
+      width: 54,
+      height: 54,
+      border: 'none',
+      fontSize: 24,
+      flex: '0 0 auto'
+    },
+    "aria-label": "Autre adresse"
+  }, "\uD83D\uDD0D")), (mode === 'home' || mode === 'nav') && React.createElement("div", {
     style: {
       position: 'absolute',
       right: 10,
@@ -79689,7 +79800,7 @@ function KbTruckGps({
       gap: 10,
       zIndex: 15
     }
-  }, mode === 'home' && fab(kbVehInfo(P).ic, true, () => setShowProf(true)), fab('🗂️', true, () => setSheet('layers')), mode === 'nav' && fab(muted ? '🔇' : '🔊', true, toggleMute), mode === 'nav' && fab('🗺️', true, overview), mode === 'home' && fab('⛽', true, () => openPoi('fuel')), mode === 'home' && fab('🅿️', true, () => openPoi('parking')), fab('❓', true, () => setSheet('help'))), mode === 'nav' && React.createElement("button", {
+  }, mode === 'home' && fab(kbVehInfo(P).ic, true, () => setShowProf(true)), fab('🗂️', true, () => setSheet('layers')), mode === 'nav' && fab('🔍', true, openSearch), mode === 'nav' && fab(muted ? '🔇' : '🔊', true, toggleMute), mode === 'nav' && fab('🗺️', true, overview), mode === 'home' && fab('⛽', true, () => openPoi('fuel')), mode === 'home' && fab('🅿️', true, () => openPoi('parking')), fab('❓', true, () => setSheet('help'))), mode === 'nav' && React.createElement("button", {
     type: "button",
     onClick: () => setSheet('report'),
     style: {
@@ -79876,7 +79987,7 @@ function KbTruckGps({
     }
   }, React.createElement("button", {
     type: "button",
-    onClick: () => setMode('home'),
+    onClick: backFromSearch,
     style: {
       width: 52,
       height: 52,
@@ -79890,7 +80001,15 @@ function KbTruckGps({
     autoFocus: true,
     value: q,
     onChange: e => setQ(e.target.value),
-    placeholder: "Adresse, magasin, entreprise\u2026",
+    onKeyDown: e => {
+      if (e.key === 'Enter' && res[0]) goSearch([{
+        id: '',
+        name: res[0].name,
+        lat: res[0].lat,
+        lng: res[0].lng
+      }]);
+    },
+    placeholder: "Tape n'importe quelle adresse\u2026",
     style: {
       flex: 1,
       height: 52,
@@ -79916,7 +80035,7 @@ function KbTruckGps({
     key: 'p' + p.id,
     type: "button",
     onClick: () => {
-      setMode('home');
+      if (NV.current) stopNav(true);else setMode('home');
       pickPlace(p);
     },
     style: {
@@ -79941,15 +80060,12 @@ function KbTruckGps({
   }, p.adresse || 'Lieu Kelbongoo'))), res.map((r, i) => React.createElement("button", {
     key: i,
     type: "button",
-    onClick: () => {
-      setMode('home');
-      goTo([{
-        id: '',
-        name: r.name,
-        lat: r.lat,
-        lng: r.lng
-      }]);
-    },
+    onClick: () => goSearch([{
+      id: '',
+      name: r.name,
+      lat: r.lat,
+      lng: r.lng
+    }]),
     style: {
       display: 'block',
       width: '100%',

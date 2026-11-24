@@ -813,7 +813,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.81';
+    const APP_VERSION = 'V11.82';
+    // V11.82 — (24/11/2026) 🧭 GPS chauffeur : 🔍 « Tape n'importe quelle adresse » aussi en plein guidage et sur l'aperçu (avant : seulement
+    //   à l'accueil) ; Entrée = 1er résultat ; ← revient au guidage en cours. 🎅 Santa secret : choix OBLIGATOIRE de la maison des lutins (PDP Maison du Père Noël Porte de Pantin,
+    //   ROB / TOL / BIC Pribon) → tirage séparé par maison (on ne mélange pas les lieux) ; lien retiré du menu à partir du 31/12.
     // V11.81 — (24/11/2026) 🎅 Santa secret (lien sous Rungis à la connexion, code perso, souhait 10 €, clôture 4/12 23h59, tirage auto
     //   le 5/12 par le 1er poste master, page animée Noël ; règles Firestore santa_2026*). Casiers : à partir de la distrib du 26/11 l'appli
     //   gère SEULE les n° (plus ceux du chargement : séries frais/sec de l'ancien site mélangées → trous 1·2·13 à STB/BIC/BOR), plus petit
@@ -4950,7 +4953,10 @@
     //   santa_2026/<uid> (inscription) · santa_2026_draw/<uid du donneur> (qui il a tiré) · santa_2026_meta/state.
     //   Le nom vient du jeton signé par le serveur (claim kbName), jamais d'une saisie.
     // ============================================================
-    const KB_SANTA = { col: 'santa_2026', draw: 'santa_2026_draw', meta: 'santa_2026_meta', closeMs: Date.UTC(2026, 11, 4, 23, 0, 0), budget: 10, showUntil: '2026-12-31' };
+    const KB_SANTA = { col: 'santa_2026', draw: 'santa_2026_draw', meta: 'santa_2026_meta', closeMs: Date.UTC(2026, 11, 4, 23, 0, 0), budget: 10, showUntil: '2026-12-30',
+      // V11.82 — maisons des lutins : le tirage se fait DANS chaque maison (jamais entre deux lieux)
+      lieux: [{ k: 'PDP', label: 'Maison du Père Noël · Porte de Pantin', ic: '🎅' }, { k: 'ROB', label: 'Pribon Robespierre', ic: '🧝' }, { k: 'TOL', label: 'Pribon Tolbiac', ic: '🦌' }, { k: 'BIC', label: 'Pribon Bichat', ic: '⛄' }] };
+    function kbSantaLieu(k) { return KB_SANTA.lieux.find(x => x.k === k) || null; }
     function kbSantaOpenNow() { return Date.now() < KB_SANTA.closeMs; }
     function kbSantaVisible() { return todayKey() <= KB_SANTA.showUntil; }
     // Mélange sûr (crypto) puis cycle : chaque personne offre à la suivante → jamais à elle-même, une seule boucle.
@@ -4969,14 +4975,18 @@
       if (st.exists() && (st.data().drawn || (st.data().drawing && Date.now() - Date.parse(st.data().drawing) < 10 * 60000))) return null;
       await F.setDoc(stRef, { drawing: new Date().toISOString(), by: who || '' }, { merge: true });
       const snap = await F.getDocs(F.collection(fb.db, KB_SANTA.col));
-      const ppl = []; snap.forEach(d => { const x = d.data(); if (x && x.name && x.active !== false) ppl.push({ uid: d.id, name: x.name, wish: x.wish || '' }); });
-      if (ppl.length < 2) { await F.setDoc(stRef, { drawn: false, drawing: null, count: ppl.length, note: 'moins de 2 participants' }, { merge: true }); return { count: ppl.length }; }
-      const pairs = kbSantaPairs(ppl);
-      const b = F.writeBatch(fb.db);
-      pairs.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), { giverName: p.giver.name, receiverName: p.receiver.name, receiverWish: p.receiver.wish, at: new Date().toISOString() }));
-      b.set(stRef, { drawn: true, drawing: null, drawnAt: new Date().toISOString(), count: pairs.length, by: who || '' }, { merge: true });
+      const byLieu = {}; // V11.82 — un tirage par maison des lutins
+      snap.forEach(d => { const x = d.data(); if (x && x.name && x.active !== false && kbSantaLieu(x.lieu)) (byLieu[x.lieu] = byLieu[x.lieu] || []).push({ uid: d.id, name: x.name, wish: x.wish || '' }); });
+      const b = F.writeBatch(fb.db), now = new Date().toISOString(), counts = {};
+      let total = 0;
+      Object.entries(byLieu).forEach(([lieu, ppl]) => {
+        counts[lieu] = ppl.length;
+        if (ppl.length < 2) { ppl.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.uid), { giverName: p.name, lieu, alone: true, receiverName: '', receiverWish: '', at: now })); return; }
+        kbSantaPairs(ppl).forEach(p => { total++; b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), { giverName: p.giver.name, lieu, receiverName: p.receiver.name, receiverWish: p.receiver.wish, at: now }); });
+      });
+      b.set(stRef, { drawn: true, drawing: null, drawnAt: now, count: total, byLieu: counts, by: who || '' }, { merge: true });
       await b.commit();
-      return { count: pairs.length };
+      return { count: total };
     }
 
     function KbSantaPage({ onClose }) {
@@ -4987,6 +4997,7 @@
       const [me, setMe] = React.useState(null);       // { uid, name }
       const [reg, setReg] = React.useState(undefined); // fiche santa_2026/<uid> (null = pas inscrit)
       const [wish, setWish] = React.useState('');
+      const [lieu, setLieu] = React.useState(''); // V11.82 — maison des lutins
       const [draw, setDraw] = React.useState(null);    // { receiverName, receiverWish } | 'wait'
       const [reveal, setReveal] = React.useState(false);
       const [now, setNow] = React.useState(Date.now());
@@ -5011,15 +5022,16 @@
           setMe(m);
           let x = null;
           try { const d = await F.getDoc(F.doc(fb.db, KB_SANTA.col, m.uid)); x = d.exists() ? d.data() : null; } catch (_) {}
-          setReg(x && x.active !== false ? x : null); setWish((x && x.wish) || '');
+          setReg(x && x.active !== false ? x : null); setWish((x && x.wish) || ''); setLieu((x && kbSantaLieu(x.lieu)) ? x.lieu : '');
         } catch (e) { setErr(kbErrMsg(e)); }
         finally { setBusy(false); setCode(''); }
       };
       const join = async () => {
         const w = String(wish || '').trim().slice(0, 300);
+        if (!kbSantaLieu(lieu)) { setErr('Choisis ta maison des lutins 🏠'); return; }
         setBusy(true); setErr('');
         try {
-          const data = { name: me.name, wish: w, active: true, at: new Date().toISOString() };
+          const data = { name: me.name, lieu, wish: w, active: true, at: new Date().toISOString() };
           await F.setDoc(F.doc(fb.db, KB_SANTA.col, me.uid), data);
           setReg(data); showToast(reg ? '🎁 Souhait mis à jour' : '🎅 Inscription confirmée !');
         } catch (e) { setErr(/permission/i.test(String(e && e.code || e)) ? (Date.now() < KB_SANTA.closeMs ? 'Accès refusé par le serveur — préviens Henry (règles du Santa secret).' : 'Inscriptions closes (4 décembre 23h59).') : kbErrMsg(e)); }
@@ -5130,10 +5142,20 @@
                 <div style={{ fontSize: 24, fontWeight: 900 }}>Bienvenue {first(me.name)} !</div>
                 {open && (
                   <>
-                    <div style={{ marginTop: 12, fontSize: 16 }}>{reg ? <>✅ <b>Tu participes au Santa secret.</b> Tu peux changer ton souhait jusqu'au 4 décembre 23h59.</> : <>Confirme ton envie de participer au <b>Santa secret</b> — budget <b>{KB_SANTA.budget} € max</b>.</>}</div>
+                    <div style={{ marginTop: 12, fontSize: 16 }}>{reg && kbSantaLieu(reg.lieu) ? <>✅ <b>Tu participes au Santa secret</b> · {kbSantaLieu(reg.lieu).ic} {kbSantaLieu(reg.lieu).label}. Tu peux changer jusqu'au 4 décembre 23h59.</> : reg ? <>⚠️ <b>Choisis ta maison des lutins</b> puis touche « Mettre à jour », sinon tu ne seras pas dans le tirage.</> : <>Confirme ton envie de participer au <b>Santa secret</b> — budget <b>{KB_SANTA.budget} € max</b>.</>}</div>
+                    <div style={{ marginTop: 12, fontSize: 15, textAlign: 'left', fontWeight: 700 }}>🏠 Choisis le lieu de ta maison des lutins :</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 6 }}>
+                      {KB_SANTA.lieux.map(l => (
+                        <button key={l.k} type="button" onClick={() => setLieu(l.k)} style={{ padding: '12px 8px', borderRadius: 16, border: lieu === l.k ? '4px solid #c62828' : '3px dashed #2e7d32', background: lieu === l.k ? '#ffebee' : '#fff', color: '#3b0a0a', fontWeight: 800, fontSize: 14, cursor: 'pointer', transform: lieu === l.k ? 'scale(1.04)' : 'none', transition: 'transform .15s' }}>
+                          <div style={{ fontSize: 30 }}>{l.ic}</div>{l.label}{lieu === l.k ? ' ✓' : ''}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>Le tirage se fait entre les lutins de la même maison.</div>
                     <div style={{ marginTop: 10, fontSize: 15, textAlign: 'left', fontWeight: 700 }}>🎁 Mets ce qui te ferait plaisir, pour aider la personne qui te choisira :</div>
                     <textarea rows={3} maxLength={300} value={wish} onChange={e => setWish(e.target.value)} placeholder="ex. du thé, un livre de cuisine, des chaussettes rigolotes…" />
-                    <button className="btn g" disabled={busy} onClick={join}>{reg ? '🎁 Mettre à jour mon souhait' : '🎅 Je participe !'}</button>
+                    <button className="btn g" disabled={busy || !lieu} onClick={join}>{reg ? '🎁 Mettre à jour' : '🎅 Je participe !'}</button>
+                    {!lieu && <div style={{ fontSize: 13, marginTop: 6, color: '#b71c1c', fontWeight: 700 }}>👆 Choisis d'abord ta maison des lutins</div>}
                     {reg && <button className="btn-ghost" style={{ marginTop: 8, color: '#7f0000' }} disabled={busy} onClick={quit}>Ne plus participer</button>}
                   </>
                 )}
@@ -5147,7 +5169,7 @@
                 {draw === 'wait' && <div style={{ marginTop: 12, fontSize: 16 }}>🧝 Les lutins font le tirage… Reviens dans un petit moment !</div>}
                 {draw && draw !== 'wait' && (
                   <div style={{ marginTop: 16 }}>
-                    {!reveal ? <div className="gift">🎁</div> : (
+                    {draw.alone ? <div className="pop" style={{ fontSize: 16, marginTop: 8 }}>🧝 Tu étais le seul lutin inscrit dans ta maison ({(kbSantaLieu(draw.lieu) || {}).label || draw.lieu}) : pas de tirage cette année. Joyeux Noël quand même ! 🎄</div> : !reveal ? <div className="gift">🎁</div> : (
                       <div className="pop" style={{ background: '#fff8e1', border: '4px dashed #c62828', borderRadius: 20, padding: 16 }}>
                         <div style={{ fontSize: 16 }}>Tu offres un cadeau à…</div>
                         <div style={{ fontSize: 34, fontWeight: 900, color: '#c62828' }}>🎄 {draw.receiverName} 🎄</div>
@@ -38206,6 +38228,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         try { const r = await kbOverpassPoi(kind, fx, S.current.prof); setPoi(r); } catch (e) { setPoi({ err: e.message }); }
       };
       // ── recherche ──
+      // V11.82 — le chauffeur tape l'adresse qu'il veut à tout moment (accueil, aperçu, en plein guidage) :
+      //   retour ← = revient où il était ; choisir une adresse en guidage = arrête le guidage et calcule le nouvel itinéraire.
+      const searchFrom = React.useRef('home');
+      const openSearch = () => { searchFrom.current = mode; setMode('search'); setQ(''); setRes([]); setMsg(''); };
+      const backFromSearch = () => setMode(searchFrom.current === 'nav' && NV.current ? 'nav' : (searchFrom.current === 'preview' && plan ? 'preview' : 'home'));
+      const goSearch = (stops) => { if (NV.current) stopNav(true); else { setMode('home'); setPlan(null); clearRoute(); } goTo(stops); };
       React.useEffect(() => {
         if (mode !== 'search') return; const s = q.trim(); if (s.length < 3) { setRes([]); return; }
         let stop = false; const t = setTimeout(async () => { setBusy('Recherche…'); const r = await kbGpsGeocode(s, F.current); if (!stop) { setRes(r); setBusy(''); } }, 380);
@@ -38254,8 +38282,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {mode !== 'nav' && mode !== 'search' && (
             <div style={{ position: 'absolute', top: 'calc(10px + env(safe-area-inset-top))', left: 10, right: 10, display: 'flex', gap: 8, zIndex: 20 }}>
               <button type="button" onClick={() => { if (mode === 'preview' || mode === 'tour') { setMode('home'); setPlan(null); clearRoute(); } else onClose(); }} style={{ ...card, width: 54, height: 54, border: 'none', fontSize: 24, fontWeight: 900, flex: '0 0 auto' }}>{mode === 'home' || mode === 'arrived' ? '✕' : '←'}</button>
-              {(mode === 'home' || mode === 'arrived') && <button type="button" onClick={() => { setMode('search'); setQ(''); setRes([]); setMsg(''); }} style={{ ...card, flex: 1, height: 54, border: 'none', textAlign: 'left', padding: '0 16px', fontSize: 19, fontWeight: 700, color: '#78909c' }}>🔍 Où va-t-on ?</button>}
+              {(mode === 'home' || mode === 'arrived') && <button type="button" onClick={openSearch} style={{ ...card, flex: 1, height: 54, border: 'none', textAlign: 'left', padding: '0 16px', fontSize: 19, fontWeight: 700, color: '#78909c' }}>🔍 Où va-t-on ?</button>}
               {mode === 'preview' && <div style={{ ...card, flex: 1, padding: '6px 14px', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}><b style={{ fontSize: 17, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{plan && plan.stops.length > 1 ? `📋 Tournée · ${plan.stops.length} arrêts` : '🏁 ' + ((plan && plan.stops[0] && plan.stops[0].name) || '')}</b><span style={{ fontSize: 13, color: '#607d8b' }}>{kbVehLabel(P)}</span></div>}
+              {mode === 'preview' && <button type="button" onClick={openSearch} style={{ ...card, width: 54, height: 54, border: 'none', fontSize: 24, flex: '0 0 auto' }} aria-label="Autre adresse">🔍</button>}
             </div>)}
 
           {/* ─── boutons flottants ─── */}
@@ -38263,6 +38292,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div style={{ position: 'absolute', right: 10, top: mode === 'nav' ? 150 + (hud ? ((hud.zone ? 46 : 0) + (hud.bridge ? 46 : 0) + (hud.zfe ? 40 : 0) + (hud.rep ? 40 : 0)) : 0) : 'calc(76px + env(safe-area-inset-top))', display: 'flex', flexDirection: 'column', gap: 10, zIndex: 15 }}>
               {mode === 'home' && fab(kbVehInfo(P).ic, true, () => setShowProf(true))}
               {fab('🗂️', true, () => setSheet('layers'))}
+              {mode === 'nav' && fab('🔍', true, openSearch)}
               {mode === 'nav' && fab(muted ? '🔇' : '🔊', true, toggleMute)}
               {mode === 'nav' && fab('🗺️', true, overview)}
               {mode === 'home' && fab('⛽', true, () => openPoi('fuel'))}
@@ -38301,16 +38331,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {mode === 'search' && (
             <div style={{ position: 'absolute', inset: 0, zIndex: 30, background: '#fff', display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', gap: 8, padding: 'calc(10px + env(safe-area-inset-top)) 10px 10px', borderBottom: '1px solid #eceff1' }}>
-                <button type="button" onClick={() => setMode('home')} style={{ width: 52, height: 52, borderRadius: 26, border: 'none', background: '#eceff1', fontSize: 24, fontWeight: 900 }}>←</button>
-                <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Adresse, magasin, entreprise…" style={{ flex: 1, height: 52, borderRadius: 14, border: '2px solid #1e88e5', padding: '0 14px', fontSize: 19, fontWeight: 600 }} />
+                <button type="button" onClick={backFromSearch} style={{ width: 52, height: 52, borderRadius: 26, border: 'none', background: '#eceff1', fontSize: 24, fontWeight: 900 }}>←</button>
+                <input autoFocus value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && res[0]) goSearch([{ id: '', name: res[0].name, lat: res[0].lat, lng: res[0].lng }]); }} placeholder="Tape n'importe quelle adresse…" style={{ flex: 1, height: 52, borderRadius: 14, border: '2px solid #1e88e5', padding: '0 14px', fontSize: 19, fontWeight: 600 }} />
               </div>
               <div style={{ flex: 1, overflowY: 'auto', padding: '6px 10px' }}>
                 {busy && <div style={{ padding: 10, color: '#1e88e5', fontWeight: 700 }}>⏳ {busy}</div>}
                 {places.filter(p => q.trim().length >= 1 && (p.code + ' ' + p.name).toLowerCase().includes(q.trim().toLowerCase())).map(p => (
-                  <button key={'p' + p.id} type="button" onClick={() => { setMode('home'); pickPlace(p); }} style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', borderBottom: '1px solid #f0f2f4', background: '#fff', padding: '12px 6px' }}>
+                  <button key={'p' + p.id} type="button" onClick={() => { if (NV.current) stopNav(true); else setMode('home'); pickPlace(p); }} style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', borderBottom: '1px solid #f0f2f4', background: '#fff', padding: '12px 6px' }}>
                     <div style={{ fontSize: 18, fontWeight: 800 }}>{p.ic} {p.code} · {p.name}</div><div style={{ fontSize: 13, color: '#78909c' }}>{p.adresse || 'Lieu Kelbongoo'}</div></button>))}
                 {res.map((r, i) => (
-                  <button key={i} type="button" onClick={() => { setMode('home'); goTo([{ id: '', name: r.name, lat: r.lat, lng: r.lng }]); }} style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', borderBottom: '1px solid #f0f2f4', background: '#fff', padding: '12px 6px' }}>
+                  <button key={i} type="button" onClick={() => goSearch([{ id: '', name: r.name, lat: r.lat, lng: r.lng }])} style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', borderBottom: '1px solid #f0f2f4', background: '#fff', padding: '12px 6px' }}>
                     <div style={{ fontSize: 18, fontWeight: 700 }}>📍 {r.name}</div>{r.sub && <div style={{ fontSize: 13, color: '#78909c' }}>{r.sub}</div>}</button>))}
                 {!busy && q.trim().length >= 3 && !res.length && <div style={{ padding: 10, color: '#90a4ae' }}>Aucun résultat.</div>}
               </div>
