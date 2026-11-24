@@ -825,7 +825,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.90';
+    const APP_VERSION = 'V11.91';
+    // V11.91 — (24/11/2026) 🧰 Atelier › 🔳 QR codes chauffeur : toutes les étiquettes (🥬 Kelbongoo rolls/dollies + 🏭 Centrale PDP dispatch, picking,
+    //   ⚡ fast delivery, dolly fromage) dès la demande d'enlèvement (⏳ avant validation Rungis, même QR) ; jours hier / aujourd'hui / demain ;
+    //   étiquette avec bandeau de marque KELBONGOO (vert, logo) ou CENTRALE PDP (noir) + badge KBG / PDP ; case « ✅ Imprimé et collé » par
+    //   étiquette, partagée (rungis_qr/printed) → déjà collée = plus cochée pour l'impression ; alerte si le nombre de supports a changé.
     // V11.90 — (24/11/2026) Fin de prépa : plus de popups-blagues (escargot…). « Tout va bien ? » + raison à toucher + note rapide (sans % ni chrono),
     //   après 10 min sans toucher l'écran à 90 % et plus ; à 100 % « Tout est posé ? » pour la clôture. Réponses dans Master › Opérations du jour.
     // V11.89 — (24/11/2026) 🎅 Thème Noël : un toucher sur le Père Noël → « À demain ! » et il s'en va (masqué pour la journée sur cet appareil).
@@ -20427,100 +20431,253 @@
     const kbQrEligible = (l) => !l.info && (l.units || []).length > 0 && !['PDP', 'RUNGIS'].includes(String(l.site || '').toUpperCase());
     const kbQrEsc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // V11.91 — 🧰 Atelier › 🔳 QR : TOUTES les étiquettes du chauffeur au même endroit
+    //   · Kelbongoo (rolls / dollies des commandes clients) ET Centrale PDP (dispatch, picking, ⚡ FAST DELIVERY,
+    //     dolly fromage) — dès la demande d'enlèvement (⏳ pas encore validée par Rungis) : même QR qu'après validation
+    //     (identifiant = demande + n° de ligne, il ne change pas).
+    //   · Étiquette : bandeau de marque en haut (🥬 KELBONGOO vert / 🏭 CENTRALE PDP noir), gros badge « KBG » / « PDP »
+    //     dans le coin, cadre de la même couleur → on voit de loin à qui est le support.
+    //   · Case « ✅ Imprimé et collé » par étiquette, partagée pour toute l'équipe (base Centrale, nœud rungis_qr/printed,
+    //     même session sécurisée que le scan) → une étiquette déjà collée n'est plus cochée pour l'impression (pas de doublon).
+    //     Si le nombre de supports change après impression (ex. 3 → 4 rolls), l'appli le signale : « 1/3 » n'est plus juste.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    const KB_QR_PRINTED = 'printed';
+    const KB_QR_KEEP_DAYS = 15;   // ménage : marques de plus de 15 jours effacées à la lecture
+    const kbQrIsKbg = (l) => l.kind === 'roll';
+    const KB_QR_BRAND = {
+      kbg: { badge: 'KBG', name: 'KELBONGOO', what: 'commandes clients', col: '#2e7d32', ic: '🥬' },
+      pdp: { badge: 'PDP', name: 'CENTRALE PDP', what: 'palettes entrepôt', col: '#212121', ic: '🏭' },
+    };
+    // Catégorie affichée : ⚡ FAST DELIVERY passe devant (récupération le jour même, sans Rungis)
+    function kbQrCatOf(l) {
+      if (kbQrIsKbg(l)) return { ic: '🥬', t: 'Rolls Kelbongoo', col: '#2e7d32' };
+      if (l.cat === 'dolly') return { ic: '🧀', t: 'Dolly fromage', col: '#f9a825' };
+      if (l.fast) return { ic: '⚡', t: 'FAST DELIVERY · ' + (l.cat === 'picking' ? 'Picking' : 'Dispatch'), col: '#c62828' };
+      if (l.cat === 'picking') return { ic: '📦', t: 'Picking', col: '#1565c0' };
+      return { ic: '🏭', t: 'Dispatch', col: '#1a4d2e' };
+    }
+    // Lignes à étiqueter pour un jour : validées / FAST (jour = récupération Rungis) + demandes pas encore validées
+    //   (jour = jour de la demande, marquées ⏳) + rolls Kelbongoo du jour.
+    function kbQrAllLines(enlList, runs, day) {
+      const ok = kbRungisDeliveryLines(enlList, runs, day, day);
+      const pend = [];
+      (enlList || []).forEach(r => {
+        if (!r || !['attente-23h59', 'envoye'].includes(r.status) || r.pickup) return;
+        const d = String(r.date || '') || (r.at ? kbDayOfMs(r.at) : '');
+        if (d !== day) return;
+        kbRungisDeliveryLines([{ ...r, status: 'valide', pickup: d }], [], d, d).forEach(l => pend.push({ ...l, pending: r.status, liv: '' }));
+      });
+      return ok.concat(pend).filter(l => kbQrEligible(l) && !l.refused);
+    }
+    // Marques « imprimé et collé » (partagées), relues toutes les 20 s
+    function useKbQrPrinted() {
+      const [d, setD] = React.useState(undefined);
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        fetch(KB_QR_DB + '/' + KB_QR_PRINTED + '.json?t=' + Date.now(), { cache: 'no-store' })
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(j => {
+            if (stop) return;
+            const o = j && typeof j === 'object' ? j : {};
+            const lim = Date.now() - KB_QR_KEEP_DAYS * 86400000, old = {};
+            Object.keys(o).forEach(k => { const x = o[k]; if (!x || typeof x !== 'object' || !(Number(x.at) > lim)) old[k] = null; });
+            if (Object.keys(old).length) kbQrPatch(KB_QR_PRINTED, old).catch(() => {});
+            Object.keys(old).forEach(k => { delete o[k]; });
+            setD(o);
+          })
+          .catch(() => { if (!stop) setD(v => v === undefined ? null : v); });
+        const t = setTimeout(() => setTick(x => x + 1), 20000);
+        return () => { stop = true; clearTimeout(t); };
+      }, [tick]);
+      return { raw: d, map: (d && typeof d === 'object') ? d : {}, reload: () => setTick(x => x + 1), set: (fn) => setD(v => fn(v && typeof v === 'object' ? v : {})) };
+    }
+    const kbQrPatch = (path, val) => fetch(KB_QR_DB + '/' + path + '.json', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(val) })
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r; });
+    // État d'une étiquette (ligne l, n° k de 1 à N)
+    function kbQrUnitState(P, l, k) {
+      const rec = P[l.id]; const u = rec && rec.u && rec.u[k];
+      return { stuck: !!(u && u.ok), by: (u && u.by) || '', at: (u && u.ok) || 0, printedAt: (u && u.p) || 0, changed: !!(rec && rec.n && rec.n !== l.units.length && u && (u.ok || u.p)) };
+    }
+    const kbQrHm = (t) => t ? new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
+
     function PrintQrPage({ session, setTab }) {
       const showToast = React.useContext(ToastContext);
       const enl = useKbEnlevements();
+      const P = useKbQrPrinted();
       const [runs, setRuns] = React.useState([]);
       const [picks, setPicks] = React.useState([]);
       React.useEffect(() => storage.subscribe('rungis_runs', a => setRuns(a || [])), []);
       React.useEffect(() => storage.subscribe('rungis_picks', a => setPicks(a || [])), []);
-      const [day, setDay] = React.useState(todayKey());
-      const [off, setOff] = React.useState({}); // lignes décochées
+      const today = todayKey();
+      const [day, setDay] = React.useState(today);
+      const [sel, setSel] = React.useState({});      // choix manuel : 'id|k' → true / false (sinon : pas encore collée = cochée)
       const [busy, setBusy] = React.useState(false);
+      const [ask, setAsk] = React.useState(null);     // après impression : « c'est collé ? »
+      const who = String((session && session.name) || 'Équipe').slice(0, 60);
       const pk = React.useMemo(() => { const m = {}; (picks || []).forEach(p => { m[p.id] = p; }); return m; }, [picks]);
-      const lines = React.useMemo(() => kbRungisDeliveryLines(enl.list, runs, day, day)
-        .filter(l => kbQrEligible(l) && !l.refused && !(pk[l.id] && pk[l.id].status === 'hidden'))
-        .sort((a, b) => a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat)), [enl.list, runs, day, pk]);
-      const chosen = lines.filter(l => !off[l.id]);
-      const nLabels = chosen.reduce((a, l) => a + l.units.length, 0);
-      const bySite = {}; lines.forEach(l => { (bySite[l.site] = bySite[l.site] || []).push(l); });
-      const days = [todayKey(), addDays(todayKey(), 1)];
+      const lines = React.useMemo(() => kbQrAllLines(enl.list, runs, day)
+        .filter(l => !(pk[l.id] && pk[l.id].status === 'hidden'))
+        .sort((a, b) => (kbQrIsKbg(b) - kbQrIsKbg(a)) || a.site.localeCompare(b.site) || a.cat.localeCompare(b.cat)), [enl.list, runs, day, pk]);
+      const units = React.useMemo(() => {
+        const o = [];
+        lines.forEach(l => l.units.forEach((u, i) => { const k = i + 1; o.push({ l, k, u, key: l.id + '|' + k, st: kbQrUnitState(P.map, l, k) }); }));
+        return o;
+      }, [lines, P.map]);
+      const isOn = (x) => sel[x.key] !== undefined ? sel[x.key] : (!x.st.stuck || x.st.changed);
+      const chosen = units.filter(isOn);
+      const nTodo = units.filter(x => !x.st.stuck || x.st.changed).length;
+      const nDone = units.length - nTodo;
+      const days = [addDays(today, -1), today, addDays(today, 1)];
+      const dayLbl = (d) => d === today ? "Aujourd'hui" : d < today ? 'Hier' : 'Demain';
+
+      // Écrit l'état d'étiquettes (partagé) — optimiste, puis relecture
+      const mark = async (list, stuck, printedOnly) => {
+        if (!list.length) return;
+        const up = {}, now = Date.now();
+        list.forEach(x => {
+          up[x.l.id + '/at'] = now; up[x.l.id + '/n'] = x.l.units.length;
+          if (printedOnly) up[x.l.id + '/u/' + x.k + '/p'] = now;
+          else up[x.l.id + '/u/' + x.k] = stuck ? { ok: now, by: who, p: x.st.printedAt || now } : (x.st.printedAt ? { p: x.st.printedAt } : null);
+        });
+        P.set(m => { const c = JSON.parse(JSON.stringify(m)); list.forEach(x => { const r = c[x.l.id] = c[x.l.id] || {}; r.at = now; r.n = x.l.units.length; r.u = r.u || {};
+          if (printedOnly) r.u[x.k] = { ...(r.u[x.k] || {}), p: now }; else r.u[x.k] = stuck ? { ok: now, by: who, p: x.st.printedAt || now } : (x.st.printedAt ? { p: x.st.printedAt } : null); }); return c; });
+        setSel(s => { const c = { ...s }; list.forEach(x => { delete c[x.key]; }); return c; });
+        try { await kbQrPatch(KB_QR_PRINTED, up); }
+        catch (e) { showToast('⚠️ Pas enregistré (' + (e.message || e) + ') — réessaie'); }
+        P.reload();
+      };
 
       const print = async () => {
-        if (!nLabels) return;
+        const todo = chosen.slice();
+        if (!todo.length) return;
         const w = window.open('', '_blank');
         if (!w) { showToast('Autorise les fenêtres pop-up pour imprimer'); return; }
         w.document.write('<p style="font:20px sans-serif;padding:20px">Préparation des QR codes…</p>');
         setBusy(true);
         try {
           const qrcode = await kbLoadQrLib();
-          const labels = [];
-          chosen.forEach(l => {
-            const [ic, cat] = KB_QR_CATS[l.cat] || ['📦', l.cat];
+          const labels = todo.map(({ l, k, u }) => {
+            const B = KB_QR_BRAND[kbQrIsKbg(l) ? 'kbg' : 'pdp'], C = kbQrCatOf(l);
             const col = SITE_NAMES[l.site] ? kbSiteColor(l.site) : '#455a64';
             const N = l.units.length;
-            l.units.forEach((u, i) => {
-              labels.push('<section class="lb"><div class="top" style="background:' + col + '"><span class="to">LIVRER À</span><span class="code">' + kbQrEsc(l.site) + '</span><span class="nm">' + kbQrEsc(siteLabel(l.site) !== l.site ? siteLabel(l.site) : (KB_ENL_STORE_LONG[l.site] || '')) + '</span></div>'
-                + '<div class="mid"><div class="qr">' + kbQrSvg(qrcode, kbQrUrl(l, i + 1)) + '</div><div class="info">'
-                + '<div class="cat">' + ic + ' ' + kbQrEsc(cat) + '</div>'
-                + '<div class="unit">' + kbQrEsc(u) + ' <b>' + (i + 1) + '/' + N + '</b></div>'
-                + '<div class="det">' + kbQrEsc(l.label) + '</div>'
-                + (l.sub ? '<div class="det">' + kbQrEsc(l.sub) + '</div>' : '')
-                + '<div class="day">🚚 ' + (l.kind === 'roll' ? 'distribution du ' : 'à prendre le ') + kbQrEsc(formatDateShort(l.when)) + (l.kind !== 'roll' && l.liv && l.liv !== l.when ? ' · livraison ' + kbQrEsc(formatDateShort(l.liv)) : '') + '</div>'
-                + '</div></div><div class="foot">Chauffeur : scanne ce QR (appli Kelbongoo ou appareil photo) au chargement à PDP</div></section>');
-            });
+            const when = l.pending ? '⏳ demandé le ' + formatDateShort(l.when) + ' · attente Rungis'
+              : (l.fast ? '⚡ à prendre AUJOURD\'HUI ' + formatDateShort(l.when) : (kbQrIsKbg(l) ? 'distribution du ' : 'à prendre le ') + formatDateShort(l.when) + (!kbQrIsKbg(l) && l.liv && l.liv !== l.when ? ' · livraison ' + formatDateShort(l.liv) : ''));
+            return '<section class="lb" style="border-color:' + B.col + '">'
+              + '<div class="brand" style="background:' + B.col + '">' + (kbQrIsKbg(l) && typeof KB_LOGO_JPG === 'string' ? '<img class="logo" src="' + KB_LOGO_JPG + '" alt="">' : '<span class="bic">' + B.ic + '</span>')
+              + '<span class="bn">' + B.name + '</span><span class="bw">' + B.what + '</span><span class="badge" style="color:' + B.col + '">' + B.badge + '</span></div>'
+              + '<div class="top" style="background:' + col + '"><span class="to">LIVRER À</span><span class="code">' + kbQrEsc(l.site) + '</span><span class="nm">' + kbQrEsc(siteLabel(l.site) !== l.site ? siteLabel(l.site) : (KB_ENL_STORE_LONG[l.site] || '')) + '</span></div>'
+              + '<div class="mid"><div class="qr">' + kbQrSvg(qrcode, kbQrUrl(l, k)) + '</div><div class="info">'
+              + '<div class="cat" style="background:' + C.col + '">' + C.ic + ' ' + kbQrEsc(C.t) + '</div>'
+              + '<div class="unit">' + kbQrEsc(u) + ' <b>' + k + '/' + N + '</b></div>'
+              + '<div class="det">' + kbQrEsc(l.label) + '</div>'
+              + (l.sub ? '<div class="det">' + kbQrEsc(l.sub) + '</div>' : '')
+              + '<div class="day">🚚 ' + kbQrEsc(when) + '</div>'
+              + '</div></div><div class="foot">Chauffeur : scanne ce QR (appli Kelbongoo ou appareil photo) au chargement à PDP</div></section>';
           });
           const css = '@page{size:A4 portrait;margin:8mm}*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;color:#111}'
-            + '.lb{height:136mm;border:1.2mm solid #111;border-radius:5mm;overflow:hidden;display:flex;flex-direction:column;margin-bottom:6mm;page-break-inside:avoid;break-inside:avoid}'
+            + '.lb{height:136mm;border:2.4mm solid #111;border-radius:5mm;overflow:hidden;display:flex;flex-direction:column;margin-bottom:6mm;page-break-inside:avoid;break-inside:avoid}'
             + '.lb:nth-child(2n){page-break-after:always;break-after:page;margin-bottom:0}'
-            + '.top{color:#fff;display:flex;align-items:baseline;gap:5mm;padding:3mm 6mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}'
-            + '.to{font-size:5mm;font-weight:700}.code{font-size:16mm;font-weight:900;line-height:1}.nm{font-size:7mm;font-weight:700}'
-            + '.mid{flex:1;display:flex;align-items:center;gap:6mm;padding:4mm 6mm}.qr{flex:0 0 92mm;height:92mm}.qr svg{width:92mm;height:92mm;display:block}'
-            + '.info{flex:1;min-width:0}.cat{font-size:9mm;font-weight:900}.unit{font-size:11mm;font-weight:700;margin-top:2mm}.unit b{font-size:14mm}'
-            + '.det{font-size:4.6mm;margin-top:2mm;color:#333}.day{font-size:5.2mm;font-weight:700;margin-top:3mm}'
-            + '.foot{font-size:3.8mm;color:#555;text-align:center;padding:0 4mm 2.5mm}';
+            + '.brand,.top,.cat{-webkit-print-color-adjust:exact;print-color-adjust:exact}'
+            + '.brand{color:#fff;display:flex;align-items:center;gap:4mm;padding:2mm 4mm;height:17mm}.logo{height:13mm;width:13mm;border-radius:2mm;background:#fff;object-fit:contain}.bic{font-size:10mm}'
+            + '.bn{font-size:9mm;font-weight:900;letter-spacing:.4mm}.bw{font-size:4.5mm;font-weight:700;opacity:.9}'
+            + '.badge{margin-left:auto;background:#fff;border-radius:3mm;padding:1mm 4mm;font-size:10mm;font-weight:900;line-height:1}'
+            + '.top{color:#fff;display:flex;align-items:baseline;gap:5mm;padding:2mm 6mm}'
+            + '.to{font-size:4.5mm;font-weight:700}.code{font-size:14mm;font-weight:900;line-height:1}.nm{font-size:6.5mm;font-weight:700}'
+            + '.mid{flex:1;display:flex;align-items:center;gap:6mm;padding:3mm 6mm}.qr{flex:0 0 82mm;height:82mm}.qr svg{width:82mm;height:82mm;display:block}'
+            + '.info{flex:1;min-width:0}.cat{display:inline-block;color:#fff;border-radius:2.5mm;padding:1mm 3mm;font-size:7.5mm;font-weight:900}'
+            + '.unit{font-size:10mm;font-weight:700;margin-top:2mm}.unit b{font-size:13mm}'
+            + '.det{font-size:4.4mm;margin-top:1.5mm;color:#333}.day{font-size:5mm;font-weight:700;margin-top:2.5mm}'
+            + '.foot{font-size:3.6mm;color:#555;text-align:center;padding:0 4mm 2mm}';
           w.document.open();
           w.document.write('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>QR Rungis ' + kbQrEsc(formatDateShort(day)) + '</title><style>' + css + '</style></head><body>' + labels.join('') + '</body></html>');
           w.document.close();
           setTimeout(() => { try { w.focus(); w.print(); } catch (_) {} }, 600);
-          kbCelebrate({ title: nLabels + ' étiquette' + (nLabels > 1 ? 's' : '') + ' QR 🔳', sub: 'Une par palette / roll / dolly · à coller bien visible' });
+          mark(todo, false, true);   // trace « imprimée » (pas encore « collée »)
+          setAsk(todo);
         } catch (e) { try { w.close(); } catch (_) {} showToast('⚠️ ' + (e.message || e)); }
         finally { setBusy(false); }
       };
 
+      const groups = [['kbg', lines.filter(kbQrIsKbg)], ['pdp', lines.filter(l => !kbQrIsKbg(l))]];
       return (
         <div className="stack">
           <KbBackToHub setTab={setTab} />
-          <h1 style={{ margin: 0 }}>🔳 QR codes du jour</h1>
-          <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Une étiquette par <b>palette picking / dispatch</b>, <b>roll</b> et <b>dolly</b> Kelbongoo. Le chauffeur la scanne au chargement : c'est validé tout seul. Pas de QR pour les palettes EPAL vides ni les emballages à détruire.</div>
+          <h1 style={{ margin: 0 }}>🔳 QR codes pour le chauffeur</h1>
+          <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Toutes les étiquettes : <b style={{ color: '#2e7d32' }}>🥬 Kelbongoo</b> (rolls, dollies des commandes) et <b>🏭 Centrale PDP</b> (dispatch, picking, ⚡ fast delivery, dolly fromage). Une fois collée, coche <b>✅ Imprimé et collé</b> : toute l'équipe le voit, pas de doublon.</div>
           <div style={{ display: 'flex', gap: 8 }}>
-            {days.map(d => <button key={d} onClick={() => { setDay(d); setOff({}); }} style={{ flex: 1, minHeight: 56, borderRadius: 14, fontSize: 18, fontWeight: 800, cursor: 'pointer', border: '3px solid #1565c0', background: day === d ? '#1565c0' : '#fff', color: day === d ? '#fff' : '#1565c0' }}>{d === todayKey() ? "Aujourd'hui" : 'Demain'} · {formatDateShort(d)}</button>)}
+            {days.map(d => <button key={d} onClick={() => { setDay(d); setSel({}); }} style={{ flex: 1, minHeight: 56, borderRadius: 14, fontSize: 17, fontWeight: 800, cursor: 'pointer', border: '3px solid #1565c0', background: day === d ? '#1565c0' : '#fff', color: day === d ? '#fff' : '#1565c0' }}>{dayLbl(d)}<span style={{ display: 'block', fontSize: 13, fontWeight: 600 }}>{formatDateShort(d)}</span></button>)}
           </div>
-          {enl.raw === undefined && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
+          {(enl.raw === undefined || P.raw === undefined) && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
           {enl.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 700 }}>⚠️ Enlèvements illisibles ({enl.err}) <button className="btn-secondary" onClick={enl.reload}>↻</button></div>}
-          {enl.raw !== undefined && !lines.length && <div className="card" style={{ textAlign: 'center', padding: '24px 14px', fontSize: 20, fontWeight: 700, color: 'var(--ink-soft)' }}>Rien à étiqueter pour le {formatDateShort(day)}.<div style={{ fontSize: 14, fontWeight: 600, marginTop: 6 }}>Les palettes apparaissent une fois validées par Rungis (ou en ⚡ FAST DELIVERY), les rolls à la clôture de la prépa.</div></div>}
-          {Object.keys(bySite).sort().map(s => (
-            <div key={s} style={{ border: '3px solid ' + (SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b'), borderRadius: 16, overflow: 'hidden', background: 'var(--bg-card)' }}>
-              <div style={{ background: SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b', color: '#fff', padding: '8px 12px', fontSize: 22, fontWeight: 800 }}>{s} <span style={{ fontSize: 15, fontWeight: 600 }}>{siteLabel(s) !== s ? siteLabel(s) : (KB_ENL_STORE_LONG[s] || '')}</span></div>
-              {bySite[s].map(l => { const on = !off[l.id]; const st = pk[l.id] && pk[l.id].status;
-                return (
-                  <label key={l.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderTop: '1px solid var(--line)', cursor: 'pointer', opacity: on ? 1 : .5 }}>
-                    <input type="checkbox" checked={on} onChange={() => setOff(o => ({ ...o, [l.id]: on }))} style={{ width: 28, height: 28, flex: '0 0 auto' }} />
-                    <span style={{ flex: 1, minWidth: 0 }}>
-                      <b style={{ fontSize: 17 }}>{l.label}</b>
-                      {l.sub && <span style={{ display: 'block', fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</span>}
-                      {st === 'ok' && <span style={{ display: 'block', fontSize: 13, fontWeight: 700, color: '#2e7d32' }}>✅ déjà pris par le chauffeur</span>}
-                    </span>
-                    <span style={{ fontSize: 22, fontWeight: 900, color: '#1565c0', whiteSpace: 'nowrap' }}>🔳 {l.units.length}</span>
-                  </label>); })}
-            </div>
-          ))}
+          {P.raw === null && <div className="card" style={{ padding: 14, color: 'var(--danger)', fontWeight: 700 }}>⚠️ Impossible de lire les étiquettes déjà collées — vérifie avant de réimprimer. <button className="btn-secondary" onClick={P.reload}>↻</button></div>}
+          {units.length > 0 && <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ flex: 1, borderRadius: 14, padding: '10px 12px', background: nTodo ? '#fff3e0' : '#e8f5e9', border: '2px solid ' + (nTodo ? '#ef6c00' : '#2e7d32') }}><div style={{ fontSize: 30, fontWeight: 900, color: nTodo ? '#ef6c00' : '#2e7d32' }}>{nTodo}</div><div style={{ fontSize: 14, fontWeight: 700 }}>à imprimer / coller</div></div>
+            <div style={{ flex: 1, borderRadius: 14, padding: '10px 12px', background: '#e8f5e9', border: '2px solid #2e7d32' }}><div style={{ fontSize: 30, fontWeight: 900, color: '#2e7d32' }}>{nDone}</div><div style={{ fontSize: 14, fontWeight: 700 }}>déjà collée{nDone > 1 ? 's' : ''}</div></div>
+          </div>}
+          {enl.raw !== undefined && !lines.length && <div className="card" style={{ textAlign: 'center', padding: '24px 14px', fontSize: 20, fontWeight: 700, color: 'var(--ink-soft)' }}>Rien à étiqueter pour le {formatDateShort(day)}.<div style={{ fontSize: 14, fontWeight: 600, marginTop: 6 }}>Les palettes apparaissent dès la demande d'enlèvement dans la Centrale, les rolls Kelbongoo à la clôture de la prépa.</div></div>}
+          {groups.map(([g, L]) => {
+            if (!L.length) return null;
+            const B = KB_QR_BRAND[g];
+            const bySite = {}; L.forEach(l => { (bySite[l.site] = bySite[l.site] || []).push(l); });
+            return (
+              <div key={g} style={{ border: '4px solid ' + B.col, borderRadius: 18, overflow: 'hidden', background: 'var(--bg-card)' }}>
+                <div style={{ background: B.col, color: '#fff', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span style={{ fontSize: 30 }}>{B.ic}</span>
+                  <span style={{ flex: 1 }}><b style={{ fontSize: 22, letterSpacing: 1 }}>{B.name}</b><span style={{ display: 'block', fontSize: 13, opacity: .9 }}>{g === 'kbg' ? 'Rolls et dollies des commandes clients' : 'Dispatch · Picking · ⚡ Fast delivery · Dolly fromage'}</span></span>
+                  <span style={{ background: '#fff', color: B.col, borderRadius: 10, padding: '4px 10px', fontSize: 20, fontWeight: 900 }}>{B.badge}</span>
+                </div>
+                {Object.keys(bySite).sort().map(s => (
+                  <div key={s}>
+                    <div style={{ background: SITE_NAMES[s] ? kbSiteColor(s) : '#607d8b', color: '#fff', padding: '6px 12px', fontSize: 20, fontWeight: 800 }}>{s} <span style={{ fontSize: 14, fontWeight: 600 }}>{siteLabel(s) !== s ? siteLabel(s) : (KB_ENL_STORE_LONG[s] || '')}</span></div>
+                    {bySite[s].map(l => {
+                      const C = kbQrCatOf(l); const drv = pk[l.id] && pk[l.id].status;
+                      const U = units.filter(x => x.l === l);
+                      return (
+                        <div key={l.id} style={{ padding: '10px 12px', borderTop: '1px solid var(--line)' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <span style={{ background: C.col, color: '#fff', borderRadius: 8, padding: '2px 10px', fontSize: 15, fontWeight: 800 }}>{C.ic} {C.t}</span>
+                            {l.pending && <span style={{ background: '#fff3e0', color: '#e65100', border: '1px solid #ef6c00', borderRadius: 8, padding: '2px 8px', fontSize: 13, fontWeight: 700 }}>⏳ pas encore validé Rungis</span>}
+                            {drv === 'ok' && <span style={{ fontSize: 13, fontWeight: 700, color: '#2e7d32' }}>🚚 déjà pris par le chauffeur</span>}
+                          </div>
+                          <div style={{ fontSize: 17, fontWeight: 700, marginTop: 4 }}>{l.label}</div>
+                          {l.sub && <div style={{ fontSize: 13, color: 'var(--ink-soft)' }}>{l.sub}</div>}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+                            {U.map(x => { const on = isOn(x); const st = x.st;
+                              return (
+                                <div key={x.key} style={{ display: 'flex', alignItems: 'center', gap: 10, borderRadius: 12, padding: '6px 8px', background: st.stuck && !st.changed ? '#e8f5e9' : st.changed ? '#fdecea' : 'var(--bg)', border: '1px solid var(--line)' }}>
+                                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, cursor: 'pointer' }} title="Imprimer cette étiquette">
+                                    <input type="checkbox" checked={on} onChange={() => setSel(m => ({ ...m, [x.key]: !on }))} style={{ width: 26, height: 26, flex: '0 0 auto' }} />
+                                    <span style={{ fontSize: 16 }}>🖨️ <b>{x.u} {x.k}/{l.units.length}</b>
+                                      {st.changed && <span style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#c62828' }}>⚠️ le nombre a changé ({P.map[l.id].n} → {l.units.length}) : réimprimer</span>}
+                                      {st.stuck && !st.changed && <span style={{ display: 'block', fontSize: 12, color: '#2e7d32' }}>collée par {st.by || '—'} à {kbQrHm(st.at)}</span>}
+                                      {!st.stuck && st.printedAt > 0 && <span style={{ display: 'block', fontSize: 12, color: '#e65100' }}>imprimée à {kbQrHm(st.printedAt)}, pas encore cochée collée</span>}
+                                    </span>
+                                  </label>
+                                  <button onClick={() => mark([x], !st.stuck)} style={{ flex: '0 0 auto', minHeight: 48, borderRadius: 12, cursor: 'pointer', fontSize: 14, fontWeight: 800, padding: '0 10px', border: '2px solid #2e7d32', background: st.stuck ? '#2e7d32' : '#fff', color: st.stuck ? '#fff' : '#2e7d32' }}>{st.stuck ? '✅ Imprimé et collé' : '⬜ Imprimé et collé'}</button>
+                                </div>); })}
+                          </div>
+                        </div>);
+                    })}
+                  </div>
+                ))}
+              </div>);
+          })}
           {lines.length > 0 && (
-            <button disabled={busy || !nLabels} onClick={print} style={{ width: '100%', minHeight: 72, borderRadius: 16, border: 'none', background: nLabels ? '#1565c0' : '#bdbdbd', color: '#fff', fontSize: 22, fontWeight: 900, cursor: nLabels ? 'pointer' : 'default' }}>
-              {busy ? 'Préparation…' : `🖨️ Imprimer ${nLabels} étiquette${nLabels > 1 ? 's' : ''}`}
+            <button disabled={busy || !chosen.length} onClick={print} style={{ width: '100%', minHeight: 72, borderRadius: 16, border: 'none', background: chosen.length ? '#1565c0' : '#bdbdbd', color: '#fff', fontSize: 22, fontWeight: 900, cursor: chosen.length ? 'pointer' : 'default' }}>
+              {busy ? 'Préparation…' : chosen.length ? `🖨️ Imprimer ${chosen.length} étiquette${chosen.length > 1 ? 's' : ''}` : '✅ Tout est déjà collé'}
             </button>
           )}
-          {lines.length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', textAlign: 'center' }}>2 étiquettes par feuille A4 (QR de 9 cm, lisible à plus d'un mètre). Imprimer en couleur si possible : la couleur du lieu aide au tri.</div>}
+          {lines.length > 0 && <div style={{ fontSize: 13, color: 'var(--ink-mute)', textAlign: 'center' }}>2 étiquettes par feuille A4. Imprimer en couleur : vert = Kelbongoo, noir = Centrale PDP, couleur du lieu pour le tri. Une étiquette déjà collée n'est pas recochée (sauf si tu la coches toi-même).</div>}
+          {ask && <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+            <div style={{ background: 'var(--bg-card, #fff)', borderRadius: 20, padding: 20, maxWidth: 460, width: '100%' }}>
+              <div style={{ fontSize: 24, fontWeight: 900 }}>🔳 {ask.length} étiquette{ask.length > 1 ? 's' : ''} envoyée{ask.length > 1 ? 's' : ''} à l'imprimante</div>
+              <div style={{ fontSize: 16, color: 'var(--ink-soft)', margin: '8px 0 16px' }}>Une fois collées sur les palettes / rolls / dollies, confirme : l'équipe verra qu'elles sont faites.</div>
+              <button onClick={() => { const a = ask; setAsk(null); mark(a.map(x => ({ ...x, st: kbQrUnitState(P.map, x.l, x.k) })), true).then(() => kbCelebrate({ title: a.length + ' étiquette' + (a.length > 1 ? 's' : '') + ' collée' + (a.length > 1 ? 's' : ''), sub: 'Le chauffeur n\'a plus qu\'à scanner' })); }} style={{ width: '100%', minHeight: 64, borderRadius: 14, border: 'none', background: '#2e7d32', color: '#fff', fontSize: 20, fontWeight: 900, cursor: 'pointer' }}>✅ Imprimé et collé</button>
+              <button onClick={() => setAsk(null)} style={{ width: '100%', minHeight: 56, marginTop: 10, borderRadius: 14, border: '2px solid var(--line)', background: '#fff', color: '#333', fontSize: 17, fontWeight: 700, cursor: 'pointer' }}>Plus tard (je cocherai une par une)</button>
+            </div>
+          </div>}
         </div>
       );
     }
