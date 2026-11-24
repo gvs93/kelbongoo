@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.80) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.81) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -731,7 +731,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.80';
+const APP_VERSION = 'V11.81';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2804,6 +2804,63 @@ function psRenumberCasiers(base, ps) {
   return changed;
 }
 const KB_CAS_CAP_DOC = 'kb_casier_cap';
+const KB_CAS_SELF_FROM = '2026-11-26';
+function kbCasSelf(day) {
+  return !!day && String(day) >= KB_CAS_SELF_FROM;
+}
+function kbSmallestFree(used) {
+  let n = 1;
+  while (used[String(n)]) n++;
+  return String(n);
+}
+async function kbCasCapLearnPrep(dayKey) {
+  const pairs = [];
+  for (let i = 1; i <= 28; i++) {
+    const d = addDays(dayKey, -i);
+    let prep = null,
+      od = null;
+    try {
+      prep = await storage.getAll(`day_${d}_prep`);
+    } catch (_) {}
+    if (!(prep || []).some(x => x.id === 'meta' && x.closed)) continue;
+    try {
+      od = await storage.getDoc(`day_${d}_orders`, 'data');
+    } catch (_) {}
+    const vol = {},
+      json = {};
+    (od && od.orders || []).forEach(o => {
+      const site = String(o.site || '').toUpperCase();
+      if (!site || site === 'DOM' || o._ps) return;
+      if (!(o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit))) return;
+      const k = site + '||' + (o.name || '(client)');
+      vol[k] = (vol[k] || 0) + (Number(o.volumeFrais) || 0);
+      if (!json[k]) json[k] = (o.casiersFrais || []).map(String);
+    });
+    const cs = {};
+    (prep || []).forEach(x => {
+      const id = String(x.id || '');
+      if (!id.startsWith('cs|')) return;
+      let k = id.slice(3);
+      try {
+        k = decodeURIComponent(k);
+      } catch (_) {}
+      cs[k] = (x.nums || []).map(String);
+    });
+    Object.keys(vol).forEach(k => {
+      const nums = (cs[k] || (kbCasSelf(d) ? [] : json[k]) || []).filter(v => /^\d+$/.test(v));
+      if (vol[k] > 0 && nums.length) pairs.push([Math.round(vol[k] * 10) / 10, nums.length]);
+    });
+  }
+  if (pairs.length < 20) return null;
+  const f = kbCapFit(pairs);
+  return f ? {
+    cap: f.cap,
+    samples: pairs.length,
+    match: Math.round(f.ok / pairs.length * 100),
+    source: 'prépa (casiers réellement utilisés, 28 j)',
+    at: new Date().toISOString()
+  } : null;
+}
 const KB_CAS_CAP_DEFAULT = {
   cap: 170,
   samples: 3775,
@@ -2979,6 +3036,26 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     } catch (_) {}
   }
   if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT;
+  const self = kbCasSelf(dayKey);
+  res.self = self;
+  if (self) {
+    try {
+      const lp = await kbCasCapLearnPrep(dayKey);
+      if (lp) {
+        capDoc = {
+          ...capDoc,
+          cap: lp.cap,
+          prep: lp
+        };
+        res.prepLearned = lp;
+        try {
+          await storage.setDoc('app_config', KB_CAS_CAP_DOC, {
+            prep: lp
+          });
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
   res.cap = capDoc.cap;
   let cartDoc = KB_CART_CAP_DEFAULT;
   try {
@@ -3043,6 +3120,7 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => own(s, String(n).trim(), 'PS|' + o.orderId));
   });
   const next = s => {
+    if (self && s !== 'DOM') return kbSmallestFree(used[s] || {});
     const u = used[s] || {};
     let n = 0;
     Object.keys(u).forEach(v => {
@@ -3055,10 +3133,25 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   };
   const writes = [];
   const keys = Object.keys(cli).sort((a, b) => a.localeCompare(b));
+  const dels = [];
+  if (self) Object.entries(fixed).forEach(([k, f]) => {
+    const s = k.split('||')[0];
+    if (s === 'DOM' || !f.auto || cli[k]) return;
+    f.nums.forEach(v => {
+      if (used[s] && used[s][v] === k) delete used[s][v];
+    });
+    dels.push(k);
+    delete fixed[k];
+    res.freed = (res.freed || 0) + 1;
+  });
   const todo = [];
   keys.forEach(k => {
     const c = cli[k];
     if (fixed[k]) return;
+    if (self && c.site !== 'DOM') {
+      todo.push(k);
+      return;
+    }
     const free = c.json.length && c.json.every(v => !(used[c.site] && used[c.site][v] && used[c.site][v] !== k));
     if (free) c.json.forEach(v => own(c.site, v, k));else {
       if (c.json.length) res.clash++;
@@ -3083,6 +3176,17 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
         vol: c.vol
       });
       if (c.site === 'DOM') res.domGrown++;else res.grown++;
+    } else if (self && c.site !== 'DOM' && need < f.nums.length && c.vol < f.vol) {
+      const nums = f.nums.slice(0, need);
+      f.nums.slice(need).forEach(v => {
+        if (used[c.site] && used[c.site][v] === k) delete used[c.site][v];
+      });
+      writes.push({
+        k,
+        nums,
+        vol: c.vol
+      });
+      res.shrunk = (res.shrunk || 0) + 1;
     }
   });
   todo.forEach(k => {
@@ -3104,6 +3208,11 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
       res.domCartons += nums.length;
     } else res.assigned++;
   });
+  for (const k of dels) {
+    try {
+      await storage.deleteDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(k));
+    } catch (_) {}
+  }
   for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), {
     nums: w.nums,
     auto: true,
@@ -3184,7 +3293,7 @@ async function psMergeDay(dayKey, json, opts) {
       });
     });
   } catch (_) {}
-  const renum = psRenumberCasiers([...base, ...casFixed], psFinal);
+  const renum = psRenumberCasiers([...(kbCasSelf(dayKey) ? [] : base), ...casFixed], psFinal);
   const bySite = {};
   psFinal.forEach(o => {
     bySite[o.site] = (bySite[o.site] || 0) + 1;
@@ -4808,12 +4917,20 @@ function parseDistribFix(arr) {
   }
   return m;
 }
-function kbApplyPrepCasiers(orders, cas) {
-  if (!cas || !Object.keys(cas).length || !Array.isArray(orders)) return orders;
+function kbApplyPrepCasiers(orders, cas, day) {
+  const self = kbCasSelf(day);
+  if (!Array.isArray(orders) || (!cas || !Object.keys(cas).length) && !self) return orders;
+  cas = cas || {};
   return orders.map(o => {
     const site = String(o.site || '').toUpperCase();
     if (site === 'DOM') return o;
     const pc = cas[site + '||' + (o.name || '(client)')];
+    if ((!pc || !pc.length) && self && !o._ps) return {
+      ...o,
+      casiersFrais: [],
+      casiersSec: [],
+      casiersJson: o.casiersJson || [...(o.casiersFrais || []), ...(o.casiersSec || [])]
+    };
     if (!pc || !pc.length) return o;
     const hasF = (o.casiersFrais || []).length,
       hasS = (o.casiersSec || []).length;
@@ -5661,10 +5778,604 @@ function KbIdleLockOverlay({
     }
   }, "Se d\xE9connecter")));
 }
+const KB_SANTA = {
+  col: 'santa_2026',
+  draw: 'santa_2026_draw',
+  meta: 'santa_2026_meta',
+  closeMs: Date.UTC(2026, 11, 4, 23, 0, 0),
+  budget: 10,
+  showUntil: '2026-12-31'
+};
+function kbSantaOpenNow() {
+  return Date.now() < KB_SANTA.closeMs;
+}
+function kbSantaVisible() {
+  return todayKey() <= KB_SANTA.showUntil;
+}
+function kbSantaPairs(list) {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) {
+    const r = new Uint32Array(1);
+    crypto.getRandomValues(r);
+    const j = r[0] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a.map((g, i) => ({
+    giver: g,
+    receiver: a[(i + 1) % a.length]
+  }));
+}
+async function kbSantaDrawIfDue(who) {
+  if (!firebaseConfigured || kbSantaOpenNow()) return null;
+  const c = window.__kbClaims;
+  if (!c || c.admin !== true) return null;
+  const F = window.__firebase;
+  const stRef = F.doc(fb.db, KB_SANTA.meta, 'state');
+  const st = await F.getDoc(stRef);
+  if (st.exists() && (st.data().drawn || st.data().drawing && Date.now() - Date.parse(st.data().drawing) < 10 * 60000)) return null;
+  await F.setDoc(stRef, {
+    drawing: new Date().toISOString(),
+    by: who || ''
+  }, {
+    merge: true
+  });
+  const snap = await F.getDocs(F.collection(fb.db, KB_SANTA.col));
+  const ppl = [];
+  snap.forEach(d => {
+    const x = d.data();
+    if (x && x.name && x.active !== false) ppl.push({
+      uid: d.id,
+      name: x.name,
+      wish: x.wish || ''
+    });
+  });
+  if (ppl.length < 2) {
+    await F.setDoc(stRef, {
+      drawn: false,
+      drawing: null,
+      count: ppl.length,
+      note: 'moins de 2 participants'
+    }, {
+      merge: true
+    });
+    return {
+      count: ppl.length
+    };
+  }
+  const pairs = kbSantaPairs(ppl);
+  const b = F.writeBatch(fb.db);
+  pairs.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), {
+    giverName: p.giver.name,
+    receiverName: p.receiver.name,
+    receiverWish: p.receiver.wish,
+    at: new Date().toISOString()
+  }));
+  b.set(stRef, {
+    drawn: true,
+    drawing: null,
+    drawnAt: new Date().toISOString(),
+    count: pairs.length,
+    by: who || ''
+  }, {
+    merge: true
+  });
+  await b.commit();
+  return {
+    count: pairs.length
+  };
+}
+function KbSantaPage({
+  onClose
+}) {
+  const F = window.__firebase;
+  const [code, setCode] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const [me, setMe] = React.useState(null);
+  const [reg, setReg] = React.useState(undefined);
+  const [wish, setWish] = React.useState('');
+  const [draw, setDraw] = React.useState(null);
+  const [reveal, setReveal] = React.useState(false);
+  const [now, setNow] = React.useState(Date.now());
+  const [info, setInfo] = React.useState('');
+  const showToast = m => {
+    setInfo(m);
+    setTimeout(() => setInfo(''), 3500);
+  };
+  React.useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const open = now < KB_SANTA.closeMs;
+  const leave = async () => {
+    try {
+      await kbSignOut();
+    } catch (_) {}
+    onClose();
+  };
+  const first = n => String(n || '').trim().split(/\s+/)[0] || '';
+  const enter = async () => {
+    setErr('');
+    const c = String(code || '').trim();
+    if (!c) {
+      setErr('Entre ton code personnel.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await kbCallable('kbgLogin')({
+        code: c,
+        role: 'prep',
+        site: ''
+      });
+      await F.signInWithCustomToken(fb.auth, r.data.token);
+      const cl = await kbRefreshClaims(true);
+      if (!cl || !cl.uid) throw new Error('Connexion refusée.');
+      const m = {
+        uid: cl.uid,
+        name: String(cl.kbName || r.data.name || '').trim()
+      };
+      setMe(m);
+      let x = null;
+      try {
+        const d = await F.getDoc(F.doc(fb.db, KB_SANTA.col, m.uid));
+        x = d.exists() ? d.data() : null;
+      } catch (_) {}
+      setReg(x && x.active !== false ? x : null);
+      setWish(x && x.wish || '');
+    } catch (e) {
+      setErr(kbErrMsg(e));
+    } finally {
+      setBusy(false);
+      setCode('');
+    }
+  };
+  const join = async () => {
+    const w = String(wish || '').trim().slice(0, 300);
+    setBusy(true);
+    setErr('');
+    try {
+      const data = {
+        name: me.name,
+        wish: w,
+        active: true,
+        at: new Date().toISOString()
+      };
+      await F.setDoc(F.doc(fb.db, KB_SANTA.col, me.uid), data);
+      setReg(data);
+      showToast(reg ? '🎁 Souhait mis à jour' : '🎅 Inscription confirmée !');
+    } catch (e) {
+      setErr(/permission/i.test(String(e && e.code || e)) ? Date.now() < KB_SANTA.closeMs ? 'Accès refusé par le serveur — préviens Henry (règles du Santa secret).' : 'Inscriptions closes (4 décembre 23h59).' : kbErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const quit = async () => {
+    if (!confirm('Ne plus participer au Santa secret ?')) return;
+    setBusy(true);
+    try {
+      await F.deleteDoc(F.doc(fb.db, KB_SANTA.col, me.uid));
+      setReg(null);
+      setWish('');
+      showToast('Désinscription faite');
+    } catch (e) {
+      setErr(kbErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const discover = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      const d = await F.getDoc(F.doc(fb.db, KB_SANTA.draw, me.uid));
+      if (d.exists()) {
+        setDraw(d.data());
+        setTimeout(() => setReveal(true), 1600);
+      } else setDraw('wait');
+    } catch (e) {
+      setErr(/permission/i.test(String(e && e.code || e)) ? 'Patience : le tirage se découvre à partir du 5 décembre.' : kbErrMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const left = Math.max(0, KB_SANTA.closeMs - now);
+  const cd = `${Math.floor(left / 864e5)} j ${Math.floor(left / 36e5) % 24} h ${Math.floor(left / 6e4) % 60} min ${Math.floor(left / 1e3) % 60} s`;
+  return React.createElement("div", {
+    className: "kb-santa"
+  }, React.createElement("style", null, `
+            .kb-santa{position:fixed;inset:0;z-index:9999;overflow-y:auto;background:radial-gradient(ellipse at top,#1b2a6b 0%,#0b1033 60%,#06081c 100%);color:#fff;font-family:inherit}
+            .kb-santa .sn{position:fixed;top:-12px;color:#fff;opacity:.85;pointer-events:none;animation:kbsFall linear infinite}
+            @keyframes kbsFall{to{transform:translateY(110vh) rotate(360deg)}}
+            .kb-santa .star{position:fixed;width:3px;height:3px;border-radius:50%;background:#fff;animation:kbsTw 2s ease-in-out infinite alternate;pointer-events:none}
+            @keyframes kbsTw{from{opacity:.15}to{opacity:1}}
+            .kb-santa .moon{position:fixed;top:30px;right:30px;width:90px;height:90px;border-radius:50%;background:#fff6c9;box-shadow:0 0 60px 20px rgba(255,246,201,.35);pointer-events:none}
+            .kb-santa .sleigh{position:fixed;top:14%;left:-460px;width:440px;pointer-events:none;animation:kbsFly 13s linear infinite}
+            .kb-santa .sleigh.s2{top:58%;width:260px;animation-duration:19s;animation-delay:6s;opacity:.75}
+            @keyframes kbsFly{0%{transform:translate(0,0) rotate(-4deg)}25%{transform:translate(35vw,-30px) rotate(3deg)}50%{transform:translate(70vw,10px) rotate(-3deg)}75%{transform:translate(105vw,-25px) rotate(4deg)}100%{transform:translate(calc(100vw + 520px),0) rotate(-2deg)}}
+            .kb-santa .rd{animation:kbsGallop .45s ease-in-out infinite alternate;transform-origin:center}
+            @keyframes kbsGallop{from{transform:translateY(0)}to{transform:translateY(-6px)}}
+            .kb-santa .nose{animation:kbsNose 1s ease-in-out infinite alternate}
+            @keyframes kbsNose{from{fill:#ff1744}to{fill:#ff8a80}}
+            .kb-santa .lights{position:fixed;top:0;left:0;right:0;height:34px;display:flex;justify-content:space-around;pointer-events:none;z-index:2;border-top:3px solid #2e7d32}
+            .kb-santa .lights i{width:14px;height:22px;border-radius:50% 50% 50% 50%/60% 60% 40% 40%;margin-top:4px;animation:kbsBlink 1.2s ease-in-out infinite alternate}
+            @keyframes kbsBlink{from{opacity:.35;filter:none}to{opacity:1;filter:drop-shadow(0 0 8px currentColor)}}
+            .kb-santa .card{position:relative;z-index:3;max-width:520px;margin:70px auto 40px;background:rgba(255,255,255,.96);color:#3b0a0a;border-radius:26px;padding:24px 22px;border:6px solid #c62828;box-shadow:0 0 0 6px #fff,0 0 0 12px #2e7d32,0 20px 60px rgba(0,0,0,.6);text-align:center}
+            .kb-santa h1{font-size:44px;margin:4px 0;color:#c62828;letter-spacing:2px;text-shadow:3px 3px 0 #ffd54f,6px 6px 0 #2e7d32;animation:kbsBounce 1.1s ease-in-out infinite}
+            @keyframes kbsBounce{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-8px) rotate(2deg)}}
+            .kb-santa .hat{font-size:64px;display:inline-block;animation:kbsWiggle 2s ease-in-out infinite}
+            @keyframes kbsWiggle{0%,100%{transform:rotate(-8deg)}50%{transform:rotate(8deg)}}
+            .kb-santa .btn{display:block;width:100%;margin-top:12px;padding:16px;font-size:19px;font-weight:900;border-radius:18px;border:0;cursor:pointer;color:#fff;background:repeating-linear-gradient(45deg,#c62828 0 18px,#e53935 18px 36px);box-shadow:0 6px 0 #7f0000}
+            .kb-santa .btn.g{background:repeating-linear-gradient(45deg,#2e7d32 0 18px,#43a047 18px 36px);box-shadow:0 6px 0 #1b5e20}
+            .kb-santa .btn:disabled{filter:grayscale(.7);opacity:.6;cursor:default}
+            .kb-santa .gift{font-size:84px;display:inline-block;animation:kbsShake .25s linear infinite}
+            @keyframes kbsShake{0%{transform:rotate(-10deg)}50%{transform:rotate(10deg)}100%{transform:rotate(-10deg)}}
+            .kb-santa .pop{animation:kbsPop .7s cubic-bezier(.2,1.6,.4,1) both}
+            @keyframes kbsPop{from{transform:scale(.2);opacity:0}to{transform:scale(1);opacity:1}}
+            .kb-santa textarea,.kb-santa input{width:100%;box-sizing:border-box;font-size:17px;padding:12px;border-radius:14px;border:3px solid #2e7d32;margin-top:8px;color:#222;background:#fff}
+            @media (prefers-reduced-motion: reduce){.kb-santa *{animation:none!important}}
+          `), React.createElement("div", {
+    className: "moon"
+  }), Array.from({
+    length: 40
+  }).map((_, i) => React.createElement("div", {
+    key: 'st' + i,
+    className: "star",
+    style: {
+      top: i * 37 % 60 + '%',
+      left: i * 53 % 100 + '%',
+      animationDelay: i % 7 * .3 + 's'
+    }
+  })), Array.from({
+    length: 45
+  }).map((_, i) => React.createElement("div", {
+    key: 'sn' + i,
+    className: "sn",
+    style: {
+      left: i * 23 % 100 + '%',
+      fontSize: 10 + i % 5 * 5,
+      animationDuration: 6 + i % 7 + 's',
+      animationDelay: -(i % 11) + 's'
+    }
+  }, "\u2744")), React.createElement("div", {
+    className: "lights"
+  }, Array.from({
+    length: 18
+  }).map((_, i) => React.createElement("i", {
+    key: i,
+    style: {
+      background: ['#ff1744', '#ffd600', '#00e676', '#2979ff', '#ff9100'][i % 5],
+      color: ['#ff1744', '#ffd600', '#00e676', '#2979ff', '#ff9100'][i % 5],
+      animationDelay: i % 4 * .3 + 's'
+    }
+  }))), [0, 1].map(k => React.createElement("svg", {
+    key: k,
+    className: 'sleigh' + (k ? ' s2' : ''),
+    viewBox: "0 0 440 130",
+    "aria-hidden": "true"
+  }, React.createElement("path", {
+    d: "M300 92 Q 250 70 205 82 M300 98 Q 250 80 205 90",
+    stroke: "#c9a227",
+    strokeWidth: "2",
+    fill: "none"
+  }), [0, 1].map(j => React.createElement("g", {
+    key: j,
+    className: "rd",
+    style: {
+      animationDelay: j * .2 + 's'
+    },
+    transform: `translate(${30 + j * 95},40)`
+  }, React.createElement("ellipse", {
+    cx: "45",
+    cy: "45",
+    rx: "34",
+    ry: "16",
+    fill: "#8d5524"
+  }), React.createElement("rect", {
+    x: "20",
+    y: "52",
+    width: "6",
+    height: "28",
+    fill: "#6d4019",
+    transform: "rotate(18 23 52)"
+  }), React.createElement("rect", {
+    x: "60",
+    y: "52",
+    width: "6",
+    height: "28",
+    fill: "#6d4019",
+    transform: "rotate(-22 63 52)"
+  }), React.createElement("path", {
+    d: "M75 38 L92 18 L100 22 L86 44 Z",
+    fill: "#8d5524"
+  }), React.createElement("circle", {
+    cx: "98",
+    cy: "20",
+    r: "9",
+    fill: "#8d5524"
+  }), React.createElement("path", {
+    d: "M93 12 L86 -4 M88 2 L80 -2 M100 12 L106 -4 M104 2 L112 -2",
+    stroke: "#5d3a1a",
+    strokeWidth: "3",
+    fill: "none"
+  }), React.createElement("circle", {
+    className: "nose",
+    cx: "107",
+    cy: "22",
+    r: "4.5",
+    fill: "#ff1744"
+  }), React.createElement("circle", {
+    cx: "97",
+    cy: "17",
+    r: "1.6",
+    fill: "#111"
+  }))), React.createElement("g", {
+    transform: "translate(265,30)"
+  }, React.createElement("path", {
+    d: "M0 40 Q 0 80 40 80 L 120 80 Q 150 80 160 55 L 150 55 Q 140 70 120 70 L 30 70 Q 12 70 12 40 Z",
+    fill: "#c62828",
+    stroke: "#ffd54f",
+    strokeWidth: "3"
+  }), React.createElement("path", {
+    d: "M-6 88 L 160 88 Q 176 88 176 74",
+    stroke: "#ffd54f",
+    strokeWidth: "5",
+    fill: "none",
+    strokeLinecap: "round"
+  }), React.createElement("rect", {
+    x: "95",
+    y: "22",
+    width: "34",
+    height: "30",
+    rx: "4",
+    fill: "#2e7d32"
+  }), React.createElement("rect", {
+    x: "109",
+    y: "22",
+    width: "6",
+    height: "30",
+    fill: "#ffd54f"
+  }), React.createElement("rect", {
+    x: "70",
+    y: "30",
+    width: "26",
+    height: "22",
+    rx: "3",
+    fill: "#1565c0"
+  }), React.createElement("rect", {
+    x: "80",
+    y: "30",
+    width: "5",
+    height: "22",
+    fill: "#fff"
+  }), React.createElement("circle", {
+    cx: "48",
+    cy: "30",
+    r: "20",
+    fill: "#e53935"
+  }), React.createElement("circle", {
+    cx: "48",
+    cy: "12",
+    r: "11",
+    fill: "#ffccbc"
+  }), React.createElement("path", {
+    d: "M37 16 Q 48 34 59 16 Q 56 28 48 29 Q 40 28 37 16 Z",
+    fill: "#fff"
+  }), React.createElement("path", {
+    d: "M36 6 Q 48 -16 64 2 L 70 -6",
+    stroke: "#e53935",
+    strokeWidth: "9",
+    fill: "none",
+    strokeLinecap: "round"
+  }), React.createElement("circle", {
+    cx: "71",
+    cy: "-7",
+    r: "5",
+    fill: "#fff"
+  }), React.createElement("rect", {
+    x: "35",
+    y: "3",
+    width: "26",
+    height: "6",
+    rx: "3",
+    fill: "#fff"
+  }), React.createElement("path", {
+    d: "M62 30 L 80 20",
+    stroke: "#e53935",
+    strokeWidth: "7",
+    strokeLinecap: "round"
+  }), React.createElement("circle", {
+    cx: "82",
+    cy: "19",
+    r: "4",
+    fill: "#fff"
+  })))), React.createElement("div", {
+    className: "card"
+  }, React.createElement("div", {
+    className: "hat"
+  }, "\uD83C\uDF85"), !me && React.createElement(React.Fragment, null, React.createElement("h1", null, "Santa secret"), React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, "Kelbongoo \xB7 No\xEBl 2026 \xB7 budget ", KB_SANTA.budget, " \u20AC max"), open ? React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 15
+    }
+  }, "Entre ton code personnel pour participer."), React.createElement("input", {
+    type: "password",
+    inputMode: "numeric",
+    autoComplete: "off",
+    value: code,
+    onChange: e => setCode(e.target.value),
+    onKeyDown: e => {
+      if (e.key === 'Enter') enter();
+    },
+    placeholder: "\u2022\u2022\u2022\u2022\u2022\u2022",
+    style: {
+      textAlign: 'center',
+      fontSize: 24,
+      letterSpacing: 6
+    }
+  }), React.createElement("button", {
+    className: "btn",
+    disabled: busy,
+    onClick: enter
+  }, busy ? 'Les lutins vérifient…' : '🎄 Entrer'), React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 13
+    }
+  }, "Inscriptions jusqu'au ", React.createElement("b", null, "jeudi 4 d\xE9cembre 23h59"), " \xB7 encore ", cd)) : React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 15
+    }
+  }, "Les inscriptions sont closes. Entre ton code pour d\xE9couvrir qui tu as tir\xE9 !"), React.createElement("input", {
+    type: "password",
+    inputMode: "numeric",
+    autoComplete: "off",
+    value: code,
+    onChange: e => setCode(e.target.value),
+    onKeyDown: e => {
+      if (e.key === 'Enter') enter();
+    },
+    placeholder: "\u2022\u2022\u2022\u2022\u2022\u2022",
+    style: {
+      textAlign: 'center',
+      fontSize: 24,
+      letterSpacing: 6
+    }
+  }), React.createElement("button", {
+    className: "btn",
+    disabled: busy,
+    onClick: enter
+  }, busy ? 'Les lutins vérifient…' : '🎁 Entrer'))), me && reg !== undefined && React.createElement(React.Fragment, null, React.createElement("h1", null, "HO HO HO"), React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontWeight: 900
+    }
+  }, "Bienvenue ", first(me.name), " !"), open && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      marginTop: 12,
+      fontSize: 16
+    }
+  }, reg ? React.createElement(React.Fragment, null, "\u2705 ", React.createElement("b", null, "Tu participes au Santa secret."), " Tu peux changer ton souhait jusqu'au 4 d\xE9cembre 23h59.") : React.createElement(React.Fragment, null, "Confirme ton envie de participer au ", React.createElement("b", null, "Santa secret"), " \u2014 budget ", React.createElement("b", null, KB_SANTA.budget, " \u20AC max"), ".")), React.createElement("div", {
+    style: {
+      marginTop: 10,
+      fontSize: 15,
+      textAlign: 'left',
+      fontWeight: 700
+    }
+  }, "\uD83C\uDF81 Mets ce qui te ferait plaisir, pour aider la personne qui te choisira :"), React.createElement("textarea", {
+    rows: 3,
+    maxLength: 300,
+    value: wish,
+    onChange: e => setWish(e.target.value),
+    placeholder: "ex. du th\xE9, un livre de cuisine, des chaussettes rigolotes\u2026"
+  }), React.createElement("button", {
+    className: "btn g",
+    disabled: busy,
+    onClick: join
+  }, reg ? '🎁 Mettre à jour mon souhait' : '🎅 Je participe !'), reg && React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      marginTop: 8,
+      color: '#7f0000'
+    },
+    disabled: busy,
+    onClick: quit
+  }, "Ne plus participer")), reg && React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, React.createElement("button", {
+    className: "btn",
+    disabled: busy || open,
+    onClick: discover
+  }, "\uD83C\uDF81 Clique \xE0 partir du 5 d\xE9cembre pour conna\xEEtre qui tu as tir\xE9"), open && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 6
+    }
+  }, "Tirage au sort dans ", cd)), !reg && !open && React.createElement("div", {
+    style: {
+      marginTop: 14,
+      fontSize: 16
+    }
+  }, "Les inscriptions sont closes depuis le 4 d\xE9cembre 23h59. \xC0 l'ann\xE9e prochaine ! \uD83C\uDF84"), draw === 'wait' && React.createElement("div", {
+    style: {
+      marginTop: 12,
+      fontSize: 16
+    }
+  }, "\uD83E\uDDDD Les lutins font le tirage\u2026 Reviens dans un petit moment !"), draw && draw !== 'wait' && React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, !reveal ? React.createElement("div", {
+    className: "gift"
+  }, "\uD83C\uDF81") : React.createElement("div", {
+    className: "pop",
+    style: {
+      background: '#fff8e1',
+      border: '4px dashed #c62828',
+      borderRadius: 20,
+      padding: 16
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 16
+    }
+  }, "Tu offres un cadeau \xE0\u2026"), React.createElement("div", {
+    style: {
+      fontSize: 34,
+      fontWeight: 900,
+      color: '#c62828'
+    }
+  }, "\uD83C\uDF84 ", draw.receiverName, " \uD83C\uDF84"), React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontSize: 15
+    }
+  }, draw.receiverWish ? React.createElement(React.Fragment, null, "Son souhait : ", React.createElement("b", null, "\xAB ", draw.receiverWish, " \xBB")) : 'Pas de souhait noté : surprends-le !'), React.createElement("div", {
+    style: {
+      marginTop: 8,
+      fontSize: 13
+    }
+  }, "Budget ", KB_SANTA.budget, " \u20AC max \xB7 chut, c'est secret ! \uD83E\uDD2B")))), info && React.createElement("div", {
+    className: "pop",
+    style: {
+      marginTop: 12,
+      padding: '10px 12px',
+      borderRadius: 12,
+      background: '#e8f5e9',
+      color: '#1b5e20',
+      fontWeight: 800
+    }
+  }, info), err && React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: '10px 12px',
+      borderRadius: 12,
+      background: '#ffebee',
+      color: '#b71c1c',
+      fontWeight: 700
+    }
+  }, err), React.createElement("button", {
+    className: "btn-ghost",
+    style: {
+      marginTop: 16,
+      color: '#555'
+    },
+    onClick: leave
+  }, me ? 'Fermer et me déconnecter' : 'Fermer')));
+}
 function LoginScreen({
   onLogin
 }) {
   const [role, setRole] = React.useState('distrib');
+  const [santaOpen, setSantaOpen] = React.useState(false);
   const [rgOpen, setRgOpen] = React.useState(false);
   const [rgCode, setRgCode] = React.useState('');
   const [rgErr, setRgErr] = React.useState('');
@@ -6031,7 +6742,22 @@ function LoginScreen({
       fontSize: 24,
       color: '#1565c0'
     }
-  }, "\u203A")))), rgOpen && React.createElement("div", {
+  }, "\u203A")), kbSantaVisible() && firebaseConfigured && React.createElement("button", {
+    type: "button",
+    onClick: () => setSantaOpen(true),
+    style: {
+      display: 'block',
+      margin: '8px auto 0',
+      background: 'none',
+      border: 0,
+      fontSize: 11,
+      color: '#c62828',
+      cursor: 'pointer',
+      textDecoration: 'underline'
+    }
+  }, "\uD83C\uDF85 participer au Santa secret"))), santaOpen && React.createElement(KbSantaPage, {
+    onClose: () => setSantaOpen(false)
+  }), rgOpen && React.createElement("div", {
     className: "fs-overlay",
     onClick: () => !rgBusy && setRgOpen(false)
   }, React.createElement("div", {
@@ -15525,6 +16251,37 @@ function QtyInput({
     style: style
   });
 }
+function kbInvDlcId(invDate, productId) {
+  return String(invDate) + '__' + String(productId).replace(/[\/#?\[\]]/g, '_');
+}
+async function kbInvDlcLoad(invDate) {
+  const m = {};
+  try {
+    ((await storage.getAll('dlc_watch')) || []).forEach(w => {
+      if (w && w.fromInventory && w.invDay === invDate && w.productId) m[w.productId] = {
+        dlc: w.dlc,
+        by: w.createdBy || '',
+        at: w.createdAt || '',
+        produit: w.produit || '',
+        producteur: w.producteur || '',
+        qty: w.qtyInit || w.qty || ''
+      };
+    });
+  } catch (e) {}
+  try {
+    ((await storage.getAll('inventory_dlc')) || []).forEach(d => {
+      if (d && d.invDate === invDate && d.productId) m[d.productId] = {
+        dlc: d.dlc,
+        by: d.by || '',
+        at: d.at || '',
+        produit: d.produit || '',
+        producteur: d.producteur || '',
+        qty: d.qty || ''
+      };
+    });
+  } catch (e) {}
+  return m;
+}
 function InventorySearch({
   metas,
   logs,
@@ -16004,6 +16761,438 @@ function InventorySearch({
     }
   }, "\u2026 ", groups.length - (hasFilter ? 400 : 150), " produit(s) de plus \u2014 affine la recherche ou exporte en CSV.")));
 }
+function KbInvCalendar({
+  kind,
+  metas,
+  logs,
+  prodById,
+  onOpen
+}) {
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const today = iso(new Date());
+  const days = React.useMemo(() => {
+    const m = {};
+    if (kind === 'fl') (metas || []).forEach(x => {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(x.id || '')) m[x.id] = {
+        by: x.validatedBy || '',
+        at: x.validatedAt || '',
+        label: '🥬 ' + (x.nbSaisis || 0) + ' prod.'
+      };
+    });else {
+      (metas || []).forEach(x => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(x.id || '')) return;
+        const tour = x.scopes ? Object.values(x.scopes).filter(y => y && y.type === 'tournant') : [];
+        const lbl = tour.length ? '🔄 ' + tour.map(y => y.kind === 'fromage' ? 'fromage' : y.value || y.kind).join(', ') : x.type === 'tournant' ? '🔄 ' + (x.scopeValue || 'tournant') : '📦 complet';
+        m[x.id] = {
+          by: x.lastBy || '',
+          at: x.lastAt || '',
+          label: lbl
+        };
+      });
+      (logs || []).forEach(l => {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(l.date || '')) m[l.date] = {
+          ...(m[l.date] || {
+            label: l.mode === 'tournant' ? '🔄 tournant' : '📦 ' + (l.mode || '')
+          }),
+          closed: true
+        };
+      });
+    }
+    return m;
+  }, [kind, metas, logs]);
+  const last = Object.keys(days).sort().pop() || today;
+  const [month, setMonth] = React.useState(last.slice(0, 7));
+  const [sel, setSel] = React.useState('');
+  const [q, setQ] = React.useState('');
+  const [det, setDet] = React.useState({});
+  React.useEffect(() => {
+    if (!sel && Object.keys(days).length) setMonth(last.slice(0, 7));
+  }, [kind, Object.keys(days).length]);
+  const fmtH = s => {
+    if (!s) return '';
+    const d = new Date(s);
+    return isNaN(d) ? '' : d.toLocaleTimeString('fr-FR', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+  const fmtDT = s => {
+    if (!s) return '—';
+    const d = new Date(s);
+    return isNaN(d) ? '—' : d.toLocaleString('fr-FR', {
+      dateStyle: 'short',
+      timeStyle: 'short'
+    });
+  };
+  const fmtD = d => {
+    const [y, mo, da] = String(d).split('-');
+    const dt = new Date(+y, +mo - 1, +da);
+    return isNaN(dt) ? d : dt.toLocaleDateString('fr-FR', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long'
+    });
+  };
+  const ddmm = d => d ? String(d).slice(8, 10) + '/' + String(d).slice(5, 7) : '';
+  const pick = async d => {
+    setSel(d);
+    setQ('');
+    if (det[d]) return;
+    setDet(x => ({
+      ...x,
+      [d]: 'load'
+    }));
+    const items = [];
+    try {
+      if (kind === 'fl') {
+        const a = await storage.getAll(`fl_inventory_${d}`);
+        (a || []).forEach(it => {
+          if (!(Number(it.colis) || Number(it.mu))) return;
+          items.push({
+            id: it.id,
+            name: it.produit || it.id,
+            producer: it.producer || '',
+            qty: (Number(it.colis) || 0) + ' colis' + (Number(it.mu) ? ' · ' + it.mu + ' µ' : ''),
+            by: it.countedBy || '—',
+            at: it.countedAt || ''
+          });
+        });
+      } else {
+        for (const md of ['matin', 'soir', '']) {
+          let a = [];
+          try {
+            a = await storage.getAll(md ? `inventory_${d}_${md}` : `inventory_${d}`);
+          } catch (e) {}
+          (a || []).forEach(it => {
+            const pr = (prodById || {})[it.id] || {};
+            items.push({
+              id: it.id,
+              mode: md || 'ancien',
+              name: it.produit || pr.name || it.id,
+              producer: it.producteur || pr.producer || '',
+              qty: Number(it.qty) || 0,
+              by: it.countedBy || '—',
+              at: it.countedAt || ''
+            });
+          });
+        }
+      }
+    } catch (e) {}
+    let dlc = {};
+    if (kind !== 'fl') {
+      try {
+        dlc = await kbInvDlcLoad(d);
+      } catch (e) {}
+    }
+    items.forEach(it => {
+      const x = dlc[it.id];
+      if (x) {
+        it.dlc = x.dlc;
+        it.dlcBy = x.by;
+        it.dlcAt = x.at;
+      }
+    });
+    Object.entries(dlc).forEach(([pid, x]) => {
+      if (!items.some(it => String(it.id) === String(pid))) items.push({
+        id: pid,
+        name: x.produit || pid,
+        producer: x.producteur || '',
+        qty: '—',
+        by: '—',
+        at: '',
+        dlc: x.dlc,
+        dlcBy: x.by,
+        dlcAt: x.at
+      });
+    });
+    items.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.name || '').localeCompare(b.name || '', 'fr'));
+    const byPerson = {};
+    items.forEach(it => {
+      if (it.by && it.by !== '—') byPerson[it.by] = (byPerson[it.by] || 0) + 1;
+    });
+    const times = items.map(it => it.at).filter(Boolean).sort();
+    const closes = kind === 'fl' ? [] : (logs || []).filter(l => l.date === d).sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
+    setDet(x => ({
+      ...x,
+      [d]: {
+        items,
+        byPerson,
+        first: times[0] || '',
+        lastT: times[times.length - 1] || '',
+        closes,
+        nDlc: items.filter(it => it.dlc).length
+      }
+    }));
+  };
+  const [y, mo] = month.split('-').map(Number);
+  const first = new Date(y, mo - 1, 1);
+  const nDays = new Date(y, mo, 0).getDate();
+  const lead = (first.getDay() + 6) % 7;
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push(null);
+  for (let i = 1; i <= nDays; i++) cells.push(`${month}-${String(i).padStart(2, '0')}`);
+  const shift = k => {
+    const d = new Date(y, mo - 1 + k, 1);
+    setMonth(iso(d).slice(0, 7));
+  };
+  const D = sel && det[sel] && det[sel] !== 'load' ? det[sel] : null;
+  const list = D ? D.items.filter(it => !q.trim() || kbSearchMatch([it.name, it.producer, it.by, it.dlcBy].join(' '), q)) : [];
+  const nMonth = cells.filter(c => c && days[c]).length;
+  return React.createElement("div", {
+    className: "stack",
+    style: {
+      gap: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 18,
+      padding: '6px 14px'
+    },
+    onClick: () => shift(-1)
+  }, "\u2039"), React.createElement("div", {
+    style: {
+      textAlign: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 17,
+      textTransform: 'capitalize'
+    }
+  }, first.toLocaleDateString('fr-FR', {
+    month: 'long',
+    year: 'numeric'
+  })), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, nMonth, " inventaire(s) ", kind === 'fl' ? 'F&L' : 'complet / tournant', " ce mois")), React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 18,
+      padding: '6px 14px'
+    },
+    onClick: () => shift(1)
+  }, "\u203A")), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(7,1fr)',
+      gap: 4
+    }
+  }, ['L', 'M', 'M', 'J', 'V', 'S', 'D'].map((x, i) => React.createElement("div", {
+    key: 'h' + i,
+    style: {
+      textAlign: 'center',
+      fontSize: 11,
+      fontWeight: 700,
+      color: 'var(--ink-mute)'
+    }
+  }, x)), cells.map((c, i) => {
+    if (!c) return React.createElement("div", {
+      key: 'e' + i
+    });
+    const has = days[c],
+      on = sel === c;
+    return React.createElement("button", {
+      key: c,
+      type: "button",
+      disabled: !has,
+      onClick: () => pick(c),
+      title: has ? has.label : '',
+      style: {
+        minHeight: 48,
+        borderRadius: 10,
+        border: on ? '3px solid #1b5e20' : c === today ? '2px solid var(--ink-mute)' : '1px solid var(--border)',
+        background: has ? kind === 'fl' ? '#e8f5e9' : '#e3f2fd' : 'transparent',
+        color: has ? 'var(--ink)' : 'var(--ink-mute)',
+        cursor: has ? 'pointer' : 'default',
+        padding: 2,
+        fontWeight: has ? 800 : 400
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 15
+      }
+    }, Number(c.slice(8))), has && React.createElement("div", {
+      style: {
+        fontSize: 9,
+        lineHeight: 1.1,
+        overflow: 'hidden',
+        whiteSpace: 'nowrap',
+        textOverflow: 'ellipsis'
+      }
+    }, has.label.split(' ')[0], has.closed ? ' ✓' : ''));
+  })), !sel && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "Touche un jour en couleur pour voir le d\xE9tail."), sel && det[sel] === 'load' && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)'
+    }
+  }, "\u23F3 Lecture du ", fmtD(sel), "\u2026"), D && React.createElement("div", {
+    style: {
+      border: '2px solid var(--border)',
+      borderRadius: 12,
+      padding: 10
+    }
+  }, React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 16,
+      textTransform: 'capitalize'
+    }
+  }, fmtD(sel), " \xB7 ", days[sel] && days[sel].label), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 4
+    }
+  }, D.items.length, " produit(s)", D.first ? ` · comptage de ${fmtH(D.first)} à ${fmtH(D.lastT)}` : '', kind !== 'fl' ? ` · ${D.nDlc} DLC saisie(s)` : ''), Object.keys(D.byPerson).length > 0 && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 2
+    }
+  }, "\uD83D\uDC65 ", Object.entries(D.byPerson).sort((a, b) => b[1] - a[1]).map(([w, n]) => `${w} (${n})`).join(' · ')), kind === 'fl' && days[sel] && days[sel].by && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 2
+    }
+  }, "\u2705 Valid\xE9 par ", days[sel].by, " le ", fmtDT(days[sel].at)), D.closes.map((l, i) => React.createElement("div", {
+    key: i,
+    style: {
+      fontSize: 13,
+      marginTop: 2
+    }
+  }, "\u2705 Cl\xF4tur\xE9 ", fmtDT(l.at), " par ", l.initials ? l.initials + ' · ' : '', l.by || '—', l.url ? React.createElement(React.Fragment, null, " \xB7 ", React.createElement("a", {
+    href: l.url,
+    target: "_blank",
+    rel: "noopener"
+  }, "classeur")) : null)), kind !== 'fl' && onOpen && React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      fontSize: 13
+    },
+    onClick: () => onOpen(sel, 'soir')
+  }, "\u21A9\uFE0F Ouvrir cet inventaire")), React.createElement("input", {
+    value: q,
+    onChange: e => setQ(e.target.value),
+    placeholder: "\uD83D\uDD0E Produit, fournisseur ou personne\u2026",
+    style: {
+      width: '100%',
+      boxSizing: 'border-box',
+      fontSize: 16,
+      padding: '10px 12px',
+      borderRadius: 8,
+      border: '1px solid var(--border)',
+      marginTop: 8
+    }
+  }), React.createElement("div", {
+    style: {
+      maxHeight: '55vh',
+      overflowY: 'auto',
+      marginTop: 8
+    }
+  }, React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: 13
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      textAlign: 'left',
+      color: 'var(--ink-mute)',
+      fontSize: 11
+    }
+  }, React.createElement("th", {
+    style: {
+      padding: '4px 6px'
+    }
+  }, "Produit"), React.createElement("th", {
+    style: {
+      padding: '4px 6px',
+      textAlign: 'right'
+    }
+  }, "Qt\xE9"), React.createElement("th", {
+    style: {
+      padding: '4px 6px'
+    }
+  }, "Par \xB7 heure"), kind !== 'fl' && React.createElement("th", {
+    style: {
+      padding: '4px 6px'
+    }
+  }, "DLC"))), React.createElement("tbody", null, list.map((it, i) => React.createElement("tr", {
+    key: it.id + '_' + (it.mode || '') + '_' + i,
+    style: {
+      borderTop: '1px solid var(--border)',
+      background: it.dlc ? '#fff8e1' : undefined
+    }
+  }, React.createElement("td", {
+    style: {
+      padding: '6px'
+    }
+  }, React.createElement("b", null, it.name), it.producer ? React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ink-mute)'
+    }
+  }, it.producer) : null), React.createElement("td", {
+    style: {
+      padding: '6px',
+      textAlign: 'right',
+      fontWeight: 800,
+      fontSize: 15,
+      whiteSpace: 'nowrap'
+    }
+  }, it.qty), React.createElement("td", {
+    style: {
+      padding: '6px',
+      whiteSpace: 'nowrap'
+    }
+  }, it.by, it.at ? React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, " \xB7 ", fmtH(it.at)) : null, it.mode === 'matin' ? ' 🌅' : ''), kind !== 'fl' && React.createElement("td", {
+    style: {
+      padding: '6px',
+      whiteSpace: 'nowrap'
+    }
+  }, it.dlc ? React.createElement(React.Fragment, null, React.createElement("b", {
+    style: {
+      color: '#b45309'
+    }
+  }, "\uD83D\uDCC5 ", ddmm(it.dlc)), React.createElement("div", {
+    style: {
+      fontSize: 11
+    }
+  }, "indiqu\xE9e par ", React.createElement("b", null, it.dlcBy || '—'), it.dlcAt ? ' · ' + fmtH(it.dlcAt) : '')) : React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)'
+    }
+  }, "\u2014")))))), !list.length && React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)',
+      padding: 8
+    }
+  }, "Rien ne correspond."))));
+}
 function InventoryHistory({
   onOpen,
   defaultTab
@@ -16167,14 +17356,34 @@ function InventoryHistory({
     onClick: () => setTab('search')
   }, "\uD83D\uDD0E Rechercher"), React.createElement("div", {
     className: `chip ${tab === 'fl' ? 'selected' : ''}`,
+    style: {
+      fontWeight: 700
+    },
     onClick: () => setTab('fl')
-  }, "\uD83E\uDD6C Inventaire F&L"), React.createElement("div", {
+  }, "\uD83E\uDD6C Inventaire F&L \uD83D\uDCC5"), React.createElement("div", {
+    className: `chip ${tab === 'cal' ? 'selected' : ''}`,
+    style: {
+      fontWeight: 700
+    },
+    onClick: () => setTab('cal')
+  }, "\uD83D\uDCE6 Inventaire complet / tournant \uD83D\uDCC5"), React.createElement("div", {
     className: `chip ${tab === 'inv' ? 'selected' : ''}`,
     onClick: () => setTab('inv')
-  }, "\uD83D\uDCCB Par date"), React.createElement("div", {
+  }, "\uD83D\uDCCB Liste par date"), React.createElement("div", {
     className: `chip ${tab === 'learn' ? 'selected' : ''}`,
     onClick: () => setTab('learn')
   }, "\uD83C\uDFF7\uFE0F Apprentissage")), tab === 'search' && React.createElement(InventorySearch, {
+    metas: metas,
+    logs: logs,
+    prodById: prodById,
+    onOpen: onOpen
+  }), tab === 'fl' && React.createElement(KbInvCalendar, {
+    kind: "fl",
+    metas: flMetas,
+    logs: [],
+    prodById: prodById
+  }), tab === 'cal' && React.createElement(KbInvCalendar, {
+    kind: "inv",
     metas: metas,
     logs: logs,
     prodById: prodById,
@@ -16386,7 +17595,16 @@ function InventoryHistory({
     style: {
       padding: '3px 4px'
     }
-  }, it.mode === 'matin' ? '🌅' : it.mode === 'soir' ? '🌙' : '—')))))))))))), tab === 'fl' && (flMetas === null ? React.createElement("p", {
+  }, it.mode === 'matin' ? '🌅' : it.mode === 'soir' ? '🌙' : '—')))))))))))), tab === 'fl' && React.createElement("details", {
+    style: {
+      marginTop: 10
+    }
+  }, React.createElement("summary", {
+    style: {
+      fontSize: 13,
+      cursor: 'pointer'
+    }
+  }, "Liste des validations F&L"), flMetas === null ? React.createElement("p", {
     style: {
       fontSize: 13,
       color: 'var(--ink-mute)'
@@ -18003,6 +19221,7 @@ function InventoryPage({
   const [lastUnknownCode, setLastUnknownCode] = React.useState(null);
   const [dlcInputs, setDlcInputs] = React.useState({});
   const [dlcExpandedId, setDlcExpandedId] = React.useState(null);
+  const [dlcBy, setDlcBy] = React.useState({});
   const kbInvOpenReq = (() => {
     try {
       const r = JSON.parse(localStorage.getItem('kbg_inv_open') || 'null');
@@ -18015,6 +19234,27 @@ function InventoryPage({
   })();
   const kbInvOpenRef = React.useRef(kbInvOpenReq);
   const [invDate, setInvDate] = React.useState(() => kbInvOpenRef.current && kbInvOpenRef.current.date || todayKey());
+  React.useEffect(() => {
+    let stop = false;
+    (async () => {
+      const m = await kbInvDlcLoad(invDate);
+      if (stop) return;
+      const inp = {},
+        by = {};
+      Object.entries(m).forEach(([pid, x]) => {
+        inp[pid] = x.dlc;
+        by[pid] = {
+          by: x.by,
+          at: x.at
+        };
+      });
+      setDlcInputs(inp);
+      setDlcBy(by);
+    })();
+    return () => {
+      stop = true;
+    };
+  }, [invDate]);
   const [mode, setMode] = React.useState(() => kbInvOpenRef.current && kbInvOpenRef.current.mode || (new Date().getDay() === 2 && new Date().getHours() < 10 ? 'matin' : 'soir'));
   const [closingInv, setClosingInv] = React.useState(false);
   const [invType, setInvType] = React.useState('complet');
@@ -18614,7 +19854,28 @@ function InventoryPage({
       ...prev,
       [productId]: dlcDate
     }));
+    setDlcBy(prev => ({
+      ...prev,
+      [productId]: {
+        by: session.name,
+        at: new Date().toISOString()
+      }
+    }));
     setDlcExpandedId(null);
+    try {
+      await storage.setDoc('inventory_dlc', kbInvDlcId(invDate, productId), {
+        invDate,
+        productId: String(productId),
+        produit: p?.name || '',
+        producteur: p?.producer || '',
+        dlc: dlcDate,
+        qty,
+        by: session.name,
+        at: new Date().toISOString()
+      }, {
+        replace: true
+      });
+    } catch (e) {}
     try {
       const all = await storage.getAll('dlc_watch');
       for (const w of all || []) {
@@ -19909,7 +21170,7 @@ function InventoryPage({
       style: {
         color: '#b45309'
       }
-    }, " \xB7 DLC ", dlcInputs[p.id].slice(8, 10), "/", dlcInputs[p.id].slice(5, 7)) : null)), React.createElement("div", {
+    }, " \xB7 DLC ", dlcInputs[p.id].slice(8, 10), "/", dlcInputs[p.id].slice(5, 7), dlcBy[p.id] && dlcBy[p.id].by ? ` indiquée par ${dlcBy[p.id].by}` : '') : null)), React.createElement("div", {
       style: {
         display: 'flex',
         alignItems: 'stretch',
@@ -40893,10 +42154,11 @@ function PrepaDuJourPage({
       orders.forEach(o => {
         const site = (o.site || '').toUpperCase();
         const client = o.name || '(client)';
-        const casier = o.casiersFrais && o.casiersFrais[0] || o.casiersSec && o.casiersSec[0] || '?';
+        const selfCas = kbCasSelf(day) && site !== 'DOM' && !o._ps;
+        const casier = selfCas ? '?' : o.casiersFrais && o.casiersFrais[0] || o.casiersSec && o.casiersSec[0] || '?';
         const rk = site + '||' + client;
         if (!resv[rk]) resv[rk] = [];
-        (o.casiersFrais && o.casiersFrais.length ? o.casiersFrais : o.casiersSec || []).forEach(n => {
+        (selfCas ? [] : o.casiersFrais && o.casiersFrais.length ? o.casiersFrais : o.casiersSec || []).forEach(n => {
           const v = String(n).trim();
           if (v && !resv[rk].includes(v)) resv[rk].push(v);
         });
@@ -41150,6 +42412,15 @@ function PrepaDuJourPage({
     let cnt = 0;
     Object.entries(miss).forEach(([s, set]) => {
       const own = casOwners(s);
+      if (kbCasSelf(day)) {
+        [...set].sort((a, b) => a.localeCompare(b)).forEach(c => {
+          const v = kbSmallestFree(own);
+          own[v] = c;
+          cnt++;
+          wCas(CK(s, c), [v]);
+        });
+        return;
+      }
       let n = 0;
       Object.keys(own).forEach(v => {
         const x = parseInt(v, 10);
@@ -42394,6 +43665,7 @@ function PrepaDuJourPage({
   };
   const nextFree = site => {
     const own = casOwners(site);
+    if (kbCasSelf(day)) return parseInt(kbSmallestFree(own), 10);
     let n = Math.max((prep.counters[site] ?? 0) || 0, seedCounter[site] || 0);
     Object.keys(own).forEach(v => {
       const x = parseInt(v, 10);
@@ -42460,10 +43732,9 @@ function PrepaDuJourPage({
       return;
     }
     const n = arr[idx];
-    if (!confirm(`Supprimer le Casier ${n} de ${client.split(' ')[0]} ?\nLe n° ${n} redevient libre pour un autre client.`)) return;
     arr.splice(idx, 1);
     wCas(CK(site, client), arr);
-    showToast(`Casier ${n} retiré — n° ${n} libre`);
+    showToast(`Casier ${n} retiré de ${client.split(' ')[0]} — n° ${n} libre`);
   };
   const removeCasier = (client, idx) => removeCasierFor(curSite, client, idx);
   const openRemAll = pk => (setRemCliOpen({}), setArtOpen({}), setRemAllOpen(o => o[pk] ? {
@@ -85402,7 +86673,10 @@ function AdminPage({
         if (rc.assigned) bits.push(`${rc.assigned} client(s) ont reçu leur casier`);
         if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
         if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
-        if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+        if (rc.self) bits.push(`casiers gérés par l'appli (n° 1, 2, 3… sans trou${rc.prepLearned ? ` · 1 casier ≈ ${Math.round(rc.prepLearned.cap)} de volume, appris sur ${rc.prepLearned.samples} clients de la prépa` : ''})`);
+        if (rc.freed) bits.push(`${rc.freed} casier(s) libéré(s) (client sans commande)`);
+        if (rc.shrunk) bits.push(`${rc.shrunk} client(s) avec casier(s) en moins (volume en baisse)`);
+        if (rc.learned && !rc.self) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
         if (rc.dom) bits.push(`📦 DOM : ${rc.dom} client(s) → ${rc.domCartons} carton(s)`);
         if (rc.domGrown) bits.push(`📦 DOM : ${rc.domGrown} avec carton(s) en plus`);
         if (rc.cartLearned) bits.push(`cartons DOM estimés sur ${rc.cartLearned.samples} livraisons compilées (${rc.cartLearned.match} % identiques)`);else if (rc.dom && rc.cartCap && !rc.cartCap.samples) bits.push('cartons DOM : estimation provisoire, s\'affine au chargement de 10h');
@@ -98839,7 +100113,8 @@ function App() {
   const [pushMessages, setPushMessages] = React.useState([]);
   const [followUpsAll, setFollowUpsAll] = React.useState([]);
   const [prepCas, setPrepCas] = React.useState({});
-  const orders = React.useMemo(() => enrichOrders(kbApplyPrepCasiers(rawOrders, prepCas), consumersByEmail), [rawOrders, prepCas, consumersByEmail]);
+  const [prepCasDay, setPrepCasDay] = React.useState('');
+  const orders = React.useMemo(() => enrichOrders(kbApplyPrepCasiers(rawOrders, prepCas, prepCasDay), consumersByEmail), [rawOrders, prepCas, prepCasDay, consumersByEmail]);
   const sitesOfDay = React.useMemo(() => {
     const set = new Set(rawOrders.map(o => o.site).filter(Boolean));
     return [...set].sort();
@@ -98887,6 +100162,22 @@ function App() {
     }
   }, [session, tab, viewAs]);
   React.useEffect(() => {
+    if (!session || !(session.role === 'master' || session.isMaster)) return;
+    let stop = false;
+    const run = () => {
+      if (!stop && !kbSantaOpenNow()) kbSantaDrawIfDue(session.name).then(r => {
+        if (r && r.count >= 2) console.log('Santa secret : tirage fait', r.count);
+      }).catch(() => {});
+    };
+    const t0 = setTimeout(run, 20000);
+    const t = setInterval(run, 10 * 60000);
+    return () => {
+      stop = true;
+      clearTimeout(t0);
+      clearInterval(t);
+    };
+  }, [session && session.name, session && session.role]);
+  React.useEffect(() => {
     if (!session) return;
     if (!(session.role === 'master' || session.isMaster || session.role === 'prep')) return;
     let stop = false;
@@ -98924,6 +100215,7 @@ function App() {
   React.useEffect(() => {
     if (!session) return;
     const dayScope = session.role === 'distrib' ? todayKey() : activeDay();
+    setPrepCasDay(dayScope);
     const uCas = storage.subscribe(`day_${dayScope}_prep`, arr => {
       const m = {};
       (arr || []).forEach(d => {

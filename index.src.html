@@ -813,7 +813,13 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.80';
+    const APP_VERSION = 'V11.81';
+    // V11.81 — (24/11/2026) 🎅 Santa secret (lien sous Rungis à la connexion, code perso, souhait 10 €, clôture 4/12 23h59, tirage auto
+    //   le 5/12 par le 1er poste master, page animée Noël ; règles Firestore santa_2026*). Casiers : à partir de la distrib du 26/11 l'appli
+    //   gère SEULE les n° (plus ceux du chargement : séries frais/sec de l'ancien site mélangées → trous 1·2·13 à STB/BIC/BOR), plus petit
+    //   n° libre, casiers d'un client sans commande libérés, apprentissage sur les casiers gardés en prépa, ✕ casier en trop en 1 toucher.
+    //   Inventaire : DLC gardées avec le nom de la personne (« DLC 28/11 indiquée par … »), visibles en rouvrant l'inventaire ;
+    //   Historique : calendriers 🥬 F&L et 📦 complet/tournant (jour → détail, heures, personnes, DLC, recherche).
     // V11.80 — (23/11/2026) 🧾 Qualité : « Retiré mais présent (à refacturer) » — produit noté en rupture à la prépa que le client a quand même eu :
     //   on coche le produit « retiré en prépa » de sa commande, montant à refacturer calculé (prix × quantité), suivi dans Master › SAV › 💶 À refacturer (✅ Refacturé).
     // V11.79 — (23/11/2026) 🧾 Qualité / SAV : montant de l'avoir et du remboursement calculé tout seul (prix payé × quantité des produits
@@ -2815,6 +2821,41 @@
     //     n° JSON est déjà pris reçoit le prochain n° libre. Une fois la prépa clôturée, rien n'est touché.
     //   • Casier modifié à la main en prépa (ajout / retrait) → plus jamais retouché automatiquement.
     const KB_CAS_CAP_DOC = 'kb_casier_cap';
+    // V11.81 — (24/11/2026) À partir de la distribution du 26/11/2026 : l'appli gère SEULE les casiers des boutiques.
+    //   Les n° du chargement (ancien site : séries frais ET sec mélangées → faux doublons, trous 1·2·13…) sont IGNORÉS.
+    //   N° = plus petit libre du lieu (1, 2, 3… sans trou), nombre de casiers = ⌈volume / capacité⌉, capacité APPRISE sur
+    //   les casiers réellement utilisés en prépa (casiers ajoutés « casier plein » / supprimés « en trop » des jours clôturés).
+    const KB_CAS_SELF_FROM = '2026-11-26';
+    function kbCasSelf(day) { return !!day && String(day) >= KB_CAS_SELF_FROM; }
+    function kbSmallestFree(used) { let n = 1; while (used[String(n)]) n++; return String(n); }
+    // Apprentissage sur la prépa : (volume du client, nb de casiers gardés à la clôture) des 28 derniers jours clôturés.
+    async function kbCasCapLearnPrep(dayKey) {
+      const pairs = [];
+      for (let i = 1; i <= 28; i++) {
+        const d = addDays(dayKey, -i);
+        let prep = null, od = null;
+        try { prep = await storage.getAll(`day_${d}_prep`); } catch (_) {}
+        if (!(prep || []).some(x => x.id === 'meta' && x.closed)) continue;
+        try { od = await storage.getDoc(`day_${d}_orders`, 'data'); } catch (_) {}
+        const vol = {}, json = {};
+        ((od && od.orders) || []).forEach(o => {
+          const site = String(o.site || '').toUpperCase(); if (!site || site === 'DOM' || o._ps) return;
+          if (!(o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit))) return;
+          const k = site + '||' + (o.name || '(client)');
+          vol[k] = (vol[k] || 0) + (Number(o.volumeFrais) || 0);
+          if (!json[k]) json[k] = (o.casiersFrais || []).map(String);
+        });
+        const cs = {};
+        (prep || []).forEach(x => { const id = String(x.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} cs[k] = (x.nums || []).map(String); });
+        Object.keys(vol).forEach(k => {
+          const nums = (cs[k] || (kbCasSelf(d) ? [] : json[k]) || []).filter(v => /^\d+$/.test(v)); // cagettes « C… » exclues
+          if (vol[k] > 0 && nums.length) pairs.push([Math.round(vol[k] * 10) / 10, nums.length]);
+        });
+      }
+      if (pairs.length < 20) return null;
+      const f = kbCapFit(pairs);
+      return f ? { cap: f.cap, samples: pairs.length, match: Math.round(f.ok / pairs.length * 100), source: 'prépa (casiers réellement utilisés, 28 j)', at: new Date().toISOString() } : null;
+    }
     // Règle de départ, calculée sur l'historique Mongo du 19/09 au 19/11/2026 (3 775 commandes compilées, 35 distributions) :
     //   l'ancien site donne ⌈volume_frais / 170⌉ bacs — 91 % des commandes identiques ; les 8 % restants = casier ajouté
     //   en prépa (« casier plein », n° hors série), imprévisible au volume. Même règle dans tous les lieux (149 à 175).
@@ -2906,6 +2947,10 @@
       const learned = kbCasCapLearn(raw, capDoc);
       if (learned) { capDoc = learned; res.learned = learned; try { await storage.setDoc('app_config', KB_CAS_CAP_DOC, learned, { replace: true }); } catch (_) {} }
       if (!capDoc || !capDoc.cap) capDoc = KB_CAS_CAP_DEFAULT; // V11.57 — règle de l'historique tant que rien n'est appris
+      const self = kbCasSelf(dayKey); res.self = self;
+      if (self) { // V11.81 — capacité apprise sur les casiers réellement gardés en prépa
+        try { const lp = await kbCasCapLearnPrep(dayKey); if (lp) { capDoc = { ...capDoc, cap: lp.cap, prep: lp }; res.prepLearned = lp; try { await storage.setDoc('app_config', KB_CAS_CAP_DOC, { prep: lp }); } catch (_) {} } } catch (_) {}
+      }
       res.cap = capDoc.cap;
       // V11.64 — capacité d'un carton DOM (apprise à part)
       let cartDoc = KB_CART_CAP_DEFAULT;
@@ -2934,13 +2979,21 @@
       const used = {}; const own = (s, v, k) => { (used[s] = used[s] || {}); if (!used[s][v]) used[s][v] = k; };
       Object.entries(fixed).forEach(([k, f]) => { const s = k.split('||')[0]; f.nums.forEach(v => own(s, v, k)); });
       (orders || []).filter(o => o._ps).forEach(o => { const s = String(o.site || '').toUpperCase(); [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => own(s, String(n).trim(), 'PS|' + o.orderId)); });
-      const next = (s) => { const u = used[s] || {}; let n = 0; Object.keys(u).forEach(v => { const x = parseInt(v, 10); if (!isNaN(x) && String(x) === v && x > n) n = x; }); n++; while (u[String(n)]) n++; return String(n); };
+      const next = (s) => { if (self && s !== 'DOM') return kbSmallestFree(used[s] || {}); const u = used[s] || {}; let n = 0; Object.keys(u).forEach(v => { const x = parseInt(v, 10); if (!isNaN(x) && String(x) === v && x > n) n = x; }); n++; while (u[String(n)]) n++; return String(n); };
       const writes = [];
       const keys = Object.keys(cli).sort((a, b) => a.localeCompare(b));
+      // V11.81 — mode autonome : casiers automatiques d'un client qui n'a plus de commande ce jour → n° libérés
+      const dels = [];
+      if (self) Object.entries(fixed).forEach(([k, f]) => {
+        const s = k.split('||')[0]; if (s === 'DOM' || !f.auto || cli[k]) return;
+        f.nums.forEach(v => { if (used[s] && used[s][v] === k) delete used[s][v]; });
+        dels.push(k); delete fixed[k]; res.freed = (res.freed || 0) + 1;
+      });
       // 4a. n° du JSON gardés s'ils sont libres (vente compilée, 1er chargement de 10h)
       const todo = [];
       keys.forEach(k => {
         const c = cli[k]; if (fixed[k]) return;
+        if (self && c.site !== 'DOM') { todo.push(k); return; } // V11.81 — n° du chargement ignorés
         const free = c.json.length && c.json.every(v => !(used[c.site] && used[c.site][v] && used[c.site][v] !== k));
         if (free) c.json.forEach(v => own(c.site, v, k));
         else { if (c.json.length) res.clash++; todo.push(k); }
@@ -2952,6 +3005,10 @@
         if (need > f.nums.length && c.vol > f.vol) {
           const nums = [...f.nums]; while (nums.length < need) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
           writes.push({ k, nums, vol: c.vol }); if (c.site === 'DOM') res.domGrown++; else res.grown++;
+        } else if (self && c.site !== 'DOM' && need < f.nums.length && c.vol < f.vol) {
+          // V11.81 — volume en baisse (rupture, article retiré au rechargement) → casiers auto en trop rendus
+          const nums = f.nums.slice(0, need); f.nums.slice(need).forEach(v => { if (used[c.site] && used[c.site][v] === k) delete used[c.site][v]; });
+          writes.push({ k, nums, vol: c.vol }); res.shrunk = (res.shrunk || 0) + 1;
         }
       });
       // 4c. clients sans casier → n° à la suite, autant que le volume l'exige
@@ -2960,6 +3017,7 @@
         for (let i = 0; i < need; i++) { const v = next(c.site); own(c.site, v, k); nums.push(v); }
         writes.push({ k, nums, vol: c.vol }); if (c.site === 'DOM') { res.dom++; res.domCartons += nums.length; } else res.assigned++;
       });
+      for (const k of dels) { try { await storage.deleteDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(k)); } catch (_) {} }
       for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), { nums: w.nums, auto: true, vol: w.vol }, { replace: true });
       return res;
     }
@@ -3006,7 +3064,7 @@
       // V11.57 — n° déjà attribués par l'appli (casiers fixés au chargement / en prépa) = occupés pour PrestaShop aussi
       const casFixed = [], psKeys = new Set(psFinal.map(o => String(o.site || '').toUpperCase() + '||' + (o.name || '(client)')));
       try { (await storage.getAll(`day_${dayKey}_prep`) || []).forEach(d => { const id = String(d.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} if (psKeys.has(k)) return; casFixed.push({ site: k.split('||')[0], casiersFrais: (d.nums || []).map(String), casiersSec: [] }); }); } catch (_) {}
-      const renum = psRenumberCasiers([...base, ...casFixed], psFinal);
+      const renum = psRenumberCasiers([...(kbCasSelf(dayKey) ? [] : base), ...casFixed], psFinal); // V11.81
       const bySite = {}; psFinal.forEach(o => { bySite[o.site] = (bySite[o.site] || 0) + 1; });
       const unknown = Object.keys(bySite).filter(k => /^PS\d+$/.test(k));
       const res = { total: psFinal.length, added: fresh.length, gone, bySite, unknown, base: base.length, test, modeSwitch, renum, siteFix, siteFixes, written: false };
@@ -4226,11 +4284,15 @@
     // Applique les décisions de prépa à UNE commande : rupture prépa → l'article passe en
     // « removed » (non livré, retiré du montant réel) ; remise prépa → ajoutée en « reduced ».
     // V9.80 — remplace les casiers du JSON par ceux de la prépa (même règle que Prépa du jour : liste frais, sinon sec)
-    function kbApplyPrepCasiers(orders, cas) {
-      if (!cas || !Object.keys(cas).length || !Array.isArray(orders)) return orders;
+    function kbApplyPrepCasiers(orders, cas, day) {
+      const self = kbCasSelf(day); // V11.81 — casiers gérés par l'appli seule : sans casier prépa, pas de n° (jamais celui du chargement)
+      if (!Array.isArray(orders) || ((!cas || !Object.keys(cas).length) && !self)) return orders;
+      cas = cas || {};
       return orders.map(o => {
         const site = String(o.site || '').toUpperCase(); if (site === 'DOM') return o;
-        const pc = cas[site + '||' + (o.name || '(client)')]; if (!pc || !pc.length) return o;
+        const pc = cas[site + '||' + (o.name || '(client)')];
+        if ((!pc || !pc.length) && self && !o._ps) return { ...o, casiersFrais: [], casiersSec: [], casiersJson: o.casiersJson || [...(o.casiersFrais || []), ...(o.casiersSec || [])] };
+        if (!pc || !pc.length) return o;
         const hasF = (o.casiersFrais || []).length, hasS = (o.casiersSec || []).length;
         return (hasF || !hasS) ? { ...o, casiersFrais: [...pc], casiersJson: o.casiersJson || o.casiersFrais || [] } : { ...o, casiersSec: [...pc], casiersJson: o.casiersJson || o.casiersSec || [] };
       });
@@ -4879,8 +4941,235 @@
       );
     }
 
+    // ============================================================
+    // V11.81 — 🎅 SANTA SECRET (édition 2026)
+    //   Écran de connexion › petit lien sous « Rungis » → code perso (kbgLogin) → « HO HO HO bienvenue <prénom> ».
+    //   Inscription + souhait (budget 10 € max) jusqu'au 4/12 23h59 (Paris) — fermé ensuite PAR LES RÈGLES FIRESTORE.
+    //   Tirage au sort le 5/12 : un seul cycle mélangé (personne ne se tire soi-même), fait automatiquement par le
+    //   premier poste MASTER ouvert après la clôture. Chacun ne peut lire QUE sa propre fiche (règles Firestore) :
+    //   santa_2026/<uid> (inscription) · santa_2026_draw/<uid du donneur> (qui il a tiré) · santa_2026_meta/state.
+    //   Le nom vient du jeton signé par le serveur (claim kbName), jamais d'une saisie.
+    // ============================================================
+    const KB_SANTA = { col: 'santa_2026', draw: 'santa_2026_draw', meta: 'santa_2026_meta', closeMs: Date.UTC(2026, 11, 4, 23, 0, 0), budget: 10, showUntil: '2026-12-31' };
+    function kbSantaOpenNow() { return Date.now() < KB_SANTA.closeMs; }
+    function kbSantaVisible() { return todayKey() <= KB_SANTA.showUntil; }
+    // Mélange sûr (crypto) puis cycle : chaque personne offre à la suivante → jamais à elle-même, une seule boucle.
+    function kbSantaPairs(list) {
+      const a = [...list];
+      for (let i = a.length - 1; i > 0; i--) { const r = new Uint32Array(1); crypto.getRandomValues(r); const j = r[0] % (i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+      return a.map((g, i) => ({ giver: g, receiver: a[(i + 1) % a.length] }));
+    }
+    // Tirage (master seulement, après la clôture, une seule fois — transaction implicite : état « drawing » posé avant)
+    async function kbSantaDrawIfDue(who) {
+      if (!firebaseConfigured || kbSantaOpenNow()) return null;
+      const c = window.__kbClaims; if (!c || c.admin !== true) return null;
+      const F = window.__firebase;
+      const stRef = F.doc(fb.db, KB_SANTA.meta, 'state');
+      const st = await F.getDoc(stRef);
+      if (st.exists() && (st.data().drawn || (st.data().drawing && Date.now() - Date.parse(st.data().drawing) < 10 * 60000))) return null;
+      await F.setDoc(stRef, { drawing: new Date().toISOString(), by: who || '' }, { merge: true });
+      const snap = await F.getDocs(F.collection(fb.db, KB_SANTA.col));
+      const ppl = []; snap.forEach(d => { const x = d.data(); if (x && x.name && x.active !== false) ppl.push({ uid: d.id, name: x.name, wish: x.wish || '' }); });
+      if (ppl.length < 2) { await F.setDoc(stRef, { drawn: false, drawing: null, count: ppl.length, note: 'moins de 2 participants' }, { merge: true }); return { count: ppl.length }; }
+      const pairs = kbSantaPairs(ppl);
+      const b = F.writeBatch(fb.db);
+      pairs.forEach(p => b.set(F.doc(fb.db, KB_SANTA.draw, p.giver.uid), { giverName: p.giver.name, receiverName: p.receiver.name, receiverWish: p.receiver.wish, at: new Date().toISOString() }));
+      b.set(stRef, { drawn: true, drawing: null, drawnAt: new Date().toISOString(), count: pairs.length, by: who || '' }, { merge: true });
+      await b.commit();
+      return { count: pairs.length };
+    }
+
+    function KbSantaPage({ onClose }) {
+      const F = window.__firebase;
+      const [code, setCode] = React.useState('');
+      const [busy, setBusy] = React.useState(false);
+      const [err, setErr] = React.useState('');
+      const [me, setMe] = React.useState(null);       // { uid, name }
+      const [reg, setReg] = React.useState(undefined); // fiche santa_2026/<uid> (null = pas inscrit)
+      const [wish, setWish] = React.useState('');
+      const [draw, setDraw] = React.useState(null);    // { receiverName, receiverWish } | 'wait'
+      const [reveal, setReveal] = React.useState(false);
+      const [now, setNow] = React.useState(Date.now());
+      const [info, setInfo] = React.useState('');
+      const showToast = (m) => { setInfo(m); setTimeout(() => setInfo(''), 3500); };
+      React.useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+      const open = now < KB_SANTA.closeMs;
+      const leave = async () => { try { await kbSignOut(); } catch (_) {} onClose(); };
+      const first = (n) => String(n || '').trim().split(/\s+/)[0] || '';
+
+      const enter = async () => {
+        setErr('');
+        const c = String(code || '').trim();
+        if (!c) { setErr('Entre ton code personnel.'); return; }
+        setBusy(true);
+        try {
+          const r = await kbCallable('kbgLogin')({ code: c, role: 'prep', site: '' });
+          await F.signInWithCustomToken(fb.auth, r.data.token);
+          const cl = await kbRefreshClaims(true);
+          if (!cl || !cl.uid) throw new Error('Connexion refusée.');
+          const m = { uid: cl.uid, name: String(cl.kbName || r.data.name || '').trim() };
+          setMe(m);
+          let x = null;
+          try { const d = await F.getDoc(F.doc(fb.db, KB_SANTA.col, m.uid)); x = d.exists() ? d.data() : null; } catch (_) {}
+          setReg(x && x.active !== false ? x : null); setWish((x && x.wish) || '');
+        } catch (e) { setErr(kbErrMsg(e)); }
+        finally { setBusy(false); setCode(''); }
+      };
+      const join = async () => {
+        const w = String(wish || '').trim().slice(0, 300);
+        setBusy(true); setErr('');
+        try {
+          const data = { name: me.name, wish: w, active: true, at: new Date().toISOString() };
+          await F.setDoc(F.doc(fb.db, KB_SANTA.col, me.uid), data);
+          setReg(data); showToast(reg ? '🎁 Souhait mis à jour' : '🎅 Inscription confirmée !');
+        } catch (e) { setErr(/permission/i.test(String(e && e.code || e)) ? (Date.now() < KB_SANTA.closeMs ? 'Accès refusé par le serveur — préviens Henry (règles du Santa secret).' : 'Inscriptions closes (4 décembre 23h59).') : kbErrMsg(e)); }
+        finally { setBusy(false); }
+      };
+      const quit = async () => {
+        if (!confirm('Ne plus participer au Santa secret ?')) return;
+        setBusy(true);
+        try { await F.deleteDoc(F.doc(fb.db, KB_SANTA.col, me.uid)); setReg(null); setWish(''); showToast('Désinscription faite'); }
+        catch (e) { setErr(kbErrMsg(e)); } finally { setBusy(false); }
+      };
+      const discover = async () => {
+        setBusy(true); setErr('');
+        try {
+          const d = await F.getDoc(F.doc(fb.db, KB_SANTA.draw, me.uid));
+          if (d.exists()) { setDraw(d.data()); setTimeout(() => setReveal(true), 1600); } else setDraw('wait');
+        } catch (e) { setErr(/permission/i.test(String(e && e.code || e)) ? 'Patience : le tirage se découvre à partir du 5 décembre.' : kbErrMsg(e)); }
+        finally { setBusy(false); }
+      };
+      const left = Math.max(0, KB_SANTA.closeMs - now);
+      const cd = `${Math.floor(left / 864e5)} j ${Math.floor(left / 36e5) % 24} h ${Math.floor(left / 6e4) % 60} min ${Math.floor(left / 1e3) % 60} s`;
+
+      return (
+        <div className="kb-santa">
+          <style>{`
+            .kb-santa{position:fixed;inset:0;z-index:9999;overflow-y:auto;background:radial-gradient(ellipse at top,#1b2a6b 0%,#0b1033 60%,#06081c 100%);color:#fff;font-family:inherit}
+            .kb-santa .sn{position:fixed;top:-12px;color:#fff;opacity:.85;pointer-events:none;animation:kbsFall linear infinite}
+            @keyframes kbsFall{to{transform:translateY(110vh) rotate(360deg)}}
+            .kb-santa .star{position:fixed;width:3px;height:3px;border-radius:50%;background:#fff;animation:kbsTw 2s ease-in-out infinite alternate;pointer-events:none}
+            @keyframes kbsTw{from{opacity:.15}to{opacity:1}}
+            .kb-santa .moon{position:fixed;top:30px;right:30px;width:90px;height:90px;border-radius:50%;background:#fff6c9;box-shadow:0 0 60px 20px rgba(255,246,201,.35);pointer-events:none}
+            .kb-santa .sleigh{position:fixed;top:14%;left:-460px;width:440px;pointer-events:none;animation:kbsFly 13s linear infinite}
+            .kb-santa .sleigh.s2{top:58%;width:260px;animation-duration:19s;animation-delay:6s;opacity:.75}
+            @keyframes kbsFly{0%{transform:translate(0,0) rotate(-4deg)}25%{transform:translate(35vw,-30px) rotate(3deg)}50%{transform:translate(70vw,10px) rotate(-3deg)}75%{transform:translate(105vw,-25px) rotate(4deg)}100%{transform:translate(calc(100vw + 520px),0) rotate(-2deg)}}
+            .kb-santa .rd{animation:kbsGallop .45s ease-in-out infinite alternate;transform-origin:center}
+            @keyframes kbsGallop{from{transform:translateY(0)}to{transform:translateY(-6px)}}
+            .kb-santa .nose{animation:kbsNose 1s ease-in-out infinite alternate}
+            @keyframes kbsNose{from{fill:#ff1744}to{fill:#ff8a80}}
+            .kb-santa .lights{position:fixed;top:0;left:0;right:0;height:34px;display:flex;justify-content:space-around;pointer-events:none;z-index:2;border-top:3px solid #2e7d32}
+            .kb-santa .lights i{width:14px;height:22px;border-radius:50% 50% 50% 50%/60% 60% 40% 40%;margin-top:4px;animation:kbsBlink 1.2s ease-in-out infinite alternate}
+            @keyframes kbsBlink{from{opacity:.35;filter:none}to{opacity:1;filter:drop-shadow(0 0 8px currentColor)}}
+            .kb-santa .card{position:relative;z-index:3;max-width:520px;margin:70px auto 40px;background:rgba(255,255,255,.96);color:#3b0a0a;border-radius:26px;padding:24px 22px;border:6px solid #c62828;box-shadow:0 0 0 6px #fff,0 0 0 12px #2e7d32,0 20px 60px rgba(0,0,0,.6);text-align:center}
+            .kb-santa h1{font-size:44px;margin:4px 0;color:#c62828;letter-spacing:2px;text-shadow:3px 3px 0 #ffd54f,6px 6px 0 #2e7d32;animation:kbsBounce 1.1s ease-in-out infinite}
+            @keyframes kbsBounce{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-8px) rotate(2deg)}}
+            .kb-santa .hat{font-size:64px;display:inline-block;animation:kbsWiggle 2s ease-in-out infinite}
+            @keyframes kbsWiggle{0%,100%{transform:rotate(-8deg)}50%{transform:rotate(8deg)}}
+            .kb-santa .btn{display:block;width:100%;margin-top:12px;padding:16px;font-size:19px;font-weight:900;border-radius:18px;border:0;cursor:pointer;color:#fff;background:repeating-linear-gradient(45deg,#c62828 0 18px,#e53935 18px 36px);box-shadow:0 6px 0 #7f0000}
+            .kb-santa .btn.g{background:repeating-linear-gradient(45deg,#2e7d32 0 18px,#43a047 18px 36px);box-shadow:0 6px 0 #1b5e20}
+            .kb-santa .btn:disabled{filter:grayscale(.7);opacity:.6;cursor:default}
+            .kb-santa .gift{font-size:84px;display:inline-block;animation:kbsShake .25s linear infinite}
+            @keyframes kbsShake{0%{transform:rotate(-10deg)}50%{transform:rotate(10deg)}100%{transform:rotate(-10deg)}}
+            .kb-santa .pop{animation:kbsPop .7s cubic-bezier(.2,1.6,.4,1) both}
+            @keyframes kbsPop{from{transform:scale(.2);opacity:0}to{transform:scale(1);opacity:1}}
+            .kb-santa textarea,.kb-santa input{width:100%;box-sizing:border-box;font-size:17px;padding:12px;border-radius:14px;border:3px solid #2e7d32;margin-top:8px;color:#222;background:#fff}
+            @media (prefers-reduced-motion: reduce){.kb-santa *{animation:none!important}}
+          `}</style>
+          <div className="moon" />
+          {Array.from({ length: 40 }).map((_, i) => <div key={'st' + i} className="star" style={{ top: (i * 37 % 60) + '%', left: (i * 53 % 100) + '%', animationDelay: (i % 7) * .3 + 's' }} />)}
+          {Array.from({ length: 45 }).map((_, i) => <div key={'sn' + i} className="sn" style={{ left: (i * 23 % 100) + '%', fontSize: 10 + (i % 5) * 5, animationDuration: 6 + (i % 7) + 's', animationDelay: -(i % 11) + 's' }}>❄</div>)}
+          <div className="lights">{Array.from({ length: 18 }).map((_, i) => <i key={i} style={{ background: ['#ff1744', '#ffd600', '#00e676', '#2979ff', '#ff9100'][i % 5], color: ['#ff1744', '#ffd600', '#00e676', '#2979ff', '#ff9100'][i % 5], animationDelay: (i % 4) * .3 + 's' }} />)}</div>
+          {[0, 1].map(k => (
+            <svg key={k} className={'sleigh' + (k ? ' s2' : '')} viewBox="0 0 440 130" aria-hidden="true">
+              <path d="M300 92 Q 250 70 205 82 M300 98 Q 250 80 205 90" stroke="#c9a227" strokeWidth="2" fill="none" />
+              {[0, 1].map(j => (
+                <g key={j} className="rd" style={{ animationDelay: j * .2 + 's' }} transform={`translate(${30 + j * 95},40)`}>
+                  <ellipse cx="45" cy="45" rx="34" ry="16" fill="#8d5524" />
+                  <rect x="20" y="52" width="6" height="28" fill="#6d4019" transform="rotate(18 23 52)" /><rect x="60" y="52" width="6" height="28" fill="#6d4019" transform="rotate(-22 63 52)" />
+                  <path d="M75 38 L92 18 L100 22 L86 44 Z" fill="#8d5524" /><circle cx="98" cy="20" r="9" fill="#8d5524" />
+                  <path d="M93 12 L86 -4 M88 2 L80 -2 M100 12 L106 -4 M104 2 L112 -2" stroke="#5d3a1a" strokeWidth="3" fill="none" />
+                  <circle className="nose" cx="107" cy="22" r="4.5" fill="#ff1744" /><circle cx="97" cy="17" r="1.6" fill="#111" />
+                </g>
+              ))}
+              <g transform="translate(265,30)">
+                <path d="M0 40 Q 0 80 40 80 L 120 80 Q 150 80 160 55 L 150 55 Q 140 70 120 70 L 30 70 Q 12 70 12 40 Z" fill="#c62828" stroke="#ffd54f" strokeWidth="3" />
+                <path d="M-6 88 L 160 88 Q 176 88 176 74" stroke="#ffd54f" strokeWidth="5" fill="none" strokeLinecap="round" />
+                <rect x="95" y="22" width="34" height="30" rx="4" fill="#2e7d32" /><rect x="109" y="22" width="6" height="30" fill="#ffd54f" />
+                <rect x="70" y="30" width="26" height="22" rx="3" fill="#1565c0" /><rect x="80" y="30" width="5" height="22" fill="#fff" />
+                <circle cx="48" cy="30" r="20" fill="#e53935" /><circle cx="48" cy="12" r="11" fill="#ffccbc" />
+                <path d="M37 16 Q 48 34 59 16 Q 56 28 48 29 Q 40 28 37 16 Z" fill="#fff" />
+                <path d="M36 6 Q 48 -16 64 2 L 70 -6" stroke="#e53935" strokeWidth="9" fill="none" strokeLinecap="round" /><circle cx="71" cy="-7" r="5" fill="#fff" />
+                <rect x="35" y="3" width="26" height="6" rx="3" fill="#fff" />
+                <path d="M62 30 L 80 20" stroke="#e53935" strokeWidth="7" strokeLinecap="round" /><circle cx="82" cy="19" r="4" fill="#fff" />
+              </g>
+            </svg>
+          ))}
+
+          <div className="card">
+            <div className="hat">🎅</div>
+            {!me && (
+              <>
+                <h1>Santa secret</h1>
+                <div style={{ fontSize: 17, fontWeight: 700 }}>Kelbongoo · Noël 2026 · budget {KB_SANTA.budget} € max</div>
+                {open ? <>
+                  <div style={{ marginTop: 10, fontSize: 15 }}>Entre ton code personnel pour participer.</div>
+                  <input type="password" inputMode="numeric" autoComplete="off" value={code} onChange={e => setCode(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') enter(); }} placeholder="••••••" style={{ textAlign: 'center', fontSize: 24, letterSpacing: 6 }} />
+                  <button className="btn" disabled={busy} onClick={enter}>{busy ? 'Les lutins vérifient…' : '🎄 Entrer'}</button>
+                  <div style={{ marginTop: 10, fontSize: 13 }}>Inscriptions jusqu'au <b>jeudi 4 décembre 23h59</b> · encore {cd}</div>
+                </> : <>
+                  <div style={{ marginTop: 10, fontSize: 15 }}>Les inscriptions sont closes. Entre ton code pour découvrir qui tu as tiré !</div>
+                  <input type="password" inputMode="numeric" autoComplete="off" value={code} onChange={e => setCode(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') enter(); }} placeholder="••••••" style={{ textAlign: 'center', fontSize: 24, letterSpacing: 6 }} />
+                  <button className="btn" disabled={busy} onClick={enter}>{busy ? 'Les lutins vérifient…' : '🎁 Entrer'}</button>
+                </>}
+              </>
+            )}
+            {me && reg !== undefined && (
+              <>
+                <h1>HO HO HO</h1>
+                <div style={{ fontSize: 24, fontWeight: 900 }}>Bienvenue {first(me.name)} !</div>
+                {open && (
+                  <>
+                    <div style={{ marginTop: 12, fontSize: 16 }}>{reg ? <>✅ <b>Tu participes au Santa secret.</b> Tu peux changer ton souhait jusqu'au 4 décembre 23h59.</> : <>Confirme ton envie de participer au <b>Santa secret</b> — budget <b>{KB_SANTA.budget} € max</b>.</>}</div>
+                    <div style={{ marginTop: 10, fontSize: 15, textAlign: 'left', fontWeight: 700 }}>🎁 Mets ce qui te ferait plaisir, pour aider la personne qui te choisira :</div>
+                    <textarea rows={3} maxLength={300} value={wish} onChange={e => setWish(e.target.value)} placeholder="ex. du thé, un livre de cuisine, des chaussettes rigolotes…" />
+                    <button className="btn g" disabled={busy} onClick={join}>{reg ? '🎁 Mettre à jour mon souhait' : '🎅 Je participe !'}</button>
+                    {reg && <button className="btn-ghost" style={{ marginTop: 8, color: '#7f0000' }} disabled={busy} onClick={quit}>Ne plus participer</button>}
+                  </>
+                )}
+                {reg && (
+                  <div style={{ marginTop: 16 }}>
+                    <button className="btn" disabled={busy || open} onClick={discover}>🎁 Clique à partir du 5 décembre pour connaître qui tu as tiré</button>
+                    {open && <div style={{ fontSize: 13, marginTop: 6 }}>Tirage au sort dans {cd}</div>}
+                  </div>
+                )}
+                {!reg && !open && <div style={{ marginTop: 14, fontSize: 16 }}>Les inscriptions sont closes depuis le 4 décembre 23h59. À l'année prochaine ! 🎄</div>}
+                {draw === 'wait' && <div style={{ marginTop: 12, fontSize: 16 }}>🧝 Les lutins font le tirage… Reviens dans un petit moment !</div>}
+                {draw && draw !== 'wait' && (
+                  <div style={{ marginTop: 16 }}>
+                    {!reveal ? <div className="gift">🎁</div> : (
+                      <div className="pop" style={{ background: '#fff8e1', border: '4px dashed #c62828', borderRadius: 20, padding: 16 }}>
+                        <div style={{ fontSize: 16 }}>Tu offres un cadeau à…</div>
+                        <div style={{ fontSize: 34, fontWeight: 900, color: '#c62828' }}>🎄 {draw.receiverName} 🎄</div>
+                        <div style={{ marginTop: 8, fontSize: 15 }}>{draw.receiverWish ? <>Son souhait : <b>« {draw.receiverWish} »</b></> : 'Pas de souhait noté : surprends-le !'}</div>
+                        <div style={{ marginTop: 8, fontSize: 13 }}>Budget {KB_SANTA.budget} € max · chut, c'est secret ! 🤫</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+            {info && <div className="pop" style={{ marginTop: 12, padding: '10px 12px', borderRadius: 12, background: '#e8f5e9', color: '#1b5e20', fontWeight: 800 }}>{info}</div>}
+            {err && <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 12, background: '#ffebee', color: '#b71c1c', fontWeight: 700 }}>{err}</div>}
+            <button className="btn-ghost" style={{ marginTop: 16, color: '#555' }} onClick={leave}>{me ? 'Fermer et me déconnecter' : 'Fermer'}</button>
+          </div>
+        </div>
+      );
+    }
+
     function LoginScreen({ onLogin }) {
       const [role, setRole] = React.useState('distrib'); // 'distrib' | 'prep' (master et Rungis = fenêtres séparées)
+      const [santaOpen, setSantaOpen] = React.useState(false); // V11.81 — Santa secret
       const [rgOpen, setRgOpen] = React.useState(false); // V10.16 — fenêtre Rungis (chauffeur / espace bureau)
       const [rgCode, setRgCode] = React.useState('');
       const [rgErr, setRgErr] = React.useState('');
@@ -5108,8 +5397,10 @@
                 <span style={{ flex: 1, minWidth: 0 }}><b style={{ display: 'block', fontSize: 16, color: '#0d3c78' }}>Rungis</b><span style={{ fontSize: 12, color: '#1e4f86' }}>Chauffeur ou espace Rungis</span></span>
                 <span style={{ fontSize: 24, color: '#1565c0' }}>›</span>
               </button>
+              {kbSantaVisible() && firebaseConfigured && <button type="button" onClick={() => setSantaOpen(true)} style={{ display: 'block', margin: '8px auto 0', background: 'none', border: 0, fontSize: 11, color: '#c62828', cursor: 'pointer', textDecoration: 'underline' }}>🎅 participer au Santa secret</button>}
             </div>
           </div>
+          {santaOpen && <KbSantaPage onClose={() => setSantaOpen(false)} />}
 
           {rgOpen && (
             <div className="fs-overlay" onClick={() => !rgBusy && setRgOpen(false)}>
@@ -9893,6 +10184,15 @@
     //   (inventory_meta + inventory_log). Fournisseur : celui enregistré dans le comptage (depuis V11.15),
     //   sinon le catalogue par ID, sinon par nom (anciens comptages, produits hors cache).
     // ============================================================
+    // V11.81 — DLC saisies pendant un inventaire : collection inventory_dlc (id = <date>__<produit>)
+    function kbInvDlcId(invDate, productId) { return String(invDate) + '__' + String(productId).replace(/[\/#?\[\]]/g, '_'); }
+    async function kbInvDlcLoad(invDate) {
+      const m = {};
+      try { (await storage.getAll('dlc_watch') || []).forEach(w => { if (w && w.fromInventory && w.invDay === invDate && w.productId) m[w.productId] = { dlc: w.dlc, by: w.createdBy || '', at: w.createdAt || '', produit: w.produit || '', producteur: w.producteur || '', qty: w.qtyInit || w.qty || '' }; }); } catch (e) {}
+      try { (await storage.getAll('inventory_dlc') || []).forEach(d => { if (d && d.invDate === invDate && d.productId) m[d.productId] = { dlc: d.dlc, by: d.by || '', at: d.at || '', produit: d.produit || '', producteur: d.producteur || '', qty: d.qty || '' }; }); } catch (e) {}
+      return m;
+    }
+
     function InventorySearch({ metas, logs, prodById, onOpen }) {
       const today = new Date();
       const iso = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -10097,6 +10397,133 @@
     }
 
     // ============================================================
+    // V11.81 — HISTORIQUE DES INVENTAIRES EN CALENDRIER
+    //   kind 'fl'  : inventaires fruits & légumes (fl_inventory_<jour> + fl_inventory_meta)
+    //   kind 'inv' : inventaires complets / tournants / frais (inventory_<jour>_matin|soir + inventory_meta + inventory_log)
+    //   Jour coloré = inventaire fait. Toucher un jour → détail : qui, à quelle heure, quantités, DLC « indiquée par … ».
+    //   Recherche (produit / fournisseur / personne) dans le jour choisi.
+    // ============================================================
+    function KbInvCalendar({ kind, metas, logs, prodById, onOpen }) {
+      const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const today = iso(new Date());
+      const days = React.useMemo(() => {
+        const m = {};
+        if (kind === 'fl') (metas || []).forEach(x => { if (/^\d{4}-\d{2}-\d{2}$/.test(x.id || '')) m[x.id] = { by: x.validatedBy || '', at: x.validatedAt || '', label: '🥬 ' + (x.nbSaisis || 0) + ' prod.' }; });
+        else {
+          (metas || []).forEach(x => {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(x.id || '')) return;
+            const tour = x.scopes ? Object.values(x.scopes).filter(y => y && y.type === 'tournant') : [];
+            const lbl = tour.length ? '🔄 ' + tour.map(y => y.kind === 'fromage' ? 'fromage' : (y.value || y.kind)).join(', ') : (x.type === 'tournant' ? '🔄 ' + (x.scopeValue || 'tournant') : '📦 complet');
+            m[x.id] = { by: x.lastBy || '', at: x.lastAt || '', label: lbl };
+          });
+          (logs || []).forEach(l => { if (/^\d{4}-\d{2}-\d{2}$/.test(l.date || '')) m[l.date] = { ...(m[l.date] || { label: l.mode === 'tournant' ? '🔄 tournant' : '📦 ' + (l.mode || '') }), closed: true }; });
+        }
+        return m;
+      }, [kind, metas, logs]);
+      const last = Object.keys(days).sort().pop() || today;
+      const [month, setMonth] = React.useState(last.slice(0, 7));
+      const [sel, setSel] = React.useState('');
+      const [q, setQ] = React.useState('');
+      const [det, setDet] = React.useState({});
+      React.useEffect(() => { if (!sel && Object.keys(days).length) setMonth(last.slice(0, 7)); }, [kind, Object.keys(days).length]);
+
+      const fmtH = (s) => { if (!s) return ''; const d = new Date(s); return isNaN(d) ? '' : d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); };
+      const fmtDT = (s) => { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? '—' : d.toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }); };
+      const fmtD = (d) => { const [y, mo, da] = String(d).split('-'); const dt = new Date(+y, +mo - 1, +da); return isNaN(dt) ? d : dt.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }); };
+      const ddmm = (d) => d ? String(d).slice(8, 10) + '/' + String(d).slice(5, 7) : '';
+
+      const pick = async (d) => {
+        setSel(d); setQ('');
+        if (det[d]) return;
+        setDet(x => ({ ...x, [d]: 'load' }));
+        const items = [];
+        try {
+          if (kind === 'fl') {
+            const a = await storage.getAll(`fl_inventory_${d}`);
+            (a || []).forEach(it => { if (!(Number(it.colis) || Number(it.mu))) return; items.push({ id: it.id, name: it.produit || it.id, producer: it.producer || '', qty: (Number(it.colis) || 0) + ' colis' + (Number(it.mu) ? ' · ' + it.mu + ' µ' : ''), by: it.countedBy || '—', at: it.countedAt || '' }); });
+          } else {
+            for (const md of ['matin', 'soir', '']) {
+              let a = []; try { a = await storage.getAll(md ? `inventory_${d}_${md}` : `inventory_${d}`); } catch (e) {}
+              (a || []).forEach(it => { const pr = (prodById || {})[it.id] || {}; items.push({ id: it.id, mode: md || 'ancien', name: it.produit || pr.name || it.id, producer: it.producteur || pr.producer || '', qty: Number(it.qty) || 0, by: it.countedBy || '—', at: it.countedAt || '' }); });
+            }
+          }
+        } catch (e) {}
+        let dlc = {}; if (kind !== 'fl') { try { dlc = await kbInvDlcLoad(d); } catch (e) {} }
+        items.forEach(it => { const x = dlc[it.id]; if (x) { it.dlc = x.dlc; it.dlcBy = x.by; it.dlcAt = x.at; } });
+        Object.entries(dlc).forEach(([pid, x]) => { if (!items.some(it => String(it.id) === String(pid))) items.push({ id: pid, name: x.produit || pid, producer: x.producteur || '', qty: '—', by: '—', at: '', dlc: x.dlc, dlcBy: x.by, dlcAt: x.at }); });
+        items.sort((a, b) => (a.producer || '').localeCompare(b.producer || '', 'fr') || (a.name || '').localeCompare(b.name || '', 'fr'));
+        const byPerson = {}; items.forEach(it => { if (it.by && it.by !== '—') byPerson[it.by] = (byPerson[it.by] || 0) + 1; });
+        const times = items.map(it => it.at).filter(Boolean).sort();
+        const closes = kind === 'fl' ? [] : (logs || []).filter(l => l.date === d).sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
+        setDet(x => ({ ...x, [d]: { items, byPerson, first: times[0] || '', lastT: times[times.length - 1] || '', closes, nDlc: items.filter(it => it.dlc).length } }));
+      };
+
+      const [y, mo] = month.split('-').map(Number);
+      const first = new Date(y, mo - 1, 1); const nDays = new Date(y, mo, 0).getDate();
+      const lead = (first.getDay() + 6) % 7; // lundi en premier
+      const cells = []; for (let i = 0; i < lead; i++) cells.push(null); for (let i = 1; i <= nDays; i++) cells.push(`${month}-${String(i).padStart(2, '0')}`);
+      const shift = (k) => { const d = new Date(y, mo - 1 + k, 1); setMonth(iso(d).slice(0, 7)); };
+      const D = sel && det[sel] && det[sel] !== 'load' ? det[sel] : null;
+      const list = D ? D.items.filter(it => !q.trim() || kbSearchMatch([it.name, it.producer, it.by, it.dlcBy].join(' '), q)) : [];
+      const nMonth = cells.filter(c => c && days[c]).length;
+
+      return (
+        <div className="stack" style={{ gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <button className="btn-secondary" style={{ fontSize: 18, padding: '6px 14px' }} onClick={() => shift(-1)}>‹</button>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontWeight: 800, fontSize: 17, textTransform: 'capitalize' }}>{first.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}</div>
+              <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{nMonth} inventaire(s) {kind === 'fl' ? 'F&L' : 'complet / tournant'} ce mois</div>
+            </div>
+            <button className="btn-secondary" style={{ fontSize: 18, padding: '6px 14px' }} onClick={() => shift(1)}>›</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 4 }}>
+            {['L', 'M', 'M', 'J', 'V', 'S', 'D'].map((x, i) => <div key={'h' + i} style={{ textAlign: 'center', fontSize: 11, fontWeight: 700, color: 'var(--ink-mute)' }}>{x}</div>)}
+            {cells.map((c, i) => {
+              if (!c) return <div key={'e' + i} />;
+              const has = days[c], on = sel === c;
+              return (
+                <button key={c} type="button" disabled={!has} onClick={() => pick(c)} title={has ? has.label : ''}
+                  style={{ minHeight: 48, borderRadius: 10, border: on ? '3px solid #1b5e20' : (c === today ? '2px solid var(--ink-mute)' : '1px solid var(--border)'), background: has ? (kind === 'fl' ? '#e8f5e9' : '#e3f2fd') : 'transparent', color: has ? 'var(--ink)' : 'var(--ink-mute)', cursor: has ? 'pointer' : 'default', padding: 2, fontWeight: has ? 800 : 400 }}>
+                  <div style={{ fontSize: 15 }}>{Number(c.slice(8))}</div>
+                  {has && <div style={{ fontSize: 9, lineHeight: 1.1, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{has.label.split(' ')[0]}{has.closed ? ' ✓' : ''}</div>}
+                </button>
+              );
+            })}
+          </div>
+          {!sel && <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>Touche un jour en couleur pour voir le détail.</div>}
+          {sel && det[sel] === 'load' && <div style={{ fontSize: 13, color: 'var(--ink-mute)' }}>⏳ Lecture du {fmtD(sel)}…</div>}
+          {D && (
+            <div style={{ border: '2px solid var(--border)', borderRadius: 12, padding: 10 }}>
+              <div style={{ fontWeight: 800, fontSize: 16, textTransform: 'capitalize' }}>{fmtD(sel)} · {days[sel] && days[sel].label}</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>
+                {D.items.length} produit(s){D.first ? ` · comptage de ${fmtH(D.first)} à ${fmtH(D.lastT)}` : ''}{kind !== 'fl' ? ` · ${D.nDlc} DLC saisie(s)` : ''}
+              </div>
+              {Object.keys(D.byPerson).length > 0 && <div style={{ fontSize: 13, marginTop: 2 }}>👥 {Object.entries(D.byPerson).sort((a, b) => b[1] - a[1]).map(([w, n]) => `${w} (${n})`).join(' · ')}</div>}
+              {kind === 'fl' && days[sel] && days[sel].by && <div style={{ fontSize: 13, marginTop: 2 }}>✅ Validé par {days[sel].by} le {fmtDT(days[sel].at)}</div>}
+              {D.closes.map((l, i) => <div key={i} style={{ fontSize: 13, marginTop: 2 }}>✅ Clôturé {fmtDT(l.at)} par {l.initials ? l.initials + ' · ' : ''}{l.by || '—'}{l.url ? <> · <a href={l.url} target="_blank" rel="noopener">classeur</a></> : null}</div>)}
+              {kind !== 'fl' && onOpen && <div style={{ marginTop: 6 }}><button className="btn-secondary" style={{ fontSize: 13 }} onClick={() => onOpen(sel, 'soir')}>↩️ Ouvrir cet inventaire</button></div>}
+              <input value={q} onChange={e => setQ(e.target.value)} placeholder="🔎 Produit, fournisseur ou personne…" style={{ width: '100%', boxSizing: 'border-box', fontSize: 16, padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border)', marginTop: 8 }} />
+              <div style={{ maxHeight: '55vh', overflowY: 'auto', marginTop: 8 }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead><tr style={{ textAlign: 'left', color: 'var(--ink-mute)', fontSize: 11 }}><th style={{ padding: '4px 6px' }}>Produit</th><th style={{ padding: '4px 6px', textAlign: 'right' }}>Qté</th><th style={{ padding: '4px 6px' }}>Par · heure</th>{kind !== 'fl' && <th style={{ padding: '4px 6px' }}>DLC</th>}</tr></thead>
+                  <tbody>{list.map((it, i) => (
+                    <tr key={it.id + '_' + (it.mode || '') + '_' + i} style={{ borderTop: '1px solid var(--border)', background: it.dlc ? '#fff8e1' : undefined }}>
+                      <td style={{ padding: '6px' }}><b>{it.name}</b>{it.producer ? <div style={{ fontSize: 11, color: 'var(--ink-mute)' }}>{it.producer}</div> : null}</td>
+                      <td style={{ padding: '6px', textAlign: 'right', fontWeight: 800, fontSize: 15, whiteSpace: 'nowrap' }}>{it.qty}</td>
+                      <td style={{ padding: '6px', whiteSpace: 'nowrap' }}>{it.by}{it.at ? <span style={{ color: 'var(--ink-mute)' }}> · {fmtH(it.at)}</span> : null}{it.mode === 'matin' ? ' 🌅' : ''}</td>
+                      {kind !== 'fl' && <td style={{ padding: '6px', whiteSpace: 'nowrap' }}>{it.dlc ? <><b style={{ color: '#b45309' }}>📅 {ddmm(it.dlc)}</b><div style={{ fontSize: 11 }}>indiquée par <b>{it.dlcBy || '—'}</b>{it.dlcAt ? ' · ' + fmtH(it.dlcAt) : ''}</div></> : <span style={{ color: 'var(--ink-mute)' }}>—</span>}</td>}
+                    </tr>))}</tbody>
+                </table>
+                {!list.length && <div style={{ fontSize: 13, color: 'var(--ink-mute)', padding: 8 }}>Rien ne correspond.</div>}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
     // HISTORIQUE INVENTAIRE (réservé master) — qui a compté / appris quoi
     // ============================================================
     function InventoryHistory({ onOpen, defaultTab }) {
@@ -10181,12 +10608,15 @@
         <div style={{marginTop:10}}>
           <div className="filter-row" style={{marginBottom:8,flexWrap:'wrap',overflowX:'visible'}}>
             <div className={`chip ${tab==='search'?'selected':''}`} style={{fontWeight:700}} onClick={()=>setTab('search')}>🔎 Rechercher</div>
-            <div className={`chip ${tab==='fl'?'selected':''}`} onClick={()=>setTab('fl')}>🥬 Inventaire F&L</div>
-            <div className={`chip ${tab==='inv'?'selected':''}`} onClick={()=>setTab('inv')}>📋 Par date</div>
+            <div className={`chip ${tab==='fl'?'selected':''}`} style={{fontWeight:700}} onClick={()=>setTab('fl')}>🥬 Inventaire F&L 📅</div>
+            <div className={`chip ${tab==='cal'?'selected':''}`} style={{fontWeight:700}} onClick={()=>setTab('cal')}>📦 Inventaire complet / tournant 📅</div>
+            <div className={`chip ${tab==='inv'?'selected':''}`} onClick={()=>setTab('inv')}>📋 Liste par date</div>
             <div className={`chip ${tab==='learn'?'selected':''}`} onClick={()=>setTab('learn')}>🏷️ Apprentissage</div>
           </div>
 
           {tab==='search' && <InventorySearch metas={metas} logs={logs} prodById={prodById} onOpen={onOpen} />}
+          {tab==='fl' && <KbInvCalendar kind="fl" metas={flMetas} logs={[]} prodById={prodById} />}
+          {tab==='cal' && <KbInvCalendar kind="inv" metas={metas} logs={logs} prodById={prodById} onOpen={onOpen} />}
 
           {tab==='inv' && logs && logs.length>0 && (
             <div style={{marginBottom:10}}>
@@ -10260,6 +10690,7 @@
           )}
 
           {tab==='fl' && (
+            <details style={{marginTop:10}}><summary style={{fontSize:13,cursor:'pointer'}}>Liste des validations F&L</summary>{
             flMetas===null ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Chargement…</p> :
             flMetas.length===0 ? <p style={{fontSize:13,color:'var(--ink-mute)'}}>Aucun inventaire fruits & légumes validé pour l'instant.</p> :
             <div className="stack" style={{gap:6}}>
@@ -10279,6 +10710,7 @@
                 </div>
               ))}
             </div>
+            }</details>
           )}
 
           {tab==='learn' && (
@@ -11113,10 +11545,23 @@
       const [lastUnknownCode, setLastUnknownCode] = React.useState(null); // dernier code non trouvé
       const [dlcInputs, setDlcInputs] = React.useState({}); // {productId: 'YYYY-MM-DD'} — DLC saisie pendant l'inventaire
       const [dlcExpandedId, setDlcExpandedId] = React.useState(null); // produit dont le champ DLC est ouvert
+      const [dlcBy, setDlcBy] = React.useState({}); // V11.81 — {productId: {by, at}} qui a saisi la DLC
       // V10.25 — ouverture demandée depuis Historique (master) : { date, mode } mémorisé avant la navigation.
       const kbInvOpenReq = (() => { try { const r = JSON.parse(localStorage.getItem('kbg_inv_open') || 'null'); if (r && r.date && (Date.now() - (r.at||0)) < 120000) { localStorage.removeItem('kbg_inv_open'); return r; } } catch (e) {} return null; })();
       const kbInvOpenRef = React.useRef(kbInvOpenReq);
       const [invDate, setInvDate] = React.useState(() => (kbInvOpenRef.current && kbInvOpenRef.current.date) || todayKey()); // date d'inventaire libre, par défaut aujourd'hui
+      // V11.81 — DLC déjà saisies pour cet inventaire (inventory_dlc, sinon dlc_watch des inventaires d'avant la V11.81)
+      React.useEffect(() => {
+        let stop = false;
+        (async () => {
+          const m = await kbInvDlcLoad(invDate);
+          if (stop) return;
+          const inp = {}, by = {};
+          Object.entries(m).forEach(([pid, x]) => { inp[pid] = x.dlc; by[pid] = { by: x.by, at: x.at }; });
+          setDlcInputs(inp); setDlcBy(by);
+        })();
+        return () => { stop = true; };
+      }, [invDate]);
       // Mode d'inventaire :
       //   'matin' → mardi avant 10h uniquement → écrit "Inventaire soir" de la feuille de la VEILLE (vendredi), écrase
       //   'soir'  → tous les jours après prépa → écrit "Inventaire soir" de la feuille DU JOUR, n'écrase pas (signale conflits)
@@ -11597,7 +12042,11 @@
         // V11.12 — DLC du jour même : on fait confirmer (c'était le symptôme du bug iPhone)
         if (days === 0 && !confirm(`DLC AUJOURD'HUI (${dlcDate.slice(8,10)}/${dlcDate.slice(5,7)}) pour « ${p?.name || ''} » ?\n\nLe produit passera tout de suite dans « À retirer ».`)) return;
         setDlcInputs(prev => ({ ...prev, [productId]: dlcDate }));
+        setDlcBy(prev => ({ ...prev, [productId]: { by: session.name, at: new Date().toISOString() } }));
         setDlcExpandedId(null);
+        // V11.81 — DLC gardée avec l'inventaire (TOUTES les DLC, même longues) : qui l'a saisie, quand → visible en rouvrant
+        //   l'inventaire et dans Historique › 📦 Inventaires (calendrier).
+        try { await storage.setDoc('inventory_dlc', kbInvDlcId(invDate, productId), { invDate, productId: String(productId), produit: p?.name || '', producteur: p?.producer || '', dlc: dlcDate, qty, by: session.name, at: new Date().toISOString() }, { replace: true }); } catch (e) {}
         // V11.12 — une seule DLC par produit et par inventaire : on retire les DLC saisies avant pour ce produit
         //   dans CET inventaire (ex. le « 10/11 » posé par erreur avant de choisir le 28/11), si encore à traiter.
         try {
@@ -12103,7 +12552,7 @@
                       <div style={{fontWeight:800,fontSize:19,lineHeight:1.2,overflowWrap:'anywhere',color:'var(--ink)'}}>{isCounted?'✓ ':''}{p.name}</div>
                       <div style={{color:'var(--ink-mute)',fontSize:13,lineHeight:1.25,overflowWrap:'anywhere',marginTop:2}}>{sub}</div>
                       {p._horsFeuille && <div style={{display:'inline-block',marginTop:4,fontSize:12,fontWeight:700,color:'#b45309',background:'#fff7ed',border:'1px solid #fdba74',borderRadius:6,padding:'2px 7px'}}>📚 Catalogue — absent de la feuille de stock (compté ici, à ajouter dans la feuille)</div>}
-                      <div style={{fontSize:13,fontWeight:700,color:'var(--ink-mute)',marginTop:3}}>en {kbIsFLProduct(p) ? 'colis' : 'articles'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}{hasDlc ? <span style={{color:'#b45309'}}> · DLC {dlcInputs[p.id].slice(8,10)}/{dlcInputs[p.id].slice(5,7)}</span> : null}</div>
+                      <div style={{fontSize:13,fontWeight:700,color:'var(--ink-mute)',marginTop:3}}>en {kbIsFLProduct(p) ? 'colis' : 'articles'}{invLv && invLv.levels && invLv.levels[p.id] ? <span style={{fontWeight:600}}> · théorique {Math.round(invLv.levels[p.id].stock)}</span> : null}{hasDlc ? <span style={{color:'#b45309'}}> · DLC {dlcInputs[p.id].slice(8,10)}/{dlcInputs[p.id].slice(5,7)}{dlcBy[p.id] && dlcBy[p.id].by ? ` indiquée par ${dlcBy[p.id].by}` : ''}</span> : null}</div>
                     </button>
                     <div style={{display:'flex',alignItems:'stretch',gap:8,marginTop:8}}>
                       <button onClick={()=>changeCount(p.id, Math.max(0,(counts[p.id] ?? 0) - 1))} aria-label="moins"
@@ -20924,10 +21373,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       orders.forEach(o => {
         const site = (o.site || '').toUpperCase();
         const client = o.name || '(client)';
-        const casier = o.casiersFrais && o.casiersFrais[0] || o.casiersSec && o.casiersSec[0] || '?';
+        const selfCas = kbCasSelf(day) && site !== 'DOM' && !o._ps; // V11.81 — n° du chargement ignorés
+        const casier = selfCas ? '?' : (o.casiersFrais && o.casiersFrais[0] || o.casiersSec && o.casiersSec[0] || '?');
         const rk = site + '||' + client;
         if (!resv[rk]) resv[rk] = [];
-        (o.casiersFrais && o.casiersFrais.length ? o.casiersFrais : o.casiersSec || []).forEach(n => {
+        (selfCas ? [] : (o.casiersFrais && o.casiersFrais.length ? o.casiersFrais : o.casiersSec || [])).forEach(n => {
           const v = String(n).trim();
           if (v && !resv[rk].includes(v)) resv[rk].push(v);
         });
@@ -21169,6 +21619,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     let cnt = 0;
     Object.entries(miss).forEach(([s, set]) => {
       const own = casOwners(s);
+      if (kbCasSelf(day)) { // V11.81 — plus petit n° libre (pas de trou)
+        [...set].sort((a, b) => a.localeCompare(b)).forEach(c => { const v = kbSmallestFree(own); own[v] = c; cnt++; wCas(CK(s, c), [v]); });
+        return;
+      }
       let n = 0;
       Object.keys(own).forEach(v => {
         const x = parseInt(v, 10);
@@ -22407,6 +22861,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   };
   const nextFree = site => {
     const own = casOwners(site);
+    if (kbCasSelf(day)) return parseInt(kbSmallestFree(own), 10); // V11.81
     let n = Math.max((prep.counters[site] ?? 0) || 0, seedCounter[site] || 0);
     Object.keys(own).forEach(v => {
       const x = parseInt(v, 10);
@@ -22473,10 +22928,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       return;
     }
     const n = arr[idx];
-    if (!confirm(`Supprimer le Casier ${n} de ${client.split(' ')[0]} ?\nLe n° ${n} redevient libre pour un autre client.`)) return;
-    arr.splice(idx, 1);
+    arr.splice(idx, 1); // V11.81 — un toucher suffit (plus de confirmation) ; l'appli apprend de ce casier en trop
     wCas(CK(site, client), arr);
-    showToast(`Casier ${n} retiré — n° ${n} libre`);
+    showToast(`Casier ${n} retiré de ${client.split(' ')[0]} — n° ${n} libre`);
   };
   const removeCasier = (client, idx) => removeCasierFor(curSite, client, idx);
   const openRemAll = pk => (setRemCliOpen({}), setArtOpen({}), setRemAllOpen(o => o[pk] ? {
@@ -39621,7 +40075,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             if (rc.assigned) bits.push(`${rc.assigned} client(s) ont reçu leur casier`);
             if (rc.grown) bits.push(`${rc.grown} avec casier(s) en plus (volume en hausse)`);
             if (rc.clash) bits.push(`${rc.clash} n° déjà pris → renuméroté(s)`);
-            if (rc.learned) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
+            if (rc.self) bits.push(`casiers gérés par l'appli (n° 1, 2, 3… sans trou${rc.prepLearned ? ` · 1 casier ≈ ${Math.round(rc.prepLearned.cap)} de volume, appris sur ${rc.prepLearned.samples} clients de la prépa` : ''})`);
+            if (rc.freed) bits.push(`${rc.freed} casier(s) libéré(s) (client sans commande)`);
+            if (rc.shrunk) bits.push(`${rc.shrunk} client(s) avec casier(s) en moins (volume en baisse)`);
+            if (rc.learned && !rc.self) bits.push(`casiers estimés sur ${rc.learned.samples} commandes compilées (${rc.learned.match} % identiques à l'ancien site)`);
             if (rc.dom) bits.push(`📦 DOM : ${rc.dom} client(s) → ${rc.domCartons} carton(s)`);
             if (rc.domGrown) bits.push(`📦 DOM : ${rc.domGrown} avec carton(s) en plus`);
             if (rc.cartLearned) bits.push(`cartons DOM estimés sur ${rc.cartLearned.samples} livraisons compilées (${rc.cartLearned.match} % identiques)`);
@@ -44845,7 +45302,8 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
 
       // V9.80 — casiers de la PRÉPA (day_X_prep cs|site||client) appliqués à toutes les vues distrib
       const [prepCas, setPrepCas] = React.useState({});
-      const orders = React.useMemo(() => enrichOrders(kbApplyPrepCasiers(rawOrders, prepCas), consumersByEmail), [rawOrders, prepCas, consumersByEmail]);
+      const [prepCasDay, setPrepCasDay] = React.useState(''); // V11.81
+      const orders = React.useMemo(() => enrichOrders(kbApplyPrepCasiers(rawOrders, prepCas, prepCasDay), consumersByEmail), [rawOrders, prepCas, prepCasDay, consumersByEmail]);
 
       // Sites présents dans les commandes du jour (sinon liste complète historique)
       const sitesOfDay = React.useMemo(() => {
@@ -44909,6 +45367,15 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         if (!viewAs) { try { sessionStorage.setItem('kb_master_tab', tab); } catch (e) {} }
       }, [session, tab, viewAs]);
 
+      // V11.81 — Santa secret : tirage automatique par le premier poste Master ouvert après le 4/12 23h59
+      React.useEffect(() => {
+        if (!session || !(session.role === 'master' || session.isMaster)) return;
+        let stop = false;
+        const run = () => { if (!stop && !kbSantaOpenNow()) kbSantaDrawIfDue(session.name).then(r => { if (r && r.count >= 2) console.log('Santa secret : tirage fait', r.count); }).catch(() => {}); };
+        const t0 = setTimeout(run, 20000); const t = setInterval(run, 10 * 60000);
+        return () => { stop = true; clearTimeout(t0); clearInterval(t); };
+      }, [session && session.name, session && session.role]);
+
       // V9.53 — Synchro PrestaShop automatique sur les postes Master et Prépa (auto-limitée à 1 appel / 15 min).
       React.useEffect(() => {
         if (!session) return;
@@ -44945,6 +45412,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         // Un vrai distributeur travaille TOUJOURS sur la distribution du jour : on ignore
         // tout override de jour (préparation du lendemain) pour ne pas lui montrer demain.
         const dayScope = (session.role === 'distrib') ? todayKey() : activeDay();
+        setPrepCasDay(dayScope);
         const uCas = storage.subscribe(`day_${dayScope}_prep`, (arr) => {
           const m = {}; (arr || []).forEach(d => { const id = String(d.id || ''); if (id.startsWith('cs|')) { const v = (d.nums || []).map(String).filter(Boolean); if (v.length) m[decodeURIComponent(id.slice(3))] = v; } });
           setPrepCas(prev => JSON.stringify(prev) === JSON.stringify(m) ? prev : m);
