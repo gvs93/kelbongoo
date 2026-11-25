@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.92) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.93) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.92';
+const APP_VERSION = 'V11.93';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -38482,11 +38482,13 @@ function kbMepRatio(calib, site) {
   if (s === 'DOM') return 1.6;
   return calib && calib.global || 1.15;
 }
-function KbMiseEnPlace() {
+function KbMiseEnPlace({
+  defaultOpen
+} = {}) {
   const [days, setDays] = React.useState(null);
   const [day, setDay] = React.useState(null);
   const [orders, setOrders] = React.useState(null);
-  const [open, setOpen] = React.useState(false);
+  const [open, setOpen] = React.useState(!!defaultOpen);
   const [fc, setFc] = React.useState(undefined);
   const [calib, setCalib] = React.useState(null);
   const [fcTick, setFcTick] = React.useState(0);
@@ -41345,13 +41347,45 @@ function KbEnlDestructionPage({
     }
   }, "Annuler"))));
 }
+function useKbToday() {
+  const [d, setD] = React.useState(todayKey);
+  React.useEffect(() => {
+    let t = null;
+    const sync = () => setD(v => {
+      const n = todayKey();
+      return v === n ? v : n;
+    });
+    const arm = () => {
+      clearTimeout(t);
+      const now = new Date();
+      const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2);
+      t = setTimeout(() => {
+        sync();
+        arm();
+      }, Math.min(next - now, 3600000));
+    };
+    const onVis = () => {
+      if (document.visibilityState !== 'hidden') sync();
+    };
+    arm();
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', onVis);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', onVis);
+    };
+  }, []);
+  return d;
+}
 function PrepSuiviHub({
   setTab
 }) {
   const board = useDlcBoard();
   const pdp = useKbPdpBoard();
   const nDlc = board.ready ? board.total : 0;
-  const day = todayKey();
+  const day = useKbToday();
+  const dayStart = new Date(day + 'T00:00:00').getTime();
   const [marks, setMarks] = React.useState({});
   React.useEffect(() => kbDocSub('v4_cache', 'atelier_' + day, d => setMarks(d && d.marks || {})), [day]);
   const [domTom, setDomTom] = React.useState(null);
@@ -41393,31 +41427,36 @@ function PrepSuiviHub({
       });
     } catch (_) {}
   };
+  const qrHandled = qrB.ready && Object.values(qrB.byDay).some(D => (D.units || []).some(u => u.st && u.st.at >= dayStart));
   const steps = [{
     k: 'dlcwatch',
     img: '🧹',
     bg: '#ffe0e0',
     ink: '#b71c1c',
     t: 'Retirer les DLC',
-    sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : 'Rien à retirer',
-    auto: board.ready && !nDlc,
-    n: nDlc
+    sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : board.done.length ? 'Tout a été retiré' : "Rien à retirer aujourd'hui",
+    ready: board.ready,
+    n: nDlc,
+    handled: board.done.length > 0
   }, {
     k: 'pdpreturns',
     img: '↩️',
     bg: '#dff0ff',
     ink: '#0d47a1',
     t: 'Traiter les retours PDP',
-    sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : 'Rien à traiter',
-    auto: pdp.ready && !pdp.toTreat,
-    n: pdp.toTreat
+    sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : (pdp.treatedToday || []).length ? 'Tout a été traité' : "Rien à traiter aujourd'hui",
+    ready: pdp.ready,
+    n: pdp.toTreat,
+    handled: (pdp.treatedToday || []).length > 0
   }, {
     k: 'printpain',
     img: '🍞',
     bg: '#fff3d6',
     ink: '#8a5a00',
     t: 'Imprimer le dispatch pain',
-    sub: '1 feuille par lieu'
+    sub: '1 feuille par lieu',
+    ready: true,
+    n: 0
   }, {
     k: 'printqr',
     img: '🔳',
@@ -41425,17 +41464,20 @@ function PrepSuiviHub({
     ink: '#4a2c91',
     t: 'Imprimer les QR codes',
     sub: qrSub,
-    auto: qrB.ready ? !qrTodo : undefined,
-    n: qrTodo
+    ready: qrB.ready,
+    n: qrTodo,
+    handled: qrHandled
   }, ...(domTom > 0 ? [{
     k: 'printlabels',
     img: '🏷️',
     bg: '#e3f8ec',
     ink: '#1b5e20',
     t: 'Imprimer les étiquettes livraison',
-    sub: `${domTom} livraison${domTom > 1 ? 's' : ''} demain · après la clôture`
+    sub: `${domTom} livraison${domTom > 1 ? 's' : ''} demain · après la clôture`,
+    ready: true,
+    n: 0
   }] : [])];
-  const isDone = s => s.auto !== undefined ? s.auto : !!marks[s.k];
+  const isDone = s => !!s.ready && !(s.n > 0) && (!!marks[s.k] || !!s.handled);
   const nDone = steps.filter(isDone).length,
     pct = Math.round(nDone / steps.length * 100);
   const tiles = [{
@@ -41601,7 +41643,7 @@ function PrepSuiviHub({
         fontWeight: 900,
         fontSize: 19
       }
-    }, s.n)), s.auto === undefined ? React.createElement("button", {
+    }, s.n)), !(s.n > 0) && s.ready && !s.handled ? React.createElement("button", {
       onClick: () => toggle(s.k),
       "aria-label": d ? 'Décocher' : 'Marquer fait',
       style: {
@@ -41628,7 +41670,9 @@ function PrepSuiviHub({
         color: '#fff'
       }
     }, d ? '✓' : '⏳'));
-  })), React.createElement("div", {
+  })), React.createElement(KbMiseEnPlace, {
+    defaultOpen: true
+  }), React.createElement("div", {
     style: {
       fontSize: 14,
       fontWeight: 800,

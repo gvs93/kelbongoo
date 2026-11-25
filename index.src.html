@@ -825,7 +825,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.92';
+    const APP_VERSION = 'V11.93';
+    // V11.93 — (25/11/2026) 🧰 Atelier : 📦 Mise en place (estimations commandes / rolls / cartons DOM / paniers solidaires) remise, ouverte d'office ;
+    //   « Ma fin de journée » repart à zéro à minuit (jour qui bascule tout seul, même écran resté ouvert) : une étape n'est cochée que si
+    //   quelque chose a été traité aujourd'hui, sinon on touche ✓ (« rien à faire aujourd'hui ») ; il reste quelque chose → jamais cochée.
     // V11.92 — (24/11/2026) 🔳 QR chauffeur : 📅 gros calendrier (avant-hier → J+6, nombre à imprimer par jour, ✅ si tout collé), jour choisi tout seul ;
     //   « 🖨️ Tout imprimer » puis « ✅ Tout a été imprimé et collé » ou « ✋ Pas tout : je coche une par une » ; Atelier : la tuile QR montre
     //   combien restent à imprimer (en retard / aujourd'hui / demain) et se coche toute seule quand tout est collé.
@@ -19584,11 +19587,11 @@
       if (s === 'DOM') return 1.6;
       return (calib && calib.global) || 1.15;
     }
-    function KbMiseEnPlace() {
+    function KbMiseEnPlace({ defaultOpen } = {}) {
       const [days, setDays] = React.useState(null);
       const [day, setDay] = React.useState(null);
       const [orders, setOrders] = React.useState(null);
-      const [open, setOpen] = React.useState(false); // V10.07 — menu déroulant
+      const [open, setOpen] = React.useState(!!defaultOpen); // V10.07 — menu déroulant · V11.93 ouvert d'office dans l'Atelier
       const [fc, setFc] = React.useState(undefined);  // V10.74 — prévision serveur (admin)
       const [calib, setCalib] = React.useState(null);
       const [fcTick, setFcTick] = React.useState(0);
@@ -20953,11 +20956,26 @@
     //   En haut : « Ma fin de journée » dans l'ordre, avec une barre (DLC et retours PDP se cochent tout seuls,
     //   les impressions se cochent d'un toucher sur ✓ — partagé pour toute l'équipe : v4_cache/atelier_<jour>).
     //   En dessous : grosses tuiles colorées pour le reste.
+    // V11.93 — jour calendaire « vivant » : bascule tout seul à minuit (écran resté ouvert) et au retour sur l'appli
+    function useKbToday() {
+      const [d, setD] = React.useState(todayKey);
+      React.useEffect(() => {
+        let t = null;
+        const sync = () => setD(v => { const n = todayKey(); return v === n ? v : n; });
+        const arm = () => { clearTimeout(t); const now = new Date(); const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2);
+          t = setTimeout(() => { sync(); arm(); }, Math.min(next - now, 3600000)); };
+        const onVis = () => { if (document.visibilityState !== 'hidden') sync(); };
+        arm(); document.addEventListener('visibilitychange', onVis); window.addEventListener('focus', onVis);
+        return () => { clearTimeout(t); document.removeEventListener('visibilitychange', onVis); window.removeEventListener('focus', onVis); };
+      }, []);
+      return d;
+    }
     function PrepSuiviHub({ setTab }) {
       const board = useDlcBoard();
       const pdp = useKbPdpBoard();
       const nDlc = board.ready ? board.total : 0;
-      const day = todayKey();
+      const day = useKbToday();
+      const dayStart = new Date(day + 'T00:00:00').getTime();
       const [marks, setMarks] = React.useState({});
       React.useEffect(() => kbDocSub('v4_cache', 'atelier_' + day, d => setMarks((d && d.marks) || {})), [day]);
       // V11.87 — étiquettes livraison : dans « Ma fin de journée » seulement s'il y a des livraisons à domicile demain
@@ -20974,14 +20992,18 @@
       const qrSub = !qrB.ready ? 'Chargement…' : !qrTodo ? 'Rien à imprimer' : [qrLate ? `en retard ${qrLate}` : '', qrN(day) ? `aujourd'hui ${qrN(day)}` : '', qrN(qrTom) ? `demain ${qrN(qrTom)}` : ''].filter(Boolean).join(' · ');
       const go = k => { setTab(k); try { window.scrollTo({ top: 0 }); } catch (_) {} };
       const toggle = async (k) => { const on = !marks[k]; try { await storage.setDoc('v4_cache', 'atelier_' + day, { marks: { [k]: on ? { at: Date.now() } : null } }); } catch (_) {} };
+      // V11.93 — tout repart à zéro à minuit : une étape « auto » n'est cochée que si quelque chose a été traité AUJOURD'HUI
+      //   (DLC retirées, retours PDP traités, QR collés) ; s'il n'y a rien à faire, on touche ✓ (« rien à faire aujourd'hui »).
+      //   Il reste quelque chose à faire → jamais cochée, même touchée avant.
+      const qrHandled = qrB.ready && Object.values(qrB.byDay).some(D => (D.units || []).some(u => u.st && u.st.at >= dayStart));
       const steps = [
-        { k: 'dlcwatch', img: '🧹', bg: '#ffe0e0', ink: '#b71c1c', t: 'Retirer les DLC', sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : 'Rien à retirer', auto: board.ready && !nDlc, n: nDlc },
-        { k: 'pdpreturns', img: '↩️', bg: '#dff0ff', ink: '#0d47a1', t: 'Traiter les retours PDP', sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : 'Rien à traiter', auto: pdp.ready && !pdp.toTreat, n: pdp.toTreat },
-        { k: 'printpain', img: '🍞', bg: '#fff3d6', ink: '#8a5a00', t: 'Imprimer le dispatch pain', sub: '1 feuille par lieu' },
-        { k: 'printqr', img: '🔳', bg: '#efe7ff', ink: '#4a2c91', t: 'Imprimer les QR codes', sub: qrSub, auto: qrB.ready ? !qrTodo : undefined, n: qrTodo },  // V11.92
-        ...(domTom > 0 ? [{ k: 'printlabels', img: '🏷️', bg: '#e3f8ec', ink: '#1b5e20', t: 'Imprimer les étiquettes livraison', sub: `${domTom} livraison${domTom > 1 ? 's' : ''} demain · après la clôture` }] : []),
+        { k: 'dlcwatch', img: '🧹', bg: '#ffe0e0', ink: '#b71c1c', t: 'Retirer les DLC', sub: !board.ready ? 'Chargement…' : nDlc ? `${nDlc} produit${nDlc > 1 ? 's' : ''} à retirer` : board.done.length ? 'Tout a été retiré' : "Rien à retirer aujourd'hui", ready: board.ready, n: nDlc, handled: board.done.length > 0 },
+        { k: 'pdpreturns', img: '↩️', bg: '#dff0ff', ink: '#0d47a1', t: 'Traiter les retours PDP', sub: !pdp.ready ? 'Chargement…' : pdp.toTreat ? `${pdp.toTreat} à traiter` : (pdp.treatedToday || []).length ? 'Tout a été traité' : "Rien à traiter aujourd'hui", ready: pdp.ready, n: pdp.toTreat, handled: (pdp.treatedToday || []).length > 0 },
+        { k: 'printpain', img: '🍞', bg: '#fff3d6', ink: '#8a5a00', t: 'Imprimer le dispatch pain', sub: '1 feuille par lieu', ready: true, n: 0 },
+        { k: 'printqr', img: '🔳', bg: '#efe7ff', ink: '#4a2c91', t: 'Imprimer les QR codes', sub: qrSub, ready: qrB.ready, n: qrTodo, handled: qrHandled },  // V11.92
+        ...(domTom > 0 ? [{ k: 'printlabels', img: '🏷️', bg: '#e3f8ec', ink: '#1b5e20', t: 'Imprimer les étiquettes livraison', sub: `${domTom} livraison${domTom > 1 ? 's' : ''} demain · après la clôture`, ready: true, n: 0 }] : []),
       ];
-      const isDone = s => s.auto !== undefined ? s.auto : !!marks[s.k];
+      const isDone = s => !!s.ready && !(s.n > 0) && (!!marks[s.k] || !!s.handled);
       const nDone = steps.filter(isDone).length, pct = Math.round(nDone / steps.length * 100);
       const tiles = [
         { k: 'losses', img: '🗑️', bg: '#ffe9d6', ink: '#a14a00', t: 'Pertes', sub: 'saisir une perte' },
@@ -21015,11 +21037,12 @@
                   </span>
                   {s.n > 0 && <span style={{ background: s.ink, color: '#fff', borderRadius: 16, padding: '3px 11px', fontWeight: 900, fontSize: 19 }}>{s.n}</span>}
                 </button>
-                {s.auto === undefined
+                {!(s.n > 0) && s.ready && !s.handled
                   ? <button onClick={() => toggle(s.k)} aria-label={d ? 'Décocher' : 'Marquer fait'} style={{ width: 62, flex: '0 0 62px', borderRadius: 18, border: '3px solid ' + (d ? '#43a047' : '#cfd8dc'), background: d ? '#43a047' : '#fff', color: d ? '#fff' : '#90a4ae', fontSize: 30, fontWeight: 900, cursor: 'pointer' }}>✓</button>
                   : <span style={{ width: 62, flex: '0 0 62px', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28, background: d ? '#43a047' : '#eceff1', color: '#fff' }}>{d ? '✓' : '⏳'}</span>}
               </div>); })}
           </div>
+          <KbMiseEnPlace defaultOpen />{/* V11.93 — estimations (commandes, rolls, cartons DOM, paniers solidaires) toujours visibles */}
           <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--ink-mute)', margin: '4px 2px 0' }}>Autres outils</div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
             {tiles.map(t => (
