@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.93) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.94) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.93';
+const APP_VERSION = 'V11.94';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -44773,6 +44773,7 @@ function PrepaDuJourPage({
         nd = {},
         lm = {},
         cs = {},
+        csa = {},
         nx = {},
         sb = {},
         pr = {},
@@ -44831,7 +44832,10 @@ function PrepaDuJourPage({
           placed: d.placed,
           alloc: d.alloc || [],
           shortage: d.shortage || []
-        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') cs[key] = d.nums || [];else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
+        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') {
+          cs[key] = d.nums || [];
+          if (d.autoPrep) csa[key] = true;
+        } else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
       });
       setPrep({
         status: st,
@@ -44841,6 +44845,7 @@ function PrepaDuJourPage({
         nd,
         lm,
         casiers: cs,
+        casAuto: csa,
         counters,
         closed,
         closedBy,
@@ -44948,9 +44953,12 @@ function PrepaDuJourPage({
   }, [rows, reserved]);
   const getCasiers = (s, c) => prep.casiers[CK(s, c)] || ((reserved[CK(s, c)] || []).length ? reserved[CK(s, c)] : [(rows.find(r => r.site === s && r.client === c) || {}).casier || '?']);
   const clientCasier = (s, c) => getCasiers(s, c).join('·');
-  const cliHasCas = (s, c) => s !== 'DOM' && rows.some(r => r.site === s && r.client === c && r.cat !== 'pain' && r.cat !== 'nd' && !kbIsSolidaire(r.product));
+  const rowInCas = r => r.site !== 'DOM' && r.cat !== 'pain' && !kbIsSolidaire(r.product) && !ndOnRef.current(PK(r.site, r.product));
+  const ndOnRef = React.useRef(() => false);
+  const cliHasCas = (s, c) => s !== 'DOM' && rows.some(r => r.site === s && r.client === c && rowInCas(r));
   const casFirst = (s, c) => getCasiers(s, c)[0];
   const casAutoSig = React.useRef('');
+  const casFreeing = React.useRef({});
   React.useEffect(() => {
     if (!day || prep.closed || prep.presence === undefined || !rows.length) return;
     const miss = {};
@@ -44967,7 +44975,7 @@ function PrepaDuJourPage({
     });
     let nClash = 0;
     rows.forEach(r => {
-      if (r.site === 'DOM' || r.cat === 'pain' || r.cat === 'nd' || kbIsSolidaire(r.product)) return;
+      if (!rowInCas(r)) return;
       const cs = getCasiers(r.site, r.client).map(String).filter(v => v && v !== '?');
       const clash = !prep.casiers[CK(r.site, r.client)] && cs.some(v => fixed[r.site] && fixed[r.site][v] && fixed[r.site][v] !== r.client);
       if (!cs.length || clash) {
@@ -44975,6 +44983,16 @@ function PrepaDuJourPage({
         if (clash && !set.has(r.client)) nClash++;
         set.add(r.client);
       }
+    });
+    if (kbCasSelf(day)) Object.keys(prep.casAuto || {}).forEach(k => {
+      const [s0, c0] = k.split('||');
+      if (s0 === 'DOM') return;
+      if (rows.some(r => r.site === s0 && r.client === c0 && rowInCas(r))) return;
+      if (casFreeing.current[k]) return;
+      casFreeing.current[k] = 1;
+      storage.deleteDoc(`day_${day}_prep`, 'cs|' + encId(k)).then(() => showToast(`🧊 Casier ${(prep.casiers[k] || []).join('·')} rendu (${c0.split(' ')[0]} n'a plus rien en casier)`)).catch(() => {}).finally(() => {
+        delete casFreeing.current[k];
+      });
     });
     const sig = Object.entries(miss).map(([s, set]) => s + ':' + [...set].sort().join(',')).sort().join('|');
     if (!sig || sig === casAutoSig.current) return;
@@ -44987,7 +45005,15 @@ function PrepaDuJourPage({
           const v = kbSmallestFree(own);
           own[v] = c;
           cnt++;
-          wCas(CK(s, c), [v]);
+          storage.setDoc(`day_${day}_prep`, 'cs|' + encId(CK(s, c)), {
+            nums: [v],
+            autoPrep: true
+          }, {
+            replace: true
+          }).catch(e => {
+            casAutoSig.current = '';
+            showToast('⚠️ Casier non enregistré pour ' + c + ' (' + s + ') : ' + (e && e.message || e) + ' — réessai automatique');
+          });
         });
         return;
       }
@@ -45034,6 +45060,7 @@ function PrepaDuJourPage({
     return m;
   }, [rows]);
   const ndOn = pk => String(pk).indexOf('DOM||') !== 0 && (kbIsSolidaire(String(pk).split('||').pop()) || !!prep.nd[pk] || painPk.has(pk) && !prep.lm[pk] || ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
+  ndOnRef.current = ndOn;
   const ndData = pk => prep.nd[pk] || {
     placed: null,
     alloc: [],

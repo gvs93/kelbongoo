@@ -825,7 +825,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.93';
+    const APP_VERSION = 'V11.94';
+    // V11.94 — (25/11/2026) 🧊 Casiers gérés par l'appli (distrib ≥ 26/11) : un client dont le seul produit « casier » est un ND spécial
+    //   gardé en casier (ex. salade fragile, « Mettre en cagette ND » pas activé) restait SANS n° (« ? ») → il reçoit le plus petit n° libre.
+    //   Pas de casier pour pain seul, panier solidaire (cagette déjà faite, envoyée comme ND) ou ND en cagette. ND passé ensuite en cagette
+    //   et plus rien en casier → casier auto rendu. Échec d'enregistrement d'un casier : message + réessai (avant : silencieux).
     // V11.93 — (25/11/2026) 🧰 Atelier : 📦 Mise en place (estimations commandes / rolls / cartons DOM / paniers solidaires) remise, ouverte d'office ;
     //   (bouton 📦 Mise en place dans les outils, comme Pertes) ; « Ma fin de journée » repart à zéro à minuit (jour qui bascule tout seul, même écran resté ouvert) : une étape n'est cochée que si
     //   quelque chose a été traité aujourd'hui, sinon on touche ✓ (« rien à faire aujourd'hui ») ; il reste quelque chose → jamais cochée.
@@ -22325,6 +22329,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         nd = {},
         lm = {},
         cs = {},
+        csa = {},
         nx = {},
         sb = {},
         pr = {},
@@ -22378,7 +22383,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           placed: d.placed,
           alloc: d.alloc || [],
           shortage: d.shortage || []
-        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') cs[key] = d.nums || [];else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
+        };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') { cs[key] = d.nums || []; if (d.autoPrep) csa[key] = true; } else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
       });
       setPrep({
         status: st,
@@ -22388,6 +22393,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         nd,
         lm,
         casiers: cs,
+        casAuto: csa, // V11.94 — casiers posés automatiquement par la prépa (rendus si le client n'a plus rien en casier)
         counters,
         closed,
         closedBy,
@@ -22496,12 +22502,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
   const getCasiers = (s, c) => prep.casiers[CK(s, c)] || ((reserved[CK(s, c)] || []).length ? reserved[CK(s, c)] : [(rows.find(r => r.site === s && r.client === c) || {}).casier || '?']);
   const clientCasier = (s, c) => getCasiers(s, c).join('·');
   // V11.05 — le client a-t-il au moins un article en casier (frais / sec) ? Sinon (pain / ND seuls) : pas de casier.
-  const cliHasCas = (s, c) => s !== 'DOM' && rows.some(r => r.site === s && r.client === c && r.cat !== 'pain' && r.cat !== 'nd' && !kbIsSolidaire(r.product));
+  // V11.94 — va dans le casier = ni pain, ni panier solidaire (cagette déjà faite, envoyée comme ND), ni produit en cagette ND.
+  //   Un ND spécial gardé en casier (ex. salade fragile : « Mettre en cagette ND » pas activé) VA dans le casier.
+  const rowInCas = r => r.site !== 'DOM' && r.cat !== 'pain' && !kbIsSolidaire(r.product) && !ndOnRef.current(PK(r.site, r.product));
+  const ndOnRef = React.useRef(() => false);
+  const cliHasCas = (s, c) => s !== 'DOM' && rows.some(r => r.site === s && r.client === c && rowInCas(r));
   const casFirst = (s, c) => getCasiers(s, c)[0];
   // V11.05 — client avec du frais / sec mais SANS n° de casier (JSON sans casier, lieu corrigé côté site…) : n° attribué
   //   tout de suite (prochain libre du lieu, clients par ordre alphabétique → même résultat sur tous les terminaux),
   //   enregistré en cs| → la distrib l'affiche. Pain / ND / panier solidaire seuls : jamais de casier.
   const casAutoSig = React.useRef('');
+  const casFreeing = React.useRef({}); // V11.94
   React.useEffect(() => {
     if (!day || prep.closed || prep.presence === undefined || !rows.length) return;
     const miss = {};
@@ -22511,10 +22522,18 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     Object.entries(prep.casiers || {}).forEach(([k, a]) => { const [s0, c0] = k.split('||'); (a || []).forEach(n => { const v = String(n).trim(); if (v && v !== '?') { fixed[s0] = fixed[s0] || {}; if (!fixed[s0][v]) fixed[s0][v] = c0; } }); });
     let nClash = 0;
     rows.forEach(r => {
-      if (r.site === 'DOM' || r.cat === 'pain' || r.cat === 'nd' || kbIsSolidaire(r.product)) return;
+      if (!rowInCas(r)) return; // V11.94 — avant : tout ND ignoré → ND spécial gardé en casier resté sans n° (« ? »)
       const cs = getCasiers(r.site, r.client).map(String).filter(v => v && v !== '?');
       const clash = !prep.casiers[CK(r.site, r.client)] && cs.some(v => fixed[r.site] && fixed[r.site][v] && fixed[r.site][v] !== r.client);
       if (!cs.length || clash) { const set = (miss[r.site] = miss[r.site] || new Set()); if (clash && !set.has(r.client)) nClash++; set.add(r.client); }
+    });
+    // V11.94 — casier posé automatiquement par la prépa alors que le client n'a plus rien en casier
+    //   (son ND spécial est passé en cagette ND, ou retiré) → n° rendu tout de suite. Casier vide par définition.
+    if (kbCasSelf(day)) Object.keys(prep.casAuto || {}).forEach(k => {
+      const [s0, c0] = k.split('||'); if (s0 === 'DOM') return;
+      if (rows.some(r => r.site === s0 && r.client === c0 && rowInCas(r))) return;
+      if (casFreeing.current[k]) return; casFreeing.current[k] = 1;
+      storage.deleteDoc(`day_${day}_prep`, 'cs|' + encId(k)).then(() => showToast(`🧊 Casier ${(prep.casiers[k] || []).join('·')} rendu (${c0.split(' ')[0]} n'a plus rien en casier)`)).catch(() => {}).finally(() => { delete casFreeing.current[k]; });
     });
     const sig = Object.entries(miss).map(([s, set]) => s + ':' + [...set].sort().join(',')).sort().join('|');
     if (!sig || sig === casAutoSig.current) return;
@@ -22523,7 +22542,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     Object.entries(miss).forEach(([s, set]) => {
       const own = casOwners(s);
       if (kbCasSelf(day)) { // V11.81 — plus petit n° libre (pas de trou)
-        [...set].sort((a, b) => a.localeCompare(b)).forEach(c => { const v = kbSmallestFree(own); own[v] = c; cnt++; wCas(CK(s, c), [v]); });
+        [...set].sort((a, b) => a.localeCompare(b)).forEach(c => { const v = kbSmallestFree(own); own[v] = c; cnt++;
+          storage.setDoc(`day_${day}_prep`, 'cs|' + encId(CK(s, c)), { nums: [v], autoPrep: true }, { replace: true }).catch(e => { casAutoSig.current = ''; showToast('⚠️ Casier non enregistré pour ' + c + ' (' + s + ') : ' + (e && e.message || e) + ' — réessai automatique'); }); }); // V11.94 — échec = on réessaie
         return;
       }
       let n = 0;
@@ -22569,6 +22589,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     return m;
   }, [rows]);
   const ndOn = pk => String(pk).indexOf('DOM||') !== 0 && (kbIsSolidaire(String(pk).split('||').pop()) || !!prep.nd[pk] || painPk.has(pk) && !prep.lm[pk] || ndAuto.has(pk) && !(prep.ndOff && prep.ndOff[pk]) && !prep.lm[pk]);
+  ndOnRef.current = ndOn; // V11.94 — utilisé par rowInCas (casiers attribués aussi aux ND spéciaux gardés en casier)
   const ndData = pk => prep.nd[pk] || {
     placed: null,
     alloc: [],
