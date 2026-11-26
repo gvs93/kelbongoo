@@ -825,7 +825,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.95';
+    const APP_VERSION = 'V11.96';
+    // V11.96 — (26/11/2026) Chauffeur : lieu où personne n'aide à décharger avant une heure (BOR : 15h30, réglable gps_config.helpFrom) → « 🧍 déchargement probablement seul » sur la tournée ; au départ (chargement validé / terminé) fenêtre au chauffeur + mail rr@ + hg@ « d'après la tournée du jour et le trafic, NOM va arriver à HHhMM à … » (une fois par jour et par lieu ; repli : envoyé par le master si le chauffeur n'a pas pu)
+    // V11.96 — Sapins (chauffeur) : plantage « can't convert undefined to object » corrigé — le récap figé dans la base perd les « par » vides (Firebase n'enregistre pas les objets vides) → récap normalisé + sapDispatch / sapProrata robustes
+    // V11.96 — Chauffeur › À livrer : décompte des supports à récupérer aujourd'hui (« 3 / 10 récupérés », il reste…, détail au toucher, aussi dans l'écran de scan) ; Retours PDP : contenants vides (rolls, dollies, cagettes) = simple encart « pense aux contenants », détail au toucher, hors cartes / compteurs / vérification
+    // V11.96 — GPS chauffeur : fenêtre « 📍 Autoriser ma position » (iPhone : la demande part d'un toucher, étapes Safari / Chrome / Réglages iPhone, relance auto au retour dans l'appli) ; pendant le guidage la carte se déplace au doigt (cap gardé, vue 2D), 📍 Recentrer ou retour auto après 20 s
     // V11.95 — (25/11/2026) 🚚 Chauffeur : tournée du bureau par défaut (verrouillée) ; 🔓 Urgence = plusieurs lieux + adresses + point d'arrivée
     //   (aucun · retour au départ · PDP · Rungis) → « 🧮 Calculer mon meilleur itinéraire » (À livrer ET GPS, choix partagé). « 🧭 Lancer le GPS
     //   sur cette tournée » (même ordre que le chargement). 🔳 Scanner toujours visible (tuile d'accueil + À livrer, plus besoin de cocher avant).
@@ -20756,7 +20760,7 @@
     }
 
     // Chauffeur : caméra plein écran, scan en continu, résultat en gros
-    function KbQrScanOverlay({ onScan, msg, onClose }) {
+    function KbQrScanOverlay({ onScan, msg, onClose, extra }) {
       const col = !msg ? '#263238' : msg.bad ? '#c62828' : msg.warn ? '#e65100' : '#2e7d32';
       return (
         <div style={{ position: 'fixed', inset: 0, zIndex: 9998, background: '#000', display: 'flex', flexDirection: 'column', padding: 10, gap: 10, overflowY: 'auto' }}>
@@ -20764,6 +20768,7 @@
             <div style={{ fontSize: 24, fontWeight: 900, lineHeight: 1.2 }}>{msg ? msg.t : '🔳 Vise l\'étiquette QR'}</div>
             <div style={{ fontSize: 17, fontWeight: 600, marginTop: 4, opacity: .95 }}>{msg ? msg.s : 'Une étiquette par palette / roll / dolly. Une fenêtre te dit si tu le prends aujourd\'hui et où le mettre.'}</div>
           </div>
+          {extra || null}
           <BarcodeScanner formats={['qr_code']} hint="Vise le QR — détection automatique." onDetected={onScan} />
           <button onClick={onClose} style={{ minHeight: 70, borderRadius: 16, border: 'none', background: '#fff', color: '#111', fontSize: 22, fontWeight: 900, cursor: 'pointer' }}>✔️ Terminer</button>
         </div>
@@ -37961,7 +37966,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function sapAttendu(recups, livrs, d, sk){ var l = ((livrs||{})[d]||{})[sk]; if (l && l.lines) return l.lines; var rc = (recups||{})[d]; return (rc && rc.dispatch) ? (rc.dispatch[sk] || {}) : null; }
     /* Répartition au prorata (méthode des plus forts restes). want = {mag:n}, total = n disponibles */
     function sapProrata(want, total){
-      var ks = Object.keys(want).filter(function(k){ return sapNum(want[k])>0; }), W = 0, res = {}, rest = [];
+      want = want || {}; var ks = Object.keys(want).filter(function(k){ return sapNum(want[k])>0; }), W = 0, res = {}, rest = [];
       ks.forEach(function(k){ W += sapNum(want[k]); });
       if (!W || total<=0){ ks.forEach(function(k){ res[k]=0; }); return res; }
       var given = 0;
@@ -37975,7 +37980,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       var disp = {}; SAP_STORES.forEach(function(s){ disp[s.k] = {}; });
       var manque = {};   // mag -> L -> manquant
       SAP_LINES.forEach(function(L){
-        var r = recap[L.k] || { tot:0, par:{} }, rl = (recupLines||{})[L.k] || {};
+        var r0 = (recap||{})[L.k] || {}, r = { tot: sapNum(r0.tot), par: r0.par || {} }, rl = (recupLines||{})[L.k] || {};   // V11.96 — « par » vide absent dans la base
         var pris = rl.pris!=null ? sapNum(rl.pris) : r.tot;
         var a = sapProrata(r.par, pris);
         Object.keys(r.par).forEach(function(m){ var g = a[m]||0; if (g) disp[m][L.k] = (disp[m][L.k]||0) + g; var miss = sapNum(r.par[m]) - g; if (miss>0) (manque[m]=manque[m]||{})[L.k]=miss; });
@@ -37990,6 +37995,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       });
       return disp;
     }
+    /* V11.96 — récap lu dans la base : Firebase supprime les objets vides ({ tot:0, par:{} } → { tot:0 }) → on remet chaque ligne en forme */
+    function sapRecapNorm(lines){ var out = {}; SAP_LINES.forEach(function(L){ var x = (lines||{})[L.k] || {}; out[L.k] = { tot: sapNum(x.tot), par: (x.par && typeof x.par === "object") ? x.par : {} }; }); return out; }
     function sapSum(obj){ var s=0; Object.keys(obj||{}).forEach(function(k){ s+=sapNum(obj[k]); }); return s; }
     function sapEur(n){ return (Math.round(sapNum(n)*100)/100).toFixed(2).replace(".", ",")+" €"; }
     /* Montant BL-facture (prix de vente magasin × quantités reçues). */
@@ -38076,7 +38083,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       if (!S || !S.n1) return <div className="card" style={{ padding: 16, fontSize: 18 }}>🎄 Pas encore de sapins à récupérer{err ? ' (' + err + ')' : ''}. <button className="btn-secondary" onClick={reload}>↻</button></div>;
       const cfg = S.config || {}, act = sapActiveDates(S.n1, cfg, 'all'), isTest = d && sapIsTest(cfg, d);
       if (!d) return <div className="card" style={{ padding: 16, fontSize: 18 }}>🎄 Aucune récupération de sapins prévue.</div>;
-      const recap = ((S.recap || {})[d] || {}).lines || sapRecap(S.n1, cfg, d, S.cmd || {}, S.recep || {});
+      const recap = sapRecapNorm(((S.recap || {})[d] || {}).lines || sapRecap(S.n1, cfg, d, S.cmd || {}, S.recep || {}));
       const rc = (S.recup || {})[d] || {};
       const tooEarly = !isTest && d > todayKey() && !rc.done;   // pas de récupération avant le jour J (sauf journée de test)
       const lines = SAP_LINES.filter(L => (recap[L.k] || {}).tot > 0 || (loc[L.k] && loc[L.k].pris != null && Number(loc[L.k].pris) > 0));
@@ -38674,6 +38681,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         {R('⬆️', 'Bandeau du haut', 'prochaine manœuvre, distance, rue en bleu · « puis » = manœuvre suivante')}
         {R('🟧', 'Bandeaux d’alerte', 'zone de danger, passage limité, ZFE, signalement de l’équipe')}
         {R('🔊', 'Son', 'coupe / remet la voix')}
+        {R('👆', 'Glisser la carte', 'avec le doigt pour regarder la route plus loin · 📍 Recentrer (ou tout seul après 20 s)')}
         {R('🗺️', 'Vue d’ensemble', 'tout le trajet · 📍 Recentrer pour revenir')}
         {R('⚠️', 'Bouton jaune', 'signaler travaux, interdit PL, passage bas, bouchon… à l’endroit où tu es')}
         {R('🔵', 'Bulle du bas', 'nom de la rue où tu roules')}
@@ -38797,6 +38805,58 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         </div>);
     }
 
+    // V11.96 — fenêtre « Autoriser ma position » (iPhone / Android) : la demande part du toucher + étapes selon le navigateur
+    function kbGpsEnv() {
+      const ua = String(navigator.userAgent || '');
+      const ios = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const nav = /CriOS/.test(ua) ? 'chrome' : /FxiOS/.test(ua) ? 'firefox' : /EdgiOS/.test(ua) ? 'edge' : 'safari';
+      let pwa = false; try { pwa = navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches); } catch (e) {}
+      return { ios, nav, pwa, android: /Android/i.test(ua) };
+    }
+    function KbGpsPermSheet({ st, code, onAsk, onClose }) {
+      const E = kbGpsEnv(), still = st === 'still', asking = st === 'asking';
+      const app = { chrome: 'Chrome', firefox: 'Firefox', edge: 'Edge', safari: 'Safari' }[E.nav];
+      const Step = ({ n, children }) => <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '7px 0', borderBottom: '1px solid #eef1f4' }}>
+        <b style={{ flex: '0 0 30px', height: 30, borderRadius: 15, background: '#1e88e5', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}>{n}</b>
+        <div style={{ fontSize: 16, lineHeight: 1.35 }}>{children}</div></div>;
+      let steps;
+      if (E.ios && E.nav === 'safari') steps = <>
+        <Step n="1">Ouvre l'app <b>Réglages</b> de l'iPhone → <b>Confidentialité et sécurité</b> → <b>Service de localisation</b> (activé).</Step>
+        <Step n="2">Dans la liste, touche <b>Sites web Safari</b> → choisis <b>« Lorsque l'app est active »</b> et active <b>Position exacte</b>. <span style={{ color: '#c62828' }}>C'est souvent ici que ça bloque, même si le reste est autorisé.</span></Step>
+        <Step n="3">Toujours dans Réglages : <b>Safari</b> (ou <b>Apps → Safari</b>) → <b>Position</b> → <b>Demander</b> ou <b>Autoriser</b>.</Step>
+        <Step n="4">Reviens ici : dans Safari, touche <b>aA</b> (ou l'icône à gauche de l'adresse) → <b>Réglages du site web</b> → <b>Position</b> → <b>Autoriser</b>.</Step>
+        <Step n="5">Touche <b>📍 Autoriser ma position</b> ci-dessous, puis <b>Autoriser</b> dans la fenêtre de l'iPhone.</Step></>;
+      else if (E.ios) steps = <>
+        <Step n="1">Ouvre l'app <b>Réglages</b> de l'iPhone → <b>Confidentialité et sécurité</b> → <b>Service de localisation</b> (activé).</Step>
+        <Step n="2">Dans la liste, touche <b>{app}</b> → choisis <b>« Lorsque l'app est active »</b> et active <b>Position exacte</b>.</Step>
+        <Step n="3">Reviens dans {app} sur l'appli Kelbongoo et touche <b>📍 Autoriser ma position</b>, puis <b>Autoriser</b>.</Step>
+        <Step n="4">Toujours bloqué ? Ouvre l'appli dans <b>Safari</b> et suis les étapes Safari.</Step></>;
+      else if (E.android) steps = <>
+        <Step n="1">Tire le haut de l'écran et active <b>Position</b> (localisation).</Step>
+        <Step n="2">Dans Chrome, touche l'icône <b>à gauche de l'adresse</b> → <b>Autorisations</b> → <b>Position</b> → <b>Autoriser</b>.</Step>
+        <Step n="3">Touche <b>📍 Autoriser ma position</b> ci-dessous.</Step></>;
+      else steps = <>
+        <Step n="1">Clique l'icône <b>à gauche de l'adresse</b> → <b>Position</b> → <b>Autoriser</b>.</Step>
+        <Step n="2">Clique <b>📍 Autoriser ma position</b> ci-dessous.</Step></>;
+      return (
+        <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 60, display: 'flex', alignItems: 'flex-end' }} onClick={onClose}>
+          <div onClick={e => e.stopPropagation()} style={{ background: '#fff', color: '#1d2a35', width: '100%', maxHeight: '92%', overflowY: 'auto', borderRadius: '22px 22px 0 0', padding: '16px 16px calc(18px + env(safe-area-inset-bottom))' }}>
+            <div style={{ fontSize: 24, fontWeight: 900 }}>📍 Le GPS a besoin de ta position</div>
+            <div style={{ fontSize: 15, color: '#607d8b', margin: '4px 0 10px' }}>{still ? '⛔ Le téléphone refuse encore la position à ce site. Fais les étapes ci-dessous puis réessaie.'
+              : code === 3 ? '⏱️ Le GPS ne répond pas : mets-toi à découvert, puis réessaie.' : code === 2 ? '⚠️ Position introuvable : vérifie que la localisation est activée.'
+              : 'Sans ta position, pas de guidage ni de suivi par le bureau.'}</div>
+            <button type="button" disabled={asking} onClick={onAsk} style={{ width: '100%', minHeight: 66, borderRadius: 18, border: 'none', background: asking ? '#90caf9' : 'linear-gradient(135deg,#1e88e5,#1565c0)', color: '#fff', fontSize: 22, fontWeight: 900 }}>{asking ? '⏳ Demande en cours…' : '📍 Autoriser ma position'}</button>
+            <div style={{ fontSize: 17, fontWeight: 800, margin: '14px 0 2px' }}>{still ? 'À faire sur ' + (E.ios ? "l'iPhone" : 'le téléphone') : 'Si rien ne s\'affiche ou si c\'est refusé'}</div>
+            {steps}
+            {E.ios && E.pwa && <div style={{ fontSize: 14, color: '#6d4c41', background: '#fff8e1', borderRadius: 12, padding: '8px 10px', marginTop: 8 }}>Appli ouverte depuis l'écran d'accueil : la position suit les réglages <b>Sites web Safari</b> (étape 2).</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button type="button" onClick={() => { try { location.reload(); } catch (e) {} }} style={{ flex: 1, minHeight: 52, borderRadius: 14, border: '2px solid #cfd8dc', background: '#fff', fontSize: 16, fontWeight: 800 }}>🔄 Recharger la page</button>
+              <button type="button" onClick={onClose} style={{ flex: 1, minHeight: 52, borderRadius: 14, border: 'none', background: '#eceff1', fontSize: 16, fontWeight: 800 }}>Plus tard</button>
+            </div>
+          </div>
+        </div>);
+    }
+
     // ═══════════════════ écran GPS chauffeur (plein écran) ═══════════════════
     function KbTruckGps({ session, onClose, initTour }) {
       const [ready, setReady] = React.useState(!!(window.L && window.L.map));
@@ -38835,8 +38895,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const rootEl = React.useRef(null), boxEl = React.useRef(null), mapEl = React.useRef(null);
       const M = React.useRef(null), LY = React.useRef({}), NV = React.useRef(null), F = React.useRef(null), HD = React.useRef(null);
       const ROT = React.useRef(0), WAKE = React.useRef(null), SIM = React.useRef(null), FIX = React.useRef(null), LIVE = React.useRef({ t: 0, trail: [] });
-      const HAZ = React.useRef(null), firstFix = React.useRef(true), S = React.useRef({}), TILT = React.useRef(false);
-      S.current = { mode, follow, muted, share, cfg, prof, tour, traffic, lay, reports };
+      const HAZ = React.useRef(null), firstFix = React.useRef(true), S = React.useRef({}), TILT = React.useRef(false), PANT = React.useRef(0);
+      S.current = { mode, follow, muted, share, cfg, prof, tour, traffic, lay, reports, gpsSt: gps.st };
       const say = t => { if (!S.current.muted) kbSay(t); };
       const day = todayKey();
       // V11.95 — tournée d'urgence : le chauffeur choisit PLUSIEURS lieux (+ adresses) et l'arrivée, puis « Calculer mon meilleur itinéraire »
@@ -38883,7 +38943,26 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         LY.current.user = L.marker([48.84, 2.39], { icon: uIcon, interactive: false, zIndexOffset: 1000 });
         const onR = () => layout(); window.addEventListener('resize', onR); window.addEventListener('orientationchange', onR);
         setTimeout(layout, 50);
-        return () => { window.removeEventListener('resize', onR); window.removeEventListener('orientationchange', onR); try { map.remove(); } catch (e) {} M.current = null; LY.current = {}; };
+        // V11.96 — guidage : la carte tourne (cap en haut) → le glisser Leaflet irait de travers. On déplace nous-mêmes la carte
+        // au doigt en tenant compte de la rotation (pincer pour zoomer reste géré par Leaflet).
+        const ct = map.getContainer(); ct.style.touchAction = 'none';
+        const PT = new Map(); let drag = null;
+        const down = e => { PT.set(e.pointerId, [e.clientX, e.clientY]); drag = PT.size === 1 && S.current.mode === 'nav' ? { x: e.clientX, y: e.clientY, moved: false } : null; };
+        const move = e => {
+          if (!PT.has(e.pointerId)) return; PT.set(e.pointerId, [e.clientX, e.clientY]);
+          if (!drag || PT.size !== 1 || S.current.mode !== 'nav' || !M.current) return;
+          const sx = e.clientX - drag.x, sy = e.clientY - drag.y;
+          if (!drag.moved) { if (Math.hypot(sx, sy) < 8) return; drag.moved = true;
+            if (S.current.follow) { const c = map.getCenter(), z = map.getZoom(); S.current.follow = false; setFollow(false); if (TILT.current) { setTilt(false); map.setView(c, z, { animate: false }); } } }
+          drag.x = e.clientX; drag.y = e.clientY; PANT.current = Date.now();
+          const a = ROT.current * Math.PI / 180, mx = sx * Math.cos(a) - sy * Math.sin(a), my = sx * Math.sin(a) + sy * Math.cos(a);
+          map.panBy([-mx, -my], { animate: false });
+        };
+        const up = e => { PT.delete(e.pointerId); if (PT.size !== 1) drag = null; };
+        ct.addEventListener('pointerdown', down); ct.addEventListener('pointermove', move); ct.addEventListener('pointerup', up); ct.addEventListener('pointercancel', up);
+        map.on('zoomstart', () => { if (S.current.mode === 'nav' && !S.current.follow) PANT.current = Date.now(); });
+        return () => { ct.removeEventListener('pointerdown', down); ct.removeEventListener('pointermove', move); ct.removeEventListener('pointerup', up); ct.removeEventListener('pointercancel', up);
+          window.removeEventListener('resize', onR); window.removeEventListener('orientationchange', onR); try { map.remove(); } catch (e) {} M.current = null; LY.current = {}; };
       }, [ready]);
       React.useEffect(() => {
         const map = M.current; if (!map) return; const L = window.L;
@@ -38898,13 +38977,29 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       }, [ready, ttKey, traffic]);
 
       // ── GPS ──
+      // V11.96 — suivi relançable (gpsTry) : après « Autoriser ma position » ou au retour dans l'appli si le GPS était refusé
+      const onGeo = p => { if (SIM.current) return; const c = p.coords;
+        FIX.current && FIX.current({ lat: c.latitude, lng: c.longitude, acc: c.accuracy || 0, spd: c.speed != null && c.speed >= 0 ? c.speed : null, hd: c.heading != null && !isNaN(c.heading) ? c.heading : null, at: p.timestamp || Date.now() }); };
+      const [gpsTry, setGpsTry] = React.useState(0);
+      const [gpsAsk, setGpsAsk] = React.useState(''); // '' | 'open' | 'asking' | 'still' (toujours refusé après le toucher) | 'closed'
       React.useEffect(() => {
         if (!navigator.geolocation) { setGps({ st: 'err', m: 'GPS non disponible sur cet appareil' }); return; }
-        const id = navigator.geolocation.watchPosition(p => { if (SIM.current) return; const c = p.coords;
-          FIX.current && FIX.current({ lat: c.latitude, lng: c.longitude, acc: c.accuracy || 0, spd: c.speed != null && c.speed >= 0 ? c.speed : null, hd: c.heading != null && !isNaN(c.heading) ? c.heading : null, at: p.timestamp || Date.now() }); },
-          e => setGps({ st: e.code === 1 ? 'denied' : 'err', m: e.message }), { enableHighAccuracy: true, maximumAge: 1000, timeout: 25000 });
+        const id = navigator.geolocation.watchPosition(onGeo,
+          e => setGps(g => (g.st === 'ok' && e.code !== 1 ? g : { st: e.code === 1 ? 'denied' : 'err', code: e.code, m: e.message })), { enableHighAccuracy: true, maximumAge: 1000, timeout: 25000 });
         return () => { try { navigator.geolocation.clearWatch(id); } catch (e) {} };
+      }, [gpsTry]);
+      React.useEffect(() => { // revient des Réglages iPhone → on redemande tout seul
+        const v = () => { if (document.visibilityState === 'visible' && S.current.gpsSt !== 'ok') setGpsTry(t => t + 1); };
+        document.addEventListener('visibilitychange', v); return () => document.removeEventListener('visibilitychange', v);
       }, []);
+      React.useEffect(() => { if (gps.st === 'denied' && !gpsAsk) setGpsAsk('open'); if (gps.st === 'ok' && gpsAsk && gpsAsk !== 'closed') setGpsAsk(''); }, [gps.st]);
+      // la demande d'autorisation part d'un TOUCHER (iPhone : sinon Safari peut refuser sans rien afficher)
+      const askGps = () => {
+        if (!navigator.geolocation) return; setGpsAsk('asking');
+        navigator.geolocation.getCurrentPosition(p => { onGeo(p); setGpsAsk(''); setGpsTry(t => t + 1); },
+          e => { setGps({ st: e.code === 1 ? 'denied' : 'err', code: e.code, m: e.message }); setGpsAsk(e.code === 1 ? 'still' : 'open'); setGpsTry(t => t + 1); },
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+      };
       // écran allumé pendant le guidage
       const wakeOn = async () => { try { if (navigator.wakeLock && !WAKE.current) { WAKE.current = await navigator.wakeLock.request('screen'); WAKE.current.addEventListener && WAKE.current.addEventListener('release', () => { WAKE.current = null; }); } } catch (e) {} };
       const wakeOff = () => { try { if (WAKE.current) WAKE.current.release(); } catch (e) {} WAKE.current = null; };
@@ -39214,7 +39309,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         goTo([{ id: p.id || '', name: p.name, lat: P.lat, lng: P.lng }]);
       };
       const recenter = () => { setFollow(true); S.current.follow = true; const map = M.current; if (map && S.current.mode === 'nav') map.dragging.disable(); const fx = F.current; if (fx) { if (S.current.mode === 'nav') camera([fx.lat, fx.lng], HD.current, fx.spd); else map && map.setView([fx.lat, fx.lng], 16); } };
-      const overview = () => { const N = NV.current, map = M.current; if (!map) return; setFollow(false); S.current.follow = false; setTilt(false); setRot(0); map.dragging.enable(); if (N && N.R) map.fitBounds(window.L.latLngBounds(N.R.pts), pads(160, 220)); };
+      React.useEffect(() => { if (mode !== 'nav' || follow) return; PANT.current = PANT.current || Date.now();
+        const t = setInterval(() => { if (S.current.mode === 'nav' && !S.current.follow && Date.now() - PANT.current > 20000) recenter(); }, 2000); return () => clearInterval(t); }, [mode, follow]);
+      const overview = () => { const N = NV.current, map = M.current; if (!map) return; PANT.current = Date.now(); setFollow(false); S.current.follow = false; setTilt(false); setRot(0); map.dragging.enable(); if (N && N.R) map.fitBounds(window.L.latLngBounds(N.R.pts), pads(160, 220)); };
       const toggleMute = () => setMuted(m => { const v = !m; try { localStorage.setItem('kb_gps_mute', v ? '1' : '0'); } catch (e) {} if (v) { try { speechSynthesis.cancel(); } catch (e) {} } return v; });
 
       // ── V11.95 — tournée choisie par le chauffeur (plusieurs lieux) ──
@@ -39307,7 +39404,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {mode === 'home' && (
             <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, zIndex: 20, ...card, borderRadius: '22px 22px 0 0', padding: '12px 14px calc(14px + env(safe-area-inset-bottom))', maxHeight: '58%', overflowY: 'auto' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 13, color: '#607d8b', fontWeight: 700, marginBottom: 8 }}>
-                <span>{gpsTxt}</span>{share && pill('📡 Position partagée avec le bureau', '#2e7d32')}{ttKey ? pill('🚦 Trafic en direct', '#1e88e5') : pill('Sans trafic en direct', '#90a4ae')}
+                {gps.st === 'ok' ? <span>{gpsTxt}</span> : <button type="button" onClick={() => setGpsAsk('open')} style={{ border: 'none', borderRadius: 10, padding: '4px 10px', background: gps.st === 'wait' ? '#eceff1' : '#ffebee', color: gps.st === 'wait' ? '#455a64' : '#c62828', fontSize: 13, fontWeight: 800 }}>{gpsTxt} ›</button>}{share && pill('📡 Position partagée avec le bureau', '#2e7d32')}{ttKey ? pill('🚦 Trafic en direct', '#1e88e5') : pill('Sans trafic en direct', '#90a4ae')}
               </div>
               {msg && <div style={{ background: '#fff3e0', borderRadius: 12, padding: '8px 12px', fontSize: 16, fontWeight: 700, marginBottom: 8 }}>{msg}</div>}
               {busy && <div style={{ fontSize: 17, fontWeight: 700, color: '#1e88e5', marginBottom: 8 }}>⏳ {busy}</div>}
@@ -39458,6 +39555,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 {sheet === 'help' && <KbGpsHelp />}
               </div>
             </div>)}
+          {gpsAsk && gpsAsk !== 'closed' && gps.st !== 'ok' && <KbGpsPermSheet st={gpsAsk} code={gps.code} onAsk={askGps} onClose={() => setGpsAsk('closed')} />}
           {showProf && <KbTruckProfSheet prof={prof} onClose={() => { if (prof) setShowProf(false); else { kbTruckProfSet(KB_TRUCK_PRESETS[0]); setProf(KB_TRUCK_PRESETS[0]); setShowProf(false); } }} onSave={p => { kbTruckProfSet(p); setProf(p); setShowProf(false); }} />}
         </div>
       );
@@ -39760,12 +39858,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         if (!drv) await storage.setDoc('followups', f.id || f.orderId, val);
       };
       const group = (man, ord) => { const g = {}; man.forEach(r => (g[r.site || '?'] = g[r.site || '?'] || []).push({ k: 'm', r, key: 'm_' + r.id })); ord.forEach(f => (g[f.site || '?'] = g[f.site || '?'] || []).push({ k: 'o', f, key: 'o_' + (f.orderId || f.id) })); return g; };
-      const toTake = B.ready ? group(B.recoverManual, B.recoverOrders) : {};
-      const toCheck = B.ready ? group(B.pickedManual, B.pickedOrders) : {};
+      // V11.96 — contenants vides (rolls, dollies, cagettes) : info seulement → encart en haut, pas dans les cartes ni les compteurs
+      const isCont = r => !!(r && r.kind === 'rolls');
+      const contTake = B.ready ? B.recoverManual.filter(isCont) : [];
+      const [contOpen, setContOpen] = React.useState(false);
+      const toTake = B.ready ? group(B.recoverManual.filter(r => !isCont(r)), B.recoverOrders) : {};
+      const toCheck = B.ready ? group(B.pickedManual.filter(r => !isCont(r)), B.pickedOrders) : {};
       const nTake = Object.values(toTake).reduce((a, l) => a + l.length, 0);
       const nCheck = Object.values(toCheck).reduce((a, l) => a + l.length, 0);
-      const nDepo = B.ready ? B.verifiedManual.length + B.verifiedOrders.length : 0;
-      const nDepoItems = B.ready ? B.verifiedManual.reduce((a, r) => a + (r.qty || 1), 0) + B.verifiedOrders.reduce((a, f) => a + (f.items || []).filter((_, i) => (f.pdpCheck || {})[String(i)] !== false).length, 0) : 0;
+      const nDepo = B.ready ? B.verifiedManual.filter(r => !isCont(r)).length + B.verifiedOrders.length : 0;
+      const nDepoItems = B.ready ? B.verifiedManual.filter(r => !isCont(r)).reduce((a, r) => a + (r.qty || 1), 0) + B.verifiedOrders.reduce((a, f) => a + (f.items || []).filter((_, i) => (f.pdpCheck || {})[String(i)] !== false).length, 0) : 0;
 
       // ── 📷 photo au lieu ──
       const addPhoto = async (site, files) => {
@@ -39814,6 +39916,27 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           muCelebrate(list.length, 'dans le camion');
         } catch (e) { denied(e); } finally { setBusy(false); }
       };
+      // V11.96 — contenants vides : « pris » au lieu → récupéré + vérifié d'office (rien à vérifier pour du vide) ; le reste repart en demande
+      const takeCont = async (x) => {
+        setBusy(true);
+        try {
+          const ask = kbContOf(x.r), got = { ...ask, ...(take[x.r.id] || {}) };
+          const tot = KB_CONT.reduce((a, t) => a + (Number(got[t.k]) || 0), 0);
+          const rest = {}; KB_CONT.forEach(t => { rest[t.k] = Math.max(0, (ask[t.k] || 0) - (Number(got[t.k]) || 0)); });
+          const nRest = KB_CONT.reduce((a, t) => a + rest[t.k], 0);
+          const ok = { status: 'verified', recoveredBy: session.name, recoveredAt: now(), verifiedBy: session.name, verifiedAt: now() };
+          if (!nRest) { await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now() }); await storage.setDoc('pdp_returns', x.r.id, ok); showToast('✓ ' + x.r.site + ' · ' + kbContLabel(ask) + ' dans le camion'); return; }
+          if (tot) { const lbl = '🛒 ' + kbContLabel(got); await storage.setDoc('pdp_returns', x.r.id, { status: 'recovered', recoveredBy: session.name, recoveredAt: now(), roll: got.roll, dolly: got.dolly, cagette: got.cagette, qty: tot, produit: lbl, productLabel: lbl, askedInit: ask });
+            await storage.setDoc('pdp_returns', x.r.id, ok); }
+          const rlbl = '🛒 ' + kbContLabel(rest), rid = tot ? `pdpret_rolls_${x.r.site}_${Date.now()}_r` : x.r.id;
+          await storage.setDoc('pdp_returns', rid, { ...(tot ? { id: rid, kind: 'rolls', site: x.r.site, productKey: 'ROLLS', producteur: '', clientName: '', dlc: '', pickupDate: x.r.pickupDate || '', day: x.r.day || todayKey(), createdBy: x.r.createdBy || session.name, createdAt: x.r.createdAt || now() } : {}),
+            status: 'pending', roll: rest.roll, dolly: rest.dolly, cagette: rest.cagette, qty: nRest, produit: rlbl, productLabel: rlbl, remark: `Reste à ramener (${session.name} en a pris ${tot ? kbContLabel(got) : 'aucun'})`, updatedAt: now() });
+          setTake(o => { const k = { ...o }; delete k[x.r.id]; return k; });
+          showToast('✓ ' + x.r.site + (tot ? ' · pris ' + kbContLabel(got) : '') + ' · reste ' + kbContLabel(rest) + ' pour la prochaine fois');
+        } catch (e) { denied(e); } finally { setBusy(false); }
+      };
+      const contTot = {}; contTake.forEach(r => { const c = kbContOf(r); KB_CONT.forEach(t => { contTot[t.k] = (contTot[t.k] || 0) + (c[t.k] || 0); }); });
+      const contSites = Array.from(new Set(contTake.map(r => r.site || '?'))).sort();
       // ── 🔍 vérification d'un lieu (photos en haut) ──
       const itemsOf = (x) => x.k === 'm' ? [{ key: x.key, label: kbProdName(x.r.produit || x.r.productLabel), qty: x.r.qty || 1, sub: [x.r.clientName, x.r.dlc ? 'DLC ' + formatDateShort(x.r.dlc) : ''].filter(Boolean).join(' · ') }]
         : (x.f.items || []).map((it, i) => ({ key: x.key + '__' + i, label: kbProdName(it.produit || ''), qty: it.qty || 1, sub: '🧺 ' + (x.f.consumer_name || '') + (it.dlc ? ' · DLC ' + formatDateShort(it.dlc) : '') }));
@@ -39864,6 +39987,34 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <StepChip n={nDepo} ic="🏭" t="Déposer" c="#2e7d32" on={false} onClick={() => { const el = document.getElementById('kb-depot'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }} />
           </div>
           {!B.ready && <div className="card" style={{ padding: 16, fontSize: 18 }}>Chargement…</div>}
+          {B.ready && contTake.length > 0 && <button type="button" onClick={() => setContOpen(true)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', border: '2px solid #a1887f', borderRadius: 14, background: '#efebe9', color: '#3e2723', padding: '8px 12px', cursor: 'pointer' }}>
+            <span style={{ fontSize: 26 }}>🛒</span>
+            <span style={{ flex: 1, minWidth: 0 }}><b style={{ fontSize: 16, display: 'block' }}>Pense aux contenants vides</b>
+              <span style={{ fontSize: 14 }}>{kbContLabel(contTot)} · {contSites.join(', ')}</span></span>
+            <span style={{ fontSize: 14, fontWeight: 800, color: '#6d4c41', whiteSpace: 'nowrap' }}>Détail ›</span>
+          </button>}
+          {contOpen && (
+            <div onClick={() => setContOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,.55)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+              <div onClick={e => e.stopPropagation()} style={{ background: '#fff', color: '#111', width: '100%', maxWidth: 560, maxHeight: '88vh', overflowY: 'auto', borderRadius: '20px 20px 0 0', padding: '14px 14px calc(16px + env(safe-area-inset-bottom))' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><b style={{ flex: 1, fontSize: 22 }}>🛒 Contenants vides à ramener</b><button type="button" onClick={() => setContOpen(false)} style={{ width: 44, height: 44, borderRadius: 22, border: 'none', background: '#eceff1', fontSize: 20, fontWeight: 900 }}>✕</button></div>
+                <div style={{ fontSize: 14, color: '#607d8b', margin: '2px 0 10px' }}>Pour info : si tu as la place. Ce que tu ne prends pas reste demandé pour la prochaine fois.</div>
+                {!contTake.length && <div style={{ fontSize: 18, fontWeight: 700, color: '#2e7d32' }}>👍 Plus rien à ramener</div>}
+                {contTake.slice().sort((a, b) => String(a.site).localeCompare(String(b.site))).map(r => { const x = { k: 'm', r, key: 'm_' + r.id }, ask = kbContOf(r), got = { ...ask, ...(take[r.id] || {}) }; return (
+                  <div key={r.id} style={{ border: '3px solid ' + kbSiteColor(r.site), borderRadius: 14, padding: '8px 12px', marginBottom: 8 }}>
+                    <div style={{ fontSize: 20, fontWeight: 900 }}>📍 {r.site} <span style={{ fontSize: 14, fontWeight: 600, color: '#607d8b' }}>{siteLabel(r.site) !== r.site ? siteLabel(r.site) : ''}</span></div>
+                    {KB_CONT.filter(t => ask[t.k]).map(t => (
+                      <div key={t.k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '3px 0' }}>
+                        <span style={{ fontSize: 17, fontWeight: 700 }}>{t.ic} {t.l} <span style={{ fontSize: 13, color: '#607d8b' }}>(demandé {ask[t.k]})</span></span>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <button type="button" disabled={busy} onClick={() => setTake(o => ({ ...o, [r.id]: { ...got, [t.k]: Math.max(0, got[t.k] - 1) } }))} style={{ width: 48, height: 48, borderRadius: 12, fontSize: 26, fontWeight: 800, border: '2px solid #cfd8dc', background: '#fff' }}>−</button>
+                          <b style={{ fontSize: 26, minWidth: 32, textAlign: 'center', color: got[t.k] < ask[t.k] ? '#e65100' : 'inherit' }}>{got[t.k]}</b>
+                          <button type="button" disabled={busy || got[t.k] >= ask[t.k]} onClick={() => setTake(o => ({ ...o, [r.id]: { ...got, [t.k]: Math.min(ask[t.k], got[t.k] + 1) } }))} style={{ width: 48, height: 48, borderRadius: 12, fontSize: 26, fontWeight: 800, border: '2px solid #2e7d32', background: '#e8f5e9' }}>+</button>
+                        </span>
+                      </div>))}
+                    <button type="button" disabled={busy} onClick={() => takeCont(x)} style={{ width: '100%', minHeight: 54, marginTop: 6, borderRadius: 12, border: 'none', background: '#6d4c41', color: '#fff', fontSize: 18, fontWeight: 800 }}>{busy ? '⏳…' : '✓ Pris à ' + r.site + ' (' + kbContLabel(got) + ')'}</button>
+                  </div>); })}
+              </div>
+            </div>)}
 
           {B.ready && step === 'lieux' && (!nTake
             ? <div className="card" style={{ textAlign: 'center', padding: '22px 14px', fontSize: 21, fontWeight: 700, color: '#2e7d32' }}>👍 Rien à prendre en boutique</div>
@@ -39898,21 +40049,6 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                   {cratesOf(list).length > 0 && <div style={{ fontSize: 16, fontWeight: 800, marginTop: 4 }}>Autres retours (sans n° de cagette) :</div>}
                   <div style={{ fontSize: 15, color: 'var(--ink-soft)' }}>Dans la cagette « Retour PDP » :</div>
                   {list.filter(x => !isCr(x) && !(x.k === 'm' && x.r.kind === 'rolls')).flatMap(itemsOf).map(i => <div key={i.key} style={{ fontSize: 18, fontWeight: 700 }}>• {i.label}{i.qty > 1 ? <span style={{ color: '#c62828' }}> ×{i.qty}</span> : ''} <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-soft)' }}>{i.sub}</span></div>)}
-                  {list.filter(x => x.k === 'm' && x.r.kind === 'rolls').map(x => { const ask = kbContOf(x.r), got = { ...ask, ...(take[x.r.id] || {}) }; return (
-                    <div key={x.key} style={{ border: '3px solid #6d4c41', borderRadius: 14, padding: '10px 12px', background: '#efebe9' }}>
-                      <div style={{ fontSize: 18, fontWeight: 800 }}>🛒 Contenants vides demandés : {kbContLabel(ask)}</div>
-                      <div style={{ fontSize: 14, color: 'var(--ink-soft)', marginBottom: 6 }}>Tu en prends moins ? Mets combien tu en prends vraiment :</div>
-                      {KB_CONT.filter(t => ask[t.k]).map(t => (
-                        <div key={t.k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '4px 0' }}>
-                          <span style={{ fontSize: 18, fontWeight: 700 }}>{t.ic} {t.l} <span style={{ fontSize: 13, color: 'var(--ink-soft)' }}>(demandé {ask[t.k]})</span></span>
-                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                            <button type="button" disabled={busy} onClick={() => setTake(o => ({ ...o, [x.r.id]: { ...got, [t.k]: Math.max(0, got[t.k] - 1) } }))} style={{ width: 54, height: 54, borderRadius: 12, fontSize: 28, fontWeight: 800, border: '2px solid var(--line)', background: '#fff' }}>−</button>
-                            <b style={{ fontSize: 28, minWidth: 36, textAlign: 'center', color: got[t.k] < ask[t.k] ? '#e65100' : 'inherit' }}>{got[t.k]}</b>
-                            <button type="button" disabled={busy || got[t.k] >= ask[t.k]} onClick={() => setTake(o => ({ ...o, [x.r.id]: { ...got, [t.k]: Math.min(ask[t.k], got[t.k] + 1) } }))} style={{ width: 54, height: 54, borderRadius: 12, fontSize: 28, fontWeight: 800, border: '2px solid #2e7d32', background: '#e8f5e9' }}>+</button>
-                          </span>
-                        </div>))}
-                      {KB_CONT.some(t => got[t.k] < ask[t.k]) && <div style={{ fontSize: 14, fontWeight: 700, color: '#e65100', marginTop: 4 }}>Le reste restera à récupérer la prochaine fois.</div>}
-                    </div>); })}
                   <KbPdpPhotoStrip photos={ph} onDel={delPhoto} />
                   <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 64, borderRadius: 14, border: '3px dashed #1565c0', background: '#e3f2fd', color: '#0d47a1', fontSize: 20, fontWeight: 800, cursor: 'pointer', margin: 0 }}>
                     📷 {ph.length ? 'Encore une photo' : 'Prendre une photo'}
@@ -40030,6 +40166,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       storage.setDoc('rungis_picks', 'tourperso_' + day, { id: 'tourperso_' + day, kind: 'tourperso', day, status: '', by: String((session && session.name) || '').slice(0, 60), at: new Date().toISOString(),
         unlocked: !!t.unlocked, sites: (codes || []).slice(0, 40), end: t.end || 'none' }).catch(() => {});
     }
+    function kbDrvAloneMail(d, lieu, hm) {
+      const hf = String(d.helpFrom || '15:30').replace(':', 'h'), h = hm || kbHM(d.eta);
+      return { subject: `🧍 ${d.site} · déchargement probablement seul · arrivée ≈ ${h} · ${d.by || 'chauffeur'}`,
+        body: `D'après la tournée du jour et le ${d.traffic ? 'trafic' : 'temps de trajet estimé'}, ${d.by || 'le chauffeur'} va arriver à ${h} à ${lieu || d.site} (${d.site}) et risque de décharger seul : personne sur place avant ${hf}.\n\n— Appli Kelbongoo · chauffeur Rungis` };
+    }
     const KB_DRV_ENDS = [{ k: 'none', l: 'Pas d\'arrivée' }, { k: 'start', l: '🔁 Retour au départ' }, { k: 'ENTREPOT', l: '🏢 Entrepôt PDP' }, { k: 'RUNGIS', l: '🏭 Rungis' }];
     // Jour où la ligne doit être PRISE à l'entrepôt : enlèvement = jour validé par Rungis ; rolls = veille pour les boutiques livrées la veille
     function kbDrvPickDay(l, lieux) {
@@ -40065,7 +40206,16 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       return legs.map(lg => ({ sec: (lg.summary && lg.summary.travelTimeInSeconds) || 0, delay: (lg.summary && lg.summary.trafficDelayInSeconds) || 0 }));
     }
     // Plan : ordre de livraison + heures + rang de chargement ; détour pour chaque lieu « extra » (hors tournée)
-    async function kbDrvPlan({ sites, extras, places, key, prof, dwellMin, ret, fixed }) {
+    // V11.96 — lieux sans personne pour aider à décharger avant une heure donnée (réglable : gps_config/main.helpFrom = { BOR: '15:30' })
+    const KB_DRV_HELP_DEF = { BOR: '15:30' };
+    function kbDrvHelpFrom(gcfg) {
+      const o = { ...KB_DRV_HELP_DEF }, h = gcfg && gcfg.helpFrom;
+      if (h && typeof h === 'object') Object.keys(h).forEach(k => { const v = String(h[k] || ''); const c = String(k).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+        if (!c) return; if (/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) o[c] = v; else if (v === '' || v === 'off') delete o[c]; });
+      return o;
+    }
+    function kbAtToday(hhmm, ref) { const d = new Date(ref || Date.now()); const [h, m] = String(hhmm).split(':').map(Number); d.setHours(h, m, 0, 0); return d.getTime(); }
+    async function kbDrvPlan({ sites, extras, places, key, prof, dwellMin, ret, fixed, help }) {
       const P0 = prof || KB_TRUCK_PRESETS[0];
       const byId = {}; (places || []).forEach(p => { byId[p.id] = p; });
       const start = byId.ENTREPOT;
@@ -40092,7 +40242,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         const prev = k ? seq[k - 1] : 0;
         t += (legs ? legs[k].sec : T[prev][i]) * 1000;
         const p = pts[i];
-        order.push({ code: p.id, name: p.name, lat: p.lat, lng: p.lng, eta: t, delay: legs ? legs[k].delay : 0, load: n - k });
+        const hf = help && help[p.id], alone = !!(hf && t < kbAtToday(hf, t)); // V11.96 — arrivée avant l'heure où quelqu'un aide
+        order.push({ code: p.id, name: p.name, lat: p.lat, lng: p.lng, eta: t, delay: legs ? legs[k].delay : 0, load: n - k, helpFrom: hf || '', alone });
         t += dwell * 1000;
       });
       // détour pour chaque lieu extra : meilleure insertion dans l'ordre trouvé
@@ -40190,7 +40341,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div key={o.code} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: i ? '1px solid var(--line)' : 'none', marginTop: i ? 0 : 6 }}>
               <span style={{ width: 34, height: 34, borderRadius: 17, background: '#1565c0', color: '#fff', fontWeight: 900, fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{i + 1}</span>
               <span style={{ flex: 1, minWidth: 0 }}><b style={{ fontSize: 19 }}>{o.code}</b> <span style={{ fontSize: 14, color: 'var(--ink-soft)' }}>{o.name !== o.code ? o.name : ''}</span>
-                <span style={{ display: 'block', fontSize: 14, color: '#1565c0', fontWeight: 700 }}>≈ {kbHM(new Date(o.eta).toISOString())}{o.delay > 120 ? ' · bouchon +' + Math.round(o.delay / 60) + ' min' : ''}</span></span>
+                <span style={{ display: 'block', fontSize: 14, color: '#1565c0', fontWeight: 700 }}>≈ {kbHM(new Date(o.eta).toISOString())}{o.delay > 120 ? ' · bouchon +' + Math.round(o.delay / 60) + ' min' : ''}</span>
+                {o.alone && <span style={{ display: 'inline-block', marginTop: 3, background: '#fff8e1', color: '#e65100', border: '2px solid #ffb300', borderRadius: 8, padding: '2px 8px', fontSize: 13, fontWeight: 800 }}>🧍 Personne avant {o.helpFrom.replace(':', 'h')} · déchargement probablement seul</span>}</span>
               <span style={{ textAlign: 'right', fontSize: 14, fontWeight: 800, background: '#fff3e0', color: '#e65100', borderRadius: 10, padding: '4px 8px' }}>📦 charger en {kbDrvRank(o.load)}{o.load === 1 ? <span style={{ display: 'block', fontSize: 11 }}>au fond</span> : o.load === plan.order.length ? <span style={{ display: 'block', fontSize: 11 }}>près des portes</span> : null}</span>
             </div>))}
           {plan && plan.ret && <div style={{ fontSize: 15, fontWeight: 700, marginTop: 4 }}>🏁 Arrivée : {plan.ret.name}</div>}
@@ -40245,11 +40397,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const fixedOrder = !dtour.unlocked && bureau.length > 0 && gtour && gtour.optimize === false;
       // lieux hors tournée qui ont une palette EN RETARD → on calcule le détour
       const extras = React.useMemo(() => cands.filter(c => c.late && !(sites || []).includes(c.code)).map(c => c.code), [cands, sites]);
-      const planSig = JSON.stringify([sites, extras, places.map(p => [p.id, p.lat, p.lng]), gcfg && gcfg.tomtomKey ? 1 : 0, endPt && [endPt.lat, endPt.lng], fixedOrder, planTick]);
+      const planSig = JSON.stringify([sites, extras, places.map(p => [p.id, p.lat, p.lng]), gcfg && gcfg.tomtomKey ? 1 : 0, gcfg && gcfg.helpFrom, endPt && [endPt.lat, endPt.lng], fixedOrder, planTick]);
       React.useEffect(() => {
         if (!sites || !sites.length || !places.length) { setPlan(null); return; }
         let stop = false; setPlanBusy(true); setPlanErr('');
-        kbDrvPlan({ sites, extras, places, key: gcfg && gcfg.tomtomKey ? String(gcfg.tomtomKey) : '', prof: kbTruckProfGet(), dwellMin: gtour && gtour.dwellMin != null ? gtour.dwellMin : 10, ret: endPt, fixed: fixedOrder })
+        kbDrvPlan({ sites, extras, places, key: gcfg && gcfg.tomtomKey ? String(gcfg.tomtomKey) : '', prof: kbTruckProfGet(), dwellMin: gtour && gtour.dwellMin != null ? gtour.dwellMin : 10, ret: endPt, fixed: fixedOrder, help: kbDrvHelpFrom(gcfg) })
           .then(r => { if (!stop) setPlan(r); }).catch(e => { if (!stop) setPlanErr(e.message || String(e)); }).finally(() => { if (!stop) setPlanBusy(false); });
         return () => { stop = true; };
       }, [planSig]);
@@ -40350,17 +40502,74 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const actionable = lines.filter(l => !l.info && !l.refused);
       // V11.78 — ce qui reste à récupérer AUJOURD'HUI (validé, sur la tournée ou détour accepté)
       const leftToday = actionable.filter(l => !(pk[l.id] && pk[l.id].status)).map(l => ({ l, v: verdictOf(l) })).filter(x => x.v.ok);
+      // V11.96 — arrivée avant l'heure d'aide (BOR 15h30) → fenêtre au chauffeur + mail rr@ / hg@ (une fois par jour et par lieu)
+      const [aloneAsk, setAloneAsk] = React.useState(null);
+      const aloneNow = plan && plan.order ? plan.order.filter(o => o.alone) : [];
+      const aloneAlert = async () => {
+        if (!canWrite || !aloneNow.length) return;
+        setAloneAsk(aloneNow);
+        for (const o of aloneNow) {
+          const id = 'alone_' + today + '_' + o.code; if (pk[id]) continue;
+          const who = String(session.name || 'Le chauffeur').slice(0, 60), hm = kbHM(new Date(o.eta).toISOString()), lieu = (siteLabel(o.code) !== o.code ? siteLabel(o.code) : o.name || o.code);
+          const doc = { id, kind: 'alone', day: today, site: o.code, eta: new Date(o.eta).toISOString(), helpFrom: o.helpFrom, by: who, at: new Date().toISOString(), status: '', mailed: false, traffic: !!(plan && plan.traffic) };
+          try { await storage.setDoc('rungis_picks', id, doc); } catch (e) { continue; }
+          const m = kbDrvAloneMail(doc, lieu, hm);
+          try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: m.subject, body: m.body });
+            if (r && r.ok !== false) await storage.setDoc('rungis_picks', id, { mailed: true, mailedAt: new Date().toISOString() }); } catch (e) { /* refus chauffeur → le master l'envoie (Enlèvements) */ }
+        }
+      };
       const confirmLoad = async () => {
-        setLoadAsk(false);
+        setLoadAsk(false); aloneAlert();
         try { await storage.setDoc('rungis_picks', 'loadcheck_' + today, { id: 'loadcheck_' + today, kind: 'loadcheck', day: today, status: '', by: session.name || '', at: new Date().toISOString(),
           sites: sites || [], order: plan ? plan.order.map(o => o.code) : [], left: leftToday.map(x => x.l.site + ' · ' + x.l.label).slice(0, 40) }); } catch (e) {}
         showToast(leftToday.length ? '⚠️ Chargement validé · ' + leftToday.length + ' chose(s) pas prises (le bureau le voit)' : '✅ Chargement validé · bonne route');
       };
+      // V11.96 — décompte des SUPPORTS (palette / roll / dolly) à récupérer aujourd'hui : scannés ou ✅ pris
+      const loadCount = (() => {
+        const rows = []; let tot = 0, got = 0;
+        actionable.forEach(l => {
+          const p = pk[l.id] || {}; if (p.status && p.status !== 'ok') return;
+          if (p.status !== 'ok' && !verdictOf(l).ok) return;
+          const N = Math.max(1, (l.units || []).length), sc = { ...(qr.scans[kbRgSafeId(l.id)] || {}), ...(qrSeen.current[l.id] || {}) };
+          const us = []; for (let k = 1; k <= N; k++) us.push({ k, name: ((l.units || [])[k - 1] || 'Support') + (N > 1 ? ' ' + k + '/' + N : ''), ok: p.status === 'ok' || !!sc[k] });
+          const g = us.filter(u => u.ok).length; tot += N; got += g; rows.push({ l, us, got: g, N });
+        });
+        const bs = {}; rows.forEach(r => { (bs[r.l.site] = bs[r.l.site] || []).push(r); });
+        const order = Object.keys(bs).sort((a, b) => (posOf(a) - posOf(b)) || a.localeCompare(b));
+        return { tot, got, left: tot - got, bs, order, leftBy: order.map(c => [c, bs[c].reduce((a, r) => a + r.N - r.got, 0)]).filter(x => x[1] > 0) };
+      })();
+      const [countOpen, setCountOpen] = React.useState(false);
+      const countBar = (dark) => loadCount.tot > 0 && (
+        <button type="button" onClick={() => setCountOpen(true)} style={{ display: 'block', width: '100%', textAlign: 'left', border: dark ? 'none' : '3px solid ' + (loadCount.left ? '#111' : '#2e7d32'), borderRadius: 16, background: loadCount.left ? (dark ? '#fff' : '#fff') : '#e8f5e9', color: '#111', padding: '10px 14px', cursor: 'pointer' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ fontSize: 30, fontWeight: 900 }}>📦 {loadCount.got} / {loadCount.tot}</span>
+            <span style={{ flex: 1, fontSize: 18, fontWeight: 800 }}>récupéré{loadCount.got > 1 ? 's' : ''}</span>
+            <span style={{ fontSize: 15, fontWeight: 800, color: '#1565c0', whiteSpace: 'nowrap' }}>Détail ›</span>
+          </div>
+          <div style={{ height: 12, background: '#e0e0e0', borderRadius: 6, marginTop: 6, overflow: 'hidden' }}><div style={{ width: (loadCount.got / loadCount.tot * 100) + '%', height: '100%', background: loadCount.left ? '#1565c0' : '#2e7d32', transition: 'width .4s' }} /></div>
+          <div style={{ fontSize: 16, fontWeight: 700, marginTop: 6, color: loadCount.left ? '#e65100' : '#2e7d32' }}>{loadCount.left ? 'Il reste ' + loadCount.left + ' : ' + loadCount.leftBy.map(x => x[0] + ' ' + x[1]).join(' · ') : '✅ Tout est récupéré pour aujourd\'hui'}</div>
+        </button>);
+      const countSheet = countOpen && (
+        <div onClick={() => setCountOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 10001, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: '#fff', color: '#111', width: '100%', maxWidth: 560, maxHeight: '88vh', overflowY: 'auto', borderRadius: '20px 20px 0 0', padding: '14px 14px calc(16px + env(safe-area-inset-bottom))' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><b style={{ flex: 1, fontSize: 23 }}>📦 {loadCount.got} / {loadCount.tot} récupérés</b><button type="button" onClick={() => setCountOpen(false)} style={{ width: 44, height: 44, borderRadius: 22, border: 'none', background: '#eceff1', fontSize: 20, fontWeight: 900 }}>✕</button></div>
+            <div style={{ fontSize: 14, color: '#607d8b', marginBottom: 8 }}>Ce qui est à prendre aujourd'hui, dans l'ordre de livraison. ⬜ = encore à scanner.</div>
+            {loadCount.order.map(c => { const rs = loadCount.bs[c], lf = rs.reduce((a, r) => a + r.N - r.got, 0); return (
+              <div key={c} style={{ border: '3px solid ' + (SITE_NAMES[c] ? kbSiteColor(c) : '#607d8b'), borderRadius: 14, marginBottom: 8, overflow: 'hidden' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', background: SITE_NAMES[c] ? kbSiteColor(c) : '#607d8b', color: '#fff' }}><b style={{ fontSize: 22 }}>{c}</b><span style={{ flex: 1, fontSize: 14 }}>{siteLabel(c) !== c ? siteLabel(c) : ''}</span><b style={{ fontSize: 16 }}>{lf ? 'reste ' + lf : '✅'}</b></div>
+                <div style={{ padding: '6px 12px' }}>{rs.map(r => r.us.map(u => (
+                  <div key={r.l.id + '_' + u.k} style={{ display: 'flex', gap: 8, alignItems: 'baseline', padding: '3px 0', opacity: u.ok ? 0.55 : 1 }}>
+                    <span style={{ fontSize: 20 }}>{u.ok ? '✅' : '⬜'}</span>
+                    <span style={{ fontSize: 17, fontWeight: u.ok ? 600 : 800, textDecoration: u.ok ? 'line-through' : 'none' }}>{u.name} <span style={{ fontSize: 14, fontWeight: 600, color: '#607d8b' }}>· {r.l.label}</span></span>
+                  </div>)))}</div>
+              </div>); })}
+          </div>
+        </div>);
       const handled = actionable.filter(l => pk[l.id] && pk[l.id].status).length;
       const done = actionable.length > 0 && handled === actionable.length;
       const was = React.useRef(null);
       React.useEffect(() => {
-        if (was.current === false && done) kbCelebrate({ title: 'Chargement terminé 🎉', sub: 'Tout est noté pour les boutiques. Bonne route !' });
+        if (was.current === false && done) { kbCelebrate({ title: 'Chargement terminé 🎉', sub: 'Tout est noté pour les boutiques. Bonne route !' }); aloneAlert(); }
         was.current = done;
       }, [done]);
 
@@ -40371,10 +40580,24 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <div style={{ fontSize: 16, color: 'var(--ink-soft)', marginTop: 4 }}>Scanne l'étiquette QR de chaque palette / roll / dolly : l'appli te dit si tu la prends aujourd'hui et où la mettre dans le camion. Ou touche <b style={{ color: '#2e7d32' }}>✅ Pris</b>. <b style={{ color: '#c62828' }}>❌ Pas pris</b> = une alerte part au bureau.</div>
           </div>
           <KbDrvTourCard cands={cands} places={places} bureau={bureau} tour={dtour} setTour={setDtour} plan={plan} planErr={planErr} busy={planBusy} recalc={() => setPlanTick(x => x + 1)} onGps={pl => onGps && onGps(pl)} />
+          {countBar(false)}
+          {countSheet}
+          {aloneAsk && aloneAsk.length > 0 && (
+            <div style={{ position: 'fixed', inset: 0, zIndex: 10002, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 14 }}>
+              <div style={{ width: '100%', maxWidth: 460, background: '#fff', color: '#111', borderRadius: 20, overflow: 'hidden' }}>
+                <div style={{ background: '#ef6c00', color: '#fff', padding: '14px 16px', fontSize: 24, fontWeight: 900 }}>🧍 Attention</div>
+                <div style={{ padding: 16 }}>
+                  {aloneAsk.map(o => <div key={o.code} style={{ fontSize: 19, fontWeight: 700, lineHeight: 1.35, marginBottom: 8 }}>
+                    <b style={{ fontSize: 22 }}>{o.code}</b> : tu arrives vers <b>{kbHM(new Date(o.eta).toISOString())}</b>, il n'y a personne avant <b>{o.helpFrom.replace(':', 'h')}</b>. <span style={{ color: '#e65100' }}>Déchargement probablement seul.</span></div>)}
+                  <div style={{ fontSize: 14, color: '#607d8b' }}>Le bureau est prévenu.</div>
+                  <button onClick={() => setAloneAsk(null)} style={{ width: '100%', minHeight: 62, marginTop: 12, borderRadius: 14, border: 'none', background: '#1565c0', color: '#fff', fontSize: 20, fontWeight: 900, cursor: 'pointer' }}>👍 OK, compris</button>
+                </div>
+              </div>
+            </div>)}
           {canWrite && <button onClick={() => { setScanMsg(null); setScanOpen(true); }} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, width: '100%', minHeight: 84, borderRadius: 18, border: 'none', background: '#111', color: '#fff', fontSize: 24, fontWeight: 900, cursor: 'pointer' }}>
             <span style={{ fontSize: 40 }}>🔳</span>Scanner les étiquettes QR</button>}
           {scanMsg && !scanOpen && <div onClick={() => setScanMsg(null)} style={{ borderRadius: 14, padding: '12px 14px', color: '#fff', background: scanMsg.bad ? '#c62828' : scanMsg.warn ? '#e65100' : '#2e7d32' }}><div style={{ fontSize: 21, fontWeight: 900 }}>{scanMsg.t}</div>{scanMsg.s && <div style={{ fontSize: 15, fontWeight: 600 }}>{scanMsg.s}</div>}</div>}
-          {scanOpen && <KbQrScanOverlay onScan={onQr} msg={scanMsg} onClose={() => setScanOpen(false)} />}
+          {scanOpen && <KbQrScanOverlay onScan={onQr} msg={scanMsg} onClose={() => setScanOpen(false)} extra={countBar(true)} />}
           {ask2 && (() => { const { l, v, q, N, unit } = ask2; const col = v.ok ? (v.k === 'today' ? '#2e7d32' : '#e65100') : v.k === 'future' ? '#1565c0' : '#c62828'; const o2 = plan && plan.order.find(x => x.code === l.site);
             return (
               <div style={{ position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12 }}>
@@ -41031,6 +41254,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       };
       // V11.95 — demandes du chauffeur du jour : envoi express, tournée d'urgence
       const expToday = (picks || []).filter(p => p && p.kind === 'express' && p.day === today);
+      const aloneToday = (picks || []).filter(p => p && p.kind === 'alone' && p.day === today); // V11.96
+      const aloneSent = React.useRef({});
+      React.useEffect(() => { if (!isAdmin) return; aloneToday.filter(d => !d.mailed && !aloneSent.current[d.id]).forEach(async d => { aloneSent.current[d.id] = 1;
+        const m = kbDrvAloneMail(d, siteLabel(d.site));
+        try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: m.subject, body: m.body }); if (r && r.ok !== false) await storage.setDoc('rungis_picks', d.id, { mailed: true, mailedAt: new Date().toISOString(), mailedBy: 'master' }); } catch (e) { console.warn('alerte BOR', e); } }); },
+        [isAdmin, aloneToday.map(d => d.id + (d.mailed ? 1 : 0)).join()]);
       const tp = pk['tourperso_' + today];
       const th = { textAlign: 'left', padding: '10px 12px', fontSize: 13, fontWeight: 700, background: 'var(--bg-muted)' };
       const Table = ({ lines }) => (
@@ -41060,10 +41289,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             <span style={{ fontSize: 38 }}>🏭</span>
             <span><b style={{ fontSize: 20, display: 'block' }}>Tout se récupère à l'entrepôt PDP — Porte de Pantin</b><span style={{ fontSize: 14, opacity: .9 }}>Palettes Dispatch / Picking, dollies fromage et rolls Kelbongoo, puis livraison à la boutique indiquée.</span></span>
           </div>
-          {(expToday.length > 0 || (tp && tp.unlocked)) && ( /* V11.95 — demandes du chauffeur */
+          {(expToday.length > 0 || aloneToday.length > 0 || (tp && tp.unlocked)) && ( /* V11.95 — demandes du chauffeur */
             <div className="card" style={{ padding: 0, overflow: 'hidden', border: '3px solid #c62828' }}>
               <div style={{ background: '#c62828', color: '#fff', padding: '12px 16px', fontSize: 20, fontWeight: 700 }}>🚚 Demandes du chauffeur aujourd'hui</div>
               {tp && tp.unlocked && <div style={{ padding: '12px 16px', fontSize: 16 }}>🔓 <b>Tournée d'urgence</b> choisie par {tp.by || 'le chauffeur'}{tp.at ? ' à ' + kbHhmm(tp.at) : ''} : <b>{(tp.sites || []).join(' → ') || '—'}</b>{tp.end && tp.end !== 'none' ? ' · arrivée ' + ((KB_DRV_ENDS.find(e => e.k === tp.end) || {}).l || tp.end) : ''}</div>}
+              {aloneToday.map(x => <div key={x.id} style={{ padding: '12px 16px', borderTop: '1px solid var(--line)', fontSize: 16 }}>🧍 <b>{x.site}</b> : {x.by || 'le chauffeur'} arrive vers <b>{kbHM(x.eta)}</b>, personne avant {String(x.helpFrom || '').replace(':', 'h')} → <b>déchargement probablement seul</b> <span style={{ color: 'var(--ink-soft)', fontSize: 13 }}>{x.mailed ? '· 📧 rr@ + hg@ prévenus' : '· mail en attente'}</span></div>)}
               {expToday.map(x => <div key={x.id} style={{ padding: '12px 16px', borderTop: '1px solid var(--line)', fontSize: 16 }}>⚡ <b>Envoi express demandé</b> · <b>{x.site}</b> · {x.label}{x.pickDay ? <span style={{ color: 'var(--ink-soft)' }}> (prévu {kbRgDayLbl(x.pickDay)})</span> : null} — {x.by || 'chauffeur'}{x.at ? ' à ' + kbHhmm(x.at) : ''}</div>)}
             </div>)}
           {enl.raw === undefined && <div className="card" style={{ padding: 16 }}>Chargement…</div>}
