@@ -825,8 +825,11 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.96';
-    // V11.96 — (26/11/2026) 💬 Master › Équipe : les personnes connectées à la CENTRALE PDP apparaissent aussi (🏭) → Discussion / À valider, fils partagés avec la Console (base Centrale, nœud chat/) ; photo du support : ouverture sûre (data:image seulement)
+    const APP_VERSION = 'V11.97';
+    // V11.97 — (26/11/2026) GPS STABLE SUR IPHONE (« Un problème récurrent est survenu » = Safari tué faute de mémoire) : sur iPhone pas de vue 3D inclinée (carte 2D cap en haut, surface carte 2× plus petite), tuiles gardées au minimum (keepBuffer 1), pas de filtre nuit sur les tuiles ; REPRISE AUTOMATIQUE du guidage si l'appli est relancée pendant une tournée (moins de 4 h) ; erreur dans le GPS → l'écran GPS se relance tout seul au lieu de planter l'appli
+    // V11.97 — GPS : appui long sur la carte → « 📷 Street View ici » (Google Maps, sans clé) ou « Y aller »
+    // V11.97 — GPS : 🇷🇺 voix et consignes en russe ; tourner la carte à deux doigts ; signalement « 🚷 Sauf service / accès interdit » (point pris sur la rue où l'itinéraire entrait) évité ensuite par TOUS les itinéraires de l'équipe (TomTom avoidAreas, OSM exclude_locations), comme « Interdit aux PL » et « Route fermée » ; OSM : routes réservées / privées fortement pénalisées
+    // V11.96 — 💬 Master › Équipe : les personnes connectées à la CENTRALE PDP apparaissent aussi (🏭) → Discussion / À valider, fils partagés avec la Console (base Centrale, nœud chat/) ; photo du support : ouverture sûre (data:image seulement)
     // V11.96 — Chauffeur : lieu où personne n'aide à décharger avant une heure (BOR : 15h30, réglable gps_config.helpFrom) → « 🧍 déchargement probablement seul » sur la tournée ; au départ (chargement validé / terminé) fenêtre au chauffeur + mail rr@ + hg@ « d'après la tournée du jour et le trafic, NOM va arriver à HHhMM à … » (une fois par jour et par lieu ; repli : envoyé par le master si le chauffeur n'a pas pu)
     // V11.96 — Sapins (chauffeur) : plantage « can't convert undefined to object » corrigé — le récap figé dans la base perd les « par » vides (Firebase n'enregistre pas les objets vides) → récap normalisé + sapDispatch / sapProrata robustes
     // V11.96 — Chauffeur › À livrer : décompte des supports à récupérer aujourd'hui (« 3 / 10 récupérés », il reste…, détail au toucher, aussi dans l'écran de scan) ; Retours PDP : contenants vides (rolls, dollies, cagettes) = simple encart « pense aux contenants », détail au toucher, hors cartes / compteurs / vérification
@@ -38207,9 +38210,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     const SP_CRUARD_TXT = 'Cruard Boudinel · MIN de Rungis';
 
     function RungisDriverHome({ session }) {
-      const [view, setView] = React.useState(() => kbQrHasPending() ? 'livraison' : 'home'); // V11.74 — QR scanné avec l'appareil photo
+      const [view, setView] = React.useState(() => kbQrHasPending() ? 'livraison' : kbGpsResumeGet() ? 'gps' : 'home'); // V11.74 — QR scanné avec l'appareil photo · V11.97 guidage en cours → GPS
       const [autoScan, setAutoScan] = React.useState(false); // V11.95 — tuile « Scanner » de l'accueil
-      const [gpsInit, setGpsInit] = React.useState(null);    // V11.95 — tournée choisie dans « À livrer » → GPS
+      const [gpsInit, setGpsInit] = React.useState(() => { const r = kbGpsResumeGet(); return r ? { ...r, resume: true } : null; }); // V11.95 · V11.97 reprise du guidage
       const openGps = pl => { setGpsInit(pl ? { stops: pl.order.filter(o => o.lat != null).map(o => ({ id: o.code, code: o.code, name: o.code + (o.name && o.name !== o.code ? ' · ' + o.name : ''), lat: +o.lat, lng: +o.lng })), ret: pl.ret || null, at: Date.now() } : null); setView('gps'); };
       const B = useKbPdpBoard();
       const enl = useKbEnlevements();
@@ -38231,7 +38234,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       if (view === 'epal') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisEpalView session={session} E={E} /></div>;
       if (view === 'sapins') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisSapinsView session={session} /></div>;
       if (view === 'livraison') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisLivraisonView session={session} lines={lines} pk={pk} enl={enl} autoScan={autoScan} onGps={openGps} /></div>;
-      if (view === 'gps') return <KbTruckGps session={session} initTour={gpsInit} onClose={() => { setGpsInit(null); setView('home'); }} />; // V11.69 · V11.95 tournée « À livrer »
+      if (view === 'gps') return <KbTruckGps session={session} initTour={gpsInit} onClose={() => { kbGpsResumeClear(); setGpsInit(null); setView('home'); }} />; // V11.69 · V11.95 tournée « À livrer »
 
       const Tile = ({ ic, title, sub, n, color, onClick }) => (
         <button onClick={onClick} style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', textAlign: 'left', padding: '20px 16px', minHeight: 120, borderRadius: 20, cursor: 'pointer',
@@ -38312,10 +38315,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function kbGpsBaseLayer(L, map, night, key, onSwap) {
       if (!document.getElementById('kb-gps-css')) { const st = document.createElement('style'); st.id = 'kb-gps-css';
         st.textContent = '.kb-tiles-night{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.9) saturate(.6)}'; document.head.appendChild(st); }
-      const osm = () => L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, className: night ? 'kb-tiles-night' : '', attribution: '© OpenStreetMap' });
+      const osm = () => L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, keepBuffer: 1, className: night && !KB_IOS ? 'kb-tiles-night' : '', attribution: '© OpenStreetMap' }); // V11.97 — pas de filtre sur iPhone
       let lay;
       if (key) {
-        lay = L.tileLayer('https://{s}.api.tomtom.com/map/1/tile/basic/' + (night ? 'night' : 'main') + '/{z}/{x}/{y}.png?key=' + encodeURIComponent(key), { subdomains: 'abcd', maxZoom: 20, attribution: '© TomTom · © OpenStreetMap' });
+        lay = L.tileLayer('https://{s}.api.tomtom.com/map/1/tile/basic/' + (night ? 'night' : 'main') + '/{z}/{x}/{y}.png?key=' + encodeURIComponent(key), { subdomains: 'abcd', maxZoom: 20, keepBuffer: 1, attribution: '© TomTom · © OpenStreetMap' });
         let errs = 0, ok = 0;
         lay.on('tileload', () => { ok++; });
         lay.on('tileerror', () => { errs++; if (errs === 4 && ok === 0 && map.hasLayer(lay)) { map.removeLayer(lay); const o = osm().addTo(map); o.bringToBack(); onSwap && onSwap(o); } });
@@ -38398,13 +38401,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       return 'straight';
     }
     // ── routage ──
+    // V11.96 — rues signalées par l'équipe (sauf service, interdit PL, route fermée) → évitées par tous les itinéraires
+    const KB_GPS_AVOID_TYPES = { noaccess: 1, nohgv: 1, closed: 1 };
+    let kbGpsAvoid = [];   // [{ lat, lng }] (max 20)
     function kbVhCosting(P) {
       const v = kbVehOf(P);
       if (v === 'scooter') return { costing: 'motor_scooter', costing_options: { motor_scooter: { top_speed: 45, use_primary: 0.5 } } };
       if (v === 'car') return { costing: 'auto', costing_options: { auto: { use_tolls: P.noToll ? 0 : 0.5 } } };
       return { costing: 'truck', costing_options: { truck: kbVhTruckOpts(P) } };
     }
-    function kbVhTruckOpts(P) { return { height: +P.h, width: +P.w, length: +P.len, weight: +P.t, axle_load: +P.axle, axle_count: Math.max(2, +P.axles || 2), hazmat: !!P.hazmat, use_tolls: P.noToll ? 0 : 0.5, use_highways: 0.8 }; }
+    function kbVhTruckOpts(P) { return { height: +P.h, width: +P.w, length: +P.len, weight: +P.t, axle_load: +P.axle, axle_count: Math.max(2, +P.axles || 2), hazmat: !!P.hazmat, use_tolls: P.noToll ? 0 : 0.5, use_highways: 0.8,
+        destination_only_penalty: 1800, private_access_penalty: 3600, service_penalty: 60, use_living_streets: 0 }; } // V11.96 — routes réservées / privées / de service fortement pénalisées
     function kbVhParse(trip, locs) {
       let pts = []; const man = [], legEnd = [];
       (trip.legs || []).forEach((lg, li) => {
@@ -38424,7 +38431,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const L0 = locs.map((l, i) => { const o = { lat: +l.lat, lon: +l.lng, type: 'break' }; if (i === 0 && hd != null) { o.heading = Math.round(hd) % 360; o.heading_tolerance = 60; } return o; });
       const body = { locations: L0, ...kbVhCosting(P), language: kbGpsLangInfo().vh, units: 'kilometers', directions_type: 'instructions' };
       if (alts && locs.length === 2) body.alternates = 2;
-      const j = await kbFetchJson(KB_GPS_VH + '/route?json=' + encodeURIComponent(JSON.stringify(body)), {}, 25000);
+      const av = kbGpsAvoid.filter(a => !locs.some(l => kbDistM(+l.lat, +l.lng, a.lat, a.lng) < 80)).slice(0, 20); // pas d'exclusion collée à un arrêt
+      if (av.length) body.exclude_locations = av.map(a => ({ lat: a.lat, lon: a.lng }));
+      let j;
+      try { j = await kbFetchJson(KB_GPS_VH + '/route?json=' + encodeURIComponent(JSON.stringify(body)), {}, 25000); }
+      catch (e) { if (!body.exclude_locations) throw e; delete body.exclude_locations; j = await kbFetchJson(KB_GPS_VH + '/route?json=' + encodeURIComponent(JSON.stringify(body)), {}, 25000); }
       const trips = [j && j.trip].concat(((j && j.alternates) || []).map(a => a && a.trip)).filter(t => t && t.legs);
       if (!trips.length) throw new Error('aucun itinéraire');
       return trips.map(t => kbVhParse(t, locs));
@@ -38454,7 +38465,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       if (P.noToll) q.append('avoid', 'tollRoads');
       if (P.hazmat && veh === 'pl') q.set('vehicleLoadType', 'otherHazmatGeneral');
       if (hd != null) q.set('vehicleHeading', String(Math.round(hd) % 360));
-      const j = await kbFetchJson('https://api.tomtom.com/routing/1/calculateRoute/' + path + '/json?' + q.toString(), {}, 20000);
+      const url = 'https://api.tomtom.com/routing/1/calculateRoute/' + path + '/json?' + q.toString();
+      const av = kbGpsAvoid.filter(a => !locs.some(l => kbDistM(+l.lat, +l.lng, a.lat, a.lng) < 80)).slice(0, 10), dd = 0.00025; // ≈ 25 m autour du point
+      let j = null;
+      if (av.length) { try { j = await kbFetchJson(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ avoidAreas: { rectangles: av.map(a => ({ southWestCorner: { latitude: a.lat - dd, longitude: a.lng - dd }, northEastCorner: { latitude: a.lat + dd, longitude: a.lng + dd } })) } }) }, 20000); } catch (e) { console.warn('TomTom zones évitées', e); } }
+      if (!j) j = await kbFetchJson(url, {}, 20000);
       const rs = ((j && j.routes) || []).map(kbTtParse).filter(r => r.pts.length > 1);
       if (!rs.length) throw new Error('aucun itinéraire');
       return rs;
@@ -38564,6 +38579,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       { k: 'danger', ic: '⚠️', l: 'Danger', voice: 'danger', c: '#f9a825' },
       { k: 'delivery', ic: '📦', l: 'Bon arrêt livraison', voice: 'bon arrêt pour livrer', c: '#2e7d32' },
       { k: 'police', ic: '👮', l: 'Contrôle', voice: 'contrôle', c: '#1565c0' },
+      { k: 'noaccess', ic: '🚷', l: 'Sauf service / accès interdit', voice: 'accès interdit, sauf service', c: '#4a148c' }, // V11.96 — évité par les itinéraires
     ];
     // V11.73 — 🗣️ langue de la voix (et des consignes du bandeau) : choisie dans 🗂️ Carte & affichage, gardée sur le téléphone
     const KB_GPS_LANGS = [
@@ -38576,6 +38592,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       { k: 'pl', l: '🇵🇱 Polski', vh: 'pl-PL', tt: 'pl-PL', sp: 'pl-PL' },
       { k: 'tr', l: '🇹🇷 Türkçe', vh: 'tr-TR', tt: 'tr-TR', sp: 'tr-TR' },
       { k: 'it', l: '🇮🇹 Italiano', vh: 'it-IT', tt: 'it-IT', sp: 'it-IT' },
+      { k: 'ru', l: '🇷🇺 Русский', vh: 'ru-RU', tt: 'ru-RU', sp: 'ru-RU' }, // V11.96
     ];
     // rep = signalements : travaux, interdit PL, passage bas, route fermée, bouchon, danger, bon arrêt livraison, contrôle
     const KB_GPS_TR = {
@@ -38583,52 +38600,57 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         bridge: 'Attention, passage limité à {h} mètres dans {d}.', lez: 'Entrée en zone à faibles émissions dans {d}.', rep: "Signalé par l'équipe : {a} dans {d}.", arrStop: 'Arrivé : {a}.', next: ' Prochain arrêt : {a}.',
         arrived: 'Vous êtes arrivé : {a}.', arrived0: 'Vous êtes arrivé.', stop: 'Guidage arrêté.', tourUpd: 'Tournée mise à jour par le bureau. Prochain arrêt : {a}.', tourEnd: 'Tournée terminée.',
         faster: 'Itinéraire plus rapide trouvé. Vous gagnez {n} minutes.', thanks: 'Merci, signalement envoyé.', test: 'Bonjour, je vous guiderai en français.', m: 'mètres', km1: 'kilomètre', km: 'kilomètres', dec: ',',
-        rep8: ['travaux', 'rue interdite aux poids lourds', 'passage bas', 'route fermée', 'bouchon', 'danger', 'bon arrêt pour livrer', 'contrôle'] },
+        rep8: ['travaux', 'rue interdite aux poids lourds', 'passage bas', 'route fermée', 'bouchon', 'danger', 'bon arrêt pour livrer', 'contrôle', 'accès interdit, sauf service'] },
       en: { go: "Let's go.", goTour: "Let's go. {n} stops. First stop: {a}.", in: 'In {d}, {a}', rr: 'Recalculating', zoneIn: 'Danger zone in {d}.', zoneNow: 'Caution, danger zone.',
         bridge: 'Caution, height limit {h} metres in {d}.', lez: 'Entering a low emission zone in {d}.', rep: 'Reported by the team: {a} in {d}.', arrStop: 'Arrived: {a}.', next: ' Next stop: {a}.',
         arrived: 'You have arrived: {a}.', arrived0: 'You have arrived.', stop: 'Navigation stopped.', tourUpd: 'Route updated by the office. Next stop: {a}.', tourEnd: 'Route finished.',
         faster: 'Faster route found. You save {n} minutes.', thanks: 'Thanks, report sent.', test: 'Hello, I will guide you in English.', m: 'metres', km1: 'kilometre', km: 'kilometres', dec: '.',
-        rep8: ['road works', 'no trucks allowed', 'low bridge', 'road closed', 'traffic jam', 'hazard', 'good delivery stop', 'police check'] },
+        rep8: ['road works', 'no trucks allowed', 'low bridge', 'road closed', 'traffic jam', 'hazard', 'good delivery stop', 'police check', 'restricted access'] },
       es: { go: 'Vamos.', goTour: 'Vamos. {n} paradas. Primera parada: {a}.', in: 'En {d}, {a}', rr: 'Recalculando', zoneIn: 'Zona de peligro en {d}.', zoneNow: 'Atención, zona de peligro.',
         bridge: 'Atención, gálibo limitado a {h} metros en {d}.', lez: 'Entrada en zona de bajas emisiones en {d}.', rep: 'Aviso del equipo: {a} en {d}.', arrStop: 'Llegada: {a}.', next: ' Próxima parada: {a}.',
         arrived: 'Ha llegado: {a}.', arrived0: 'Ha llegado.', stop: 'Guiado detenido.', tourUpd: 'Ruta actualizada por la oficina. Próxima parada: {a}.', tourEnd: 'Ruta terminada.',
         faster: 'Ruta más rápida encontrada. Ahorra {n} minutos.', thanks: 'Gracias, aviso enviado.', test: 'Hola, le guiaré en español.', m: 'metros', km1: 'kilómetro', km: 'kilómetros', dec: ',',
-        rep8: ['obras', 'prohibido camiones', 'paso bajo', 'carretera cortada', 'atasco', 'peligro', 'buena parada para entregar', 'control'] },
+        rep8: ['obras', 'prohibido camiones', 'paso bajo', 'carretera cortada', 'atasco', 'peligro', 'buena parada para entregar', 'control', 'acceso restringido'] },
       pt: { go: 'Vamos.', goTour: 'Vamos. {n} paragens. Primeira paragem: {a}.', in: 'Em {d}, {a}', rr: 'A recalcular', zoneIn: 'Zona de perigo a {d}.', zoneNow: 'Atenção, zona de perigo.',
         bridge: 'Atenção, altura limitada a {h} metros a {d}.', lez: 'Entrada em zona de baixas emissões a {d}.', rep: 'Aviso da equipa: {a} a {d}.', arrStop: 'Chegada: {a}.', next: ' Próxima paragem: {a}.',
         arrived: 'Chegou: {a}.', arrived0: 'Chegou.', stop: 'Navegação parada.', tourUpd: 'Rota atualizada pelo escritório. Próxima paragem: {a}.', tourEnd: 'Rota terminada.',
         faster: 'Rota mais rápida encontrada. Ganha {n} minutos.', thanks: 'Obrigado, aviso enviado.', test: 'Olá, vou guiá-lo em português.', m: 'metros', km1: 'quilómetro', km: 'quilómetros', dec: ',',
-        rep8: ['obras', 'proibido a pesados', 'passagem baixa', 'estrada fechada', 'trânsito', 'perigo', 'bom sítio para entregar', 'controlo'] },
+        rep8: ['obras', 'proibido a pesados', 'passagem baixa', 'estrada fechada', 'trânsito', 'perigo', 'bom sítio para entregar', 'controlo', 'acesso restrito'] },
       ar: { go: 'لننطلق.', goTour: 'لننطلق. {n} توقفات. أول توقف: {a}.', in: 'بعد {d}، {a}', rr: 'إعادة الحساب', zoneIn: 'منطقة خطر بعد {d}.', zoneNow: 'انتبه، منطقة خطر.',
         bridge: 'انتبه، ارتفاع محدود {h} متر بعد {d}.', lez: 'دخول منطقة منخفضة الانبعاثات بعد {d}.', rep: 'تنبيه من الفريق: {a} بعد {d}.', arrStop: 'وصلت: {a}.', next: ' التوقف التالي: {a}.',
         arrived: 'لقد وصلت: {a}.', arrived0: 'لقد وصلت.', stop: 'تم إيقاف الإرشاد.', tourUpd: 'تم تحديث الجولة من المكتب. التوقف التالي: {a}.', tourEnd: 'انتهت الجولة.',
         faster: 'تم العثور على طريق أسرع. توفر {n} دقائق.', thanks: 'شكرا، تم إرسال التنبيه.', test: 'مرحبا، سأرشدك باللغة العربية.', m: 'متر', km1: 'كيلومتر', km: 'كيلومتر', dec: '.',
-        rep8: ['أشغال', 'ممنوع على الشاحنات', 'ممر منخفض', 'طريق مغلق', 'ازدحام', 'خطر', 'مكان جيد للتسليم', 'مراقبة'] },
+        rep8: ['أشغال', 'ممنوع على الشاحنات', 'ممر منخفض', 'طريق مغلق', 'ازدحام', 'خطر', 'مكان جيد للتسليم', 'مراقبة', 'دخول ممنوع إلا للخدمة'] },
       ro: { go: 'Să mergem.', goTour: 'Să mergem. {n} opriri. Prima oprire: {a}.', in: 'În {d}, {a}', rr: 'Recalculare', zoneIn: 'Zonă periculoasă în {d}.', zoneNow: 'Atenție, zonă periculoasă.',
         bridge: 'Atenție, înălțime limitată la {h} metri în {d}.', lez: 'Intrare în zonă cu emisii scăzute în {d}.', rep: 'Semnalat de echipă: {a} în {d}.', arrStop: 'Ați ajuns: {a}.', next: ' Următoarea oprire: {a}.',
         arrived: 'Ați ajuns: {a}.', arrived0: 'Ați ajuns.', stop: 'Ghidare oprită.', tourUpd: 'Traseu actualizat de birou. Următoarea oprire: {a}.', tourEnd: 'Traseu terminat.',
         faster: 'Traseu mai rapid găsit. Câștigați {n} minute.', thanks: 'Mulțumesc, semnalare trimisă.', test: 'Bună, vă voi ghida în română.', m: 'metri', km1: 'kilometru', km: 'kilometri', dec: ',',
-        rep8: ['lucrări', 'interzis camioanelor', 'pasaj jos', 'drum închis', 'ambuteiaj', 'pericol', 'loc bun de livrare', 'control'] },
+        rep8: ['lucrări', 'interzis camioanelor', 'pasaj jos', 'drum închis', 'ambuteiaj', 'pericol', 'loc bun de livrare', 'control', 'acces interzis, doar serviciu'] },
       pl: { go: 'Ruszamy.', goTour: 'Ruszamy. Przystanki: {n}. Pierwszy przystanek: {a}.', in: 'Za {d}, {a}', rr: 'Przeliczanie trasy', zoneIn: 'Strefa niebezpieczna za {d}.', zoneNow: 'Uwaga, strefa niebezpieczna.',
         bridge: 'Uwaga, ograniczenie wysokości {h} metra za {d}.', lez: 'Wjazd do strefy czystego transportu za {d}.', rep: 'Zgłoszenie zespołu: {a} za {d}.', arrStop: 'Dojechano: {a}.', next: ' Następny przystanek: {a}.',
         arrived: 'Jesteś na miejscu: {a}.', arrived0: 'Jesteś na miejscu.', stop: 'Nawigacja zatrzymana.', tourUpd: 'Trasa zmieniona przez biuro. Następny przystanek: {a}.', tourEnd: 'Trasa zakończona.',
         faster: 'Znaleziono szybszą trasę. Oszczędzasz {n} minut.', thanks: 'Dziękuję, zgłoszenie wysłane.', test: 'Dzień dobry, poprowadzę cię po polsku.', m: 'metrów', km1: 'kilometr', km: 'kilometrów', dec: ',',
-        rep8: ['roboty drogowe', 'zakaz dla ciężarówek', 'niski przejazd', 'droga zamknięta', 'korek', 'niebezpieczeństwo', 'dobre miejsce na dostawę', 'kontrola'] },
+        rep8: ['roboty drogowe', 'zakaz dla ciężarówek', 'niski przejazd', 'droga zamknięta', 'korek', 'niebezpieczeństwo', 'dobre miejsce na dostawę', 'kontrola', 'zakaz wjazdu poza obsługą'] },
       tr: { go: 'Hadi gidelim.', goTour: 'Hadi gidelim. {n} durak. İlk durak: {a}.', in: '{d} sonra, {a}', rr: 'Yeniden hesaplanıyor', zoneIn: '{d} sonra tehlikeli bölge.', zoneNow: 'Dikkat, tehlikeli bölge.',
         bridge: 'Dikkat, {d} sonra yükseklik sınırı {h} metre.', lez: '{d} sonra düşük emisyon bölgesine giriş.', rep: 'Ekip bildirimi: {d} sonra {a}.', arrStop: 'Varıldı: {a}.', next: ' Sonraki durak: {a}.',
         arrived: 'Vardınız: {a}.', arrived0: 'Vardınız.', stop: 'Navigasyon durduruldu.', tourUpd: 'Rota ofis tarafından güncellendi. Sonraki durak: {a}.', tourEnd: 'Rota bitti.',
         faster: 'Daha hızlı rota bulundu. {n} dakika kazanırsınız.', thanks: 'Teşekkürler, bildirim gönderildi.', test: 'Merhaba, size Türkçe rehberlik edeceğim.', m: 'metre', km1: 'kilometre', km: 'kilometre', dec: ',',
-        rep8: ['yol çalışması', 'kamyon yasak', 'alçak geçit', 'yol kapalı', 'trafik sıkışıklığı', 'tehlike', 'teslimat için iyi yer', 'kontrol'] },
+        rep8: ['yol çalışması', 'kamyon yasak', 'alçak geçit', 'yol kapalı', 'trafik sıkışıklığı', 'tehlike', 'teslimat için iyi yer', 'kontrol', 'yetkisiz giriş yasak'] },
       it: { go: 'Si parte.', goTour: 'Si parte. {n} fermate. Prima fermata: {a}.', in: 'Tra {d}, {a}', rr: 'Ricalcolo', zoneIn: 'Zona di pericolo tra {d}.', zoneNow: 'Attenzione, zona di pericolo.',
         bridge: 'Attenzione, altezza limitata a {h} metri tra {d}.', lez: 'Ingresso in zona a basse emissioni tra {d}.', rep: 'Segnalato dalla squadra: {a} tra {d}.', arrStop: 'Arrivato: {a}.', next: ' Prossima fermata: {a}.',
         arrived: 'Sei arrivato: {a}.', arrived0: 'Sei arrivato.', stop: 'Navigazione fermata.', tourUpd: 'Giro aggiornato dall’ufficio. Prossima fermata: {a}.', tourEnd: 'Giro terminato.',
         faster: 'Trovato un percorso più veloce. Risparmi {n} minuti.', thanks: 'Grazie, segnalazione inviata.', test: 'Ciao, ti guiderò in italiano.', m: 'metri', km1: 'chilometro', km: 'chilometri', dec: ',',
-        rep8: ['lavori', 'vietato ai camion', 'passaggio basso', 'strada chiusa', 'coda', 'pericolo', 'buon posto per consegnare', 'controllo'] },
+        rep8: ['lavori', 'vietato ai camion', 'passaggio basso', 'strada chiusa', 'coda', 'pericolo', 'buon posto per consegnare', 'controllo', 'accesso riservato'] },
+      ru: { go: 'Поехали.', goTour: 'Поехали. Остановок: {n}. Первая остановка: {a}.', in: 'Через {d}, {a}', rr: 'Пересчёт маршрута', zoneIn: 'Опасная зона через {d}.', zoneNow: 'Внимание, опасная зона.',
+        bridge: 'Внимание, ограничение высоты {h} метра через {d}.', lez: 'Въезд в зону низких выбросов через {d}.', rep: 'Сообщение команды: {a} через {d}.', arrStop: 'Прибыли: {a}.', next: ' Следующая остановка: {a}.',
+        arrived: 'Вы прибыли: {a}.', arrived0: 'Вы прибыли.', stop: 'Навигация остановлена.', tourUpd: 'Маршрут обновлён офисом. Следующая остановка: {a}.', tourEnd: 'Маршрут завершён.',
+        faster: 'Найден более быстрый маршрут. Экономия {n} минут.', thanks: 'Спасибо, сообщение отправлено.', test: 'Здравствуйте, я буду вести вас на русском языке.', m: 'метров', km1: 'километр', km: 'километра', dec: ',',
+        rep8: ['дорожные работы', 'грузовикам запрещено', 'низкий проезд', 'дорога закрыта', 'пробка', 'опасность', 'хорошее место для разгрузки', 'контроль', 'въезд запрещён, только для служебного транспорта'] },
     };
     let kbGpsLang = 'fr';
     const kbGpsLangInfo = () => KB_GPS_LANGS.find(x => x.k === kbGpsLang) || KB_GPS_LANGS[0];
     function kbT(key, v) { const D = KB_GPS_TR[kbGpsLang] || KB_GPS_TR.fr; let s = D[key] != null ? D[key] : KB_GPS_TR.fr[key]; Object.keys(v || {}).forEach(k => { s = s.split('{' + k + '}').join(v[k]); }); return s; }
-    function kbRepVoice(type) { const i = KB_GPS_REPORTS.findIndex(x => x.k === type); const D = KB_GPS_TR[kbGpsLang] || KB_GPS_TR.fr; return (D.rep8 || KB_GPS_TR.fr.rep8)[Math.max(0, i)]; }
+    function kbRepVoice(type) { const i = Math.max(0, KB_GPS_REPORTS.findIndex(x => x.k === type)); const D = KB_GPS_TR[kbGpsLang] || KB_GPS_TR.fr; return (D.rep8 || [])[i] || KB_GPS_TR.fr.rep8[i] || ''; }
     // consommation moyenne (L/100 km) → estimation carburant
     const KB_FUEL = { scooter: 3, car: 6.5, vl: 10, f35: 10, p75: 17, p12: 21, p19: 26, s44: 33 };
     function kbFuelL(P, m) { const v = kbVehOf(P); let k = v; if (v === 'pl') k = KB_FUEL[P && P.k] ? P.k : (+P.t >= 26 ? 's44' : +P.t >= 16 ? 'p19' : +P.t >= 10 ? 'p12' : 'p75'); return (KB_FUEL[k] || 25) * (m || 0) / 100000; }
@@ -38682,7 +38704,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         {R('⬆️', 'Bandeau du haut', 'prochaine manœuvre, distance, rue en bleu · « puis » = manœuvre suivante')}
         {R('🟧', 'Bandeaux d’alerte', 'zone de danger, passage limité, ZFE, signalement de l’équipe')}
         {R('🔊', 'Son', 'coupe / remet la voix')}
-        {R('👆', 'Glisser la carte', 'avec le doigt pour regarder la route plus loin · 📍 Recentrer (ou tout seul après 20 s)')}
+        {R('👆', 'Glisser la carte', 'avec le doigt pour regarder la route plus loin · deux doigts pour la tourner · 📍 Recentrer (ou tout seul après 20 s)')}
+        {R('📷', 'Appui long sur la carte', 'Street View de cet endroit (Google Maps) ou « Y aller »')}
+        {R('🚷', 'Sauf service', 'bouton jaune ⚠️ › « Sauf service » devant la rue interdite : itinéraire recalculé, la rue est évitée pour toute l’équipe')}
         {R('🗺️', 'Vue d’ensemble', 'tout le trajet · 📍 Recentrer pour revenir')}
         {R('⚠️', 'Bouton jaune', 'signaler travaux, interdit PL, passage bas, bouchon… à l’endroit où tu es')}
         {R('🔵', 'Bulle du bas', 'nom de la rue où tu roules')}
@@ -38859,7 +38883,31 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     }
 
     // ═══════════════════ écran GPS chauffeur (plein écran) ═══════════════════
-    function KbTruckGps({ session, onClose, initTour }) {
+    // V11.97 — iPhone / iPad : Safari est tué si la carte inclinée (3D) est trop grande → 2D cap en haut
+    const KB_IOS = (() => { try { const ua = navigator.userAgent || ''; return /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); } catch (e) { return false; } })();
+    const kbGpsView = v => (KB_IOS && v === '3d') ? 'cap' : v;
+    // V11.97 — reprise du guidage après un redémarrage de l'appli (Safari relancé, téléphone verrouillé longtemps…)
+    const KB_GPS_RESUME = 'kb_gps_resume_v1';
+    function kbGpsResumeSave(N) { try { if (!N || !N.stops) return; localStorage.setItem(KB_GPS_RESUME, JSON.stringify({ at: Date.now(), stops: N.stops.slice(N.leg || 0).map(x => ({ id: x.id || '', code: x.code || '', name: String(x.name || '').slice(0, 80), lat: +x.lat, lng: +x.lng, ret: !!x.ret })).slice(0, 20), tour: !!N.tour, custom: !!N.custom })); } catch (e) {} }
+    function kbGpsResumeClear() { try { localStorage.removeItem(KB_GPS_RESUME); } catch (e) {} }
+    function kbGpsResumeGet() { try { const r = JSON.parse(localStorage.getItem(KB_GPS_RESUME) || 'null'); if (r && Array.isArray(r.stops) && r.stops.length && Date.now() - (+r.at || 0) < 4 * 3600e3) return r; } catch (e) {} return null; }
+    // V11.97 — une erreur dans le GPS ne doit jamais laisser le chauffeur sans rien : l'écran GPS se relance
+    class KbGpsBoundary extends React.Component {
+      constructor(p) { super(p); this.state = { err: null, n: 0 }; }
+      static getDerivedStateFromError(err) { return { err }; }
+      componentDidCatch(err) { console.error('GPS', err); if (this.state.n < 3) setTimeout(() => this.setState(st => ({ err: null, n: st.n + 1 })), 1500); }
+      render() {
+        if (!this.state.err) return <React.Fragment key={this.state.n}>{this.props.children}</React.Fragment>;
+        return <div style={{ position: 'fixed', inset: 0, zIndex: 10001, background: '#16212b', color: '#fff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24, textAlign: 'center', fontFamily: 'system-ui' }}>
+          <div style={{ fontSize: 26, fontWeight: 900 }}>🔄 Le GPS redémarre…</div>
+          <div style={{ fontSize: 15, opacity: .8, marginTop: 8 }}>Le guidage reprend tout seul.</div>
+          <button type="button" onClick={() => this.setState(st => ({ err: null, n: st.n + 1 }))} style={{ marginTop: 18, minHeight: 56, padding: '0 22px', borderRadius: 16, border: 'none', background: '#1e88e5', color: '#fff', fontSize: 19, fontWeight: 900 }}>Relancer le GPS</button>
+          <button type="button" onClick={this.props.onClose} style={{ marginTop: 10, minHeight: 46, padding: '0 18px', borderRadius: 14, border: '2px solid rgba(255,255,255,.4)', background: 'transparent', color: '#fff', fontSize: 16, fontWeight: 700 }}>Quitter le GPS</button>
+        </div>;
+      }
+    }
+    function KbTruckGps(props) { return <KbGpsBoundary onClose={props.onClose}><KbTruckGpsInner {...props} /></KbGpsBoundary>; }
+    function KbTruckGpsInner({ session, onClose, initTour }) {
       const [ready, setReady] = React.useState(!!(window.L && window.L.map));
       const [loadErr, setLoadErr] = React.useState('');
       const [prof, setProf] = React.useState(() => kbTruckProfGet());
@@ -38886,6 +38934,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => { if (langRef.current === kbGpsLang) return; langRef.current = kbGpsLang; if (S.current.mode === 'nav' && NV.current) reroute('lang'); }, [lay.voice]);
       const [sheet, setSheet] = React.useState(''); // '' | layers | report | fuel | parking | help
       const [poi, setPoi] = React.useState(null);
+      const [press, setPress] = React.useState(null); // V11.96 — appui long : { lat, lng }
       const [reports, setReports] = React.useState([]);
       const [cfg, setCfg] = React.useState(null);
       const [tour, setTour] = React.useState(null);
@@ -38909,7 +38958,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => { if (ready) return; kbLeaflet().then(() => setReady(true)).catch(e => setLoadErr(e.message || 'Carte indisponible')); }, []);
       React.useEffect(() => kbDocSub('gps_config', 'main', d => setCfg(d || {})), []);
       React.useEffect(() => kbDocSub('gps_tour', day, d => setTour(d)), [day]);
-      React.useEffect(() => storage.subscribe('gps_reports', a => { const t0 = Date.now() - 7 * 86400000; setReports((a || []).filter(r => r && r.lat != null && Date.parse(r.at) > t0)); }), []);
+      React.useEffect(() => storage.subscribe('gps_reports', a => { const now = Date.now(); // V11.96 — accès interdits gardés 180 j, le reste 7 j
+        const L = (a || []).filter(r => r && r.lat != null && Date.parse(r.at) > now - (KB_GPS_AVOID_TYPES[r.type] ? 180 : 7) * 86400000);
+        kbGpsAvoid = L.filter(r => KB_GPS_AVOID_TYPES[r.type]).map(r => ({ lat: +(r.alat != null ? r.alat : r.lat), lng: +(r.alng != null ? r.alng : r.lng) })).filter(x => isFinite(x.lat) && isFinite(x.lng)).slice(-20);
+        setReports(L); }), []);
       const lieux = React.useMemo(() => (cfg && cfg.lieux) || kbLieuxCached() || null, [cfg]);
       const places = React.useMemo(() => kbGpsPlaces(lieux), [lieux]);
       const ttKey = cfg && cfg.tomtomKey ? String(cfg.tomtomKey) : '';
@@ -38947,19 +38999,33 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         // V11.96 — guidage : la carte tourne (cap en haut) → le glisser Leaflet irait de travers. On déplace nous-mêmes la carte
         // au doigt en tenant compte de la rotation (pincer pour zoomer reste géré par Leaflet).
         const ct = map.getContainer(); ct.style.touchAction = 'none';
-        const PT = new Map(); let drag = null;
-        const down = e => { PT.set(e.pointerId, [e.clientX, e.clientY]); drag = PT.size === 1 && S.current.mode === 'nav' ? { x: e.clientX, y: e.clientY, moved: false } : null; };
+        map.dragging.disable(); // V11.96 — la carte peut être tournée partout : on gère nous-mêmes le glisser (rotation prise en compte)
+        const PT = new Map(); let drag = null, rot = null;
+        const ang2 = () => { const [a, b] = Array.from(PT.values()); return Math.atan2(b[1] - a[1], b[0] - a[0]) * 180 / Math.PI; };
+        const freeView = () => { if (S.current.follow) { const c = map.getCenter(), z = map.getZoom(); S.current.follow = false; setFollow(false); if (TILT.current) { setTilt(false); map.setView(c, z, { animate: false }); } } PANT.current = Date.now(); };
+        // V11.96 — appui long (0,6 s sans bouger) → point de la carte (rotation prise en compte) → Street View / Y aller
+        let lp = null;
+        const lpCancel = () => { if (lp) { clearTimeout(lp); lp = null; } };
+        const lpAt = (x, y) => { const r = rootEl.current.getBoundingClientRect(), sz = map.getSize(), a = ROT.current * Math.PI / 180, vx = x - (r.left + r.width / 2), vy = y - (r.top + r.height / 2);
+          return map.containerPointToLatLng([sz.x / 2 + vx * Math.cos(a) - vy * Math.sin(a), sz.y / 2 + vx * Math.sin(a) + vy * Math.cos(a)]); };
+        const down = e => { PT.set(e.pointerId, [e.clientX, e.clientY]); drag = PT.size === 1 ? { x: e.clientX, y: e.clientY, moved: false } : null;
+          rot = PT.size === 2 ? { a0: ang2(), r0: ROT.current, on: false } : null;
+          lpCancel(); if (PT.size === 1) { const x = e.clientX, y = e.clientY; lp = setTimeout(() => { lp = null; if (PT.size !== 1 || (drag && drag.moved)) return; try { const ll = lpAt(x, y); try { navigator.vibrate && navigator.vibrate(30); } catch (_) {} setPress({ lat: ll.lat, lng: ll.lng }); } catch (_) {} }, 600); } };
         const move = e => {
           if (!PT.has(e.pointerId)) return; PT.set(e.pointerId, [e.clientX, e.clientY]);
-          if (!drag || PT.size !== 1 || S.current.mode !== 'nav' || !M.current) return;
+          if (lp && (PT.size !== 1 || !drag || Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 8)) lpCancel();
+          if (rot && PT.size === 2 && M.current) { // V11.96 — deux doigts : tourner la carte
+            let d = ang2() - rot.a0; d = ((d % 360) + 540) % 360 - 180;
+            if (!rot.on) { if (Math.abs(d) < 10) return; rot.on = true; freeView(); if (boxEl.current) boxEl.current.style.transition = 'none'; rot.a0 += d > 0 ? 10 : -10; d = ((ang2() - rot.a0) % 360 + 540) % 360 - 180; }
+            setRot(rot.r0 - d); PANT.current = Date.now(); return; }
+          if (!drag || PT.size !== 1 || !M.current) return;
           const sx = e.clientX - drag.x, sy = e.clientY - drag.y;
-          if (!drag.moved) { if (Math.hypot(sx, sy) < 8) return; drag.moved = true;
-            if (S.current.follow) { const c = map.getCenter(), z = map.getZoom(); S.current.follow = false; setFollow(false); if (TILT.current) { setTilt(false); map.setView(c, z, { animate: false }); } } }
+          if (!drag.moved) { if (Math.hypot(sx, sy) < 8) return; drag.moved = true; if (S.current.mode === 'nav') freeView(); }
           drag.x = e.clientX; drag.y = e.clientY; PANT.current = Date.now();
           const a = ROT.current * Math.PI / 180, mx = sx * Math.cos(a) - sy * Math.sin(a), my = sx * Math.sin(a) + sy * Math.cos(a);
           map.panBy([-mx, -my], { animate: false });
         };
-        const up = e => { PT.delete(e.pointerId); if (PT.size !== 1) drag = null; };
+        const up = e => { lpCancel(); PT.delete(e.pointerId); if (PT.size !== 1) drag = null; if (PT.size < 2 && rot) { if (rot.on && boxEl.current) boxEl.current.style.transition = 'transform .6s linear'; rot = null; } };
         ct.addEventListener('pointerdown', down); ct.addEventListener('pointermove', move); ct.addEventListener('pointerup', up); ct.addEventListener('pointercancel', up);
         map.on('zoomstart', () => { if (S.current.mode === 'nav' && !S.current.follow) PANT.current = Date.now(); });
         return () => { ct.removeEventListener('pointerdown', down); ct.removeEventListener('pointermove', move); ct.removeEventListener('pointerup', up); ct.removeEventListener('pointercancel', up);
@@ -38968,13 +39034,13 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => {
         const map = M.current; if (!map) return; const L = window.L;
         if (LY.current.tiles) map.removeLayer(LY.current.tiles);
-        if (lay.base === 'sat' && ttKey) { LY.current.tiles = L.tileLayer('https://api.tomtom.com/map/1/tile/sat/main/{z}/{x}/{y}.jpg?key=' + encodeURIComponent(ttKey), { maxZoom: 19, attribution: '© TomTom' }).addTo(map); LY.current.tiles.bringToBack(); }
+        if (lay.base === 'sat' && ttKey) { LY.current.tiles = L.tileLayer('https://api.tomtom.com/map/1/tile/sat/main/{z}/{x}/{y}.jpg?key=' + encodeURIComponent(ttKey), { maxZoom: 19, keepBuffer: 1, attribution: '© TomTom' }).addTo(map); LY.current.tiles.bringToBack(); }
         else LY.current.tiles = kbGpsBaseLayer(L, map, night, ttKey, l => { LY.current.tiles = l; });
       }, [ready, night, ttKey, lay.base]);
       React.useEffect(() => {
         const map = M.current; if (!map) return; const L = window.L;
         if (LY.current.traf) { map.removeLayer(LY.current.traf); LY.current.traf = null; }
-        if (ttKey && traffic) LY.current.traf = L.tileLayer('https://{s}.api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=' + encodeURIComponent(ttKey), { subdomains: 'abcd', maxZoom: 19, opacity: 0.75, zIndex: 5 }).addTo(map);
+        if (ttKey && traffic) LY.current.traf = L.tileLayer('https://{s}.api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=' + encodeURIComponent(ttKey), { subdomains: 'abcd', maxZoom: 19, opacity: 0.75, zIndex: 5, keepBuffer: 1 }).addTo(map);
       }, [ready, ttKey, traffic]);
 
       // ── GPS ──
@@ -39047,7 +39113,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       };
       const camera = (ll, hd, spd) => {
         const map = M.current; if (!map || !S.current.follow) return;
-        const v = S.current.lay.view, z = (spd == null || spd < 8 ? 17 : spd < 17 ? 16 : 15) - (v === '3d' ? 0.5 : 0);
+        const v = kbGpsView(S.current.lay.view), z = (spd == null || spd < 8 ? 17 : spd < 17 ? 16 : 15) - (v === '3d' ? 0.5 : 0);
         setTilt(v === '3d');
         if (hd == null || v === 'nord') { setRot(0); map.setView(ll, z, { animate: true, duration: 0.8 }); return; }
         setRot(hd);
@@ -39094,7 +39160,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           html: `<div style="width:34px;height:34px;border-radius:17px 17px 17px 3px;transform:rotate(-45deg);background:${i === stops.length - 1 ? '#e53935' : '#fb8c00'};border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center"><b style="transform:rotate(45deg);color:#fff;font:800 15px system-ui">${stops.length > 1 ? i + 1 : '🏁'}</b></div>` }) })));
       };
       const drawPreview = (routes, sel, stops) => {
-        const map = M.current, L = window.L; if (!map) return; clearRoute(); setTilt(false); setRot(0); setFollow(false); map.dragging.enable();
+        const map = M.current, L = window.L; if (!map) return; clearRoute(); setTilt(false); setRot(0); setFollow(false); /* V11.96 glisser maison */
         LY.current.alts = L.layerGroup(routes.map((R, i) => i === sel ? null : L.polyline(R.pts, { color: night ? '#78909c' : '#90a4ae', weight: 7, opacity: 0.9 }).on('click', () => selRoute(i))).filter(Boolean)).addTo(map);
         const R = routes[sel];
         LY.current.casing = L.polyline(R.pts, { color: '#0d47a1', weight: 12, opacity: 0.9 }).addTo(map);
@@ -39136,11 +39202,11 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           N.haz = kbRouteHaz(R, nodes, +((S.current.prof || {}).h || 0), kbVehOf(S.current.prof)); drawHaz(R, N.haz);
         } catch (e) { console.warn('feux/zones', e); }
       };
-      const startNav = (sim) => {
-        const p = plan; if (!p) return; const R = p.routes[p.sel];
+      const startNav = (sim, p0) => {
+        const p = p0 || plan; if (!p) return; const R = p.routes[p.sel];
         NV.current = { R, stops: p.stops.slice(), leg: 0, idx: 0, off: 0, sp: {}, rr: false, lastRr: Date.now(), haz: null, tour: p.tour, custom: !!p.custom, tourSig: p.sig, t0: Date.now(), lastTraf: Date.now() };
-        setMode('nav'); setFollow(true); setArrived(null);
-        const map = M.current; if (map) map.dragging.disable();
+        setMode('nav'); setFollow(true); setArrived(null); if (!sim) kbGpsResumeSave(NV.current); else kbGpsResumeClear();
+        const map = M.current; 
         drawNav(R, p.stops); loadHaz(NV.current); wakeOn();
         try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
         say(p.stops.length > 1 ? kbT('goTour', { n: p.stops.length, a: p.stops[0].name || '' }) : kbT('go'));
@@ -39155,8 +39221,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       };
       const stopNav = (silent) => {
         if (SIM.current) { clearInterval(SIM.current); SIM.current = null; }
-        NV.current = null; wakeOff(); clearRoute(); setHud(null); setTilt(false); setRot(0); setFollow(true);
-        const map = M.current; if (map) map.dragging.enable();
+        NV.current = null; wakeOff(); clearRoute(); setHud(null); setTilt(false); setRot(0); setFollow(true); kbGpsResumeClear();
         try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
         setMode('home'); setPlan(null); if (!silent) livePush(false);
       };
@@ -39211,12 +39276,12 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         // arrêts intermédiaires
         while (N.leg < R.legEnd.length - 1 && along >= R.cum[R.legEnd[N.leg]] - 40) {
           const s = N.stops[N.leg], nx = N.stops[N.leg + 1]; markDone(s);
-          say(kbT('arrStop', { a: s.name || '' }) + (nx ? kbT('next', { a: nx.name || '' }) : '')); N.leg++;
+          say(kbT('arrStop', { a: s.name || '' }) + (nx ? kbT('next', { a: nx.name || '' }) : '')); N.leg++; if (!SIM.current) kbGpsResumeSave(N);
         }
         if (total - along < 40 && sn.d < 60) {
           const s = N.stops[N.stops.length - 1]; markDone(s); say(s && s.name ? kbT('arrived', { a: s.name }) : kbT('arrived0'));
           setArrived(s || {}); setMode('arrived'); if (SIM.current) { clearInterval(SIM.current); SIM.current = null; }
-          NV.current = null; wakeOff(); setHud(null); setTilt(false); setRot(0); const map = M.current; if (map) map.dragging.enable(); return;
+          NV.current = null; wakeOff(); setHud(null); setTilt(false); setRot(0); kbGpsResumeClear(); return;
         }
         let k = R.man.findIndex(m => m.b > sn.i); if (k < 0) k = R.man.length - 1; const kc = Math.max(0, k - 1), m = R.man[k], mc = R.man[kc];
         const dist = Math.max(0, R.cum[m.b] - along);
@@ -39282,8 +39347,14 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const sendReport = async (T) => {
         const fx = F.current; if (!fx) { setMsg('⚠️ GPS pas encore trouvé'); return; }
         const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-        try { await storage.setDoc('gps_reports', id, { type: T.k, lat: +fx.lat.toFixed(6), lng: +fx.lng.toFixed(6), at: new Date().toISOString(), day: todayKey(), by: (session && session.name) || '' }, { replace: true });
-          setSheet(''); setMsg(`✓ Signalé : ${T.ic} ${T.l} — merci !`); say(kbT('thanks')); setTimeout(() => setMsg(''), 6000);
+        // V11.96 — accès interdit : le point à éviter = ~45 m plus loin SUR l'itinéraire (la rue où le GPS voulait entrer), pas la rue où l'on est
+        let alat = null, alng = null; const N = NV.current;
+        if (KB_GPS_AVOID_TYPES[T.k] && N && N.R && S.current.mode === 'nav') { try { const sn = kbSnap(N.R, [fx.lat, fx.lng], -1); if (sn && sn.d < 60) { const q = kbAtAlong(N.R, sn.along + 45); alat = +q.lat.toFixed(6); alng = +q.lng.toFixed(6); } } catch (e) {} }
+        const doc = { type: T.k, lat: +fx.lat.toFixed(6), lng: +fx.lng.toFixed(6), at: new Date().toISOString(), day: todayKey(), by: (session && session.name) || '' };
+        if (alat != null) { doc.alat = alat; doc.alng = alng; }
+        try { await storage.setDoc('gps_reports', id, doc, { replace: true });
+          setSheet(''); setMsg(`✓ Signalé : ${T.ic} ${T.l} — merci !` + (KB_GPS_AVOID_TYPES[T.k] ? ' Itinéraire recalculé, cette rue sera évitée.' : '')); say(kbT('thanks')); setTimeout(() => setMsg(''), 8000);
+          if (KB_GPS_AVOID_TYPES[T.k]) { kbGpsAvoid = kbGpsAvoid.concat([{ lat: alat != null ? alat : doc.lat, lng: alng != null ? alng : doc.lng }]).slice(-20); if (NV.current) { NV.current.rr = false; reroute('report'); } }
         } catch (e) { setMsg('⚠️ Signalement refusé : ' + e.message); }
       };
       // ── ⛽ gazole / 🅿️ parkings PL autour de moi ──
@@ -39309,10 +39380,10 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         if (!P) { setMsg('⚠️ Adresse introuvable pour ' + (p.name || p.code)); return; }
         goTo([{ id: p.id || '', name: p.name, lat: P.lat, lng: P.lng }]);
       };
-      const recenter = () => { setFollow(true); S.current.follow = true; const map = M.current; if (map && S.current.mode === 'nav') map.dragging.disable(); const fx = F.current; if (fx) { if (S.current.mode === 'nav') camera([fx.lat, fx.lng], HD.current, fx.spd); else map && map.setView([fx.lat, fx.lng], 16); } };
+      const recenter = () => { setFollow(true); S.current.follow = true; const map = M.current;  const fx = F.current; if (fx) { if (S.current.mode === 'nav') camera([fx.lat, fx.lng], HD.current, fx.spd); else if (map) { setRot(0); map.setView([fx.lat, fx.lng], 16); } } };
       React.useEffect(() => { if (mode !== 'nav' || follow) return; PANT.current = PANT.current || Date.now();
         const t = setInterval(() => { if (S.current.mode === 'nav' && !S.current.follow && Date.now() - PANT.current > 20000) recenter(); }, 2000); return () => clearInterval(t); }, [mode, follow]);
-      const overview = () => { const N = NV.current, map = M.current; if (!map) return; PANT.current = Date.now(); setFollow(false); S.current.follow = false; setTilt(false); setRot(0); map.dragging.enable(); if (N && N.R) map.fitBounds(window.L.latLngBounds(N.R.pts), pads(160, 220)); };
+      const overview = () => { const N = NV.current, map = M.current; if (!map) return; PANT.current = Date.now(); setFollow(false); S.current.follow = false; setTilt(false); setRot(0); /* V11.96 glisser maison */ if (N && N.R) map.fitBounds(window.L.latLngBounds(N.R.pts), pads(160, 220)); };
       const toggleMute = () => setMuted(m => { const v = !m; try { localStorage.setItem('kb_gps_mute', v ? '1' : '0'); } catch (e) {} if (v) { try { speechSynthesis.cancel(); } catch (e) {} } return v; });
 
       // ── V11.95 — tournée choisie par le chauffeur (plusieurs lieux) ──
@@ -39335,6 +39406,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         setDtourS(t); if (isDriver) kbDrvTourNotify(day, t, session, pick.ids);
         goTo(null, { tour: { stops: st, returnTo: ret, optimize: st.length > 1, dwellMin: tour && tour.dwellMin != null ? tour.dwellMin : 10 }, custom: true });
       };
+      // V11.97 — reprise du guidage interrompu (appli relancée) : directement en guidage, sans repasser par l'aperçu
+      React.useEffect(() => {
+        if (initDone.current || !initTour || !initTour.resume || !ready || gps.st !== 'ok') return;
+        initDone.current = true;
+        (async () => { setBusy('Reprise du guidage…');
+          try { const st = initTour.stops.filter(x => x && isFinite(x.lat) && isFinite(x.lng)); const routes = await computeRoutes(st, false);
+            const pl = { stops: st, routes, sel: 0, tour: !!initTour.tour, custom: initTour.custom !== false, sig: '' }; setPlan(pl); startNav(false, pl); setMsg('🔁 Guidage repris'); setTimeout(() => setMsg(''), 6000); }
+          catch (e) { setMsg('⚠️ Reprise impossible : ' + (e.message || 'erreur')); kbGpsResumeClear(); } finally { setBusy(''); } })();
+      }, [ready, gps.st, initTour]);
       // Tournée choisie dans « À livrer » (même ordre que le chargement) → aperçu dès que le GPS est trouvé
       React.useEffect(() => {
         if (initDone.current || !initTour || !initTour.stops || !initTour.stops.length || !ready || gps.st !== 'ok') return;
@@ -39556,6 +39636,15 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
                 {sheet === 'help' && <KbGpsHelp />}
               </div>
             </div>)}
+          {press && <div style={{ position: 'absolute', inset: 0, zIndex: 55, background: 'rgba(0,0,0,.35)', display: 'flex', alignItems: 'flex-end' }} onClick={() => setPress(null)}>
+            <div onClick={e => e.stopPropagation()} style={{ ...card, width: '100%', borderRadius: '22px 22px 0 0', padding: '14px 14px calc(16px + env(safe-area-inset-bottom))' }}>
+              <div style={{ fontSize: 20, fontWeight: 900 }}>📍 Ce point de la carte</div>
+              <div style={{ fontSize: 13, color: '#607d8b', marginBottom: 10 }}>{press.lat.toFixed(5)}, {press.lng.toFixed(5)}</div>
+              <a href={'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=' + press.lat.toFixed(6) + ',' + press.lng.toFixed(6)} target="_blank" rel="noopener noreferrer" onClick={() => setPress(null)}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 60, borderRadius: 16, background: '#1e88e5', color: '#fff', fontSize: 20, fontWeight: 900, textDecoration: 'none' }}>📷 Voir en Street View</a>
+              <button type="button" onClick={() => { const P = press; setPress(null); goSearch([{ id: '', name: 'Point choisi sur la carte', lat: P.lat, lng: P.lng }]); }} style={{ width: '100%', minHeight: 56, marginTop: 8, borderRadius: 16, border: '2px solid #cfd8dc', background: '#fff', fontSize: 18, fontWeight: 800 }}>🏁 Y aller</button>
+              <button type="button" onClick={() => setPress(null)} style={{ width: '100%', minHeight: 48, marginTop: 6, borderRadius: 14, border: 'none', background: '#eceff1', fontSize: 16, fontWeight: 700 }}>Fermer</button>
+            </div></div>}
           {gpsAsk && gpsAsk !== 'closed' && gps.st !== 'ok' && <KbGpsPermSheet st={gpsAsk} code={gps.code} onAsk={askGps} onClose={() => setGpsAsk('closed')} />}
           {showProf && <KbTruckProfSheet prof={prof} onClose={() => { if (prof) setShowProf(false); else { kbTruckProfSet(KB_TRUCK_PRESETS[0]); setProf(KB_TRUCK_PRESETS[0]); setShowProf(false); } }} onSave={p => { kbTruckProfSet(p); setProf(p); setShowProf(false); }} />}
         </div>
