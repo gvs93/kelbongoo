@@ -825,7 +825,10 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.98';
+    const APP_VERSION = 'V11.99';
+    // V11.99 — (26/11/2026) 🎄 Master › Réglages › Saisonnier : désactiver / réactiver les Sapins (sapins/config/off dans la base Centrale).
+    //   Désactivé = plus de tuile chauffeur, plus de Sapins dans l'Espace Rungis, onglet retiré de la Console (2.21.0), mails / alertes
+    //   du serveur Sapins coupés (fichier KBG_SapinsVeille.gs). Clôture distrib : plus de « marquer aussi sur distributions.kelbongoo.com ».
     // V11.98 — CASIERS (26/11/2026, bug « casiers vides ») : un terminal de prépa qui lisait la prépa VIDE (erreur réseau / droits →
     //   liste vide) croyait que les 77 clients n'avaient pas de casier et RÉÉCRIVAIT tous les casiers (1 chacun, 1·2·3…) : casiers
     //   « plein → +1 » effacés, produits dans des casiers que la distrib n'affichait plus. Désormais : erreur de lecture = on garde
@@ -15356,8 +15359,6 @@
                   <h3 style={{color:'var(--warn)',marginBottom:8}}>⚠️ Confirmation</h3>
                   <p style={{fontSize:13,marginBottom:12,color:'var(--ink-soft)'}}>
                     {notPassed.length} non-passés vont être ajoutés au suivi pour relance.
-                    <br/><br/>
-                    <em>N'oublie pas de marquer aussi sur distributions.kelbongoo.com.</em>
                   </p>
                   {closing && (
                     <div style={{margin:'12px 0',fontSize:12,color:'var(--ink-soft)'}}>
@@ -33406,6 +33407,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {sub === 'conso' && <KbConsoPage session={session} master={true} />}
           <KbConsoAlerter />
           {sub === 'theme' && <KbThemePage session={session} />}
+          {sub === 'saison' && <KbSaisonPage session={session} />}
           {sub === 'rungis' && <><h1 style={{ margin: '0 0 4px' }}>🚚 Camion Rungis</h1><KbGpsSettingsCard /><KbGpsTourCard session={session} /><KbDriverLiveCard session={session} /><KbRungisRoute /><GeotabTruckCard /><GeotabTruckCard title="🚚🥬 Camion F&L" device={GEOTAB_DEVICE_FL} color="#2e7d32" bg="#e8f5e9" /><RungisEnlClearPage session={session} /><details className="card" style={{ padding: '10px 14px' }}><summary style={{ fontWeight: 700, cursor: 'pointer' }}>🗂️ Détail des demandes (Centrale PDP)</summary><div style={{ marginTop: 10 }}><RungisEnlevementsPage session={session} /></div></details></>}
           {sub === 'invfl' && <div className="stack"><h1 style={{ margin: '0 0 4px' }}>📦 Inventaire &amp; ajout F&amp;L</h1><FlInventorySuiviCard session={session} /><FlRuptureCard session={session} /></div>}
           {sub === 'live' && <KbLivePage />}
@@ -38153,6 +38155,46 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       React.useEffect(() => { load(); const t = setInterval(load, 20000); return () => clearInterval(t); }, [load]);
       return { S, err, reload: load };
     }
+    // V11.99 — Sapins désactivés (Master › Réglages › Saisonnier) : sapins/config/off = true
+    function kbSapOff(S) { return !!(S && S.config && S.config.off === true); }
+    function useKbSapOff() {
+      const [off, setOff] = React.useState(false);
+      const load = React.useCallback(async () => { try { const v = await kbSapGet('config/off'); setOff(v === true); } catch (_) {} }, []);
+      React.useEffect(() => { load(); const t = setInterval(load, 60000); const h = () => load(); window.addEventListener('kb:sap-off', h); return () => { clearInterval(t); window.removeEventListener('kb:sap-off', h); }; }, [load]);
+      return off;
+    }
+    function KbSaisonPage({ session }) {
+      const showToast = React.useContext(ToastContext);
+      const [cfg, setCfg] = React.useState(undefined);
+      const [busy, setBusy] = React.useState(false);
+      const load = React.useCallback(async () => { try { setCfg((await kbSapGet('config')) || {}); } catch (e) { setCfg(null); } }, []);
+      React.useEffect(() => { load(); }, [load]);
+      const off = !!(cfg && cfg.off === true);
+      const toggle = async () => {
+        const nv = !off;
+        if (nv && !window.confirm('Désactiver les Sapins ?\n\n• plus de Sapins dans le menu chauffeur et l\'Espace Rungis\n• onglet Sapins retiré de la Console\n• plus aucun mail / alerte Sapins\n\nTout reste enregistré : on peut réactiver à tout moment.')) return;
+        setBusy(true);
+        try {
+          await kbSapPut('config', { off: nv, offBy: session.name || session.adminEmail || '', offAt: Date.now() }, 'PATCH');
+          showToast(nv ? '🎄 Sapins désactivés partout' : '🎄 Sapins réactivés');
+          try { window.dispatchEvent(new Event('kb:sap-off')); } catch (_) {}
+          await load();
+        } catch (e) { showToast('⚠️ Non enregistré : ' + e.message); }
+        setBusy(false);
+      };
+      return <div className="stack">
+        <h1 style={{ margin: '0 0 4px' }}>🎄 Saisonnier</h1>
+        <div className="card" style={{ padding: 18, border: '3px solid ' + (off ? '#9e9e9e' : '#2e7d32'), background: off ? '#f5f5f5' : '#e8f5e9' }}>
+          <div style={{ fontSize: 22, fontWeight: 800 }}>🎄 Sapins de Noël : {cfg === undefined ? '…' : cfg === null ? 'lecture impossible' : off ? 'DÉSACTIVÉS' : 'ACTIFS'}</div>
+          <div style={{ fontSize: 15, color: 'var(--ink-soft)', marginTop: 6, lineHeight: 1.45 }}>
+            Désactivé : plus de tuile « Sapins à récupérer » pour le chauffeur, plus de Sapins dans l'Espace Rungis, onglet Sapins retiré de la Console,
+            et plus aucun mail ni alerte du serveur Sapins. Les données restent enregistrées.
+          </div>
+          {off && cfg && cfg.offBy && <div style={{ fontSize: 14, marginTop: 6 }}>Désactivé par <b>{cfg.offBy}</b>{cfg.offAt ? ' le ' + new Date(cfg.offAt).toLocaleString('fr-FR') : ''}</div>}
+          <button className={off ? 'btn-primary btn-lg' : 'btn-warn btn-lg'} style={{ marginTop: 12, width: '100%' }} disabled={busy || cfg == null} onClick={toggle}>{busy ? '…' : off ? '✅ Réactiver les Sapins' : '⛔ Désactiver les Sapins'}</button>
+        </div>
+      </div>;
+    }
     function kbSapTodo(S) { // nb de choses à faire pour le chauffeur aujourd'hui (tuile)
       if (!S || !S.n1) return null;
       const d = kbSapDate(S); if (!d) return 0;
@@ -38353,7 +38395,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const Back = () => <button onClick={() => { setAutoScan(false); setView('home'); }} style={{ alignSelf: 'flex-start', minHeight: 56, fontSize: 19, fontWeight: 700, padding: '8px 18px', borderRadius: 14, border: '2px solid var(--line)', background: 'var(--bg-card)', cursor: 'pointer' }}>← Accueil</button>;
       if (view === 'retours') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisRetoursView session={session} B={B} /></div>;
       if (view === 'epal') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisEpalView session={session} E={E} /></div>;
-      if (view === 'sapins') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisSapinsView session={session} /></div>;
+      if (view === 'sapins' && !kbSapOff(SAP.S)) return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisSapinsView session={session} /></div>;
       if (view === 'livraison') return <div className="stack" style={{ marginTop: 10 }}><Back /><RungisLivraisonView session={session} lines={lines} pk={pk} enl={enl} autoScan={autoScan} onGps={openGps} /></div>;
       if (view === 'gps') return <KbTruckGps session={session} initTour={gpsInit} onClose={() => { kbGpsResumeClear(); setGpsInit(null); setView('home'); }} />; // V11.69 · V11.95 tournée « À livrer »
 
@@ -38385,7 +38427,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <Tile ic="📦" title="À livrer aux boutiques" sub="À prendre à PDP : palettes validées + rolls Kelbongoo" n={enl.raw === undefined ? null : livTodo} color="#1565c0" onClick={() => setView('livraison')} />
           <Tile ic="↩️" title="Retours PDP" sub="📷 Photo en boutique · 🔍 vérifier · 🏭 déposer à PDP" n={B.ready ? B.driverTodo : null} color="#e65100" onClick={() => setView('retours')} />
           <Tile ic="🟫" title="Retour palettes EPAL" sub="Compter les palettes vides récupérées en boutique" n={E.raw === undefined ? null : E.dueTotal} color="#5d4037" onClick={() => setView('epal')} />
-          {SAP.S && SAP.S.n1 && <Tile ic="🎄" title="Sapins à récupérer" sub="Chez Cruard (MIN de Rungis) → magasins · réception signée" n={kbSapTodo(SAP.S)} color="#c62828" onClick={() => setView('sapins')} />}
+          {SAP.S && SAP.S.n1 && !kbSapOff(SAP.S) && <Tile ic="🎄" title="Sapins à récupérer" sub="Chez Cruard (MIN de Rungis) → magasins · réception signée" n={kbSapTodo(SAP.S)} color="#c62828" onClick={() => setView('sapins')} />}
           <div style={{ fontSize: 14, color: 'var(--ink-soft)', textAlign: 'center', padding: '4px 10px' }}>Touche une grande carte. Tout ce que tu coches est enregistré tout de suite.</div>
         </div>
       );
@@ -41051,6 +41093,9 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     function RungisSpace({ session, onLogout, switcher, overlay }) {
       const [page, setPage] = React.useState('cmd');
       const [open, setOpen] = React.useState(false);
+      const sapOff = useKbSapOff(); // V11.99
+      const rgGroups = KB_RG_GROUPS.map(g => ({ ...g, items: g.items.filter(k => !(sapOff && k === 'sapins')) })).filter(g => g.items.length);
+      React.useEffect(() => { if (sapOff && page === 'sapins') setPage('cmd'); }, [sapOff, page]);
       React.useEffect(() => { if (!open) return; const k = (e) => { if (e.key === 'Escape') setOpen(false); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [open]);
       const go = (k) => { setPage(k); setOpen(false); try { window.scrollTo({ top: 0 }); } catch (e) {} };
       const navOf = (k) => KB_RG_NAV.find(n => n.k === k);
@@ -41066,7 +41111,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           <nav className={'kb-side' + (open ? ' kb-side-open' : '')} aria-label="Navigation Espace Rungis">
             <div className="kb-side-brand"><div className="kb-side-logo" style={{ background: 'linear-gradient(135deg,#1565c0,#0d3c78)' }}>R</div><div style={{ flex: 1 }}><b>Espace Rungis</b><small>Kelbongoo · {APP_VERSION}</small></div><button type="button" className="kb-side-x" onClick={() => setOpen(false)} aria-label="Fermer">✕</button></div>
             {switcher && <div className="kb-side-vs" onClick={e => e.stopPropagation()}>{switcher}</div>}
-            {KB_RG_GROUPS.map(g => g.items.length === 1
+            {rgGroups.map(g => g.items.length === 1
               ? <div key={g.s} className="kb-solo">{item(g.items[0])}</div>
               : <div key={g.s} className="kb-grp" style={{ '--g': g.c }}>
                   <div className="kb-grp-h"><span className="kb-grp-ic">{g.ic}</span>{g.l}</div>
@@ -41087,7 +41132,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           {page === 'enl' && <RungisEnlClearPage session={session} />}
           {page === 'trucks' && <RungisTrucksPage />}
           {page === 'epal' && <><KbRduMasterCard /><RungisEpalBureauPage /></>}
-          {page === 'sapins' && <RungisSapinsMasterPage session={session} />}
+          {page === 'sapins' && !sapOff && <RungisSapinsMasterPage session={session} />}
         </div>
       );
     }
@@ -47833,6 +47878,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         { sub: 'dlcrules', l: 'Règles DLC', ic: '📅' },
         { sub: 'invrules', l: 'Règle inventaire', ic: '📋' },
         { sub: 'theme', l: 'Design & thèmes', ic: '🎨' },
+        { sub: 'saison', l: 'Saisonnier (Sapins)', ic: '🎄' }, // V11.99
         { sub: 'ancien', l: 'Synchro ancien site', ic: '🔁' },
       ] },
     ];
