@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V11.97) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V11.98) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -35,7 +35,7 @@
     import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
     import {
       getFirestore, collection, doc, setDoc, getDoc, getDocs,
-      onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp
+      onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp, runTransaction
     } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
     import {
       getAuth, onAuthStateChanged, signInWithEmailAndPassword, signInWithCustomToken,
@@ -44,7 +44,7 @@
     import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
     window.__firebase = {
       initializeApp, getFirestore, collection, doc, setDoc, getDoc, getDocs,
-      onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp,
+      onSnapshot, query, where, deleteDoc, updateDoc, writeBatch, serverTimestamp, runTransaction,
       getAuth, onAuthStateChanged, signInWithEmailAndPassword, signInWithCustomToken,
       GoogleAuthProvider, signInWithPopup, signOut,
       getFunctions, httpsCallable
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V11.97';
+const APP_VERSION = 'V11.98';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2165,7 +2165,7 @@ const storage = {
       } catch (_) {}
     });
   },
-  subscribe(c, callback) {
+  subscribe(c, callback, onErr) {
     if (firebaseConfigured) {
       return fb.onSnapshot(fb.collection(fb.db, c), snap => {
         callback(kbOrdersRead(c, snap.docs.map(d => ({
@@ -2174,6 +2174,12 @@ const storage = {
         }))));
       }, err => {
         if (err && err.code !== 'permission-denied') console.warn('subscribe ' + c, err);
+        if (typeof onErr === 'function') {
+          try {
+            onErr(err);
+          } catch (_) {}
+          return;
+        }
         try {
           callback([]);
         } catch (_) {}
@@ -3106,9 +3112,21 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     } catch (_) {}
     fixed[k] = {
       nums: (d.nums || []).map(String),
-      auto: !!d.auto,
-      vol: Number(d.vol) || 0
+      auto: !!(d.auto || d.autoPrep),
+      vol: Number(d.vol) || 0,
+      act: d.act || ''
     };
+  });
+  const started = new Set();
+  (prepArr || []).forEach(d => {
+    const id = String(d.id || '');
+    if (!/^(st|pc)\|/.test(id)) return;
+    let k = id.slice(3);
+    try {
+      k = decodeURIComponent(k);
+    } catch (_) {}
+    const g = k.split('||');
+    if (g.length >= 3) started.add(g[0] + '||' + g[1]);
   });
   const cli = {};
   (orders || []).forEach(o => {
@@ -3121,7 +3139,12 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
       site,
       client: o.name || '(client)',
       vol: 0,
-      json: []
+      json: [],
+      jsonF: []
+    });
+    (o.casiersFrais || []).forEach(n => {
+      const v = String(n).trim();
+      if (v && !c.jsonF.includes(v)) c.jsonF.push(v);
     });
     c.vol += site === 'DOM' ? kbCartVol(o, cartDoc) : Number(o.volumeFrais) || 0;
     [...(o.casiersFrais || []), ...(o.casiersSec || [])].forEach(n => {
@@ -3156,10 +3179,17 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   };
   const writes = [];
   const keys = Object.keys(cli).sort((a, b) => a.localeCompare(b));
+  const needOf = c => {
+    if (!(self && c.site !== 'DOM')) return kbCasNeed(c.vol, capOf(c.site));
+    if (c.jsonF.length) return c.jsonF.length;
+    const cap = Number(capOf(c.site) && capOf(c.site).cap) || 0;
+    return cap > 0 && c.vol > 0 ? Math.max(1, Math.floor(c.vol / cap + 1e-9)) : 1;
+  };
+  res.compiled = keys.filter(k => cli[k].jsonF.length).length;
   const dels = [];
   if (self) Object.entries(fixed).forEach(([k, f]) => {
     const s = k.split('||')[0];
-    if (s === 'DOM' || !f.auto || cli[k]) return;
+    if (s === 'DOM' || !f.auto || cli[k] || started.has(k)) return;
     f.nums.forEach(v => {
       if (used[s] && used[s][v] === k) delete used[s][v];
     });
@@ -3185,8 +3215,9 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
     const c = cli[k],
       f = fixed[k];
     if (!f || !f.auto) return;
-    const need = kbCasNeed(c.vol, capOf(c.site));
-    if (need > f.nums.length && c.vol > f.vol) {
+    const need = needOf(c);
+    const mayGrow = self && c.site !== 'DOM' ? c.jsonF.length > 0 : c.vol > f.vol;
+    if (need > f.nums.length && mayGrow) {
       const nums = [...f.nums];
       while (nums.length < need) {
         const v = next(c.site);
@@ -3199,7 +3230,7 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
         vol: c.vol
       });
       if (c.site === 'DOM') res.domGrown++;else res.grown++;
-    } else if (self && c.site !== 'DOM' && need < f.nums.length && c.vol < f.vol) {
+    } else if (self && c.site !== 'DOM' && need < f.nums.length && !started.has(k)) {
       const nums = f.nums.slice(0, need);
       f.nums.slice(need).forEach(v => {
         if (used[c.site] && used[c.site][v] === k) delete used[c.site][v];
@@ -3207,14 +3238,15 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
       writes.push({
         k,
         nums,
-        vol: c.vol
+        vol: c.vol,
+        act: nums.includes(String(f.act)) ? f.act : ''
       });
       res.shrunk = (res.shrunk || 0) + 1;
     }
   });
   todo.forEach(k => {
     const c = cli[k],
-      need = kbCasNeed(c.vol, capOf(c.site)),
+      need = needOf(c),
       nums = [];
     for (let i = 0; i < need; i++) {
       const v = next(c.site);
@@ -3239,7 +3271,12 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   for (const w of writes) await storage.setDoc(`day_${dayKey}_prep`, 'cs|' + encodeURIComponent(w.k), {
     nums: w.nums,
     auto: true,
-    vol: w.vol
+    vol: w.vol,
+    ...(w.act ? {
+      act: String(w.act)
+    } : fixed[w.k] && fixed[w.k].act && w.nums.includes(String(fixed[w.k].act)) ? {
+      act: String(fixed[w.k].act)
+    } : {})
   }, {
     replace: true
   });
@@ -5018,6 +5055,17 @@ function kbApplyPrepCasiers(orders, cas, day) {
     if (!pc || !pc.length) return o;
     const hasF = (o.casiersFrais || []).length,
       hasS = (o.casiersSec || []).length;
+    if (self && !o._ps) return hasF || !hasS ? {
+      ...o,
+      casiersFrais: [...pc],
+      casiersSec: [],
+      casiersJson: o.casiersJson || [...(o.casiersFrais || []), ...(o.casiersSec || [])]
+    } : {
+      ...o,
+      casiersSec: [...pc],
+      casiersFrais: [],
+      casiersJson: o.casiersJson || o.casiersSec || []
+    };
     return hasF || !hasS ? {
       ...o,
       casiersFrais: [...pc],
@@ -44605,6 +44653,8 @@ function PrepaDuJourPage({
   const [doneOpen, setDoneOpen] = React.useState({});
   const [recent, setRecent] = React.useState({});
   const [casPick, setCasPick] = React.useState(null);
+  const [rowsDay, setRowsDay] = React.useState('');
+  const [prepErr, setPrepErr] = React.useState('');
   const [casNum, setCasNum] = React.useState('');
   const [casErr, setCasErr] = React.useState('');
   const [prodSite, setProdSite] = React.useState('');
@@ -44761,6 +44811,7 @@ function PrepaDuJourPage({
       Object.values(resv).forEach(a => a.sort(casCmp));
       setRows(rws);
       setReserved(resv);
+      setRowsDay(day);
     });
     return unsub;
   }, [day]);
@@ -44775,6 +44826,8 @@ function PrepaDuJourPage({
         lm = {},
         cs = {},
         csa = {},
+        ca = {},
+        sc = {},
         nx = {},
         sb = {},
         pr = {},
@@ -44815,9 +44868,13 @@ function PrepaDuJourPage({
           key = decodeURIComponent(id.slice(bar + 1));
         if (pfx === 'st') {
           st[key] = d.v;
+          if (d.cas) sc[key] = String(d.cas);
           sb[key] = d.by || '';
           if (d.v === 'partiel') pc[key] = d.n || pc[key] || 0;
-        } else if (pfx === 'pc') pc[key] = d.n || 0;else if (pfx === 'pr') {
+        } else if (pfx === 'pc') {
+          pc[key] = d.n || 0;
+          if (d.cas && !sc[key]) sc[key] = String(d.cas);
+        } else if (pfx === 'pr') {
           if (d.at && Date.now() - d.at < 180000) pr[key] = d;
         } else if (pfx === 'pd') pd[key] = d.v;else if (pfx === 'rc') rc[key] = {
           pct: d.pct,
@@ -44836,6 +44893,7 @@ function PrepaDuJourPage({
         };else if (pfx === 'lm') lm[key] = true;else if (pfx === 'cs') {
           cs[key] = d.nums || [];
           if (d.autoPrep) csa[key] = true;
+          if (d.act) ca[key] = String(d.act);
         } else if (pfx === 'nx') nx[key] = true;else if (pfx === 'rp' && d.to) rp[key] = d;
       });
       setPrep({
@@ -44855,14 +44913,60 @@ function PrepaDuJourPage({
         presence: pr,
         count: pc,
         dom,
-        repl: rp
+        repl: rp,
+        casAct: ca,
+        stCas: sc,
+        _day: day
       });
+      setPrepErr('');
+    }, err => {
+      setPrepErr(err && err.code || 'erreur');
+      showToast('⚠️ Prépa : lecture impossible (' + (err && err.code || 'réseau') + ') — casiers non modifiés, recharge la page');
     });
     return unsub;
   }, [day]);
+  const casRef = ck => fb.doc(fb.db, `day_${day}_prep`, 'cs|' + encId(ck));
+  const casTx = async (ck, fn) => {
+    if (!firebaseConfigured || !fb.runTransaction) throw new Error('hors ligne');
+    let out = null;
+    await fb.runTransaction(fb.db, async tx => {
+      const snap = await tx.get(casRef(ck));
+      const cur = snap.exists() ? snap.data() : null;
+      const nx = fn(cur);
+      out = nx;
+      if (nx === undefined) return;
+      if (nx === null) tx.delete(casRef(ck));else tx.set(casRef(ck), {
+        ...nx,
+        by: user,
+        _ts: Date.now()
+      });
+    });
+    if (out !== undefined) {
+      try {
+        kbPrepLog(`day_${day}_prep`, 'cs|' + encId(ck), out === null ? 'delete' : 'set', out ? {
+          ...out,
+          by: user
+        } : {
+          by: user
+        });
+      } catch (_) {}
+    }
+    return out;
+  };
+  const prepReady = () => !!day && prep._day === day && rowsDay === day && !prepErr && prep.presence !== undefined;
+  const casOfKey = (key, v) => {
+    if (v !== 'done' && v !== 'partiel' && v !== 'count') return {};
+    const r = rows.find(x => K(x) === key);
+    if (!r || !rowInCas(r)) return {};
+    const a = activeCas(r.site, r.client);
+    return a ? {
+      cas: a
+    } : {};
+  };
   const wStatus = (key, v, extra) => v ? storage.setDoc(`day_${day}_prep`, 'st|' + encId(key), {
     v,
     by: user,
+    ...casOfKey(key, v),
     ...(extra || {})
   }, {
     replace: true
@@ -44906,7 +45010,8 @@ function PrepaDuJourPage({
   }) : storage.deleteDoc(`day_${day}_prep`, 'lm|' + encId(pk));
   const wCount = (key, n) => n ? storage.setDoc(`day_${day}_prep`, 'pc|' + encId(key), {
     n,
-    by: user
+    by: user,
+    ...casOfKey(key, 'count')
   }, {
     replace: true
   }) : storage.deleteDoc(`day_${day}_prep`, 'pc|' + encId(key)).catch(() => {});
@@ -44960,77 +45065,121 @@ function PrepaDuJourPage({
   const casFirst = (s, c) => getCasiers(s, c)[0];
   const casAutoSig = React.useRef('');
   const casFreeing = React.useRef({});
-  React.useEffect(() => {
-    if (!day || prep.closed || prep.presence === undefined || !rows.length) return;
-    const miss = {};
-    const fixed = {};
-    Object.entries(prep.casiers || {}).forEach(([k, a]) => {
-      const [s0, c0] = k.split('||');
-      (a || []).forEach(n => {
-        const v = String(n).trim();
-        if (v && v !== '?') {
-          fixed[s0] = fixed[s0] || {};
-          if (!fixed[s0][v]) fixed[s0][v] = c0;
-        }
-      });
+  const casBusy = React.useRef({});
+  const activeCas = (s, c) => {
+    const l = getCasiers(s, c).map(String).filter(v => v && v !== '?');
+    const a = (prep.casAct || {})[CK(s, c)];
+    return a && l.includes(a) ? a : l[0] || '';
+  };
+  const casUsed = (s, c) => {
+    const u = {};
+    rows.forEach(r => {
+      if (r.site !== s || r.client !== c) return;
+      const v = (prep.stCas || {})[K(r)];
+      if (v) u[v] = (u[v] || 0) + 1;
     });
-    let nClash = 0;
+    return u;
+  };
+  React.useEffect(() => {
+    if (!prepReady() || prep.closed || !rows.length) return;
+    const self = kbCasSelf(day);
+    const miss = {};
     rows.forEach(r => {
       if (!rowInCas(r)) return;
-      const cs = getCasiers(r.site, r.client).map(String).filter(v => v && v !== '?');
-      const clash = !prep.casiers[CK(r.site, r.client)] && cs.some(v => fixed[r.site] && fixed[r.site][v] && fixed[r.site][v] !== r.client);
-      if (!cs.length || clash) {
-        const set = miss[r.site] = miss[r.site] || new Set();
-        if (clash && !set.has(r.client)) nClash++;
-        set.add(r.client);
-      }
+      const k = CK(r.site, r.client);
+      if (prep.casiers[k] && prep.casiers[k].length) return;
+      if (!self && (reserved[k] || []).length) return;
+      (miss[r.site] = miss[r.site] || new Set()).add(r.client);
     });
-    if (kbCasSelf(day)) Object.keys(prep.casAuto || {}).forEach(k => {
+    if (self) Object.keys(prep.casAuto || {}).forEach(k => {
       const [s0, c0] = k.split('||');
       if (s0 === 'DOM') return;
       if (rows.some(r => r.site === s0 && r.client === c0 && rowInCas(r))) return;
       if (casFreeing.current[k]) return;
       casFreeing.current[k] = 1;
-      storage.deleteDoc(`day_${day}_prep`, 'cs|' + encId(k)).then(() => showToast(`🧊 Casier ${(prep.casiers[k] || []).join('·')} rendu (${c0.split(' ')[0]} n'a plus rien en casier)`)).catch(() => {}).finally(() => {
+      const was = (prep.casiers[k] || []).map(String).join('·');
+      casTx(k, cur => cur && cur.autoPrep && (cur.nums || []).map(String).join('·') === was ? null : undefined).then(o => {
+        if (o === null) showToast(`🧊 Casier ${was} rendu (${c0.split(' ')[0]} n'a plus rien en casier)`);
+      }).catch(() => {}).finally(() => {
         delete casFreeing.current[k];
       });
     });
+    if (self) {
+      const seen = new Set();
+      rows.forEach(r => {
+        if (r.site === 'DOM' || !rowInCas(r)) return;
+        const k = CK(r.site, r.client);
+        if (seen.has(k)) return;
+        seen.add(k);
+        const l = (prep.casiers[k] || []).map(String).filter(v => v && v !== '?');
+        if (l.length < 2) return;
+        const lines = rows.filter(x => x.site === r.site && x.client === r.client && rowInCas(x));
+        if (!lines.every(handled)) return;
+        const posed = lines.filter(x => {
+          const t = prep.status[K(x)];
+          return t === 'done' || t === 'partiel' || ((prep.count || {})[K(x)] || 0) > 0;
+        });
+        if (!posed.length || posed.some(x => !(prep.stCas || {})[K(x)])) return;
+        const used = new Set(posed.map(x => prep.stCas[K(x)]));
+        const empty = l.filter(v => !used.has(v));
+        if (!empty.length || empty.length >= l.length) return;
+        const fk = 'e|' + k;
+        if (casFreeing.current[fk]) return;
+        casFreeing.current[fk] = 1;
+        casTx(k, cur => {
+          if (!cur) return undefined;
+          const all = (cur.nums || []).map(String),
+            n = all.filter(v => !empty.includes(v));
+          if (!n.length || n.length === all.length) return undefined;
+          return {
+            nums: n,
+            act: n.includes(String(cur.act || '')) ? String(cur.act) : n[n.length - 1],
+            freed: [...(cur.freed || []), ...empty],
+            ...(cur.autoPrep ? {
+              autoPrep: true
+            } : {})
+          };
+        }).then(o => {
+          if (o) showToast(`🧊 ${r.client.split(' ')[0]} fini : ${empty.map(kbCasName).join(', ')} vide → libéré`);
+        }).catch(() => {}).finally(() => {
+          delete casFreeing.current[fk];
+        });
+      });
+    }
     const sig = Object.entries(miss).map(([s, set]) => s + ':' + [...set].sort().join(',')).sort().join('|');
     if (!sig || sig === casAutoSig.current) return;
     casAutoSig.current = sig;
-    let cnt = 0;
     Object.entries(miss).forEach(([s, set]) => {
       const own = casOwners(s);
-      if (kbCasSelf(day)) {
-        [...set].sort((a, b) => a.localeCompare(b)).forEach(c => {
-          const v = kbSmallestFree(own);
-          own[v] = c;
-          cnt++;
-          storage.setDoc(`day_${day}_prep`, 'cs|' + encId(CK(s, c)), {
-            nums: [v],
-            autoPrep: true
-          }, {
-            replace: true
-          }).catch(e => {
-            casAutoSig.current = '';
-            showToast('⚠️ Casier non enregistré pour ' + c + ' (' + s + ') : ' + (e && e.message || e) + ' — réessai automatique');
-          });
-        });
-        return;
-      }
-      let n = 0;
-      Object.keys(own).forEach(v => {
-        const x = parseInt(v, 10);
-        if (!isNaN(x) && String(x) === v && x > n) n = x;
-      });
       [...set].sort((a, b) => a.localeCompare(b)).forEach(c => {
-        n++;
-        cnt++;
-        wCas(CK(s, c), [String(n)]);
+        const k = CK(s, c);
+        if (casBusy.current[k]) return;
+        casBusy.current[k] = 1;
+        let v;
+        if (self) v = kbSmallestFree(own);else {
+          let n = 0;
+          Object.keys(own).forEach(x => {
+            const y = parseInt(x, 10);
+            if (!isNaN(y) && String(y) === x && y > n) n = y;
+          });
+          v = String(n + 1);
+        }
+        own[v] = c;
+        casTx(k, cur => cur && (cur.nums || []).length ? undefined : {
+          nums: [v],
+          act: v,
+          autoPrep: true
+        }).then(o => {
+          if (o) showToast(`🧊 ${c.split(' ')[0]} (${s}) sans casier → ${kbCasName(v)}`);
+        }).catch(e => {
+          casAutoSig.current = '';
+          showToast('⚠️ Casier non enregistré pour ' + c + ' (' + s + ') : ' + (e && e.message || e) + ' — réessai automatique');
+        }).finally(() => {
+          delete casBusy.current[k];
+        });
       });
     });
-    if (cnt) showToast(nClash ? `🧊 ${nClash} casier(s) en double après le nouveau chargement → nouveau n° attribué` : `🧊 ${cnt} client${cnt > 1 ? 's' : ''} sans casier → n° attribué`);
-  }, [day, rows, prep]);
+  }, [day, rows, prep, rowsDay, prepErr]);
   const basket = (s, c) => rows.filter(r => r.site === s && r.client === c).reduce((a, r) => a + r.qty, 0);
   const weighable = t => /\d\s*(g|kg)\s*[-–]\s*\d/i.test(t || '');
   const st = r => prep.status[K(r)] || 'todo';
@@ -46274,6 +46423,19 @@ function PrepaDuJourPage({
     while (own[String(n)]) n++;
     return n;
   };
+  const casBase = (site, client, cur) => (cur && cur.nums ? cur.nums : getCasiers(site, client)).map(String).filter(v => v && v !== '?');
+  const casKeep = cur => {
+    const o = {};
+    if (cur && Array.isArray(cur.freed)) o.freed = cur.freed;
+    if (cur && Array.isArray(cur.before)) o.before = cur.before;
+    return o;
+  };
+  const casDone = () => {
+    setCasPick(null);
+    setCasNum('');
+    setCasErr('');
+  };
+  const casFail = e => showToast('⚠️ Casier non enregistré : ' + (e && e.message || e) + ' — réessaie');
   const giveCasier = (site, client, num) => {
     const v = String(num).trim();
     if (!/^\d{1,4}$/.test(v) || parseInt(v, 10) < 1) {
@@ -46293,11 +46455,18 @@ function PrepaDuJourPage({
     const n = parseInt(v, 10),
       c = (prep.counters[site] ?? 0) || 0;
     if (n > c) wCounter(site, n);
-    wCas(CK(site, client), [...cur, v]);
-    showToast(`Casier ${v} attribué à ${client.split(' ')[0]} (${site})`);
-    setCasPick(null);
-    setCasNum('');
-    setCasErr('');
+    casTx(CK(site, client), x => {
+      const l = casBase(site, client, x);
+      if (l.includes(v)) return undefined;
+      return {
+        ...casKeep(x),
+        nums: [...l, v],
+        act: v
+      };
+    }).then(o => {
+      if (o) showToast(`📦 ${kbCasName(v)} pour ${client.split(' ')[0]} (${site}) → on pose dedans`);
+    }).catch(casFail);
+    casDone();
     return true;
   };
   const nextCagette = site => {
@@ -46307,13 +46476,33 @@ function PrepaDuJourPage({
     return 'C' + i;
   };
   const giveCagette = (site, client) => {
-    const v = nextCagette(site),
-      cur = getCasiers(site, client).map(String);
-    wCas(CK(site, client), [...cur, v]);
-    showToast(`🧺 Cagette ${v.slice(1)} ajoutée à ${client.split(' ')[0]} (${site}) — pas de nouveau roll`);
-    setCasPick(null);
-    setCasNum('');
-    setCasErr('');
+    const v = nextCagette(site);
+    casTx(CK(site, client), x => {
+      const l = casBase(site, client, x);
+      if (l.includes(v)) return undefined;
+      return {
+        ...casKeep(x),
+        nums: [...l, v],
+        act: v
+      };
+    }).then(o => {
+      if (o) showToast(`🧺 Cagette ${v.slice(1)} ajoutée à ${client.split(' ')[0]} (${site}) — on pose dedans`);
+    }).catch(casFail);
+    casDone();
+  };
+  const setActiveCas = (site, client, v) => {
+    casTx(CK(site, client), x => {
+      const l = casBase(site, client, x);
+      if (!l.includes(String(v))) return undefined;
+      return {
+        ...(x || {}),
+        nums: l,
+        act: String(v)
+      };
+    }).then(o => {
+      if (o) showToast(`▶ ${client.split(' ')[0]} : on pose dans ${kbCasName(v)}`);
+    }).catch(casFail);
+    casDone();
   };
   const addCasierFor = (site, client) => {
     setCasPick({
@@ -46331,9 +46520,30 @@ function PrepaDuJourPage({
       return;
     }
     const n = arr[idx];
-    arr.splice(idx, 1);
-    wCas(CK(site, client), arr);
-    showToast(`Casier ${n} retiré de ${client.split(' ')[0]} — n° ${n} libre`);
+    const u = casUsed(site, client)[n] || 0;
+    if (u > 0) {
+      showToast(`⛔ ${kbCasName(n)} contient ${u} produit${u > 1 ? 's' : ''} de ${client.split(' ')[0]} : impossible de le retirer`);
+      return;
+    }
+    const lines = rows.filter(r => r.site === site && r.client === client && rowInCas(r));
+    const unknown = lines.some(r => {
+      const t = prep.status[K(r)];
+      return (t === 'done' || t === 'partiel' || ((prep.count || {})[K(r)] || 0) > 0) && !(prep.stCas || {})[K(r)];
+    });
+    if (unknown && !window.confirm(`${kbCasName(n)} de ${client} : vérifie qu'il est bien VIDE.\nDes produits ont été posés sans casier enregistré.\n\nRetirer ${kbCasName(n)} ?`)) return;
+    casTx(CK(site, client), x => {
+      const l = casBase(site, client, x);
+      if (!l.includes(n) || l.length <= 1) return undefined;
+      const nl = l.filter(v => v !== n);
+      return {
+        ...casKeep(x),
+        nums: nl,
+        act: x && x.act && nl.includes(String(x.act)) ? String(x.act) : nl[nl.length - 1],
+        freed: [...(x && x.freed || []), n]
+      };
+    }).then(o => {
+      if (o) showToast(`Casier ${n} retiré de ${client.split(' ')[0]} — n° ${n} libre`);
+    }).catch(casFail);
   };
   const removeCasier = (client, idx) => removeCasierFor(curSite, client, idx);
   const openRemAll = pk => (setRemCliOpen({}), setArtOpen({}), setRemAllOpen(o => o[pk] ? {
@@ -47561,6 +47771,24 @@ function PrepaDuJourPage({
         }
       }, site), (() => {
         const cs = getCasiers(site, r.client);
+        if (cs.length > 1 && rowInCas(r)) {
+          const a = (prep.stCas || {})[k] || activeCas(site, r.client);
+          const others = cs.map(String).filter(v => v !== a);
+          return React.createElement("span", {
+            className: "pdj-cnum"
+          }, React.createElement("span", {
+            title: "Casier où poser"
+          }, kbCasShort(a)), React.createElement("small", {
+            style: {
+              fontSize: 14,
+              fontWeight: 600,
+              color: '#777',
+              alignSelf: 'center',
+              border: 'none',
+              padding: 0
+            }
+          }, "aussi ", others.map(kbCasShort).join('·')));
+        }
         return React.createElement("span", {
           className: "pdj-cnum" + (cs.length > 1 ? " many" : "")
         }, cs.map((c, ci) => React.createElement("span", {
@@ -48620,7 +48848,7 @@ function PrepaDuJourPage({
     const cur = getCasiers(site, client);
     const auto = String(nextFree(site));
     return React.createElement(KbSheet, {
-      title: `📦 Nouveau casier · ${client} · ${site}`,
+      title: `📦 Casiers · ${client} · ${site}`,
       onClose: () => {
         setCasPick(null);
         setCasErr('');
@@ -48629,16 +48857,49 @@ function PrepaDuJourPage({
       className: "pdj-cpick"
     }, React.createElement("div", {
       className: "pdj-cpcur"
-    }, "Casier(s) actuel(s) :"), React.createElement("div", {
-      className: "pdj-cb"
-    }, cur.map((n, i) => React.createElement("span", {
-      key: n,
-      className: "pdj-cas"
-    }, kbCasName(n), cur.length > 1 && React.createElement("button", {
-      className: "pdj-rmcas",
-      title: "Supprimer ce casier",
-      onClick: () => removeCasierFor(site, client, i)
-    }, "✕")))), React.createElement("button", {
+    }, cur.length > 1 ? "Où poser les produits ? (casier plein → touche le suivant)" : "Casier actuel :"), React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        margin: '6px 0 12px'
+      }
+    }, cur.map((n, i) => {
+      const act = activeCas(site, client) === String(n),
+        u = casUsed(site, client)[String(n)] || 0;
+      return React.createElement("div", {
+        key: n,
+        style: {
+          display: 'flex',
+          gap: 8,
+          alignItems: 'stretch'
+        }
+      }, React.createElement("button", {
+        className: "pdj-cpbtn",
+        style: {
+          flex: 1,
+          margin: 0,
+          background: act ? '#1b5e20' : '#fff',
+          color: act ? '#fff' : '#0b2545',
+          border: '3px solid ' + (act ? '#1b5e20' : '#0b2545')
+        },
+        onClick: () => act ? casDone() : setActiveCas(site, client, n)
+      }, (act ? '▶ ' : '') + kbCasName(n), React.createElement("small", {
+        style: {
+          color: act ? '#e8f5e9' : '#555'
+        }
+      }, act ? 'on pose ici' : 'poser ici', ' · ', u ? u + ' produit' + (u > 1 ? 's' : '') + ' dedans' : 'vide')), cur.length > 1 && !u && React.createElement("button", {
+        className: "pdj-rmcas",
+        style: {
+          position: 'static',
+          width: 64,
+          fontSize: 22,
+          borderRadius: 12
+        },
+        title: "Retirer ce casier vide",
+        onClick: () => removeCasierFor(site, client, i)
+      }, "✕"));
+    })), React.createElement("button", {
       className: "pdj-cpbtn",
       style: {
         background: '#7a3a12'
@@ -48683,7 +48944,7 @@ function PrepaDuJourPage({
       style: {
         marginTop: 8
       }
-    }, "Un numéro = un seul client par lieu. Casier pas utilisé ? ✕ pour le supprimer : son n° redevient libre.")));
+    }, "Un numéro = un seul client par lieu. On pose toujours dans le casier ▶. Casier vide en trop : ✕ (ou libéré tout seul quand le client est fini).")));
   })(), rgPopup, replPopup, remPopup, tourRg && React.createElement(KbSheet, {
     title: "🚚 Tournée " + String(tourCfg.depart).replace(':', 'h') + " — prévenir Rungis",
     onClose: () => {
@@ -98151,7 +98412,7 @@ function kbPrepEvent(docId, d, ctx, at, by, op) {
       site,
       client,
       produit,
-      casier: casOf(site, client),
+      casier: d && d.cas ? String(d.cas) : casOf(site, client) + (v === 'done' ? ' (actuel)' : ''),
       qty: q
     };
   }
@@ -98165,7 +98426,7 @@ function kbPrepEvent(docId, d, ctx, at, by, op) {
       site,
       client,
       produit,
-      casier: casOf(site, client),
+      casier: d && d.cas ? String(d.cas) : casOf(site, client),
       qty: q
     };
   }
