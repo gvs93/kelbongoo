@@ -826,7 +826,8 @@
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
     const APP_VERSION = 'V11.96';
-    // V11.96 — (26/11/2026) Chauffeur : lieu où personne n'aide à décharger avant une heure (BOR : 15h30, réglable gps_config.helpFrom) → « 🧍 déchargement probablement seul » sur la tournée ; au départ (chargement validé / terminé) fenêtre au chauffeur + mail rr@ + hg@ « d'après la tournée du jour et le trafic, NOM va arriver à HHhMM à … » (une fois par jour et par lieu ; repli : envoyé par le master si le chauffeur n'a pas pu)
+    // V11.96 — (26/11/2026) 💬 Master › Équipe : les personnes connectées à la CENTRALE PDP apparaissent aussi (🏭) → Discussion / À valider, fils partagés avec la Console (base Centrale, nœud chat/) ; photo du support : ouverture sûre (data:image seulement)
+    // V11.96 — Chauffeur : lieu où personne n'aide à décharger avant une heure (BOR : 15h30, réglable gps_config.helpFrom) → « 🧍 déchargement probablement seul » sur la tournée ; au départ (chargement validé / terminé) fenêtre au chauffeur + mail rr@ + hg@ « d'après la tournée du jour et le trafic, NOM va arriver à HHhMM à … » (une fois par jour et par lieu ; repli : envoyé par le master si le chauffeur n'a pas pu)
     // V11.96 — Sapins (chauffeur) : plantage « can't convert undefined to object » corrigé — le récap figé dans la base perd les « par » vides (Firebase n'enregistre pas les objets vides) → récap normalisé + sapDispatch / sapProrata robustes
     // V11.96 — Chauffeur › À livrer : décompte des supports à récupérer aujourd'hui (« 3 / 10 récupérés », il reste…, détail au toucher, aussi dans l'écran de scan) ; Retours PDP : contenants vides (rolls, dollies, cagettes) = simple encart « pense aux contenants », détail au toucher, hors cartes / compteurs / vérification
     // V11.96 — GPS chauffeur : fenêtre « 📍 Autoriser ma position » (iPhone : la demande part d'un toucher, étapes Safari / Chrome / Réglages iPhone, relance auto au retour dans l'appli) ; pendant le guidage la carte se déplace au doigt (cap gardé, vue 2D), 📍 Recentrer ou retour auto après 20 s
@@ -40166,6 +40167,13 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       storage.setDoc('rungis_picks', 'tourperso_' + day, { id: 'tourperso_' + day, kind: 'tourperso', day, status: '', by: String((session && session.name) || '').slice(0, 60), at: new Date().toISOString(),
         unlocked: !!t.unlocked, sites: (codes || []).slice(0, 40), end: t.end || 'none' }).catch(() => {});
     }
+    // V11.96 — envoi EN DIRECT depuis l'appli du chauffeur : action serveur dédiée « rungis_alone » (KBG_Seul.gs, destinataires fixés
+    //   côté serveur, texte construit par le serveur → le compte chauffeur ne peut pas envoyer d'autre mail). Repli : proxy mail (master / prépa).
+    async function kbDrvAloneSend(d, lieu, hm) {
+      const a = { site: String(d.site || '').slice(0, 10), siteLabel: String(lieu || '').slice(0, 60), eta: String(hm || kbHM(d.eta)).slice(0, 5), helpFrom: String(d.helpFrom || '').slice(0, 5), traffic: !!d.traffic, day: String(d.day || '').slice(0, 10) };
+      try { const r = await kbRungisCall('rungis_alone', { alone: a, by: d.by || '' }); if (r && r.ok) return true; } catch (e) { console.warn('rungis_alone', e); }
+      try { const m = kbDrvAloneMail(d, lieu, hm); const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: m.subject, body: m.body }); return !!(r && r.ok !== false); } catch (e) { return false; }
+    }
     function kbDrvAloneMail(d, lieu, hm) {
       const hf = String(d.helpFrom || '15:30').replace(':', 'h'), h = hm || kbHM(d.eta);
       return { subject: `🧍 ${d.site} · déchargement probablement seul · arrivée ≈ ${h} · ${d.by || 'chauffeur'}`,
@@ -40513,9 +40521,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           const who = String(session.name || 'Le chauffeur').slice(0, 60), hm = kbHM(new Date(o.eta).toISOString()), lieu = (siteLabel(o.code) !== o.code ? siteLabel(o.code) : o.name || o.code);
           const doc = { id, kind: 'alone', day: today, site: o.code, eta: new Date(o.eta).toISOString(), helpFrom: o.helpFrom, by: who, at: new Date().toISOString(), status: '', mailed: false, traffic: !!(plan && plan.traffic) };
           try { await storage.setDoc('rungis_picks', id, doc); } catch (e) { continue; }
-          const m = kbDrvAloneMail(doc, lieu, hm);
-          try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: m.subject, body: m.body });
-            if (r && r.ok !== false) await storage.setDoc('rungis_picks', id, { mailed: true, mailedAt: new Date().toISOString() }); } catch (e) { /* refus chauffeur → le master l'envoie (Enlèvements) */ }
+          if (await kbDrvAloneSend(doc, lieu, hm)) { try { await storage.setDoc('rungis_picks', id, { mailed: true, mailedAt: new Date().toISOString() }); } catch (e) {} }
         }
       };
       const confirmLoad = async () => {
@@ -41257,8 +41263,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
       const aloneToday = (picks || []).filter(p => p && p.kind === 'alone' && p.day === today); // V11.96
       const aloneSent = React.useRef({});
       React.useEffect(() => { if (!isAdmin) return; aloneToday.filter(d => !d.mailed && !aloneSent.current[d.id]).forEach(async d => { aloneSent.current[d.id] = 1;
-        const m = kbDrvAloneMail(d, siteLabel(d.site));
-        try { const r = await stockPost({ secret: FRESHDESK_SECRET, action: 'send_mail', to: KB_PDP_RECAP_TO, subject: m.subject, body: m.body }); if (r && r.ok !== false) await storage.setDoc('rungis_picks', d.id, { mailed: true, mailedAt: new Date().toISOString(), mailedBy: 'master' }); } catch (e) { console.warn('alerte BOR', e); } }); },
+        try { if (await kbDrvAloneSend(d, siteLabel(d.site))) await storage.setDoc('rungis_picks', d.id, { mailed: true, mailedAt: new Date().toISOString(), mailedBy: 'master' }); } catch (e) { console.warn('alerte BOR', e); } }); },
         [isAdmin, aloneToday.map(d => d.id + (d.mailed ? 1 : 0)).join()]);
       const tp = pk['tourperso_' + today];
       const th = { textAlign: 'left', padding: '10px 12px', fontSize: 13, fontWeight: 700, background: 'var(--bg-muted)' };
@@ -46343,7 +46348,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
             <div key={i} style={{ alignSelf: mine ? 'flex-end' : 'flex-start', maxWidth: '88%', background: mine ? '#e8f5e9' : '#f3f3f3', border: '1px solid ' + (mine ? '#a5d6a7' : '#e0e0e0'), borderRadius: 12, padding: '7px 10px' }}>
               <div style={{ fontSize: 11, color: 'var(--ink-mute)', fontWeight: 600 }}>{t.by === 'master' ? '🛟 ' : ''}{t.from} · {kbHm(t.at)}</div>
               <div style={{ fontSize: 15, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{t.text}</div>
-              {t.img && <img src={t.img} alt="photo" onClick={() => { const w = window.open(); if (w) w.document.write('<img src="' + t.img + '" style="max-width:100%">'); }} style={{ marginTop: 6, maxWidth: 180, maxHeight: 140, borderRadius: 8, cursor: 'zoom-in' }} />}
+              {t.img && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(t.img) && <img src={t.img} alt="photo" onClick={() => { const w = window.open(); if (w) { const im = w.document.createElement('img'); im.src = t.img; im.style.maxWidth = '100%'; w.document.body.appendChild(im); } }} style={{ marginTop: 6, maxWidth: 180, maxHeight: 140, borderRadius: 8, cursor: 'zoom-in' }} />}
             </div>); })}
         </div>
       );
@@ -46450,6 +46455,28 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         </React.Fragment>
       );
     }
+    // V11.96 — 💬 chat avec la CENTRALE PDP (base Centrale, nœud chat/ ; REST avec la session Kelbongoo → kelbongoo-prep)
+    const KB_CC_DB = 'https://' + KB_PREP_HOST + '/chat';
+    const kbCcArr = t => Array.isArray(t) ? t.filter(Boolean) : Object.values(t || {}).filter(Boolean).sort((a, b) => (a.at || 0) - (b.at || 0));
+    function useKbCentraleChat() {
+      const [d, setD] = React.useState({ pres: {}, msgs: {}, err: '' });
+      const [tick, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let stop = false;
+        Promise.all(['presence', 'msgs'].map(k => fetch(KB_CC_DB + '/' + k + '.json?t=' + Date.now(), { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })))
+          .then(([pres, msgs]) => { if (!stop) setD({ pres: pres || {}, msgs: msgs || {}, err: '' }); })
+          .catch(e => { if (!stop) setD(x => ({ ...x, err: e.message })); });
+        const t = setTimeout(() => setTick(x => x + 1), 12000);
+        return () => { stop = true; clearTimeout(t); };
+      }, [tick]);
+      const now = Date.now(), t0 = now - 7 * 864e5;
+      const online = Object.keys(d.pres).map(k => ({ dev: k, ...d.pres[k] })).filter(p => p && p.name && now - (p.at || 0) < 5 * 60000).sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr'));
+      const list = Object.keys(d.msgs).map(id => ({ id, ...d.msgs[id], thread: kbCcArr(d.msgs[id].thread) })).filter(m => (m.at || 0) > t0).sort((a, b) => (b.at || 0) - (a.at || 0));
+      const put = async (path, method, body) => { const r = await fetch(KB_CC_DB + path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); if (!r.ok) throw new Error('base Centrale : HTTP ' + r.status); setTick(x => x + 1); return r.json(); };
+      return { online, list, err: d.err, nNew: list.filter(m => m.status === 'new').length,
+        send: (to, mode, text, from) => { const now2 = Date.now(); return put('/msgs.json', 'POST', { to: String(to.dev), toName: String(to.name || '').slice(0, 60), toModule: String(to.module || '').slice(0, 40), mode: mode === 'ack' ? 'ack' : 'chat', status: 'open', at: now2, fromApp: 'master', userReadAt: 0, thread: [{ by: 'bureau', from: String(from || 'Bureau').slice(0, 60), text: String(text).slice(0, 1000), at: now2 }] }); },
+        answer: (m, text, done, from) => { const th = text ? m.thread.concat([{ by: 'bureau', from: String(from || 'Bureau').slice(0, 60), text: String(text).slice(0, 1000), at: Date.now() }]).slice(-60) : m.thread; return put('/msgs/' + encodeURIComponent(m.id) + '.json', 'PATCH', { thread: th, status: done ? 'done' : 'answered' }); } };
+    }
     // ---------- côté Master : boîte support + chat master ----------
     function KbMasterComms({ session, tab, bottom }) {
       const showToast = React.useContext(ToastContext);
@@ -46463,6 +46490,7 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
       const [pres, setPres] = React.useState([]); // V11.65 — chat équipe : personnes en ligne
       const [tTo, setTTo] = React.useState(null); const [tMode, setTMode] = React.useState('chat'); const [tMsg, setTMsg] = React.useState('');
       React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
+      const cc = useKbCentraleChat(); // V11.96 — équipe de la Centrale PDP
       const [seenChat, setSeenChat] = React.useState(() => { try { return Number(localStorage.getItem('kb_chat_seen') || 0); } catch (_) { return 0; } });
       const mount = React.useRef(Date.now());
       const online = useKbMastersOnline();
@@ -46482,12 +46510,13 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
         setChat(prev => { const n = L[L.length - 1]; if (n && n.at > mount.current && n.from !== session.name && (!prev.length || prev[prev.length - 1].id !== n.id)) setPop({ kind: 'chat', from: n.from, text: n.text }); return L; });
       }), []);
       const supOnly = sup.filter(m => m.kind !== 'team'), team = sup.filter(m => m.kind === 'team');
-      const nNew = supOnly.filter(m => m.status === 'new').length, nTeam = team.filter(m => m.status === 'new').length;
+      const nNew = supOnly.filter(m => m.status === 'new').length, nTeam = team.filter(m => m.status === 'new').length + cc.nNew;
       const tNow = Date.now();
       const staffOn = pres.filter(p => p && p.name && p.uid && !String(p.id || '').startsWith('~') && p.role !== 'master' && tNow - (p.at || 0) < 5 * 60000)
         .sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr'));
       const sendTeam = async () => {
         const t = tMsg.trim(); if (!tTo) { showToast('Choisis la personne'); return; } if (!t) { showToast('Écris le message'); return; }
+        if (tTo.centrale) { try { await cc.send(tTo, tMode, t, session.name); setTMsg(''); showToast(tMode === 'ack' ? '📣 Envoyé à valider à ' + tTo.name + ' (Centrale)' : '💬 Envoyé à ' + tTo.name + ' (Centrale)'); } catch (e) { showToast('Erreur : ' + e.message); } return; }
         const now = Date.now(), id = 'team_' + now + '_' + Math.random().toString(36).slice(2, 6);
         try {
           await storage.setDoc('support_msgs', id, { kind: 'team', mode: tMode, from: tTo.name, fromUid: tTo.uid, role: tTo.role || '', site: tTo.site || '', tab: '', theme: 'team', text: '', img: '',
@@ -46524,7 +46553,8 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
               <div style={{ overflowY: 'auto', flex: 1, padding: '6px 12px 20px' }}>
                 <div style={{ fontSize: 14, fontWeight: 700, margin: '4px 0 6px' }}>1. À qui ? <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--ink-mute)' }}>(personnes connectées à l'appli ces 5 dernières minutes)</span></div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-                  {!staffOn.length && <div style={{ color: 'var(--ink-mute)', fontSize: 14 }}>Personne de l'équipe en ligne pour l'instant.</div>}
+                  {!staffOn.length && !cc.online.length && <div style={{ color: 'var(--ink-mute)', fontSize: 14 }}>Personne de l'équipe en ligne pour l'instant.</div>}
+                  {cc.online.map(p => { const on = tTo && tTo.centrale && tTo.dev === p.dev; return <button key={'cc_' + p.dev} onClick={() => setTTo(on ? null : { ...p, centrale: true })} style={{ padding: '7px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 14, fontWeight: 700, border: '2px solid ' + (on ? '#ef6c00' : 'var(--line,#ddd)'), background: on ? '#fff3e0' : '#fff' }}>🏭 {p.name} <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--ink-mute)' }}>· {p.module || 'Centrale'}</span></button>; })}
                   {staffOn.map(p => { const on = tTo && tTo.uid === p.uid; return <button key={p.id} onClick={() => setTTo(on ? null : p)} style={{ padding: '7px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 14, fontWeight: 700, border: '2px solid ' + (on ? '#ef6c00' : 'var(--line,#ddd)'), background: on ? '#fff3e0' : '#fff' }}>{p.role === 'distrib' ? '🛍️' : p.role === 'pdp' ? '🚚' : '🧺'} {p.name}{p.site ? ' · ' + p.site : ''}</button>; })}
                 </div>
                 <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>2. Quel type ?</div>
@@ -46536,7 +46566,19 @@ ${doc.img ? '<p style="font-size:13px;color:#555">📎 Photo jointe.</p>' : ''}
                   <textarea value={tMsg} onChange={e => setTMsg(e.target.value)} rows={2} placeholder={tTo ? 'Message pour ' + tTo.name + '…' : 'Choisis d\'abord la personne'} style={{ flex: 1, fontSize: 15, padding: '8px 10px', borderRadius: 12, border: '1px solid var(--line,#ddd)' }} />
                   <button className="btn-primary" style={{ width: 'auto' }} onClick={sendTeam}>➤</button>
                 </div>
-                {!team.length && <div style={{ color: 'var(--ink-mute)', padding: 10 }}>Aucune demande envoyée à l'équipe.</div>}
+                {cc.err && <div style={{ fontSize: 12, color: 'var(--ink-mute)', marginBottom: 6 }}>🏭 Centrale injoignable ({cc.err})</div>}
+                {cc.list.map(m => { const ack = m.thread.find(t => t.ack); return (
+                  <div key={'cc_' + m.id} style={{ border: '2px solid ' + (m.status === 'new' ? '#ef6c00' : 'var(--line,#ddd)'), borderRadius: 12, padding: 10, marginBottom: 10, opacity: m.status === 'done' ? .7 : 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700 }}>{m.mode === 'ack' ? '✅ À valider' : '💬 Discussion'} → 🏭 {m.toName}{m.toModule ? ' · ' + m.toModule : ''} <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--ink-mute)' }}>{m.fromApp === 'console' ? '(Console)' : ''}</span></div>
+                    <div style={{ fontSize: 12, color: m.status === 'done' ? '#2e7d32' : m.status === 'new' ? '#e65100' : 'var(--ink-mute)', fontWeight: 600, marginBottom: 6 }}>{ack ? '✅ validé par ' + ack.ack + ' à ' + kbHm(ack.at) : m.status === 'done' ? '✓ terminé' : m.status === 'new' ? '🔔 nouvelle réponse' : m.userReadAt ? '👀 vu à ' + kbHm(m.userReadAt) : '⏳ pas encore vu'}</div>
+                    <KbThread m={{ thread: m.thread.map(t => ({ ...t, by: t.by === 'bureau' ? 'master' : 'user' })) }} me="master" />
+                    {m.status !== 'done' && <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                      {m.mode !== 'ack' && <><input value={reply['cc_' + m.id] || ''} onChange={e => setReply(r => ({ ...r, ['cc_' + m.id]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') { cc.answer(m, String(reply['cc_' + m.id] || '').trim(), false, session.name).then(() => setReply(r => ({ ...r, ['cc_' + m.id]: '' }))).catch(er => showToast('Erreur : ' + er.message)); } }} placeholder="Répondre…" style={{ flex: 1, fontSize: 15, padding: '8px 10px', borderRadius: 10, border: '1px solid var(--line,#ddd)' }} />
+                      <button className="btn-primary" style={{ width: 'auto' }} onClick={() => { const t = String(reply['cc_' + m.id] || '').trim(); if (!t) return; cc.answer(m, t, false, session.name).then(() => setReply(r => ({ ...r, ['cc_' + m.id]: '' }))).catch(er => showToast('Erreur : ' + er.message)); }}>➤</button></>}
+                      <button className="btn-secondary" style={{ width: 'auto' }} title="Clore la discussion" onClick={() => cc.answer(m, '', true, session.name).catch(er => showToast('Erreur : ' + er.message))}>✓ Clore</button>
+                    </div>}
+                  </div>); })}
+                {!team.length && !cc.list.length && <div style={{ color: 'var(--ink-mute)', padding: 10 }}>Aucune demande envoyée à l'équipe.</div>}
                 {team.map(m => { const ack = (m.thread || []).find(t => t.ack); return (
                   <div key={m.id} style={{ border: '2px solid ' + (m.status === 'new' ? '#ef6c00' : 'var(--line,#ddd)'), borderRadius: 12, padding: 10, marginBottom: 10, opacity: m.status === 'done' ? .7 : 1 }}>
                     <div style={{ fontSize: 14, fontWeight: 700 }}>{m.mode === 'ack' ? '✅ À valider' : '💬 Discussion'} → {m.from}{m.site ? ' · ' + m.site : ''}</div>

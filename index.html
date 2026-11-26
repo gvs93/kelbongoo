@@ -86504,6 +86504,38 @@ function kbDrvTourNotify(day, t, session, codes) {
     end: t.end || 'none'
   }).catch(() => {});
 }
+async function kbDrvAloneSend(d, lieu, hm) {
+  const a = {
+    site: String(d.site || '').slice(0, 10),
+    siteLabel: String(lieu || '').slice(0, 60),
+    eta: String(hm || kbHM(d.eta)).slice(0, 5),
+    helpFrom: String(d.helpFrom || '').slice(0, 5),
+    traffic: !!d.traffic,
+    day: String(d.day || '').slice(0, 10)
+  };
+  try {
+    const r = await kbRungisCall('rungis_alone', {
+      alone: a,
+      by: d.by || ''
+    });
+    if (r && r.ok) return true;
+  } catch (e) {
+    console.warn('rungis_alone', e);
+  }
+  try {
+    const m = kbDrvAloneMail(d, lieu, hm);
+    const r = await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'send_mail',
+      to: KB_PDP_RECAP_TO,
+      subject: m.subject,
+      body: m.body
+    });
+    return !!(r && r.ok !== false);
+  } catch (e) {
+    return false;
+  }
+}
 function kbDrvAloneMail(d, lieu, hm) {
   const hf = String(d.helpFrom || '15:30').replace(':', 'h'),
     h = hm || kbHM(d.eta);
@@ -87618,20 +87650,14 @@ function RungisLivraisonView({
       } catch (e) {
         continue;
       }
-      const m = kbDrvAloneMail(doc, lieu, hm);
-      try {
-        const r = await stockPost({
-          secret: FRESHDESK_SECRET,
-          action: 'send_mail',
-          to: KB_PDP_RECAP_TO,
-          subject: m.subject,
-          body: m.body
-        });
-        if (r && r.ok !== false) await storage.setDoc('rungis_picks', id, {
-          mailed: true,
-          mailedAt: new Date().toISOString()
-        });
-      } catch (e) {}
+      if (await kbDrvAloneSend(doc, lieu, hm)) {
+        try {
+          await storage.setDoc('rungis_picks', id, {
+            mailed: true,
+            mailedAt: new Date().toISOString()
+          });
+        } catch (e) {}
+      }
     }
   };
   const confirmLoad = async () => {
@@ -90704,16 +90730,8 @@ function RungisEnlClearPage({
     if (!isAdmin) return;
     aloneToday.filter(d => !d.mailed && !aloneSent.current[d.id]).forEach(async d => {
       aloneSent.current[d.id] = 1;
-      const m = kbDrvAloneMail(d, siteLabel(d.site));
       try {
-        const r = await stockPost({
-          secret: FRESHDESK_SECRET,
-          action: 'send_mail',
-          to: KB_PDP_RECAP_TO,
-          subject: m.subject,
-          body: m.body
-        });
-        if (r && r.ok !== false) await storage.setDoc('rungis_picks', d.id, {
+        if (await kbDrvAloneSend(d, siteLabel(d.site))) await storage.setDoc('rungis_picks', d.id, {
           mailed: true,
           mailedAt: new Date().toISOString(),
           mailedBy: 'master'
@@ -103520,12 +103538,17 @@ function KbThread({
         whiteSpace: 'pre-wrap',
         wordBreak: 'break-word'
       }
-    }, t.text), t.img && React.createElement("img", {
+    }, t.text), t.img && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(t.img) && React.createElement("img", {
       src: t.img,
       alt: "photo",
       onClick: () => {
         const w = window.open();
-        if (w) w.document.write('<img src="' + t.img + '" style="max-width:100%">');
+        if (w) {
+          const im = w.document.createElement('img');
+          im.src = t.img;
+          im.style.maxWidth = '100%';
+          w.document.body.appendChild(im);
+        }
       },
       style: {
         marginTop: 6,
@@ -104051,6 +104074,101 @@ function KbSupportUser({
     }, "\u27A4")));
   }))));
 }
+const KB_CC_DB = 'https://' + KB_PREP_HOST + '/chat';
+const kbCcArr = t => Array.isArray(t) ? t.filter(Boolean) : Object.values(t || {}).filter(Boolean).sort((a, b) => (a.at || 0) - (b.at || 0));
+function useKbCentraleChat() {
+  const [d, setD] = React.useState({
+    pres: {},
+    msgs: {},
+    err: ''
+  });
+  const [tick, setTick] = React.useState(0);
+  React.useEffect(() => {
+    let stop = false;
+    Promise.all(['presence', 'msgs'].map(k => fetch(KB_CC_DB + '/' + k + '.json?t=' + Date.now(), {
+      cache: 'no-store'
+    }).then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }))).then(([pres, msgs]) => {
+      if (!stop) setD({
+        pres: pres || {},
+        msgs: msgs || {},
+        err: ''
+      });
+    }).catch(e => {
+      if (!stop) setD(x => ({
+        ...x,
+        err: e.message
+      }));
+    });
+    const t = setTimeout(() => setTick(x => x + 1), 12000);
+    return () => {
+      stop = true;
+      clearTimeout(t);
+    };
+  }, [tick]);
+  const now = Date.now(),
+    t0 = now - 7 * 864e5;
+  const online = Object.keys(d.pres).map(k => ({
+    dev: k,
+    ...d.pres[k]
+  })).filter(p => p && p.name && now - (p.at || 0) < 5 * 60000).sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr'));
+  const list = Object.keys(d.msgs).map(id => ({
+    id,
+    ...d.msgs[id],
+    thread: kbCcArr(d.msgs[id].thread)
+  })).filter(m => (m.at || 0) > t0).sort((a, b) => (b.at || 0) - (a.at || 0));
+  const put = async (path, method, body) => {
+    const r = await fetch(KB_CC_DB + path, {
+      method,
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error('base Centrale : HTTP ' + r.status);
+    setTick(x => x + 1);
+    return r.json();
+  };
+  return {
+    online,
+    list,
+    err: d.err,
+    nNew: list.filter(m => m.status === 'new').length,
+    send: (to, mode, text, from) => {
+      const now2 = Date.now();
+      return put('/msgs.json', 'POST', {
+        to: String(to.dev),
+        toName: String(to.name || '').slice(0, 60),
+        toModule: String(to.module || '').slice(0, 40),
+        mode: mode === 'ack' ? 'ack' : 'chat',
+        status: 'open',
+        at: now2,
+        fromApp: 'master',
+        userReadAt: 0,
+        thread: [{
+          by: 'bureau',
+          from: String(from || 'Bureau').slice(0, 60),
+          text: String(text).slice(0, 1000),
+          at: now2
+        }]
+      });
+    },
+    answer: (m, text, done, from) => {
+      const th = text ? m.thread.concat([{
+        by: 'bureau',
+        from: String(from || 'Bureau').slice(0, 60),
+        text: String(text).slice(0, 1000),
+        at: Date.now()
+      }]).slice(-60) : m.thread;
+      return put('/msgs/' + encodeURIComponent(m.id) + '.json', 'PATCH', {
+        thread: th,
+        status: done ? 'done' : 'answered'
+      });
+    }
+  };
+}
 function KbMasterComms({
   session,
   tab,
@@ -104069,6 +104187,7 @@ function KbMasterComms({
   const [tMode, setTMode] = React.useState('chat');
   const [tMsg, setTMsg] = React.useState('');
   React.useEffect(() => storage.subscribe(KB_PRES, arr => setPres(arr || [])), []);
+  const cc = useKbCentraleChat();
   const [seenChat, setSeenChat] = React.useState(() => {
     try {
       return Number(localStorage.getItem('kb_chat_seen') || 0);
@@ -104121,7 +104240,7 @@ function KbMasterComms({
   const supOnly = sup.filter(m => m.kind !== 'team'),
     team = sup.filter(m => m.kind === 'team');
   const nNew = supOnly.filter(m => m.status === 'new').length,
-    nTeam = team.filter(m => m.status === 'new').length;
+    nTeam = team.filter(m => m.status === 'new').length + cc.nNew;
   const tNow = Date.now();
   const staffOn = pres.filter(p => p && p.name && p.uid && !String(p.id || '').startsWith('~') && p.role !== 'master' && tNow - (p.at || 0) < 5 * 60000).sort((a, b) => String(a.name).localeCompare(String(b.name), 'fr'));
   const sendTeam = async () => {
@@ -104132,6 +104251,16 @@ function KbMasterComms({
     }
     if (!t) {
       showToast('Écris le message');
+      return;
+    }
+    if (tTo.centrale) {
+      try {
+        await cc.send(tTo, tMode, t, session.name);
+        setTMsg('');
+        showToast(tMode === 'ack' ? '📣 Envoyé à valider à ' + tTo.name + ' (Centrale)' : '💬 Envoyé à ' + tTo.name + ' (Centrale)');
+      } catch (e) {
+        showToast('Erreur : ' + e.message);
+      }
       return;
     }
     const now = Date.now(),
@@ -104357,12 +104486,36 @@ function KbMasterComms({
       gap: 6,
       marginBottom: 10
     }
-  }, !staffOn.length && React.createElement("div", {
+  }, !staffOn.length && !cc.online.length && React.createElement("div", {
     style: {
       color: 'var(--ink-mute)',
       fontSize: 14
     }
-  }, "Personne de l'\xE9quipe en ligne pour l'instant."), staffOn.map(p => {
+  }, "Personne de l'\xE9quipe en ligne pour l'instant."), cc.online.map(p => {
+    const on = tTo && tTo.centrale && tTo.dev === p.dev;
+    return React.createElement("button", {
+      key: 'cc_' + p.dev,
+      onClick: () => setTTo(on ? null : {
+        ...p,
+        centrale: true
+      }),
+      style: {
+        padding: '7px 12px',
+        borderRadius: 20,
+        cursor: 'pointer',
+        fontSize: 14,
+        fontWeight: 700,
+        border: '2px solid ' + (on ? '#ef6c00' : 'var(--line,#ddd)'),
+        background: on ? '#fff3e0' : '#fff'
+      }
+    }, "\uD83C\uDFED ", p.name, " ", React.createElement("span", {
+      style: {
+        fontWeight: 400,
+        fontSize: 12,
+        color: 'var(--ink-mute)'
+      }
+    }, "\xB7 ", p.module || 'Centrale'));
+  }), staffOn.map(p => {
     const on = tTo && tTo.uid === p.uid;
     return React.createElement("button", {
       key: p.id,
@@ -104433,7 +104586,99 @@ function KbMasterComms({
       width: 'auto'
     },
     onClick: sendTeam
-  }, "\u27A4")), !team.length && React.createElement("div", {
+  }, "\u27A4")), cc.err && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginBottom: 6
+    }
+  }, "\uD83C\uDFED Centrale injoignable (", cc.err, ")"), cc.list.map(m => {
+    const ack = m.thread.find(t => t.ack);
+    return React.createElement("div", {
+      key: 'cc_' + m.id,
+      style: {
+        border: '2px solid ' + (m.status === 'new' ? '#ef6c00' : 'var(--line,#ddd)'),
+        borderRadius: 12,
+        padding: 10,
+        marginBottom: 10,
+        opacity: m.status === 'done' ? .7 : 1
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700
+      }
+    }, m.mode === 'ack' ? '✅ À valider' : '💬 Discussion', " \u2192 \uD83C\uDFED ", m.toName, m.toModule ? ' · ' + m.toModule : '', " ", React.createElement("span", {
+      style: {
+        fontWeight: 400,
+        fontSize: 12,
+        color: 'var(--ink-mute)'
+      }
+    }, m.fromApp === 'console' ? '(Console)' : '')), React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: m.status === 'done' ? '#2e7d32' : m.status === 'new' ? '#e65100' : 'var(--ink-mute)',
+        fontWeight: 600,
+        marginBottom: 6
+      }
+    }, ack ? '✅ validé par ' + ack.ack + ' à ' + kbHm(ack.at) : m.status === 'done' ? '✓ terminé' : m.status === 'new' ? '🔔 nouvelle réponse' : m.userReadAt ? '👀 vu à ' + kbHm(m.userReadAt) : '⏳ pas encore vu'), React.createElement(KbThread, {
+      m: {
+        thread: m.thread.map(t => ({
+          ...t,
+          by: t.by === 'bureau' ? 'master' : 'user'
+        }))
+      },
+      me: "master"
+    }), m.status !== 'done' && React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 6,
+        marginTop: 8
+      }
+    }, m.mode !== 'ack' && React.createElement(React.Fragment, null, React.createElement("input", {
+      value: reply['cc_' + m.id] || '',
+      onChange: e => setReply(r => ({
+        ...r,
+        ['cc_' + m.id]: e.target.value
+      })),
+      onKeyDown: e => {
+        if (e.key === 'Enter') {
+          cc.answer(m, String(reply['cc_' + m.id] || '').trim(), false, session.name).then(() => setReply(r => ({
+            ...r,
+            ['cc_' + m.id]: ''
+          }))).catch(er => showToast('Erreur : ' + er.message));
+        }
+      },
+      placeholder: "R\xE9pondre\u2026",
+      style: {
+        flex: 1,
+        fontSize: 15,
+        padding: '8px 10px',
+        borderRadius: 10,
+        border: '1px solid var(--line,#ddd)'
+      }
+    }), React.createElement("button", {
+      className: "btn-primary",
+      style: {
+        width: 'auto'
+      },
+      onClick: () => {
+        const t = String(reply['cc_' + m.id] || '').trim();
+        if (!t) return;
+        cc.answer(m, t, false, session.name).then(() => setReply(r => ({
+          ...r,
+          ['cc_' + m.id]: ''
+        }))).catch(er => showToast('Erreur : ' + er.message));
+      }
+    }, "\u27A4")), React.createElement("button", {
+      className: "btn-secondary",
+      style: {
+        width: 'auto'
+      },
+      title: "Clore la discussion",
+      onClick: () => cc.answer(m, '', true, session.name).catch(er => showToast('Erreur : ' + er.message))
+    }, "\u2713 Clore")));
+  }), !team.length && !cc.list.length && React.createElement("div", {
     style: {
       color: 'var(--ink-mute)',
       padding: 10
