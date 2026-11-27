@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V12.02) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V12.03) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V12.02';
+const APP_VERSION = 'V12.03';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -66566,6 +66566,973 @@ function SuiviGeneralPage({
     session: session
   }));
 }
+const KB_DLC_EV = {
+  note: {
+    ic: '📝',
+    l: 'DLC notée',
+    c: '#1565c0'
+  },
+  suivi: {
+    ic: '👀',
+    l: 'Lot suivi',
+    c: '#1565c0'
+  },
+  vendu: {
+    ic: '✅',
+    l: 'Vendu (plus en rayon)',
+    c: '#2e7d32'
+  },
+  commandes: {
+    ic: '🛒',
+    l: 'Parti dans les commandes',
+    c: '#2e7d32'
+  },
+  ecoule: {
+    ic: '✅',
+    l: 'Écoulé',
+    c: '#2e7d32'
+  },
+  rob: {
+    ic: '♻️',
+    l: 'Retiré → navette ROB',
+    c: '#6e4a9c'
+  },
+  partage: {
+    ic: '🤝',
+    l: 'Retiré → partage équipe',
+    c: '#c62828'
+  },
+  remis: {
+    ic: '↩️',
+    l: 'Remis en rayon (correction)',
+    c: '#00838f'
+  },
+  nonremis: {
+    ic: '⛔',
+    l: 'Correction : pas remis',
+    c: '#8d6e63'
+  },
+  prise: {
+    ic: '👤',
+    l: 'Liste du matin prise en charge',
+    c: '#555'
+  },
+  fini: {
+    ic: '🏁',
+    l: 'Liste du matin terminée',
+    c: '#555'
+  },
+  recap: {
+    ic: '✉️',
+    l: 'Récap DLC envoyé',
+    c: '#555'
+  },
+  perte: {
+    ic: '💶',
+    l: 'Perte enregistrée',
+    c: '#c62828'
+  }
+};
+const kbPad2 = n => String(n).padStart(2, '0');
+function kbLocalDay(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return `${d.getFullYear()}-${kbPad2(d.getMonth() + 1)}-${kbPad2(d.getDate())}`;
+}
+function kbLocalHm(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return `${kbPad2(d.getHours())}:${kbPad2(d.getMinutes())}`;
+}
+function kbMondayOf(day) {
+  const x = new Date(day + 'T12:00:00');
+  return addDays(day, -((x.getDay() + 6) % 7));
+}
+const kbIsDay = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+function kbDlcSourceLabel(w) {
+  if (w.source === 'retour_pdp' || String(w.id || '').startsWith('pdpret_')) return 'Retour PDP';
+  if (w.fromInventory) return 'Inventaire';
+  if (w.horsInv) return 'Ajout hors inventaire';
+  return 'Ajout manuel';
+}
+function kbDlcIssue(w) {
+  if (!w.status || w.status === 'watch') return 'en rayon (suivi)';
+  if (w.outcome === 'vide') return 'vendu (plus en rayon)';
+  if (w.outcome === 'commandes') return 'parti dans les commandes';
+  if (w.outcome === 'rob' || w.status === 'rob') return 'retiré → ROB';
+  if (w.outcome === 'partage' || w.status === 'perte') return 'retiré → partage équipe';
+  if (w.status === 'ecoule') return 'écoulé';
+  return String(w.status);
+}
+async function kbLoadDlcPertesRaw() {
+  const [watch, invDlc, losses, arch] = await Promise.all([storage.getAll('dlc_watch').catch(() => []), storage.getAll('inventory_dlc').catch(() => []), storage.getAll('losses').catch(() => []), storage.getAll('losses_archive').catch(() => [])]);
+  const lots = (watch || []).filter(w => w && !String(w.id || '').startsWith('_'));
+  const mornings = (watch || []).filter(w => w && String(w.id || '').startsWith('_morning_'));
+  const seen = new Set();
+  const allLosses = [];
+  const addL = l => {
+    if (!l) return;
+    const k = l.id || `${l.day}|${l.produit}|${l.quantity}|${l.createdAt}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    allLosses.push(l);
+  };
+  (losses || []).forEach(addL);
+  (arch || []).forEach(a => {
+    let it = [];
+    try {
+      it = JSON.parse(a.losses || '[]');
+    } catch (_) {}
+    it.forEach(addL);
+  });
+  return {
+    lots,
+    mornings,
+    inv: (invDlc || []).filter(Boolean),
+    losses: allLosses
+  };
+}
+function kbBuildDlcEvents(raw) {
+  const ev = [];
+  const lossById = {};
+  raw.losses.forEach(l => {
+    if (l.id) lossById[l.id] = l;
+  });
+  const invKeys = new Set();
+  raw.inv.forEach(d => {
+    invKeys.add(`${d.invDate}|${d.productId}|${d.dlc}`);
+    const at = d.at || (d.invDate ? d.invDate + 'T12:00:00' : '');
+    ev.push({
+      t: 'note',
+      at,
+      day: kbLocalDay(at) || d.invDate,
+      produit: d.produit,
+      producteur: d.producteur,
+      productId: d.productId,
+      dlc: d.dlc,
+      qty: d.qty,
+      by: d.by,
+      detail: `Inventaire du ${d.invDate || '?'}`,
+      ref: `inv:${d.invDate}|${d.productId}`
+    });
+  });
+  raw.lots.forEach(w => {
+    const base = {
+      produit: w.produit,
+      producteur: w.producteur,
+      productId: w.productId,
+      dlc: w.dlc,
+      ref: w.id,
+      site: w.site || ''
+    };
+    if (w.createdAt && !(w.fromInventory && invKeys.has(`${w.invDay}|${w.productId}|${w.dlc}`))) ev.push({
+      ...base,
+      t: w.fromInventory ? 'note' : 'suivi',
+      at: w.createdAt,
+      day: kbLocalDay(w.createdAt),
+      qty: w.qtyInit || w.qty,
+      by: w.createdBy,
+      detail: kbDlcSourceLabel(w) + (w.invDay ? ` · inventaire du ${w.invDay}` : '')
+    });
+    if (w.resolvedAt && w.status && w.status !== 'watch') {
+      const t = w.outcome === 'vide' ? 'vendu' : w.outcome === 'commandes' ? 'commandes' : w.outcome === 'rob' || w.status === 'rob' ? 'rob' : w.outcome === 'partage' || w.status === 'perte' ? 'partage' : 'ecoule';
+      const l = w.lossId ? lossById[w.lossId] : null;
+      const q = t === 'rob' || t === 'partage' ? Number(w.qtyRetiredAvant) || Number(w.qtyRetired) || 0 : Number(w.qtyCmd) || 0;
+      ev.push({
+        ...base,
+        t,
+        at: w.resolvedAt,
+        day: kbLocalDay(w.resolvedAt),
+        qty: q,
+        by: w.resolvedBy,
+        value: l ? (Number(l.unitPrice) || 0) * q : '',
+        detail: [t === 'rob' && w.navetteDate ? `navette ${w.navetteLabel || ''} ${w.navetteDate}` : '', Number(w.qtyCmd) ? `${w.qtyCmd} dans les commandes` : ''].filter(Boolean).join(' · ')
+      });
+    }
+    if (w.corrAt) ev.push({
+      ...base,
+      t: Number(w.corrQty) > 0 ? 'remis' : 'nonremis',
+      at: w.corrAt,
+      day: kbLocalDay(w.corrAt),
+      qty: Number(w.corrQty) || 0,
+      by: w.corrBy,
+      detail: w.corrNote || ''
+    });
+  });
+  raw.mornings.forEach(m => {
+    const n = (t, at, by, detail) => {
+      if (at) ev.push({
+        t,
+        at,
+        day: kbLocalDay(at),
+        by: by || '',
+        detail,
+        ref: m.id,
+        produit: '',
+        producteur: ''
+      });
+    };
+    n('prise', m.takenAt, m.takenBy, m.count != null ? `${m.count} produit(s) à retirer` : '');
+    n('fini', m.doneAt, m.doneBy, '');
+    n('recap', m.mailSentAt, m.mailBy, 'à rr@ et hg@');
+  });
+  raw.losses.filter(l => !l.fromDlc).forEach(l => {
+    const at = l.createdAt || (l.day ? l.day + 'T12:00:00' : '');
+    ev.push({
+      t: 'perte',
+      at,
+      day: kbLocalDay(at) || l.day,
+      produit: l.produit || l.productName,
+      producteur: l.producteur,
+      dlc: l.dlc,
+      qty: l.quantity || l.qty,
+      by: l.createdBy,
+      value: Number(l.totalValue) || 0,
+      site: l.site || '',
+      detail: `${{
+        pribon: 'ROB',
+        partage: 'partage',
+        jete: 'jeté'
+      }[l.destination] || l.destination || ''}${String(l.id || '').startsWith('lossret_') ? ' · retour PDP' : ''}`,
+      ref: l.id
+    });
+  });
+  return ev.filter(e => kbIsDay(e.day)).sort((a, b) => String(a.at).localeCompare(String(b.at)));
+}
+function kbExportDlcPertesXlsx(raw, from, to, who) {
+  const inP = d => kbIsDay(d) && d >= from && d <= to;
+  const dow = d => kbIsDay(d) ? new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', {
+    weekday: 'long'
+  }) : '';
+  const jAvant = (dlc, d) => kbIsDay(dlc) && kbIsDay(d) ? dlcDaysLeft(dlc, d) : '';
+  const s = v => v == null ? '' : String(v);
+  const num = v => v === '' || v == null || isNaN(Number(v)) ? '' : Math.round(Number(v) * 100) / 100;
+  const today = todayKey();
+  const nd = kbNextDistribDay(today);
+  const events = kbBuildDlcEvents(raw).filter(e => inP(e.day));
+  const lossById = {};
+  raw.losses.forEach(l => {
+    if (l.id) lossById[l.id] = l;
+  });
+  const evRows = events.map(e => ({
+    'Date': e.day,
+    'Heure': kbLocalHm(e.at),
+    'Jour': dow(e.day),
+    'Semaine (lundi)': kbMondayOf(e.day),
+    'Événement': (KB_DLC_EV[e.t] || {}).l || e.t,
+    'Code événement': e.t,
+    'Produit': s(kbProdName(e.produit)),
+    'Producteur': s(e.producteur),
+    'ID produit': s(e.productId),
+    'DLC': s(e.dlc),
+    'Jours avant DLC (ce jour-là)': jAvant(e.dlc, e.day),
+    'Quantité': num(e.qty),
+    'Valeur € (prix achat)': num(e.value),
+    'Fait par': s(e.by),
+    'Lieu': s(e.site),
+    'Détail': s(e.detail),
+    'Réf. lot / ligne': s(e.ref)
+  }));
+  const touched = w => [kbLocalDay(w.createdAt), kbLocalDay(w.resolvedAt), kbLocalDay(w.corrAt)].some(inP) || (!w.status || w.status === 'watch') && (kbLocalDay(w.createdAt) || w.invDay || '') <= to;
+  const lotRows = raw.lots.filter(touched).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))).map(w => {
+    const l = w.lossId ? lossById[w.lossId] : null;
+    const open = !w.status || w.status === 'watch';
+    const dc = kbLocalDay(w.createdAt),
+      dr = kbLocalDay(w.resolvedAt);
+    let risk = '';
+    if (open && kbIsDay(w.dlc)) {
+      try {
+        risk = kbDlcToRemove(w, today) ? 'OUI – à retirer' : dlcDaysLeft(w.dlc, nd) < kbDlcMinDays(w) + 4 ? 'à surveiller' : 'non';
+      } catch (_) {}
+    }
+    return {
+      'Réf. lot': s(w.id),
+      'Produit': s(kbProdName(w.produit)),
+      'Producteur': s(w.producteur),
+      'ID produit': s(w.productId),
+      'DLC': s(w.dlc),
+      'Origine': kbDlcSourceLabel(w),
+      'Inventaire du': s(w.invDay),
+      'Noté le': dc,
+      'Noté à': kbLocalHm(w.createdAt),
+      'Noté par': s(w.createdBy),
+      'Jours avant DLC à la saisie': jAvant(w.dlc, dc),
+      'Quantité vue': num(w.qtyInit || w.qty),
+      'Statut actuel': kbDlcIssue(w),
+      'Traité le': dr,
+      'Traité à': kbLocalHm(w.resolvedAt),
+      'Traité par': s(w.resolvedBy),
+      'Jours entre saisie et traitement': kbIsDay(dc) && kbIsDay(dr) ? dlcDaysLeft(dr, dc) : '',
+      'Jours avant DLC au traitement': jAvant(w.dlc, dr),
+      'Quantité retirée (avant correction)': num(Number(w.qtyRetiredAvant) || Number(w.qtyRetired) || 0),
+      'Quantité retirée (finale)': num(w.qtyRetired || 0),
+      'Quantité partie dans les commandes': num(w.qtyCmd || 0),
+      'Navette ROB': w.navetteDate ? `${s(w.navetteLabel)} ${w.navetteDate}`.trim() : '',
+      'Prix achat unitaire €': l ? num(l.unitPrice) : '',
+      'Valeur perte € (finale)': l ? num(l.totalValue) : '',
+      'Remis en rayon (qté)': w.corrAt ? num(w.corrQty || 0) : '',
+      'Remis le': kbLocalDay(w.corrAt),
+      'Remis à': kbLocalHm(w.corrAt),
+      'Remis par': s(w.corrBy),
+      'Note correction': s(w.corrNote),
+      'À risque aujourd\'hui': risk,
+      [`Jours avant DLC à la prochaine distrib (${nd})`]: open ? jAvant(w.dlc, nd) : ''
+    };
+  });
+  const invRows = raw.inv.filter(d => inP(d.invDate)).sort((a, b) => String(a.invDate).localeCompare(String(b.invDate)) || String(a.produit).localeCompare(String(b.produit))).map(d => ({
+    'Inventaire du': s(d.invDate),
+    'Jour': dow(d.invDate),
+    'Produit': s(kbProdName(d.produit)),
+    'Producteur': s(d.producteur),
+    'ID produit': s(d.productId),
+    'DLC': s(d.dlc),
+    'Jours avant DLC': jAvant(d.dlc, d.invDate),
+    'Quantité comptée': num(d.qty),
+    'Noté par': s(d.by),
+    'Noté le': kbLocalDay(d.at),
+    'Noté à': kbLocalHm(d.at)
+  }));
+  const lossDay = l => kbLocalDay(l.createdAt) || l.day || '';
+  const lossRows = raw.losses.filter(l => inP(lossDay(l))).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))).map(l => ({
+    'Date retrait': lossDay(l),
+    'Heure': kbLocalHm(l.createdAt),
+    'Jour': dow(lossDay(l)),
+    'Semaine (lundi)': kbMondayOf(lossDay(l)),
+    'Destination': {
+      pribon: 'ROB (Pribon Robespierre)',
+      partage: 'Partage équipe (perte sèche)',
+      jete: 'Jeté (perte sèche)'
+    }[l.destination] || s(l.destination),
+    'Raison': s(l.reason),
+    'Origine': String(l.id || '').startsWith('lossret_') ? 'Retour PDP' : l.fromDlc ? 'Console DLC' : 'Saisie manuelle',
+    'Produit': s(kbProdName(l.produit || l.productName)),
+    'Producteur': s(l.producteur),
+    'Unité': s(l.unite),
+    'Quantité': num(l.quantity || l.qty),
+    'Poids (kg)': l.usingWeight ? num(l.weight) : '',
+    'Prix achat unitaire €': num(l.unitPrice),
+    'Valeur €': num(l.totalValue),
+    'Prix manquant': Number(l.unitPrice) > 0 ? '' : 'OUI',
+    'DLC': s(l.dlc),
+    'Jours avant DLC au retrait': jAvant(l.dlc, lossDay(l)),
+    'Navette ROB du': s(l.robSentDate),
+    'Saisi par': s(l.createdBy),
+    'Contrôle (initiales)': s(l.controlInitials),
+    'Lieu': s(l.site),
+    'Remarque': s(l.remark),
+    'Réf.': s(l.id)
+  }));
+  const mornRows = raw.mornings.filter(m => inP(m.day)).sort((a, b) => String(a.day).localeCompare(String(b.day))).map(m => ({
+    'Jour': s(m.day),
+    'Jour semaine': dow(m.day),
+    'Pris en charge par': s(m.takenBy),
+    'Pris à': kbLocalHm(m.takenAt),
+    'Nb à retirer au départ': num(m.count),
+    'Terminé par': s(m.doneBy),
+    'Terminé à': kbLocalHm(m.doneAt),
+    'Récap envoyé à': kbLocalHm(m.mailSentAt),
+    'Erreur récap': s(m.mailErr),
+    'Corrections prises par': s(m.corrTakenBy),
+    'Corrections prises à': kbLocalHm(m.corrTakenAt),
+    'Lien Sheet DLC': s(m.sheetUrl)
+  }));
+  const wk = {};
+  const W = d => wk[kbMondayOf(d)] = wk[kbMondayOf(d)] || {
+    notes: 0,
+    retROB: 0,
+    retPart: 0,
+    vendus: 0,
+    cmd: 0,
+    remis: 0,
+    eurRob: 0,
+    eurSeche: 0
+  };
+  events.forEach(e => {
+    const w = W(e.day);
+    if (e.t === 'note' || e.t === 'suivi') w.notes++;
+    if (e.t === 'rob') w.retROB++;
+    if (e.t === 'partage') w.retPart++;
+    if (e.t === 'vendu' || e.t === 'ecoule') w.vendus++;
+    if (e.t === 'commandes') w.cmd++;
+    if (e.t === 'remis') w.remis++;
+  });
+  raw.losses.filter(l => inP(lossDay(l))).forEach(l => {
+    const w = W(lossDay(l));
+    const v = Number(l.totalValue) || 0;
+    if (l.destination === 'pribon') w.eurRob += v;else w.eurSeche += v;
+  });
+  const sumRows = Object.keys(wk).sort().map(m => ({
+    'Semaine du (lundi)': m,
+    'DLC notées / lots suivis': wk[m].notes,
+    'Lots retirés → ROB': wk[m].retROB,
+    'Lots retirés → partage': wk[m].retPart,
+    'Lots vendus sans perte': wk[m].vendus,
+    'Lots partis dans les commandes': wk[m].cmd,
+    'Remises en rayon (corrections)': wk[m].remis,
+    'Pertes ROB €': num(wk[m].eurRob),
+    'Pertes sèches € (partage + jeté)': num(wk[m].eurSeche),
+    'Total pertes €': num(wk[m].eurRob + wk[m].eurSeche)
+  }));
+  let minD = 3;
+  try {
+    minD = _kbDlcRules && _kbDlcRules.minDays || 3;
+  } catch (_) {}
+  const readme = [['Kelbongoo — Pertes ROB & DLC — données brutes'], [''], ['Période', `du ${from} au ${to} (inclus)`], ['Fabriqué le', `${today} à ${kbLocalHm(new Date().toISOString())}`], ['Par', s(who)], ['Version appli', APP_VERSION], [''], ['ONGLETS'], ['Evenements', 'Journal complet, 1 ligne = 1 action datée (DLC notée, retrait, vente, remise en rayon, prise en charge de la liste du matin, perte). Trié par heure.'], ['Lots_DLC', '1 ligne = 1 lot DLC suivi, de sa saisie à sa fin (qui l\'a noté, qui l\'a traité, comment, combien, valeur). Inclut les lots encore en rayon.'], ['DLC_inventaire', 'Toutes les DLC notées pendant les inventaires (en général le mardi), même les DLC longues non suivies.'], ['Pertes', 'Toutes les pertes en € (ROB, partage équipe, jeté), toutes origines : console DLC, retours PDP, saisie manuelle.'], ['Journees_DLC', 'Pour chaque jour : qui a pris la liste « À retirer » du matin, quand elle a été finie, récap envoyé.'], ['Resume_semaine', 'Totaux par semaine (lundi).'], [''], ['RÈGLES'], ['DLC client', `Le client doit avoir au moins J+${minD} de DLC le jour de la distribution (exceptions par fournisseur dans Master › Réglages › Règles DLC, ex. La Belle Blonde J+4).`], ['À retirer', 'Un lot devient « à retirer » s\'il ne sera plus vendable à la prochaine distribution. Les lots encore vendables servent d\'abord les commandes.'], ['ROB / partage', 'Retiré avec une navette Robespierre avant la DLC = envoi ROB ; sinon partage équipe = perte sèche (comme jeté).'], ['Vendu', '« Vendu (plus en rayon) » et « parti dans les commandes » = pas de perte.'], ['Remis en rayon', 'Correction quand un produit a été retiré alors qu\'il était commandé : la perte est réduite d\'autant.'], ['Valeur', 'Prix d\'achat catalogue × quantité. « Prix manquant = OUI » = valeur à 0 €, à compléter.'], ['Heures', 'Heure de France. Dates au format AAAA-MM-JJ.'], [''], ['IDÉE DE QUESTION À CLAUDE'], ['', 'Voici l\'export Kelbongoo des pertes ROB et DLC. Analyse par semaine : produits et producteurs qui reviennent le plus en perte, délai entre la DLC notée à l\'inventaire et le retrait, part retirée vs vendue, qui traite quoi, et propose des actions (commande, rotation, prix) pour réduire les pertes.'], [''], ['Confidentiel', 'Données internes (prénoms des salariés). Ne pas diffuser hors de l\'équipe.']];
+  const wb = XLSX.utils.book_new();
+  const ws0 = XLSX.utils.aoa_to_sheet(readme);
+  ws0['!cols'] = [{
+    wch: 18
+  }, {
+    wch: 120
+  }];
+  XLSX.utils.book_append_sheet(wb, ws0, 'LISEZMOI');
+  const add = (rows, name, empty) => {
+    const ws = rows.length ? XLSX.utils.json_to_sheet(rows) : XLSX.utils.aoa_to_sheet([[empty]]);
+    if (rows.length) ws['!cols'] = Object.keys(rows[0]).map(k => ({
+      wch: Math.min(40, Math.max(10, k.length + 2))
+    }));
+    XLSX.utils.book_append_sheet(wb, ws, name);
+  };
+  add(evRows, 'Evenements', 'Aucun événement sur la période');
+  add(lotRows, 'Lots_DLC', 'Aucun lot DLC sur la période');
+  add(invRows, 'DLC_inventaire', 'Aucune DLC notée à l\'inventaire sur la période');
+  add(lossRows, 'Pertes', 'Aucune perte sur la période');
+  add(mornRows, 'Journees_DLC', 'Aucune journée DLC sur la période');
+  add(sumRows, 'Resume_semaine', 'Rien sur la période');
+  const name = `Kelbongoo_pertes_DLC_${from}${to !== from ? '_au_' + to : ''}.xlsx`;
+  XLSX.writeFile(wb, name, {
+    compression: true
+  });
+  return {
+    name,
+    counts: {
+      ev: evRows.length,
+      lots: lotRows.length,
+      inv: invRows.length,
+      pertes: lossRows.length
+    }
+  };
+}
+function KbDlcExportCard({
+  session,
+  calDay,
+  calMonth
+}) {
+  const showToast = React.useContext(ToastContext);
+  useKbDlcRules();
+  const [per, setPer] = React.useState('sem');
+  const [from, setFrom] = React.useState(() => addDays(todayKey(), -27));
+  const [to, setTo] = React.useState(() => todayKey());
+  const [busy, setBusy] = React.useState(false);
+  const [last, setLast] = React.useState(null);
+  const range = (() => {
+    if (per === 'jour') return [calDay, calDay];
+    if (per === 'sem') {
+      const m = kbMondayOf(calDay);
+      return [m, addDays(m, 6)];
+    }
+    if (per === 'mois') {
+      const [Y, M] = calMonth.split('-').map(Number);
+      return [`${calMonth}-01`, `${calMonth}-${kbPad2(new Date(Y, M, 0).getDate())}`];
+    }
+    return [from, to];
+  })();
+  const ok = kbIsDay(range[0]) && kbIsDay(range[1]) && range[0] <= range[1] && dlcDaysLeft(range[1], range[0]) <= 400;
+  const go = async () => {
+    if (!session || !session.isMaster) {
+      showToast('Master uniquement');
+      return;
+    }
+    if (!ok) {
+      showToast('Période invalide (400 jours maximum)');
+      return;
+    }
+    if (typeof XLSX === 'undefined') {
+      showToast('⚠️ Module Excel pas chargé — recharge la page');
+      return;
+    }
+    setBusy(true);
+    try {
+      const raw = await kbLoadDlcPertesRaw();
+      const r = kbExportDlcPertesXlsx(raw, range[0], range[1], session.name);
+      setLast(r);
+      showToast('⬇️ ' + r.name);
+    } catch (e) {
+      showToast('Erreur export : ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!session || !session.isMaster) return null;
+  const fr = d => kbIsDay(d) ? formatDateShort(d) : '?';
+  return React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14,
+      borderLeft: '5px solid #2e7d32'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700
+    }
+  }, "\u2B07\uFE0F Donn\xE9es brutes (Excel)"), React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-soft)',
+      margin: '4px 0 10px'
+    }
+  }, "Tout le d\xE9tail DLC + pertes : qui a not\xE9 la DLC et quand (inventaire), produits \xE0 risque, retir\xE9 / vendu / remis en vente, valeur en \u20AC. Fichier pr\xEAt \xE0 donner \xE0 Claude pour analyser."), React.createElement("div", {
+    className: "seg",
+    style: {
+      marginBottom: 10
+    }
+  }, [['jour', 'Jour'], ['sem', 'Semaine'], ['mois', 'Mois'], ['libre', 'Dates libres']].map(([k, l]) => React.createElement("button", {
+    key: k,
+    className: per === k ? 'active' : '',
+    onClick: () => setPer(k)
+  }, l))), per === 'libre' && React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 10,
+      flexWrap: 'wrap',
+      marginBottom: 10
+    }
+  }, React.createElement("label", {
+    style: {
+      fontSize: 13
+    }
+  }, "Du ", React.createElement("input", {
+    type: "date",
+    value: from,
+    max: to,
+    onChange: e => setFrom(e.target.value)
+  })), React.createElement("label", {
+    style: {
+      fontSize: 13
+    }
+  }, "Au ", React.createElement("input", {
+    type: "date",
+    value: to,
+    min: from,
+    onChange: e => setTo(e.target.value)
+  }))), per !== 'libre' && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginBottom: 8
+    }
+  }, "Suit le jour / mois choisi dans le calendrier ci-dessus."), React.createElement("button", {
+    className: "btn-primary btn-block",
+    disabled: busy || !ok,
+    onClick: go,
+    style: {
+      minHeight: 50,
+      fontSize: 16
+    }
+  }, busy ? 'Préparation…' : `⬇️ Télécharger du ${fr(range[0])} au ${fr(range[1])}`), last && React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      marginTop: 8
+    }
+  }, "\u2713 ", last.name, " \xB7 ", last.counts.ev, " \xE9v\xE9nements \xB7 ", last.counts.lots, " lots DLC \xB7 ", last.counts.inv, " DLC d'inventaire \xB7 ", last.counts.pertes, " pertes"));
+}
+function KbDlcCalView({
+  mode,
+  calMonth,
+  setCalMonth,
+  calDay,
+  setCalDay
+}) {
+  useKbDlcRules();
+  const [raw, setRaw] = React.useState(null);
+  const [err, setErr] = React.useState('');
+  React.useEffect(() => {
+    let alive = true;
+    let t = null;
+    const load = () => kbLoadDlcPertesRaw().then(r => {
+      if (alive) {
+        setRaw(r);
+        setErr('');
+      }
+    }).catch(e => {
+      if (alive) setErr(e.message || String(e));
+    });
+    load();
+    t = setInterval(load, 120000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+  const events = React.useMemo(() => raw ? kbBuildDlcEvents(raw) : [], [raw]);
+  const byDay = React.useMemo(() => {
+    const m = {};
+    events.forEach(e => (m[e.day] = m[e.day] || []).push(e));
+    return m;
+  }, [events]);
+  if (err) return React.createElement("div", {
+    className: "card"
+  }, React.createElement("p", {
+    style: {
+      margin: 0,
+      color: 'var(--danger)'
+    }
+  }, "DLC non charg\xE9es : ", err));
+  if (!raw) return React.createElement("div", {
+    className: "card"
+  }, React.createElement("p", {
+    style: {
+      margin: 0
+    }
+  }, "Chargement des DLC\u2026"));
+  const cnt = d => {
+    const a = byDay[d] || [];
+    return {
+      notes: a.filter(e => e.t === 'note' || e.t === 'suivi').length,
+      ret: a.filter(e => e.t === 'rob' || e.t === 'partage').length,
+      ok: a.filter(e => e.t === 'vendu' || e.t === 'commandes' || e.t === 'ecoule' || e.t === 'remis').length,
+      n: a.length
+    };
+  };
+  const today = todayKey();
+  const nd = kbNextDistribDay(today);
+  const risk = raw.lots.filter(w => (!w.status || w.status === 'watch') && kbIsDay(w.dlc)).map(w => {
+    let r = false;
+    try {
+      r = kbDlcToRemove(w, today);
+    } catch (_) {}
+    return {
+      w,
+      r,
+      j: dlcDaysLeft(w.dlc, nd)
+    };
+  }).filter(x => x.r || x.j < kbDlcMinDays(x.w) + 4).sort((a, b) => String(a.w.dlc).localeCompare(String(b.w.dlc)));
+  const renderRisk = () => React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12,
+      borderLeft: '5px solid #ef6c00'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 700
+    }
+  }, "\u26A0\uFE0F \xC0 risque en ce moment \xB7 ", risk.length), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      margin: '2px 0 6px'
+    }
+  }, "Lots encore en rayon : \xE0 retirer, ou proches de la limite pour la distrib du ", formatDateShort(nd), "."), risk.length === 0 && React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, "Rien \xE0 risque. \uD83D\uDC4D"), risk.slice(0, 40).map(({
+    w,
+    r,
+    j
+  }) => React.createElement("div", {
+    key: w.id,
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 8,
+      fontSize: 13,
+      padding: '5px 0',
+      borderBottom: '1px solid var(--line)'
+    }
+  }, React.createElement("span", {
+    style: {
+      minWidth: 0
+    }
+  }, React.createElement("b", null, kbProdName(w.produit)), " \xD7", w.qty || w.qtyInit || '?', React.createElement("span", {
+    style: {
+      color: 'var(--ink-mute)',
+      fontSize: 11
+    }
+  }, " \xB7 ", w.producteur || '', " \xB7 not\xE9 par ", w.createdBy || '?', w.invDay ? ` (inv. ${formatDateShort(w.invDay)})` : '')), React.createElement("span", {
+    style: {
+      whiteSpace: 'nowrap',
+      fontWeight: 700,
+      color: r ? '#c62828' : '#ef6c00'
+    }
+  }, "DLC ", formatDateShort(w.dlc), r ? ' · à retirer' : ''))));
+  if (mode === 'sem') {
+    const wk = {};
+    events.forEach(e => {
+      const m = kbMondayOf(e.day);
+      const w = wk[m] = wk[m] || {
+        notes: 0,
+        ret: 0,
+        ok: 0,
+        rem: 0
+      };
+      if (e.t === 'note' || e.t === 'suivi') w.notes++;
+      if (e.t === 'rob' || e.t === 'partage') w.ret++;
+      if (e.t === 'vendu' || e.t === 'commandes' || e.t === 'ecoule') w.ok++;
+      if (e.t === 'remis') w.rem++;
+    });
+    const ks = Object.keys(wk).sort().reverse();
+    const max = Math.max(1, ...ks.map(k => wk[k].ret + wk[k].ok));
+    return React.createElement(React.Fragment, null, renderRisk(), React.createElement("div", {
+      className: "card",
+      style: {
+        padding: '8px 10px'
+      }
+    }, ks.length === 0 && React.createElement("p", {
+      style: {
+        margin: 0
+      }
+    }, "Aucun \xE9v\xE9nement DLC."), ks.map(k => {
+      const w = wk[k];
+      return React.createElement("button", {
+        key: k,
+        onClick: () => {
+          setCalDay(k);
+          setCalMonth(k.slice(0, 7));
+        },
+        style: {
+          display: 'block',
+          width: '100%',
+          textAlign: 'left',
+          border: 'none',
+          borderBottom: '1px solid var(--line)',
+          background: 'transparent',
+          padding: '10px 4px',
+          cursor: 'pointer'
+        }
+      }, React.createElement("div", {
+        style: {
+          fontSize: 15,
+          fontWeight: 700
+        }
+      }, "Semaine du ", formatDateShort(k), k === kbMondayOf(today) ? ' (en cours)' : ''), React.createElement("div", {
+        style: {
+          display: 'flex',
+          height: 10,
+          background: 'var(--bg-muted)',
+          borderRadius: 6,
+          marginTop: 6,
+          overflow: 'hidden'
+        }
+      }, React.createElement("div", {
+        style: {
+          width: `${Math.round(w.ret / max * 100)}%`,
+          background: '#6e4a9c'
+        }
+      }), React.createElement("div", {
+        style: {
+          width: `${Math.round(w.ok / max * 100)}%`,
+          background: '#2e7d32'
+        }
+      })), React.createElement("div", {
+        style: {
+          fontSize: 12,
+          color: 'var(--ink-mute)',
+          marginTop: 4
+        }
+      }, "\uD83D\uDCDD ", w.notes, " not\xE9es \xB7 \uD83E\uDDF9 ", w.ret, " retir\xE9es \xB7 \u2705 ", w.ok, " vendues sans perte", w.rem ? ` · ↩️ ${w.rem} remises en rayon` : ''));
+    })));
+  }
+  const [Y, M] = calMonth.split('-').map(Number);
+  const nDays = new Date(Y, M, 0).getDate();
+  const lead = (new Date(Y, M - 1, 1).getDay() + 6) % 7;
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push(null);
+  for (let d = 1; d <= nDays; d++) cells.push(`${calMonth}-${kbPad2(d)}`);
+  const shift = k => {
+    const d = new Date(Y, M - 1 + k, 1);
+    setCalMonth(`${d.getFullYear()}-${kbPad2(d.getMonth() + 1)}`);
+  };
+  const mt = cells.filter(Boolean).reduce((t, d) => {
+    const c = cnt(d);
+    t.notes += c.notes;
+    t.ret += c.ret;
+    t.ok += c.ok;
+    return t;
+  }, {
+    notes: 0,
+    ret: 0,
+    ok: 0
+  });
+  const maxRet = Math.max(1, ...cells.filter(Boolean).map(d => cnt(d).ret));
+  const items = byDay[calDay] || [];
+  return React.createElement(React.Fragment, null, React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+      marginBottom: 10
+    }
+  }, React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => shift(-1),
+    style: {
+      padding: '4px 12px'
+    }
+  }, "\u2039"), React.createElement("div", {
+    style: {
+      textAlign: 'center'
+    }
+  }, React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      textTransform: 'capitalize'
+    }
+  }, new Date(Y, M - 1, 1).toLocaleDateString('fr-FR', {
+    month: 'long',
+    year: 'numeric'
+  })), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)'
+    }
+  }, "\uD83D\uDCDD ", mt.notes, " not\xE9es \xB7 \uD83E\uDDF9 ", mt.ret, " retir\xE9es \xB7 \u2705 ", mt.ok, " sans perte")), React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => shift(1),
+    style: {
+      padding: '4px 12px'
+    }
+  }, "\u203A")), React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(7,1fr)',
+      gap: 4
+    }
+  }, ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(j => React.createElement("div", {
+    key: j,
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: 'var(--ink-mute)',
+      textAlign: 'center'
+    }
+  }, j)), cells.map((d, i) => {
+    if (!d) return React.createElement("div", {
+      key: 'e' + i
+    });
+    const c = cnt(d);
+    const sel = d === calDay;
+    const a = c.ret ? 0.12 + 0.5 * (c.ret / maxRet) : 0;
+    return React.createElement("button", {
+      key: d,
+      onClick: () => setCalDay(d),
+      style: {
+        minHeight: 58,
+        borderRadius: 8,
+        cursor: 'pointer',
+        padding: '4px 2px',
+        textAlign: 'center',
+        border: sel ? '2px solid #ef6c00' : d === today ? '2px solid var(--ink-mute)' : '1px solid var(--line)',
+        background: c.ret ? `rgba(239,108,0,${a})` : c.n ? 'rgba(21,101,192,.08)' : 'transparent'
+      }
+    }, React.createElement("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700
+      }
+    }, Number(d.slice(8))), c.notes > 0 && React.createElement("div", {
+      style: {
+        fontSize: 10
+      }
+    }, "\uD83D\uDCDD ", c.notes), c.ret > 0 && React.createElement("div", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700
+      }
+    }, "\uD83E\uDDF9 ", c.ret), c.ok > 0 && React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: '#2e7d32'
+      }
+    }, "\u2705 ", c.ok));
+  }))), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 12
+    }
+  }, React.createElement("h2", {
+    style: {
+      margin: 0,
+      fontSize: 17,
+      textTransform: 'capitalize'
+    }
+  }, "DLC du ", new Date(calDay + 'T12:00:00').toLocaleDateString('fr-FR', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long'
+  })), React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: 'var(--ink-mute)',
+      margin: '2px 0 8px'
+    }
+  }, items.length, " \xE9v\xE9nement", items.length > 1 ? 's' : '', " \xB7 tri\xE9 par heure"), items.length === 0 && React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: 'var(--ink-mute)',
+      margin: 0
+    }
+  }, "Rien ce jour."), items.map((e, i) => {
+    const E = KB_DLC_EV[e.t] || {
+      ic: '•',
+      l: e.t,
+      c: '#555'
+    };
+    return React.createElement("div", {
+      key: i,
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '48px 1fr auto',
+        gap: 8,
+        alignItems: 'start',
+        padding: '7px 0',
+        borderBottom: '1px solid var(--line)',
+        fontSize: 13
+      }
+    }, React.createElement("div", {
+      style: {
+        fontWeight: 700
+      }
+    }, kbLocalHm(e.at).replace(':', 'h') || '—'), React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, React.createElement("div", null, React.createElement("span", {
+      style: {
+        color: E.c,
+        fontWeight: 700
+      }
+    }, E.ic, " ", E.l), e.produit ? React.createElement(React.Fragment, null, " \xB7 ", React.createElement("b", null, kbProdName(e.produit))) : null, e.qty ? ` ×${e.qty}` : ''), React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--ink-mute)',
+        marginTop: 2
+      }
+    }, "\uD83D\uDC64 ", e.by || '?', e.producteur ? ` · ${e.producteur}` : '', e.dlc ? ` · DLC ${formatDateShort(e.dlc)}` : '', e.detail ? ` · ${e.detail}` : '')), React.createElement("div", {
+      style: {
+        textAlign: 'right',
+        whiteSpace: 'nowrap',
+        fontWeight: 700
+      }
+    }, e.value ? Number(e.value).toLocaleString('fr-FR', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }) + ' €' : ''));
+  })), renderRisk());
+}
 function KbPertesRobPage({
   session
 }) {
@@ -66687,7 +67654,7 @@ function KbPertesRobPage({
     style: {
       margin: 0
     }
-  }, "\u267B\uFE0F Pertes envoy\xE9es \xE0 ROB"), React.createElement("div", {
+  }, "\u267B\uFE0F Pertes ROB & DLC"), React.createElement("div", {
     className: "seg",
     style: {
       alignSelf: 'flex-start'
@@ -66701,7 +67668,10 @@ function KbPertesRobPage({
   }, "\uD83D\uDDD1\uFE0F Perte s\xE8che"), React.createElement("button", {
     className: what === 'tout' ? 'active' : '',
     onClick: () => setWhat('tout')
-  }, "Tout")), React.createElement("div", {
+  }, "Tout"), React.createElement("button", {
+    className: what === 'dlc' ? 'active' : '',
+    onClick: () => setWhat('dlc')
+  }, "\uD83D\uDCC5 DLC")), what !== 'dlc' && React.createElement("div", {
     style: {
       display: 'grid',
       gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))',
@@ -66753,7 +67723,13 @@ function KbPertesRobPage({
   }, "\uD83D\uDCC5 Calendrier"), React.createElement("button", {
     className: mode === 'sem' ? 'active' : '',
     onClick: () => setMode('sem')
-  }, "\uD83D\uDCCA Par semaine")), mode === 'cal' && (() => {
+  }, "\uD83D\uDCCA Par semaine")), what === 'dlc' && React.createElement(KbDlcCalView, {
+    mode: mode,
+    calMonth: calMonth,
+    setCalMonth: setCalMonth,
+    calDay: calDay,
+    setCalDay: setCalDay
+  }), what !== 'dlc' && mode === 'cal' && (() => {
     const [Y, M] = calMonth.split('-').map(Number);
     const first = `${calMonth}-01`;
     const nDays = new Date(Y, M, 0).getDate();
@@ -66995,13 +67971,13 @@ function KbPertesRobPage({
         }
       }, "prix inconnu")));
     })));
-  })(), mode === 'sem' && weeks.length === 0 && React.createElement("div", {
+  })(), what !== 'dlc' && mode === 'sem' && weeks.length === 0 && React.createElement("div", {
     className: "card"
   }, React.createElement("p", {
     style: {
       margin: 0
     }
-  }, "Aucune perte enregistr\xE9e.")), mode === 'sem' && React.createElement("div", {
+  }, "Aucune perte enregistr\xE9e.")), what !== 'dlc' && mode === 'sem' && React.createElement("div", {
     className: "card",
     style: {
       padding: '8px 10px'
@@ -67066,7 +68042,11 @@ function KbPertesRobPage({
         marginTop: 4
       }
     }, "ROB ", eur(w.robEur), " (", w.rob.length, " ligne", w.rob.length > 1 ? 's' : '', ") \xB7 perte s\xE8che ", eur(w.secheEur), w.noPrice ? ` · ⚠️ ${w.noPrice} sans prix` : ''));
-  })), W && React.createElement("div", {
+  })), React.createElement(KbDlcExportCard, {
+    session: session,
+    calDay: calDay,
+    calMonth: calMonth
+  }), W && what !== 'dlc' && React.createElement("div", {
     className: "modal-backdrop",
     onClick: e => {
       if (e.target.className === 'modal-backdrop') setOpen(null);
@@ -107799,7 +108779,7 @@ const KB_MNAV = [{
     ic: '💸'
   }, {
     sub: 'pertes',
-    l: 'Pertes ROB',
+    l: 'Pertes ROB & DLC',
     ic: '♻️'
   }, {
     sub: 'stats',
