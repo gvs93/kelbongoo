@@ -900,7 +900,8 @@ const KB_DLC_RULES_DEFAULT = {
     min: 30
   }],
   checkDow: [2, 3, 4, 5],
-  anticipe: true
+  anticipe: true,
+  robTot: true
 };
 function kbDlcRulesNorm(r) {
   const d = KB_DLC_RULES_DEFAULT;
@@ -933,6 +934,7 @@ function kbDlcRulesNorm(r) {
     navettes: navettes.length ? navettes : d.navettes,
     checkDow,
     anticipe: r.anticipe === undefined ? d.anticipe : !!r.anticipe,
+    robTot: r.robTot === undefined ? d.robTot : !!r.robTot,
     pdpRet,
     updatedBy: r.updatedBy || '',
     updatedAt: r.updatedAt || ''
@@ -66107,6 +66109,7 @@ function KbDlcRulesPage({
         navettes: clean.navettes,
         checkDow: clean.checkDow,
         anticipe: clean.anticipe,
+        robTot: clean.robTot,
         pdpRet: clean.pdpRet,
         updatedBy: session.name || '',
         updatedAt: new Date().toISOString()
@@ -66241,7 +66244,7 @@ function KbDlcRulesPage({
     style: {
       color: 'var(--ink-mute)'
     }
-  }, "(ex. vendredi : on retire ce qui serait perdu mardi)")), rules.updatedBy && React.createElement("div", {
+  }, "(ex. vendredi : on retire ce qui serait perdu mardi)")), rules.anticipe && React.createElement("div", null, "\u267B\uFE0F Perdu au prochain contr\xF4le \u2192 part \xE0 ROB ", React.createElement("b", null, "tout de suite"), " (navette du jour) : ", React.createElement("b", null, rules.robTot ? 'OUI' : 'non')), rules.updatedBy && React.createElement("div", {
     style: {
       fontSize: 13,
       color: 'var(--ink-mute)'
@@ -66443,7 +66446,24 @@ function KbDlcRulesPage({
       width: 26,
       height: 26
     }
-  }), "\u23E9 Retirer \xE0 l'avance ce qui serait perdu au prochain contr\xF4le (derni\xE8re navette avant un trou)"), React.createElement("button", {
+  }), "\u23E9 Retirer \xE0 l'avance ce qui serait perdu au prochain contr\xF4le (derni\xE8re navette avant un trou)"), React.createElement("label", {
+    style: {
+      ...big,
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      opacity: f.anticipe ? 1 : .5
+    }
+  }, React.createElement("input", {
+    type: "checkbox",
+    disabled: !f.anticipe,
+    checked: !!f.robTot,
+    onChange: e => set('robTot', e.target.checked),
+    style: {
+      width: 26,
+      height: 26
+    }
+  }), "\u267B\uFE0F Ne pas attendre : si c'est perdu au prochain contr\xF4le, envoyer \xE0 ROB avec la navette d'avant (ex. vendredi : DLC jusqu'au mercredi + 2 \u2192 navette du vendredi)"), React.createElement("button", {
     className: "btn-primary",
     disabled: busy,
     onClick: save,
@@ -95184,10 +95204,17 @@ function kbDlcAnticipe(i, today, need) {
   if (!nc) return null;
   const nd2 = kbNextDistribDay(nc);
   if (dlcDaysLeft(i.dlc, nd2) >= need) return null;
-  if (kbFirstNavetteBeforeDLC(i.dlc, new Date(nc + 'T05:00:00'))) return null;
   const now = today === todayKey() ? new Date() : new Date(today + 'T05:00:00');
   const nav = kbFirstNavetteBeforeDLC(i.dlc, now);
   if (!nav) return null;
+  if (_kbDlcRules.robTot) {
+    if (nav.date >= nc) return null;
+    return {
+      nextCheck: nc,
+      navette: nav
+    };
+  }
+  if (kbFirstNavetteBeforeDLC(i.dlc, new Date(nc + 'T05:00:00'))) return null;
   return {
     nextCheck: nc,
     navette: nav
@@ -96237,17 +96264,20 @@ function DlcMorningBanner({
     }
   }, "\uD83C\uDF89 DLC du jour : tout a \xE9t\xE9 trait\xE9", m && m.takenBy ? ` (${m.takenBy})` : '');
   if (!board.total) return null;
-  if (m && m.takenBy) return React.createElement("div", {
-    style: {
-      background: '#fff8e1',
-      border: '2px solid #f0b429',
-      borderRadius: 12,
-      padding: '10px 12px',
-      fontSize: 16,
-      fontWeight: 700,
-      color: '#7a4f00'
-    }
-  }, "\uD83E\uDDF9 ", board.total, " produit", board.total > 1 ? 's' : '', " \xE0 retirer \xB7 ", m.takenBy, " s'en occupe depuis ", kbHhmm(m.takenAt));
+  if (m && m.takenBy) {
+    const ex = m.extraTakenAt && (!m.doneAt || m.extraTakenAt > m.doneAt);
+    return React.createElement("div", {
+      style: {
+        background: '#fff8e1',
+        border: '2px solid #f0b429',
+        borderRadius: 12,
+        padding: '10px 12px',
+        fontSize: 16,
+        fontWeight: 700,
+        color: '#7a4f00'
+      }
+    }, "\uD83E\uDDF9 ", board.total, " produit", board.total > 1 ? 's' : '', " \xE0 retirer \xB7 ", ex ? m.extraTakenBy : m.takenBy, " s'en occupe depuis ", kbHhmm(ex ? m.extraTakenAt : m.takenAt));
+  }
   return React.createElement("div", {
     style: {
       background: '#fdecea',
@@ -96996,9 +97026,19 @@ function DlcMorningPopup({
   if (!board.ready || !board.total) return null;
   if (!board.ordersLoaded) return null;
   if (board.corr && board.corr.length) return null;
-  if (board.morning && board.morning.takenBy) return null;
+  const m0 = board.morning || {};
+  const extra = !!(m0.takenBy && m0.doneAt && !(m0.extraTakenAt && m0.extraTakenAt > m0.doneAt));
+  if (m0.takenBy && !extra) return null;
   const now = new Date();
-  if (!_kbDlcRules.checkDow.includes(now.getDay()) || now.getHours() < 5) return null;
+  if (!extra && (!_kbDlcRules.checkDow.includes(now.getDay()) || now.getHours() < 5)) return null;
+  const navToday = NAVETTE_ROB.filter(n => n.dow === now.getDay()).map(n => {
+    const d = new Date(now);
+    d.setHours(n.hour, n.min || 0, 0, 0);
+    return {
+      ...n,
+      dep: d
+    };
+  }).find(n => n.dep > now);
   const valider = async () => {
     const c = String(code).trim();
     if (!c) {
@@ -97024,7 +97064,12 @@ function DlcMorningPopup({
         setErr('Code reconnu mais nom absent du registre Salariés');
         return;
       }
-      await storage.setDoc('dlc_watch', kbMorningId(board.today), {
+      if (extra) await storage.setDoc('dlc_watch', kbMorningId(board.today), {
+        id: kbMorningId(board.today),
+        extraTakenBy: name,
+        extraTakenAt: new Date().toISOString(),
+        extraCount: board.total
+      });else await storage.setDoc('dlc_watch', kbMorningId(board.today), {
         id: kbMorningId(board.today),
         kind: 'morning',
         day: board.today,
@@ -97068,12 +97113,22 @@ function DlcMorningPopup({
       fontWeight: 900,
       letterSpacing: .5
     }
-  }, "\uD83D\uDEA8 URGENT \xB7 DLC \xE0 retirer"), React.createElement("div", {
+  }, "\uD83D\uDEA8 URGENT \xB7 DLC \xE0 retirer", extra ? ' en plus' : ''), extra && React.createElement("div", {
+    style: {
+      fontSize: 20,
+      fontWeight: 800,
+      background: '#fff',
+      color: '#c62828',
+      borderRadius: 10,
+      padding: '6px 10px',
+      margin: '6px 0'
+    }
+  }, navToday ? `🚚 À mettre en zone ROB avant la navette de ${navToday.hour}h${navToday.min ? String(navToday.min).padStart(2, '0') : ''}` : '🚚 À retirer maintenant'), React.createElement("div", {
     style: {
       fontSize: 15,
       fontWeight: 600
     }
-  }, board.total, " produit", board.total > 1 ? 's' : '', " DLC \xE0 contr\xF4ler \xB7 commandes du ", formatDateShort(board.nextDistrib), " d\xE9j\xE0 d\xE9duites")), React.createElement("div", {
+  }, board.total, " produit", board.total > 1 ? 's' : '', " DLC \xE0 contr\xF4ler \xB7 commandes du ", formatDateShort(board.nextDistrib), " d\xE9j\xE0 d\xE9duites", extra ? ' · invendables au prochain contrôle, ils partent à ROB maintenant' : '')), React.createElement("div", {
     style: {
       padding: '10px 18px 18px',
       maxHeight: '74vh',
@@ -97439,7 +97494,7 @@ function DlcWatchPage({
         doneBy: session.name
       });
     } catch (_) {}
-    if (m.mailSentAt) return;
+    if (m.mailSentAt && !(m.extraTakenAt && m.extraTakenAt > m.mailSentAt)) return;
     const arr = await storage.getAll('dlc_watch').catch(() => []);
     const done = (arr || []).filter(x => !String(x.id || '').startsWith('_') && x.retirerDay === today && x.status && x.status !== 'watch');
     const r = await kbSendDlcRecap(today, done, {
