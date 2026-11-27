@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V12.00) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V12.01) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V12.00';
+const APP_VERSION = 'V12.01';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -2842,8 +2842,88 @@ function kbSmallestFree(used) {
   while (used[String(n)]) n++;
   return String(n);
 }
+function kbFloorNeed(v, c) {
+  v = Number(v) || 0;
+  c = Number(c) || 0;
+  return c > 0 && v > 0 ? Math.max(1, Math.floor(v / c + 1e-9)) : 1;
+}
+function kbCapFitFloor(pairs) {
+  const cand = new Set();
+  pairs.forEach(([v, k]) => {
+    if (v > 0 && k > 0) {
+      cand.add(v / k);
+      cand.add(v / (k + 1) + 0.01);
+    }
+  });
+  let best = null,
+    bestOk = -1;
+  [...cand].filter(c => c > 0).sort((a, b) => a - b).forEach(c => {
+    let ok = 0;
+    pairs.forEach(([v, k]) => {
+      if (kbFloorNeed(v, c) === k) ok++;
+    });
+    if (ok >= bestOk) {
+      bestOk = ok;
+      best = c;
+    }
+  });
+  return best ? {
+    cap: Math.round(best * 100) / 100,
+    ok: bestOk
+  } : null;
+}
+function kbCasDayRows(prep, od, log) {
+  const vol = {};
+  (od && od.orders || []).forEach(o => {
+    const site = String(o.site || '').toUpperCase();
+    if (!site || site === 'DOM' || o._test) return;
+    if (!(o.items || []).some(it => it.cat !== 'pain' && it.cat !== 'nd' && !kbIsSolidaire(it.produit))) return;
+    const k = site + '||' + (o.name || '(client)');
+    vol[k] = (vol[k] || 0) + (Number(o.volumeFrais) || 0);
+  });
+  const num = l => (l || []).map(String).filter(v => /^\d+$/.test(v));
+  const fin = {},
+    used = {};
+  (prep || []).forEach(x => {
+    const id = String(x.id || '');
+    let k = id.slice(3);
+    try {
+      k = decodeURIComponent(k);
+    } catch (_) {}
+    if (id.startsWith('cs|')) fin[k] = num(x.nums);else if ((id.startsWith('st|') || id.startsWith('pc|')) && x.cas && /^\d+$/.test(String(x.cas))) {
+      const g = k.split('||');
+      const ck = g[0] + '||' + g[1];
+      (used[ck] = used[ck] || new Set()).add(String(x.cas));
+    }
+  });
+  const first = {};
+  (log || []).slice().sort((a, b) => (a.at || 0) - (b.at || 0)).forEach(l => {
+    const id = String(l.docId || '');
+    if (!id.startsWith('cs|') || l.op === 'delete') return;
+    let k = id.slice(3);
+    try {
+      k = decodeURIComponent(k);
+    } catch (_) {}
+    if (!first[k]) first[k] = num((l.data || {}).nums);
+  });
+  const rows = [];
+  Object.keys(vol).forEach(k => {
+    const u = used[k] ? used[k].size : (fin[k] || []).length;
+    const pl = first[k] ? first[k].length : null;
+    if (vol[k] > 0 && u > 0) rows.push({
+      k,
+      site: k.split('||')[0],
+      v: Math.round(vol[k] * 10) / 10,
+      planned: pl,
+      used: u,
+      sure: !!used[k]
+    });
+  });
+  return rows;
+}
 async function kbCasCapLearnPrep(dayKey) {
-  const pairs = [];
+  const pairs = [],
+    pairsU = [];
   for (let i = 1; i <= 28; i++) {
     const d = addDays(dayKey, -i);
     let prep = null,
@@ -2877,18 +2957,138 @@ async function kbCasCapLearnPrep(dayKey) {
     });
     Object.keys(vol).forEach(k => {
       const nums = (cs[k] || (kbCasSelf(d) ? [] : json[k]) || []).filter(v => /^\d+$/.test(v));
-      if (vol[k] > 0 && nums.length) pairs.push([Math.round(vol[k] * 10) / 10, nums.length]);
+      if (vol[k] > 0 && nums.length) {
+        pairs.push([Math.round(vol[k] * 10) / 10, nums.length]);
+        if (!kbCasSelf(d)) pairsU.push([Math.round(vol[k] * 10) / 10, nums.length]);
+      }
     });
+    if (kbCasSelf(d)) {
+      try {
+        kbCasDayRows(prep, od, []).forEach(r => pairsU.push([r.v, r.used]));
+      } catch (_) {}
+    }
   }
   if (pairs.length < 20) return null;
-  const f = kbCapFit(pairs);
+  const f = kbCapFit(pairs),
+    ff = pairsU.length >= 20 ? kbCapFitFloor(pairsU) : null;
   return f ? {
     cap: f.cap,
     samples: pairs.length,
     match: Math.round(f.ok / pairs.length * 100),
     source: 'prépa (casiers réellement utilisés, 28 j)',
-    at: new Date().toISOString()
+    at: new Date().toISOString(),
+    ...(ff ? {
+      capFloor: ff.cap,
+      floorSamples: pairsU.length,
+      floorMatch: Math.round(ff.ok / pairsU.length * 100)
+    } : {})
   } : null;
+}
+async function kbCasBilan(day) {
+  let prep = [],
+    od = null,
+    log = [],
+    capDoc = null;
+  try {
+    prep = await storage.getAll(`day_${day}_prep`);
+  } catch (_) {}
+  try {
+    od = await storage.getDoc(`day_${day}_orders`, 'data');
+  } catch (_) {}
+  try {
+    log = await storage.getAll(`day_${day}_preplog`);
+  } catch (_) {}
+  try {
+    capDoc = await storage.getDoc('app_config', KB_CAS_CAP_DOC);
+  } catch (_) {}
+  const rows = kbCasDayRows(prep, od, log).filter(r => r.planned != null && r.planned > 0);
+  if (!rows.length) return null;
+  const lp = await kbCasCapLearnPrep(addDays(day, 1));
+  const capAvant = Number(capDoc && (capDoc.prep && capDoc.prep.capFloor || capDoc.capFloor || capDoc.prep && capDoc.prep.cap || capDoc.cap) || KB_CAS_CAP_DEFAULT.cap);
+  const capApres = Number(lp && (lp.capFloor || lp.cap) || capAvant);
+  const agg = list => {
+    const a = {
+      clients: list.length,
+      prevus: 0,
+      utilises: 0,
+      vides: 0,
+      ajoutes: 0,
+      justes: 0,
+      sousEst: 0,
+      surEst: 0,
+      justesApres: 0
+    };
+    list.forEach(r => {
+      a.prevus += r.planned;
+      a.utilises += r.used;
+      a.vides += Math.max(0, r.planned - r.used);
+      a.ajoutes += Math.max(0, r.used - r.planned);
+      if (r.planned === r.used) a.justes++;else if (r.planned < r.used) a.sousEst++;else a.surEst++;
+      if (kbFloorNeed(r.v, capApres) === r.used) a.justesApres++;
+    });
+    a.pct = list.length ? Math.round(a.justes / list.length * 100) : 0;
+    a.pctApres = list.length ? Math.round(a.justesApres / list.length * 100) : 0;
+    return a;
+  };
+  const sites = {};
+  [...new Set(rows.map(r => r.site))].sort().forEach(s => {
+    sites[s] = agg(rows.filter(r => r.site === s));
+  });
+  return {
+    day,
+    at: new Date().toISOString(),
+    total: agg(rows),
+    sites,
+    capAvant: Math.round(capAvant * 100) / 100,
+    capApres: Math.round(capApres * 100) / 100,
+    echantillons: lp && lp.floorSamples || 0,
+    surs: rows.filter(r => r.sure).length,
+    ecarts: rows.filter(r => r.planned !== r.used).sort((a, b) => Math.abs(b.used - b.planned) - Math.abs(a.used - a.planned)).slice(0, 12).map(r => ({
+      k: r.k,
+      v: r.v,
+      prevu: r.planned,
+      utilise: r.used,
+      apres: kbFloorNeed(r.v, capApres)
+    }))
+  };
+}
+function kbCasBilanHtml(b) {
+  const t = b.total,
+    row = (l, a) => `<tr><td style="padding:6px 10px;font-weight:700">${l}</td><td style="padding:6px 10px;text-align:center">${a.clients}</td><td style="padding:6px 10px;text-align:center">${a.prevus}</td><td style="padding:6px 10px;text-align:center">${a.utilises}</td><td style="padding:6px 10px;text-align:center;color:#c62828">${a.vides}</td><td style="padding:6px 10px;text-align:center;color:#e65100">${a.ajoutes}</td><td style="padding:6px 10px;text-align:center;font-weight:800">${a.pct} %</td><td style="padding:6px 10px;text-align:center;font-weight:800;color:#2e7d32">${a.pctApres} %</td></tr>`;
+  const esc = x => String(x).replace(/[&<>"]/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;'
+  })[c]);
+  return `<div style="font-family:Arial,sans-serif;color:#222;max-width:720px">
+        <h2 style="margin:0 0 6px">🧠 Casiers — prépa du ${esc(formatDateShort(b.day))}</h2>
+        <p style="font-size:18px;margin:6px 0"><b>${t.pct} %</b> des clients avaient le bon nombre de casiers · <b style="color:#c62828">${t.vides}</b> casier(s) prévu(s) restés vides · <b style="color:#e65100">${t.ajoutes}</b> ajouté(s) en prépa</p>
+        <p style="font-size:18px;margin:6px 0;color:#2e7d32">Avec ce qu'elle vient d'apprendre (capacité ${b.capAvant} → <b>${b.capApres}</b>), l'appli aurait eu juste pour <b>${t.pctApres} %</b> des clients.</p>
+        <table style="border-collapse:collapse;font-size:15px;margin-top:8px" border="1" cellspacing="0"><tr style="background:#f1f1f1"><th style="padding:6px 10px">Lieu</th><th>Clients</th><th>Prévus</th><th>Utilisés</th><th>Vides</th><th>Ajoutés</th><th>Juste</th><th>Juste après apprentissage</th></tr>
+        ${Object.entries(b.sites).map(([s, a]) => row(s, a)).join('')}${row('TOTAL', t)}</table>
+        ${b.ecarts.length ? `<p style="margin:12px 0 4px;font-weight:700">Plus gros écarts</p><ul style="margin:0;padding-left:18px">${b.ecarts.map(e => `<li>${esc(e.k.replace('||', ' · '))} : prévu ${e.prevu}, utilisé ${e.utilise} → prévision maintenant ${e.apres}</li>`).join('')}</ul>` : ''}
+        <p style="font-size:13px;color:#777;margin-top:12px">Estimation avant 10h = volume ÷ capacité, arrondi en dessous (mieux vaut ajouter un casier). Apprentissage sur ${b.echantillons} client(s) des 28 derniers jours ; ${b.surs} client(s) avec le casier enregistré à chaque pose.</p></div>`;
+}
+async function kbCasBilanRun(day, by) {
+  const b = await kbCasBilan(day);
+  if (!b) return null;
+  try {
+    await storage.setDoc(`day_${day}_casbilan`, 'bilan', b, {
+      replace: true
+    });
+  } catch (_) {}
+  try {
+    await stockPost({
+      secret: FRESHDESK_SECRET,
+      action: 'send_mail',
+      to: KB_RECAP_TO,
+      subject: `🧠 Casiers prépa ${formatDateShort(day)} : ${b.total.pct} % juste → ${b.total.pctApres} % après apprentissage · ${b.total.vides} vide(s), ${b.total.ajoutes} ajouté(s)`,
+      body: `Casiers prépa ${day} : ${b.total.pct} % juste, ${b.total.vides} vides, ${b.total.ajoutes} ajoutés. Après apprentissage : ${b.total.pctApres} %.`,
+      htmlBody: kbCasBilanHtml(b)
+    });
+  } catch (_) {}
+  return b;
 }
 const KB_CAS_CAP_DEFAULT = {
   cap: 170,
@@ -3074,7 +3274,10 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
         capDoc = {
           ...capDoc,
           cap: lp.cap,
-          prep: lp
+          prep: lp,
+          ...(lp.capFloor ? {
+            capFloor: lp.capFloor
+          } : {})
         };
         res.prepLearned = lp;
         try {
@@ -3182,8 +3385,8 @@ async function kbAssignCasiersOnLoad(dayKey, orders, raw) {
   const needOf = c => {
     if (!(self && c.site !== 'DOM')) return kbCasNeed(c.vol, capOf(c.site));
     if (c.jsonF.length) return c.jsonF.length;
-    const cap = Number(capOf(c.site) && capOf(c.site).cap) || 0;
-    return cap > 0 && c.vol > 0 ? Math.max(1, Math.floor(c.vol / cap + 1e-9)) : 1;
+    const cd = capOf(c.site) || {};
+    return kbFloorNeed(c.vol, Number(cd.capFloor || cd.prep && cd.prep.capFloor || cd.cap) || 0);
   };
   res.compiled = keys.filter(k => cli[k].jsonF.length).length;
   const dels = [];
@@ -47567,6 +47770,9 @@ function PrepaDuJourPage({
     kbAfterPrepClose(rungisList);
   };
   const kbAfterPrepClose = async rungisList => {
+    if (kbCasSelf(day)) kbCasBilanRun(day, user).then(b => {
+      if (b) showToast(`🧠 Casiers : ${b.total.pct} % juste aujourd'hui → ${b.total.pctApres} % avec ce que l'appli vient d'apprendre`);
+    }).catch(() => {});
     if (KB_COHABITATION) kbAncienLaunch(day, user).then(ar => showToast(ar && ar.ok ? `🤖 Ancien site : report lancé${ar.result && ar.result.n ? ` (${ar.result.n} produits)` : ''}` : ar && ar.pending ? '🤖 Ancien site : report déjà en cours' : '⚠️ Report ancien site non lancé : ' + (ar && ar.error || '?') + ' — nouvel essai automatique')).catch(e => showToast('⚠️ Report ancien site : ' + e.message));
     if (rungisList && rungisList.length) {
       try {
@@ -66282,7 +66488,7 @@ function SuiviGeneralPage({
     session: session
   }), sub === 'saison' && React.createElement(KbSaisonPage, {
     session: session
-  }), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement("h1", {
+  }), sub === 'casappr' && React.createElement(KbCasApprPage, null), sub === 'rungis' && React.createElement(React.Fragment, null, React.createElement("h1", {
     style: {
       margin: '0 0 4px'
     }
@@ -78347,6 +78553,185 @@ function useKbSapOff() {
     };
   }, [load]);
   return off;
+}
+function KbCasApprPage() {
+  const showToast = React.useContext(ToastContext);
+  const [list, setList] = React.useState(null);
+  const [cap, setCap] = React.useState(null);
+  const [busy, setBusy] = React.useState('');
+  const load = React.useCallback(async () => {
+    const out = [];
+    const t = todayKey();
+    for (let i = -2; i <= 21; i++) {
+      const d = addDays(t, -i);
+      if (!kbCasSelf(d)) continue;
+      try {
+        const b = await storage.getDoc(`day_${d}_casbilan`, 'bilan');
+        if (b) out.push(b);else {
+          const m = await storage.getDoc(`day_${d}_prep`, 'meta');
+          if (m && m.closed) out.push({
+            day: d,
+            missing: true
+          });
+        }
+      } catch (_) {}
+    }
+    setList(out.sort((a, b) => a.day < b.day ? 1 : -1));
+    try {
+      setCap(await storage.getDoc('app_config', KB_CAS_CAP_DOC));
+    } catch (_) {}
+  }, []);
+  React.useEffect(() => {
+    load();
+  }, [load]);
+  const run = async d => {
+    setBusy(d);
+    try {
+      const b = await kbCasBilanRun(d, '');
+      showToast(b ? `🧠 Bilan du ${formatDateShort(d)} calculé et envoyé` : 'Rien à comparer pour ce jour');
+      await load();
+    } catch (e) {
+      showToast('⚠️ ' + e.message);
+    }
+    setBusy('');
+  };
+  const cell = {
+    padding: '6px 8px',
+    textAlign: 'center',
+    borderBottom: '1px solid #eee'
+  };
+  return React.createElement("div", {
+    className: "stack"
+  }, React.createElement("h1", {
+    style: {
+      margin: '0 0 4px'
+    }
+  }, "\uD83E\uDDE0 Apprentissage casiers"), React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14,
+      fontSize: 15,
+      lineHeight: 1.5
+    }
+  }, "Avant 10h, l'appli pr\xE9voit ", React.createElement("b", null, "volume \xF7 capacit\xE9, arrondi en dessous"), " (mieux vaut ajouter un casier que d'en laisser un vide). La capacit\xE9 est r\xE9apprise \xE0 chaque chargement sur les casiers ", React.createElement("b", null, "vraiment utilis\xE9s"), " en pr\xE9pa (casier enregistr\xE9 \xE0 chaque pose, 28 derniers jours).", cap && React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, "Capacit\xE9 actuelle : ", React.createElement("b", {
+    style: {
+      fontSize: 18
+    }
+  }, cap.prep && cap.prep.capFloor || cap.capFloor || '—'), cap.prep && cap.prep.floorSamples ? ` (appris sur ${cap.prep.floorSamples} clients, ${cap.prep.floorMatch} % justes)` : '')), list === null ? React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14
+    }
+  }, "Chargement\u2026") : !list.length ? React.createElement("div", {
+    className: "card",
+    style: {
+      padding: 14
+    }
+  }, "Aucune pr\xE9pa cl\xF4tur\xE9e depuis le 26/11.") : list.map(b => React.createElement("div", {
+    key: b.day,
+    className: "card",
+    style: {
+      padding: 14
+    }
+  }, React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 8,
+      alignItems: 'center',
+      flexWrap: 'wrap'
+    }
+  }, React.createElement("b", {
+    style: {
+      fontSize: 18
+    }
+  }, "Pr\xE9pa du ", formatDateShort(b.day)), React.createElement("button", {
+    className: "btn-ghost",
+    disabled: !!busy,
+    onClick: () => run(b.day)
+  }, busy === b.day ? '…' : b.missing ? '🧠 Calculer le bilan' : '↻ Recalculer')), !b.missing && React.createElement(React.Fragment, null, React.createElement("div", {
+    style: {
+      fontSize: 17,
+      marginTop: 6
+    }
+  }, React.createElement("b", null, b.total.pct, " %"), " juste \xB7 ", React.createElement("b", {
+    style: {
+      color: '#c62828'
+    }
+  }, b.total.vides), " vide(s) \xB7 ", React.createElement("b", {
+    style: {
+      color: '#e65100'
+    }
+  }, b.total.ajoutes), " ajout\xE9(s) \xB7 ", React.createElement("span", {
+    style: {
+      color: '#2e7d32'
+    }
+  }, "apr\xE8s apprentissage : ", React.createElement("b", null, b.total.pctApres, " %"), " (capacit\xE9 ", b.capAvant, " \u2192 ", b.capApres, ")")), React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      marginTop: 8,
+      fontSize: 14
+    }
+  }, React.createElement("thead", null, React.createElement("tr", {
+    style: {
+      background: '#f5f5f5'
+    }
+  }, React.createElement("th", {
+    style: cell
+  }, "Lieu"), React.createElement("th", {
+    style: cell
+  }, "Clients"), React.createElement("th", {
+    style: cell
+  }, "Pr\xE9vus"), React.createElement("th", {
+    style: cell
+  }, "Utilis\xE9s"), React.createElement("th", {
+    style: cell
+  }, "Vides"), React.createElement("th", {
+    style: cell
+  }, "Ajout\xE9s"), React.createElement("th", {
+    style: cell
+  }, "Juste"), React.createElement("th", {
+    style: cell
+  }, "Apr\xE8s"))), React.createElement("tbody", null, Object.entries(b.sites).map(([s, a]) => React.createElement("tr", {
+    key: s
+  }, React.createElement("td", {
+    style: {
+      ...cell,
+      fontWeight: 700
+    }
+  }, s), React.createElement("td", {
+    style: cell
+  }, a.clients), React.createElement("td", {
+    style: cell
+  }, a.prevus), React.createElement("td", {
+    style: cell
+  }, a.utilises), React.createElement("td", {
+    style: {
+      ...cell,
+      color: '#c62828'
+    }
+  }, a.vides), React.createElement("td", {
+    style: {
+      ...cell,
+      color: '#e65100'
+    }
+  }, a.ajoutes), React.createElement("td", {
+    style: {
+      ...cell,
+      fontWeight: 700
+    }
+  }, a.pct, " %"), React.createElement("td", {
+    style: {
+      ...cell,
+      fontWeight: 700,
+      color: '#2e7d32'
+    }
+  }, a.pctApres, " %")))))))));
 }
 function KbSaisonPage({
   session
@@ -107446,6 +107831,10 @@ const KB_MNAV = [{
     sub: 'saison',
     l: 'Saisonnier (Sapins)',
     ic: '🎄'
+  }, {
+    sub: 'casappr',
+    l: 'Apprentissage casiers',
+    ic: '🧠'
   }, {
     sub: 'ancien',
     l: 'Synchro ancien site',
