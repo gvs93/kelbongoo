@@ -825,7 +825,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V11.99';
+    const APP_VERSION = 'V12.00';
+    // V12.00 — (27/11/2026) Prépa : ➕ = « casier plein » → passe tout de suite au casier PRÉVU suivant (ex. 20 → 21) ; s'il n'y en a plus,
+    //   fenêtre pour en ouvrir un. Mise en place : nb de casiers = casiers vraiment attribués par l'appli (avant : 1 par commande avant 10h).
     // V11.99 — (26/11/2026) 🎄 Master › Réglages › Saisonnier : désactiver / réactiver les Sapins (sapins/config/off dans la base Centrale).
     //   Désactivé = plus de tuile chauffeur, plus de Sapins dans l'Espace Rungis, onglet retiré de la Console (2.21.0), mails / alertes
     //   du serveur Sapins coupés (fichier KBG_SapinsVeille.gs). Clôture distrib : plus de « marquer aussi sur distributions.kelbongoo.com ».
@@ -19655,6 +19657,7 @@
       const [calib, setCalib] = React.useState(null);
       const [fcTick, setFcTick] = React.useState(0);
       const [ordTick, setOrdTick] = React.useState(0); // V10.82 — relecture tant que rien n'est chargé
+      const [mepCas, setMepCas] = React.useState(null); // V12.00 — casiers attribués par client (« LIEU||client » → n°)
       React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; setDays((l || []).filter(x => x.count > 0)); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
       React.useEffect(() => {
         let stop = false;
@@ -19674,6 +19677,9 @@
       const cur = allDays.find(d => d.day === day) || null;
       React.useEffect(() => { if (!day || !cur || !cur.exact) { setOrders(null); return; } let stop = false; setOrders(null);
         storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
+        // V12.00 — casiers gérés par l'appli : on compte les VRAIS casiers attribués (day_X_prep cs|…), pas 1 par commande
+        if (kbCasSelf(day)) storage.getAll(`day_${day}_prep`).then(arr => { if (stop) return; const m = {}; (arr || []).forEach(x => { const id = String(x.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} m[k] = (x.nums || []).map(String).filter(v => v && v !== '?'); }); setMepCas(m); }).catch(() => { if (!stop) setMepCas(null); });
+        else setMepCas(null);
         return () => { stop = true; }; }, [day, cur && cur.exact, ordTick]);
       // V10.82 — jour connu mais 0 commande chargée (chargement à 10h, parfois plus tard) : ce n'est PAS « 0 commande ».
       //   On montre la prévision admin si elle existe, sinon « en attente du chargement », et on relit toutes les 2 min.
@@ -19688,7 +19694,10 @@
       let rows = [], totN = null, totSol = null, totNow = null, est = false;
       if (eff && eff.exact && orders) {
         const by = {};
-        orders.forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0, cont: 0 }; r.n++; r.cont += kbMepOrderCont(o);
+        const seenCli = new Set(); // V12.00 — un client = ses casiers (une seule fois même avec 2 commandes)
+        orders.forEach(o => { const s = String(o.site || '?').toUpperCase(); const r = by[s] = by[s] || { n: 0, sol: 0, cont: 0 }; r.n++;
+          if (mepCas && s !== 'DOM') { const k = s + '||' + (o.name || ''); if (!seenCli.has(k)) { seenCli.add(k); const l = mepCas[k]; r.cont += l ? l.length : (kbNeedsCasier(o) ? 1 : 0); } }
+          else r.cont += kbMepOrderCont(o);
           r.sol += (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); });
         rows = Object.entries(by).map(([c, r]) => ({ c, n: r.n, sol: r.sol, cont: r.cont }));
         totN = orders.length; totSol = rows.reduce((a, r) => a + r.sol, 0);
@@ -23966,6 +23975,14 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
     setCasErr('');
   };
   const addCasier = client => addCasierFor(curSite, client);
+  // V12.00 — ➕ = « casier plein » : s'il y a un casier PRÉVU après celui en cours → on passe dessus en 1 toucher ;
+  //   sinon (dernier casier plein) → fenêtre pour en ouvrir un nouveau (⚡ automatique / n° au choix / cagette)
+  const casPlein = (site, client) => {
+    const l = getCasiers(site, client).map(String).filter(v => v && v !== '?');
+    const a = activeCas(site, client), i = l.indexOf(a);
+    if (i >= 0 && i < l.length - 1) { setActiveCas(site, client, l[i + 1]); return; }
+    addCasierFor(site, client);
+  };
   const removeCasierFor = (site, client, idx) => {
     const arr = [...getCasiers(site, client)].map(String);
     if (arr.length <= 1) {
@@ -24890,8 +24907,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         onClick: () => openRemBox('cli', r, 'pct')
       }, "🏷️"), React.createElement("button", {
         className: "pdj-xr",
-        title: "Nouveau casier pour ce client",
-        onClick: () => addCasierFor(r.site, r.client)
+        title: "Casier plein → casier suivant",
+        onClick: () => casPlein(r.site, r.client)
       }, "➕")), remCliOpen[k] && remCliInline(k, r.client.split(' ')[0]), artOpen[k] && artPanel(r));
     }), po.some(isHidden) && React.createElement("button", {
       className: "pdj-donebar" + (doneOpen[pk] ? " on" : ""),
@@ -25821,8 +25838,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           onClick: () => openRemBox('cli', r, 'pct')
         }, "🏷️"), React.createElement("button", {
           className: "pdj-xr",
-          title: "Nouveau casier pour ce client",
-          onClick: () => addCasierFor(r.site, r.client)
+          title: "Casier plein → casier suivant",
+          onClick: () => casPlein(r.site, r.client)
         }, "➕")), remCliOpen[k] && remCliInline(k), artOpen[k] && artPanel(r));
       }), ords.some(isHidden) && React.createElement("button", {
         className: "pdj-donebar" + (doneOpen['c|' + c] ? " on" : ""),
@@ -25873,8 +25890,8 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
         onClick: () => removeCasier(c, i)
       }, "✕"))), React.createElement("button", {
         className: "pdj-addcas",
-        onClick: () => addCasier(c)
-      }, "📦 Casier plein → +1 casier / 🧺 cagette")));
+        onClick: () => casPlein(curSite, c)
+      }, "📦 Casier plein → casier suivant / +1 casier")));
     }) : React.createElement("div", {
       className: "pdj-no"
     }, "Aucun client ne correspond."));
