@@ -825,7 +825,9 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V12.01';
+    const APP_VERSION = 'V12.02';
+    // V12.02 — (27/11/2026) Chargement AVANT la clôture des ventes (10h la veille de la distrib, ex. vendredi 7h) = commandes PARTIELLES :
+    //   la MU reste en ESTIMATION (plus de « MU exacte » sur un chargement partiel) et la Mise en place affiche « ≈ » (prévision si dispo).
     // V12.01 — (27/11/2026) APPRENTISSAGE CASIERS PROUVÉ : estimation avant 10h = ⌊volume / capacité⌋ (basse) avec une capacité
     //   apprise sur les casiers VRAIMENT utilisés en prépa (casier enregistré à chaque pose, 28 j). À chaque clôture de prépa :
     //   bilan (prévus / utilisés / vides / ajoutés, % juste) + ce que l'appli aurait prévu avec ce qu'elle vient d'apprendre,
@@ -16624,6 +16626,12 @@
         const loadedAt = Math.max(new Date(nextOrders.uploadedAt||0).getTime()||0, new Date(nextOrders.psLoadedAt||0).getTime()||0);
         if(snapToday && snapToday.exactSource==='manuel' && (snapToday.exactAt||0) >= loadedAt) return;
         if(!(nextOrders.orders||[]).length) return;
+        // V12.02 — chargement AVANT la clôture des ventes (vendredi 7h…) = commandes partielles → la MU reste en ESTIMATION ;
+        //   une « MU exacte » automatique déjà écrite avec ces commandes partielles est retirée.
+        if(!kbOrdersFinal(nextDay, nextOrders)){
+          if(snapToday && snapToday.exactSource==='auto' && snapToday.exactFor===nextDay && snapToday.exactJson) storage.setDoc('mu_'+dateKey, MU_REEL_DOC, { exactJson: null, exactFor: null, exactSource: null, exactFile: '', exactAt: 0 }).catch(()=>{});
+          return;
+        }
         const res = muExactFromLines(muLinesFromOrders(nextOrders.orders), flIdx);
         if(!res.matched) return;
         const json = JSON.stringify(res.exact);
@@ -19709,6 +19717,13 @@
     //   par le serveur (KBG_MEP.gs, toutes les 30 min, action fl_auto_mep) et projetée à 10h d'après les ventes passées.
     //   Par lieu : ≈ commandes, ≈ casiers (boutiques) / cagettes (camions) / cartons (DOM), ≈ rolls (16 casiers par roll).
     //   Casiers par commande appris sur les 10 derniers jours chargés dans l'appli (JSON), lieu par lieu.
+    // V12.02 — commandes FINALES = chargées après la clôture des ventes (10h la veille de la distribution)
+    function kbOrdersFinal(distribDay, d) {
+      if (!d || !(d.orders || []).length) return false;
+      const closeAt = new Date(addDays(distribDay, -1) + 'T10:00:00').getTime();
+      const atMs = Math.max(new Date(d.uploadedAt || 0).getTime() || 0, new Date(d.psLoadedAt || 0).getTime() || 0);
+      return atMs >= closeAt;
+    }
     function kbMepWord(site, n) {
       const s = String(site || '').toUpperCase();
       const w = s === 'DOM' ? 'carton' : BOUTIQUES.includes(s) ? 'casier' : 'cagette';
@@ -19750,6 +19765,8 @@
       const [fcTick, setFcTick] = React.useState(0);
       const [ordTick, setOrdTick] = React.useState(0); // V10.82 — relecture tant que rien n'est chargé
       const [mepCas, setMepCas] = React.useState(null); // V12.00 — casiers attribués par client (« LIEU||client » → n°)
+      const [ordFinal, setOrdFinal] = React.useState(true); // V12.02 — chargement avant 10h la veille = partiel
+      const [ordAt, setOrdAt] = React.useState('');
       React.useEffect(() => { let stop = false; kbUpcomingDays(7).then(l => { if (stop) return; setDays((l || []).filter(x => x.count > 0)); }).catch(() => { if (!stop) setDays([]); }); return () => { stop = true; }; }, []);
       React.useEffect(() => {
         let stop = false;
@@ -19768,7 +19785,7 @@
       React.useEffect(() => { if (day || !allDays.length) return; setDay(allDays[0].day); }, [allDays.length, day]);
       const cur = allDays.find(d => d.day === day) || null;
       React.useEffect(() => { if (!day || !cur || !cur.exact) { setOrders(null); return; } let stop = false; setOrders(null);
-        storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) setOrders(((d && d.orders) || []).filter(o => !o._test)); }).catch(() => { if (!stop) setOrders([]); });
+        storage.getDoc(`day_${day}_orders`, 'data').then(d => { if (!stop) { setOrdFinal(kbOrdersFinal(day, d)); setOrdAt((d && (d.psLoadedAt || d.uploadedAt)) || ''); setOrders(((d && d.orders) || []).filter(o => !o._test)); } }).catch(() => { if (!stop) setOrders([]); });
         // V12.00 — casiers gérés par l'appli : on compte les VRAIS casiers attribués (day_X_prep cs|…), pas 1 par commande
         if (kbCasSelf(day)) storage.getAll(`day_${day}_prep`).then(arr => { if (stop) return; const m = {}; (arr || []).forEach(x => { const id = String(x.id || ''); if (!id.startsWith('cs|')) return; let k = id.slice(3); try { k = decodeURIComponent(k); } catch (_) {} m[k] = (x.nums || []).map(String).filter(v => v && v !== '?'); }); setMepCas(m); }).catch(() => { if (!stop) setMepCas(null); });
         else setMepCas(null);
@@ -19780,6 +19797,9 @@
       React.useEffect(() => { if (!emptyLoaded) return; const t = setTimeout(() => setOrdTick(x => x + 1), 120000); return () => clearTimeout(t); }, [emptyLoaded, ordTick]);
       const fcZero = f => !!(f && !((f.total && (f.total.n || f.total.nEst)) || 0)); // prévision vide = rien de lu, pas « 0 »
       let eff = emptyLoaded ? (fcFor(day) ? { day, exact: false, f: fcFor(day) } : { day, exact: false, waiting: true }) : cur;
+      // V12.02 — chargement partiel (ex. vendredi 7h) : la prévision du serveur si elle existe, sinon les commandes chargées marquées « ≈ »
+      const partialLoad = !!(cur && cur.exact && orders && orders.length && !ordFinal);
+      if (partialLoad && fcFor(day) && !fcZero(fcFor(day))) eff = { day, exact: false, f: fcFor(day), partialN: orders.length };
       if (eff && !eff.exact && eff.f && fcZero(eff.f)) eff = { day, exact: false, waiting: true };
 
       // lignes par lieu : { c, n, sol, cont, rolls, now } — exact (JSON) ou estimé (admin)
@@ -19793,6 +19813,7 @@
           r.sol += (o.items || []).filter(it => it && (it.solidaire || kbIsSolidaire(it.produit))).reduce((t, it) => t + (parseInt(it.qty || it.quantity, 10) || 1), 0); });
         rows = Object.entries(by).map(([c, r]) => ({ c, n: r.n, sol: r.sol, cont: r.cont }));
         totN = orders.length; totSol = rows.reduce((a, r) => a + r.sol, 0);
+        if (partialLoad) est = true; // V12.02 — commandes encore ouvertes : ce n'est pas le chiffre final
       } else if (eff && !eff.exact && eff.f) {
         est = !eff.f.closed;
         rows = Object.entries(eff.f.sites || {}).map(([c, r]) => ({ c, n: r.nEst, now: r.n, sol: r.solEst != null ? r.solEst : r.sol, cont: Math.max(r.nEst ? 1 : 0, Math.round(r.nEst * kbMepRatio(calib, c))) }));
@@ -19807,7 +19828,7 @@
       const first = allDays[0];
       const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir'
         : (eff && eff.waiting ? `⏳ Distrib. du ${formatDateShort(day)} : commandes pas encore chargées`
-        : cur && cur.day === day ? `${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`);
+        : cur && cur.day === day ? `${partialLoad ? `≈ Chargement partiel${ordAt ? ' de ' + new Date(ordAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''} (ventes ouvertes jusqu'à 10h${eff.partialN ? ', ' + eff.partialN + ' cmd déjà là' : ''}) —` : ''} ${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`);
       const Card = ({ bg, lbl, v, col, note }) => (
         <div style={{ flex: 1, minWidth: 140, background: bg, borderRadius: 12, padding: '10px 12px' }}>
           <div style={{ fontSize: 14, fontWeight: 600 }}>{lbl}</div>

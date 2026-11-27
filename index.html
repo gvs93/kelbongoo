@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V12.01) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V12.02) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V12.01';
+const APP_VERSION = 'V12.02';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -30700,6 +30700,16 @@ function useMuReel(dateKey, items, flRows, entries, targetDay, opts) {
     const loadedAt = Math.max(new Date(nextOrders.uploadedAt || 0).getTime() || 0, new Date(nextOrders.psLoadedAt || 0).getTime() || 0);
     if (snapToday && snapToday.exactSource === 'manuel' && (snapToday.exactAt || 0) >= loadedAt) return;
     if (!(nextOrders.orders || []).length) return;
+    if (!kbOrdersFinal(nextDay, nextOrders)) {
+      if (snapToday && snapToday.exactSource === 'auto' && snapToday.exactFor === nextDay && snapToday.exactJson) storage.setDoc('mu_' + dateKey, MU_REEL_DOC, {
+        exactJson: null,
+        exactFor: null,
+        exactSource: null,
+        exactFile: '',
+        exactAt: 0
+      }).catch(() => {});
+      return;
+    }
     const res = muExactFromLines(muLinesFromOrders(nextOrders.orders), flIdx);
     if (!res.matched) return;
     const json = JSON.stringify(res.exact);
@@ -38716,6 +38726,12 @@ function PainPribonPage({
     }, "\u2705 Marquer factur\xE9 (", eur(todoEur), ")")));
   })));
 }
+function kbOrdersFinal(distribDay, d) {
+  if (!d || !(d.orders || []).length) return false;
+  const closeAt = new Date(addDays(distribDay, -1) + 'T10:00:00').getTime();
+  const atMs = Math.max(new Date(d.uploadedAt || 0).getTime() || 0, new Date(d.psLoadedAt || 0).getTime() || 0);
+  return atMs >= closeAt;
+}
 function kbMepWord(site, n) {
   const s = String(site || '').toUpperCase();
   const w = s === 'DOM' ? 'carton' : BOUTIQUES.includes(s) ? 'casier' : 'cagette';
@@ -38793,6 +38809,8 @@ function KbMiseEnPlace({
   const [fcTick, setFcTick] = React.useState(0);
   const [ordTick, setOrdTick] = React.useState(0);
   const [mepCas, setMepCas] = React.useState(null);
+  const [ordFinal, setOrdFinal] = React.useState(true);
+  const [ordAt, setOrdAt] = React.useState('');
   React.useEffect(() => {
     let stop = false;
     kbUpcomingDays(7).then(l => {
@@ -38876,7 +38894,11 @@ function KbMiseEnPlace({
     let stop = false;
     setOrders(null);
     storage.getDoc(`day_${day}_orders`, 'data').then(d => {
-      if (!stop) setOrders((d && d.orders || []).filter(o => !o._test));
+      if (!stop) {
+        setOrdFinal(kbOrdersFinal(day, d));
+        setOrdAt(d && (d.psLoadedAt || d.uploadedAt) || '');
+        setOrders((d && d.orders || []).filter(o => !o._test));
+      }
     }).catch(() => {
       if (!stop) setOrders([]);
     });
@@ -38917,6 +38939,13 @@ function KbMiseEnPlace({
     exact: false,
     waiting: true
   } : cur;
+  const partialLoad = !!(cur && cur.exact && orders && orders.length && !ordFinal);
+  if (partialLoad && fcFor(day) && !fcZero(fcFor(day))) eff = {
+    day,
+    exact: false,
+    f: fcFor(day),
+    partialN: orders.length
+  };
   if (eff && !eff.exact && eff.f && fcZero(eff.f)) eff = {
     day,
     exact: false,
@@ -38956,6 +38985,7 @@ function KbMiseEnPlace({
     }));
     totN = orders.length;
     totSol = rows.reduce((a, r) => a + r.sol, 0);
+    if (partialLoad) est = true;
   } else if (eff && !eff.exact && eff.f) {
     est = !eff.f.closed;
     rows = Object.entries(eff.f.sites || {}).map(([c, r]) => ({
@@ -38978,7 +39008,10 @@ function KbMiseEnPlace({
   const ap = est || eff && !eff.exact && eff.f ? '≈ ' : '';
   const loading = days === null || fc === undefined;
   const first = allDays[0];
-  const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir' : eff && eff.waiting ? `⏳ Distrib. du ${formatDateShort(day)} : commandes pas encore chargées` : cur && cur.day === day ? `${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`;
+  const sub = loading && !allDays.length ? 'Chargement…' : !allDays.length ? 'Aucune commande à venir' : eff && eff.waiting ? `⏳ Distrib. du ${formatDateShort(day)} : commandes pas encore chargées` : cur && cur.day === day ? `${partialLoad ? `≈ Chargement partiel${ordAt ? ' de ' + new Date(ordAt).toLocaleTimeString('fr-FR', {
+    hour: '2-digit',
+    minute: '2-digit'
+  }) : ''} (ventes ouvertes jusqu'à 10h${eff.partialN ? ', ' + eff.partialN + ' cmd déjà là' : ''}) —` : ''} ${eff.exact ? 'Commandes' : '≈ Prévision'} du ${formatDateShort(day)} : ${totN == null ? '…' : ap + totN} cmd · ${ap}${totRolls} roll${totRolls > 1 ? 's' : ''} · 🧺 ${totSol == null ? '…' : ap + totSol}` : `Distribution du ${formatDateShort(first.day)}`;
   const Card = ({
     bg,
     lbl,
