@@ -825,13 +825,17 @@
     // la dernière valeur connue n'est PLUS présentée comme la température actuelle ni comme une
     // alerte live (évite un faux « au-dessus du seuil » sur une mesure vieille de plusieurs mois).
     const KOOVEA_OFFLINE_MIN = 120; // minutes (ajustable)
-    const APP_VERSION = 'V12.03';
+    const APP_VERSION = 'V12.04';
     // V12.03 — (27/11/2026) Master › Chiffres › ♻️ Pertes ROB & DLC : bouton 📅 DLC dans le même calendrier (DLC notées à l'inventaire, retraits ROB / partage,
     //   vendus, partis dans les commandes, remises en rayon, liste du matin : qui / quand) + ⚠️ à risque ; ⬇️ Données brutes (Excel, jour / semaine / mois / dates libres) :
     //   LISEZMOI, Evenements, Lots_DLC, DLC_inventaire, Pertes, Journees_DLC, Resume_semaine — lecture seule, fabriqué dans le navigateur du Master (aucun serveur).
     //   + Règle DLC « ♻️ ne pas attendre » (robTot, défaut OUI) : perdu au prochain contrôle → ROB avec la 1re navette AVANT ce contrôle
     //   (ven. 27/11 : DLC jusqu'au 04/12 → navette vendredi 14h30, avant : seulement jusqu'au 02/12) ; popup 🚨 URGENT à nouveau si la liste du
     //   matin était finie et que de nouveaux produits arrivent (« avant la navette de 14h30 »), 2e récap mail rr@ + hg@.
+    // V12.04 — (28/11/2026) Chargement des commandes : FICHIER PÉRIMÉ REFUSÉ (fenêtre ⛔, « charger quand même » possible) si sa
+    //   dernière commande n'est pas plus récente que le chargement précédent, ou date de plus de 2 h avant la clôture des ventes alors
+    //   que les ventes sont closes. Incident 27/11 : chargement 10h30 = export arrêté à 07:11 → commandes 7h-10h annulées sur l'ancien site.
+    //   Heure de la commande la plus récente enregistrée (newestOrderAt). Côté serveur : KBG_Ancien v2.0 + KBG_Locaux v1.1.
     // V12.02 — (27/11/2026) Chargement AVANT la clôture des ventes (10h la veille de la distrib, ex. vendredi 7h) = commandes PARTIELLES :
     //   la MU reste en ESTIMATION (plus de « MU exacte » sur un chargement partiel) et la Mise en place affiche « ≈ » (prévision si dispo).
     // V12.01 — (27/11/2026) APPRENTISSAGE CASIERS PROUVÉ : estimation avant 10h = ⌊volume / capacité⌋ (basse) avec une capacité
@@ -19725,6 +19729,25 @@
     //   Par lieu : ≈ commandes, ≈ casiers (boutiques) / cagettes (camions) / cartons (DOM), ≈ rolls (16 casiers par roll).
     //   Casiers par commande appris sur les 10 derniers jours chargés dans l'appli (JSON), lieu par lieu.
     // V12.02 — commandes FINALES = chargées après la clôture des ventes (10h la veille de la distribution)
+    // V12.04 — heure de la commande la plus récente d'un fichier (identifiant de commande de l'ancien site = horodaté)
+    function kbNewestOrderMs(orders) {
+      let m = 0;
+      (orders || []).forEach(o => { const id = String((o && o.orderId) || ''); if (/^[0-9a-f]{24}$/i.test(id)) { const t = parseInt(id.slice(0, 8), 16) * 1000; if (t > m) m = t; } });
+      return m;
+    }
+    // V12.04 — raison (texte) si le fichier est périmé, sinon ''. prev = chargement déjà enregistré pour ce jour.
+    function kbStaleOrdersWhy(distribDay, newestMs, count, prev, nowMs) {
+      if (!newestMs) return '';
+      const hm = t => new Date(t).toLocaleString('fr-FR', { weekday: 'long', hour: '2-digit', minute: '2-digit' });
+      const closeAt = new Date(addDays(distribDay, -1) + 'T10:00:00').getTime();
+      const prevNewest = prev ? (new Date(prev.newestOrderAt || 0).getTime() || kbNewestOrderMs((prev.orders || []).filter(o => !o._ps))) : 0;
+      const prevAt = prev ? new Date(prev.uploadedAt || 0).getTime() || 0 : 0;
+      if (prevNewest && newestMs <= prevNewest && count <= (Number(prev.count) || 0) && nowMs - prevAt > 20 * 60000)
+        return `Ce fichier s'arrête à la commande de ${hm(newestMs)} : il n'a RIEN de plus que le chargement de ${hm(prevAt)} (même fichier ?).`;
+      if (nowMs >= closeAt && newestMs < closeAt - 2 * 3600000)
+        return `Les ventes sont closes (10h la veille), mais la dernière commande de ce fichier date de ${hm(newestMs)} : les commandes passées après ne sont pas dedans.`;
+      return '';
+    }
     function kbOrdersFinal(distribDay, d) {
       if (!d || !(d.orders || []).length) return false;
       const closeAt = new Date(addDays(distribDay, -1) + 'T10:00:00').getTime();
@@ -42240,6 +42263,17 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
           // V9.52 — on conserve les commandes PrestaShop déjà fusionnées pour ce jour (Mongo ne les écrase pas)
           let psKeep = [];
           try { const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data'); psKeep = (ex && ex.orders) ? ex.orders.filter(o => o._ps) : []; } catch (_) {}
+          // V12.04 — (28/11/2026) FICHIER PÉRIMÉ REFUSÉ : le 27/11, le chargement de 10h30 contenait un export arrêté à 07:11
+          //   → commandes de 7h-10h absentes de l'appli → annulées sur l'ancien site. Heure de la commande la plus récente du
+          //   fichier (lue dans l'identifiant de commande) comparée au chargement précédent et à la clôture des ventes (10h la veille).
+          const newestMs = kbNewestOrderMs(res.orders);
+          {
+            let prev = null; try { prev = await storage.getDoc(`day_${dayKey}_orders`, 'data'); } catch (_) {}
+            const why = kbStaleOrdersWhy(dayKey, newestMs, res.orders.length, prev, Date.now());
+            if (why && !window.confirm(`⛔ FICHIER DE COMMANDES PAS À JOUR\n\n${why}\n\nRetélécharge l'export des commandes sur l'admin (après 10h la veille de la distrib), puis recharge-le.\n\nOK = charger QUAND MÊME ce fichier (déconseillé)\nAnnuler = ne rien charger`)) {
+              showToast('⛔ Chargement annulé : fichier pas à jour'); setBusy(false); return;
+            }
+          }
           // V10.64 — un casier du nouveau site déjà pris par l'ancien site → renuméroté à la suite
           const nRenum = psRenumberCasiers(res.orders, psKeep);
           if (nRenum) { const w = [...new Set(psKeep.filter(o => o._renum).map(o => o.site === 'DOM' ? 'carton' : KB_BOUTIQUES_DEFAULT.includes(o.site) ? 'casier' : 'cagette'))].join(' / ');
@@ -42251,6 +42285,7 @@ ${kbCmExcHtml(kbCmExc(lieu, day, c.site), day)}
             count: res.orders.length,
             source: 'v4-json',
             targetDate: dayKey,
+            newestOrderAt: newestMs ? new Date(newestMs).toISOString() : '', // V12.04
           });
           // V11.57 — casiers attribués tout de suite (même sans n° dans le JSON), mêmes n° au rechargement de 10h
           try {

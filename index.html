@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- FICHIER GÉNÉRÉ (V12.03) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
+<!-- FICHIER GÉNÉRÉ (V12.04) depuis index.src.html — pour modifier l'appli, modifier index.src.html puis recompiler. -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -743,7 +743,7 @@ function siteLabel(code) {
 }
 const BOUTIQUES = ['BIC', 'BOR', 'STB', 'PDP', 'TOL', 'ROB', 'PDC'];
 const KOOVEA_OFFLINE_MIN = 120;
-const APP_VERSION = 'V12.03';
+const APP_VERSION = 'V12.04';
 const DISTRIB_SCHEDULE = {
   0: [],
   1: [],
@@ -38727,6 +38727,31 @@ function PainPribonPage({
       onClick: () => markInvoiced(m, list)
     }, "\u2705 Marquer factur\xE9 (", eur(todoEur), ")")));
   })));
+}
+function kbNewestOrderMs(orders) {
+  let m = 0;
+  (orders || []).forEach(o => {
+    const id = String(o && o.orderId || '');
+    if (/^[0-9a-f]{24}$/i.test(id)) {
+      const t = parseInt(id.slice(0, 8), 16) * 1000;
+      if (t > m) m = t;
+    }
+  });
+  return m;
+}
+function kbStaleOrdersWhy(distribDay, newestMs, count, prev, nowMs) {
+  if (!newestMs) return '';
+  const hm = t => new Date(t).toLocaleString('fr-FR', {
+    weekday: 'long',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+  const closeAt = new Date(addDays(distribDay, -1) + 'T10:00:00').getTime();
+  const prevNewest = prev ? new Date(prev.newestOrderAt || 0).getTime() || kbNewestOrderMs((prev.orders || []).filter(o => !o._ps)) : 0;
+  const prevAt = prev ? new Date(prev.uploadedAt || 0).getTime() || 0 : 0;
+  if (prevNewest && newestMs <= prevNewest && count <= (Number(prev.count) || 0) && nowMs - prevAt > 20 * 60000) return `Ce fichier s'arrête à la commande de ${hm(newestMs)} : il n'a RIEN de plus que le chargement de ${hm(prevAt)} (même fichier ?).`;
+  if (nowMs >= closeAt && newestMs < closeAt - 2 * 3600000) return `Les ventes sont closes (10h la veille), mais la dernière commande de ce fichier date de ${hm(newestMs)} : les commandes passées après ne sont pas dedans.`;
+  return '';
 }
 function kbOrdersFinal(distribDay, d) {
   if (!d || !(d.orders || []).length) return false;
@@ -93612,6 +93637,19 @@ function AdminPage({
         const ex = await storage.getDoc(`day_${dayKey}_orders`, 'data');
         psKeep = ex && ex.orders ? ex.orders.filter(o => o._ps) : [];
       } catch (_) {}
+      const newestMs = kbNewestOrderMs(res.orders);
+      {
+        let prev = null;
+        try {
+          prev = await storage.getDoc(`day_${dayKey}_orders`, 'data');
+        } catch (_) {}
+        const why = kbStaleOrdersWhy(dayKey, newestMs, res.orders.length, prev, Date.now());
+        if (why && !window.confirm(`⛔ FICHIER DE COMMANDES PAS À JOUR\n\n${why}\n\nRetélécharge l'export des commandes sur l'admin (après 10h la veille de la distrib), puis recharge-le.\n\nOK = charger QUAND MÊME ce fichier (déconseillé)\nAnnuler = ne rien charger`)) {
+          showToast('⛔ Chargement annulé : fichier pas à jour');
+          setBusy(false);
+          return;
+        }
+      }
       const nRenum = psRenumberCasiers(res.orders, psKeep);
       if (nRenum) {
         const w = [...new Set(psKeep.filter(o => o._renum).map(o => o.site === 'DOM' ? 'carton' : KB_BOUTIQUES_DEFAULT.includes(o.site) ? 'casier' : 'cagette'))].join(' / ');
@@ -93623,7 +93661,8 @@ function AdminPage({
         uploadedAt: new Date().toISOString(),
         count: res.orders.length,
         source: 'v4-json',
-        targetDate: dayKey
+        targetDate: dayKey,
+        newestOrderAt: newestMs ? new Date(newestMs).toISOString() : ''
       });
       try {
         const rawCas = typeof v4Orders === 'string' ? JSON.parse(v4Orders) : v4Orders;
